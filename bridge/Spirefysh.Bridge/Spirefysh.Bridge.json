@@ -1,0 +1,12 @@
+{
+  "id": "spirefysh.bridge",
+  "name": "Spirefysh Advisor Bridge",
+  "author": "Spirefysh contributors",
+  "description": "Shows current and action-specific model-estimated win probabilities.",
+  "version": "v0.3.0",
+  "min_game_version": "0.107.1",
+  "has_pck": false,
+  "has_dll": true,
+  "dependencies": [],
+  "affects_gameplay": true
+}

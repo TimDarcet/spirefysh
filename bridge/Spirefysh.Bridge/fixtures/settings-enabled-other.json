@@ -1,0 +1,12 @@
+{
+  "mod_settings": {
+    "mod_list": [
+      {
+        "id": "enabled.example",
+        "is_enabled": true,
+        "source": "steam_workshop"
+      }
+    ],
+    "mods_enabled": true
+  }
+}

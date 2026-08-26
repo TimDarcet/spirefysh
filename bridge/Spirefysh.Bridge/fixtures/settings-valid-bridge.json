@@ -1,0 +1,17 @@
+{
+  "mod_settings": {
+    "mod_list": [
+      {
+        "id": "spirefysh.bridge",
+        "is_enabled": true,
+        "source": "local"
+      },
+      {
+        "id": "disabled.example",
+        "is_enabled": false,
+        "source": "steam_workshop"
+      }
+    ],
+    "mods_enabled": true
+  }
+}
