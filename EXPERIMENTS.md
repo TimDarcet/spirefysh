@@ -2233,3 +2233,9 @@ Rationale: Cost-homogeneous batches can align game phase and action complexity a
 Experiment: Restart the MODEL64 uniform-random batching design from scratch for a controlled comparison with MODEL63. Reuse MODEL63's model seed `6301`, training seed `3,200,000,000`, architecture, batch `4,096`, learning rate `6e-4`, PPO settings, curriculum, and reporting cadence. Initialize new weights, Adam state, replay, curriculum counters, and decision counter at A0/+24.
 
 Rationale: MODEL64 continued trained MODEL63 weights and therefore measured a before/after timeline rather than a controlled batching comparison. MODEL65 changes only minibatch selection: MODEL63 used character-balanced advantage-prioritized sampling, whereas MODEL65 samples every queued fresh row and replay row uniformly without replacement.
+
+## 2026-08-29 — MODEL66 reusable priority-decay dataset
+
+Experiment: Replace one-pass fresh batches and the separate winning reservoir with one reusable dataset. Exclude forced one-action rows on admission. Give each actionable row priority `1 + |Awin| + active*|Aprogress| + 4*terminal + 4*winning_return`, sample uniformly across compute costs, subtract `3` after every use, and retire the row only when priority becomes negative. Screen current-to-behavior action-log-probability drift before constructing the optimizer batch; rejected rows are removed and replacements are drawn until the requested usable size or dataset exhaustion.
+
+Instrumentation: Report current and peak dataset rows, total seen and admitted rows, uses, priority retirements, forced and ratio removals, mean/max remaining priority, and screening time. Plot dataset size directly in the dashboard. The winning-reservoir capacity is zero.
