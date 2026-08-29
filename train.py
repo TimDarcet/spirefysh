@@ -923,7 +923,6 @@ class Agent(nn.Module):
         self.progress_value = nn.Sequential(
             nn.Linear(self.state_width, self.head_width), nn.ReLU(), nn.Linear(self.head_width, 1),
         )
-        self.policy_entropy = None
         self._card_cache, self._graph_cache = {}, {}
         self.cache_stats = {"card_hit": 0, "card_miss": 0, "graph_hit": 0, "graph_miss": 0}
         nn.init.normal_(self.policy[-1].weight, std=0.01)
@@ -1108,12 +1107,6 @@ class Agent(nn.Module):
         value = score - torch.where(torch.isfinite(normalizer), normalizer, 0)[group]
         return torch.where(legal, value, torch.zeros_like(value))
 
-    @staticmethod
-    def group_entropy(log_probability, legal, index):
-        offsets, group, _position, _maximum = index
-        term = torch.where(legal, -log_probability.exp() * log_probability, 0)
-        return term.new_zeros(len(offsets) - 1).index_add(0, group, term)
-
     def score(self, state, action, row):
         return self.policy(torch.cat((state[row], action), 1)).squeeze(-1)
 
@@ -1124,17 +1117,6 @@ class Agent(nn.Module):
         policy = scores.new_zeros(len(state) * actions).scatter(
             0, action_flat, scores,
         ).reshape(len(state), actions)
-        with torch.no_grad():
-            entropy = self.group_entropy(scores, legal, sequence)
-            legal_count = legal.new_zeros(len(state), dtype=torch.long).index_add(
-                0, action_row, legal.long(),
-            )
-            self.policy_entropy = {
-                "candidate": entropy.detach(), "normalized": torch.where(
-                    legal_count > 1, entropy / legal_count.clamp_min(2).log(),
-                    torch.zeros_like(entropy),
-                ).detach(), "effective_actions": entropy.exp().detach(),
-            }
         return policy
 
     def encode_map(self, encoded, index):
