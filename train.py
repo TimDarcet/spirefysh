@@ -2310,6 +2310,20 @@ def summaries(episodes):
     return [episode_summary(rows) for rows in episodes]
 
 
+def promotion_sample(episodes, size, threshold):
+    recent = episodes[-size:]
+    grouped = [[row for character, row in recent if character == value] for value in range(5)]
+    result = episode_summary([row for _, row in recent]) | {
+        "runs": len(recent),
+        "characters": [episode_summary(rows) | {
+            "character": character, "runs": len(rows),
+        } for character, rows in enumerate(grouped)],
+    }
+    return len(recent) == size and all(
+        rows and sum(row[0] for row in rows) / len(rows) > threshold for rows in grouped
+    ), result
+
+
 def curriculum_weights(stage, stage_decisions, auxiliary_decisions, args, active=True):
     stage_fraction = min(1, stage_decisions / args.progress_decisions)
     progress_fraction = min(1, auxiliary_decisions / args.progress_decisions)
@@ -2777,6 +2791,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
     collector_args.envs //= args.samplers
     dataset = ExperienceDataset()
     episodes = [[] for _ in range(5)]
+    promotion_episodes = []
     losses = {key: [] for key in ("mean_advantage", "policy_loss", "value_loss", "progress_value_loss", "progress_beta", "entropy", "entropy_weight", "kl", "post_kl", "clip_fraction", "winning_loss", "winning_kl")}
     pipeline = [
         f"{args.samplers} continuous CPU actor{'s' if args.samplers > 1 else ''} → "
@@ -2902,6 +2917,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         )
         for target_episodes, collected in zip(episodes, result["episodes"]):
             target_episodes.extend(collected)
+        for character, collected in enumerate(result["episodes"]):
+            promotion_episodes.extend((character, row) for row in collected)
         collector_seconds[worker] += result["collect_seconds"]
         collect_seconds = max(collector_seconds)
         for key in cache_stats:
@@ -3117,6 +3134,14 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
     next_report = base_decisions + args.report_decisions
     next_save = base_decisions + args.save_decisions
     promotion_ready = False
+    promotion_result = None
+    def update_promotion():
+        nonlocal promotion_ready, promotion_result
+        if promotion_ready or stage + 1 >= len(STAGES):
+            return
+        promotion_ready, promotion_result = promotion_sample(
+            promotion_episodes, args.promotion_window, args.promote_win_rate,
+        )
     pending = []
     def drain_results():
         while True:
@@ -3193,12 +3218,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     windows += 1
                     report()
                     next_report += args.report_decisions
-                    recent = [rows[-args.promotion_window:] for rows in episodes]
-                    promotion_ready |= stage + 1 < len(STAGES) and all(
-                        len(rows) >= args.promotion_window
-                        and sum(row[0] for row in rows) / len(rows) >= args.promotion_trigger_rate
-                        for rows in recent
-                    )
+                    update_promotion()
                     if promotion_ready:
                         stop.set()
                     continue
@@ -3495,12 +3515,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 windows += 1
                 report()
                 next_report += args.report_decisions
-                recent = [rows[-args.promotion_window:] for rows in episodes]
-                promotion_ready |= stage + 1 < len(STAGES) and all(
-                    len(rows) >= args.promotion_window
-                    and sum(row[0] for row in rows) / len(rows) >= args.promotion_trigger_rate
-                    for rows in recent
-                )
+                update_promotion()
                 if promotion_ready:
                     stop.set()
     finally:
@@ -3563,6 +3578,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         "terminals": terminal_summary,
         "description": f"Continuously trained V{MODEL_VERSION} on A{ascension}/+{bonus} trajectories.",
         "pipeline": pipeline, "promotion_ready": promotion_ready,
+        "promotion_result": promotion_result,
         "dataset_rows": len(dataset), "dataset_peak": dataset_peak, "dataset_seen": dataset.seen,
         "dataset_attempted": attempted, "dataset_trained": trained,
         "dataset_stale_dropped": dataset.stale_dropped,
@@ -4089,8 +4105,20 @@ function showVersion(){const run=versions[versionSelect.value],reports=run.repor
         "An immutable numbered checkpoint plus latest.pt and SHA-256 metadata are written every ${n(training.save_decisions)} handled decisions.",
         "An immutable numbered checkpoint plus latest.pt and SHA-256 metadata are written every ${n(training.save_decisions)} handled decisions, then evaluated on fixed development seed ${training.development_seed??'?'}.",
     ).replace(
-        "each reach at least ${percent(training.promote_win_rate)} wins. This stops the actor and starts deterministic evaluation.",
-        "each reach at least ${percent(training.promotion_trigger_rate??training.promote_win_rate)} wins. This schedules the independent promotion panel; it is not the promotion decision.",
+        "${n(training.promotion_window)} episodes/character",
+        "${n(training.promotion_window)} recent trajectories",
+    ).replace(
+        "The last ${n(training.promotion_window)} training episodes for every character must each reach at least ${percent(training.promote_win_rate)} wins. This stops the actor and starts deterministic evaluation.",
+        "The latest ${n(training.promotion_window)} completed training trajectories are grouped by character. Every character must appear and exceed ${percent(training.promote_win_rate)} wins; the stage then advances immediately.",
+    ).replace(
+        "Greedy evaluation",
+        "Automatic promotion",
+    ).replace(
+        "Argmax actions run in batches of ${n(training.evaluation_batch)}, with ${n(training.evaluation_max_steps)}-step run and ${n(training.evaluation_max_combat_steps)}-step combat caps.",
+        "No separate promotion evaluation runs. Fixed development panels remain diagnostic and select stage champions.",
+    ).replace(
+        "Every character must win at least ${percent(training.promote_win_rate)} of all evaluation runs. Pass: advance to ${next?`A${next.ascension}/+${next.bonus}`:'the final stage'} and clear winning replay.",
+        "A passing rolling training window advances to ${next?`A${next.ascension}/+${next.bonus}`:'the final stage'} and clears winning replay.",
     ).replace(
         "xaxis.value==='decisions'?iteration*envs:",
         "xaxis.value==='decisions'?(training.samplers?report.step:iteration*envs):",
@@ -4292,44 +4320,44 @@ def train(args):
     if stage_bests != best.get("stages", {}):
         best["stages"] = stage_bests
         atomic_json(best_path, best)
-    def promote():
+    def promote(result=None):
         nonlocal stage, stage_decisions, promotion_index, progress_active, promotion_seconds
         path = promotions_dir / f"{decisions:012}.json"
         if path.exists() or stage + 1 >= len(STAGES):
             raise ValueError("promotion is not available at this checkpoint")
         promotion_started = time.monotonic()
-        seed = args.promotion_seed + promotion_index * 100_000_000 + stage * 10_000_000
-        result = evaluate(
-            model, args, target, seed, args.promotion_runs, stage,
-            args.evaluation_max_steps, args.evaluation_max_combat_steps,
-        )
-        promoted = all(row["wins"] / row["runs"] >= args.promote_win_rate
-                       for row in result["characters"])
+        manual = result is None
+        if manual:
+            panels = sorted(development_dir.glob("*.json"))
+            result = json.loads(panels[-1].read_text())["result"] if panels else {
+                "runs": 0, "wins": 0, "characters": [],
+            }
         promotion_index += 1
         promotion = {
-            "schema": 1, "step": decisions, "seed": seed,
+            "schema": 1, "step": decisions, "seed": None,
             "seconds": elapsed_offset + time.monotonic() - started,
             "stage": {"index": stage, "ascension": STAGES[stage][0], "bonus": STAGES[stage][1]},
             "trigger": {
-                "episodes_per_character": args.promotion_window,
-                "win_rate": args.promotion_trigger_rate,
+                "mode": "manual" if manual else "last sampled trajectories",
+                "trajectories": args.promotion_window,
+                "minimum_per_character": 1,
+                "win_rate": args.promote_win_rate,
             },
-            "threshold": args.promote_win_rate, "promoted": promoted, "result": result,
+            "threshold": args.promote_win_rate, "promoted": True, "result": result,
         }
         immutable_json(path, promotion)
-        if promoted:
-            progress_active &= stage != 6
-            stage += 1
-            stage_decisions = 0
-            reservoir.clear()
-            entry = entries_dir / f"{stage:02}-{decisions:012}.pt"
-            entry_digest = save(entry, decisions, False)
-            best.setdefault("entries", {})[str(stage)] = {
-                "step": decisions,
-                "stage": {"index": stage, "ascension": STAGES[stage][0], "bonus": STAGES[stage][1]},
-                "checkpoint": str(entry.relative_to(output)), "sha256": entry_digest,
-            }
-            atomic_json(best_path, best)
+        progress_active &= stage != 6
+        stage += 1
+        stage_decisions = 0
+        reservoir.clear()
+        entry = entries_dir / f"{stage:02}-{decisions:012}.pt"
+        entry_digest = save(entry, decisions, False)
+        best.setdefault("entries", {})[str(stage)] = {
+            "step": decisions,
+            "stage": {"index": stage, "ascension": STAGES[stage][0], "bonus": STAGES[stage][1]},
+            "checkpoint": str(entry.relative_to(output)), "sha256": entry_digest,
+        }
+        atomic_json(best_path, best)
         promotion_seconds += time.monotonic() - promotion_started
         digest = save(latest, decisions, True)
         atomic_json(output / "latest.json", {
@@ -4430,7 +4458,7 @@ def train(args):
         training_seconds += training["seconds"]
         if not training["promotion_ready"] or time.monotonic() >= deadline:
             break
-        promote()
+        promote(training["promotion_result"])
     digest = save(latest, decisions, True)
     atomic_json(output / "latest.json", {
         "step": decisions, "stage": stage, "sampler_session": sampler_session,
@@ -4850,6 +4878,16 @@ def probe():
     torch.manual_seed(7); np.random.seed(7)
     assert bands([])["mean"] is None
     assert episode_summary([])["floor_mean"] is None
+    promotion = [
+        (character, (int(index < 9), 1, 0, 0, 0, index))
+        for character in range(5) for index in range(40)
+    ]
+    ready, result = promotion_sample(promotion, 200, .2)
+    assert ready and all(row["runs"] == 40 and row["win_rate"] == .225
+                         for row in result["characters"])
+    promotion[8] = (0, (0, 1, 0, 0, 0, 8))
+    assert not promotion_sample(promotion, 200, .2)[0]
+    assert not promotion_sample(promotion[:199], 200, .2)[0]
     accelerator = device(); target = torch.device("cpu")
     schedule = argparse.Namespace(
         progress_decisions=5_000_000, progress_beta=None,
@@ -5257,8 +5295,8 @@ def parser():
     run.add_argument("--development-seed", type=int, default=3_500_000_000)
     run.add_argument("--development-runs", type=int, default=32)
     run.add_argument("--promotion-seed", type=int, default=3_700_000_000)
-    run.add_argument("--promotion-window", type=int, default=128)
-    run.add_argument("--promotion-trigger-rate", type=float, default=.12)
+    run.add_argument("--promotion-window", type=int, default=200)
+    run.add_argument("--promotion-trigger-rate", type=float, default=.2)
     run.add_argument("--promotion-runs", type=int, default=256)
     run.add_argument("--promote-win-rate", type=float, default=0.2)
     run.add_argument("--evaluation-batch", type=int, default=32)

@@ -2215,3 +2215,9 @@ Experiment: Promote the exact MODEL62 throughput patch into a fresh model identi
 Rationale: The isolated second 32,768-decision window reached `1,228.9` end-to-end decisions/s with `100%` utilization, zero stale, ratio, pre-KL, or post-KL drops, and `4.117 GiB` peak MPS driver allocation. The larger batch performs eight optimizer/trust-region cycles per report instead of 32; the doubled learning rate partially compensates for the lower update frequency without applying full linear scaling.
 
 Next: Require the live second window to reproduce at least `1,000` end-to-end decisions/s. Monitor KL utilization and early learning separately because the batch and learning-rate change alters optimization cadence despite identical model outputs and PPO equations.
+
+## 2026-08-29 — MODEL63 automatic curriculum promotion
+
+Experiment: Remove the separate 256-run-per-character promotion panel. After every report, inspect the latest 200 completed training trajectories as one chronological window, group them by character, and advance immediately when every character appears and has a win rate strictly above `20%`. Manual `--promote-now` now advances unconditionally. Fixed development panels remain diagnostic and continue selecting stage champions.
+
+Rationale: The prior promotion panel duplicated evaluation work, blocked training for tens of minutes, and retained excessive memory. The rolling rule reacts directly to current sampled-policy performance while still requiring success from all five characters.
