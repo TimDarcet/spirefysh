@@ -539,6 +539,45 @@ kernel void token_backward_norm_reduce(
     }
 }
 
+kernel void semantic_forward(
+    device const int *semantic, device const float *numeric, device const float *embedding,
+    device const float *field, device const float *numeric_weight, device const float *bias,
+    device const float *gamma, device const float *beta, device float *input,
+    device float *output, device float *stats, constant uint& rows, constant uint& fields,
+    constant uint& numeric_width, constant uint& width,
+    uint tid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+    uint row = tid / 32, base = row * width + lane, present = 0;
+    float2 value = 0.0f;
+    for (uint position = 0; position < fields; ++position) {
+        int id = semantic[row * fields + position];
+        if (id) {
+            present += 1;
+            value[0] += embedding[id * width + lane] * field[position * width + lane];
+            value[1] += embedding[id * width + lane + 32] * field[position * width + lane + 32];
+        }
+    }
+    float scale = rsqrt(float(max(present, 1u)));
+    value *= scale;
+    value += float2(bias[lane], bias[lane + 32]);
+    for (uint feature = 0; feature < numeric_width; ++feature) {
+        float number = numeric[row * numeric_width + feature];
+        value[0] += number * numeric_weight[lane * numeric_width + feature];
+        value[1] += number * numeric_weight[(lane + 32) * numeric_width + feature];
+    }
+    float sum = simd_sum(value[0] + value[1]);
+    float square = simd_sum(value[0] * value[0] + value[1] * value[1]);
+    float mean = sum / width;
+    float inverse_std = rsqrt(max(0.0f, square / width - mean * mean) + 1e-5f);
+    input[base] = value[0];
+    input[base + 32] = value[1];
+    output[base] = max(0.0f, (value[0] - mean) * inverse_std * gamma[lane] + beta[lane]);
+    output[base + 32] = max(0.0f, (value[1] - mean) * inverse_std * gamma[lane + 32] + beta[lane + 32]);
+    if (lane == 0) {
+        stats[row * 2] = mean;
+        stats[row * 2 + 1] = inverse_std;
+    }
+}
+
 """
 
 
@@ -678,6 +717,63 @@ class _FusedTokens(torch.autograd.Function):
         return None, None, None, None, None, grad_embedding, grad_numeric, grad_gamma, grad_beta
 
 
+class _FusedSemantic(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, semantic, numeric, embedding, field, numeric_weight, bias, gamma, beta):
+        if _RaggedAttention.library is None:
+            _RaggedAttention.library = torch.mps.compile_shader(_TRAINING_METAL)
+        rows, fields = semantic.shape
+        width, numeric_width = numeric_weight.shape
+        input = embedding.new_empty((rows, width))
+        output = torch.empty_like(input)
+        stats = embedding.new_empty((rows, 2))
+        _RaggedAttention.library.semantic_forward(
+            semantic, numeric, embedding, field, numeric_weight, bias, gamma, beta,
+            input, output, stats, rows, fields, numeric_width, width,
+            threads=rows * 32, group_size=32,
+        )
+        ctx.save_for_backward(
+            semantic, numeric, embedding, field, numeric_weight, gamma, beta, input, stats,
+        )
+        ctx.width = width
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        semantic, numeric, embedding, field, numeric_weight, gamma, beta, input, stats = ctx.saved_tensors
+        grad_output = grad_output.contiguous()
+        grad_input = torch.empty_like(input)
+        _RaggedAttention.library.token_backward_input(
+            input, gamma, beta, stats, grad_output, grad_input,
+            ctx.width, threads=len(input) * 32, group_size=32,
+        )
+        blocks = (len(input) + 127) // 128
+        partial = torch.empty((blocks, 2, ctx.width), dtype=torch.float32, device=input.device)
+        grad_gamma = torch.empty_like(gamma)
+        grad_beta = torch.empty_like(beta)
+        _RaggedAttention.library.token_backward_norm_partial(
+            input, gamma, beta, stats, grad_output, partial, len(input), 128, ctx.width,
+            threads=blocks * ctx.width, group_size=ctx.width,
+        )
+        _RaggedAttention.library.token_backward_norm_reduce(
+            partial, grad_gamma, grad_beta, blocks, ctx.width,
+            threads=ctx.width * 128, group_size=128,
+        )
+        present = semantic != 0
+        count = present.sum(1).clamp_min(1).sqrt().to(grad_input.dtype)
+        ids = semantic.long()
+        scaled = grad_input[:, None] / count[:, None, None]
+        mask = present[:, :, None]
+        grad_embedding = torch.zeros_like(embedding).index_add(
+            0, ids.reshape(-1), (scaled * field * mask).reshape(-1, ctx.width),
+        )
+        grad_field = (scaled * nn.functional.embedding(ids, embedding) * mask).sum(0)
+        return (
+            None, None, grad_embedding, grad_field, grad_input.T @ numeric,
+            grad_input.sum(0), grad_gamma, grad_beta,
+        )
+
+
 def device():
     if torch.backends.mps.is_available():
         return torch.device("mps")
@@ -720,6 +816,11 @@ class SemanticEncoder(nn.Module):
     def forward(self, semantic, numeric, embedding):
         if not len(semantic):
             return self.bias.new_empty((0, len(self.bias)))
+        if semantic.device.type == "mps":
+            return _FusedSemantic.apply(
+                semantic, numeric, embedding.weight, self.field, self.numeric.weight,
+                self.bias, self.norm.weight, self.norm.bias,
+            )
         present = semantic != 0
         categorical = (embedding(semantic.long()) * self.field * present[:, :, None]).sum(1)
         categorical = categorical / present.sum(1).clamp_min(1).sqrt()[:, None]
@@ -923,24 +1024,33 @@ class Agent(nn.Module):
             current[offsets[:groups]], current[destination]
         )
 
-    def pool(self, encoded, source, group, count, groups, state, tuple_linear, pool_linear):
+    def pool(self, encoded, source, group, count, groups, state, tuple_linear, pool_linear,
+             source_count=None):
         if not groups:
             return encoded.new_empty((0, self.width))
-        pooled = encoded.new_zeros((groups, self.width))
         if len(source):
             values = encoded[source] if tuple_linear is None else torch.relu(tuple_linear(encoded[source]))
-            pooled = pooled.index_add(0, group, values.to(pooled.dtype))
+            if source_count is not None and len(source) > source_count:
+                values = values.clone(); values[source_count:] = 0
+            pooled = encoded.new_zeros((len(count), self.width)).index_add(
+                0, group, values.to(encoded.dtype),
+            )
+        else:
+            pooled = encoded.new_zeros((len(count), self.width))
         pooled = pooled / count.clamp_min(1).sqrt()[:, None]
         exact = count[:, None].to(pooled.dtype)
         pooled = pool_linear(torch.cat((pooled, exact / 64, exact.log1p() / 5), 1))
-        return torch.relu(pooled + state.to(pooled.dtype))
+        return torch.relu(pooled + state.to(pooled.dtype))[:groups]
 
     def encode_cards(self, encoded, raw, cards):
-        source, raw_source, sequence, zones, inverse, counts = cards
+        source, raw_source, sequence, zones, inverse, source_count, counts = cards
         states = self.card_state[zones] + self.card_count(counts.to(encoded.dtype))
         if self.training or encoded.device.type != "cpu":
+            values = encoded[source]
+            if len(source) > source_count:
+                values = values.clone(); values[source_count:] = 0
             return self.encode_sequence(
-                encoded[source], sequence, states, self.card_transformer, True,
+                values, sequence, states, self.card_transformer, True,
             )[0][inverse]
         semantic, numeric = raw[-2:]
         lengths = (sequence[0][1:] - sequence[0][:-1] - 1).tolist()
@@ -1035,8 +1145,14 @@ class Agent(nn.Module):
             nodes = torch.cat(cached)
         else:
             if not self.training and node_source.device.type == "cpu":
-                self.cache_stats["graph_miss"] += len(keys)
+                self.cache_stats["graph_hit"] += sum(value is not None for value in cached)
+                self.cache_stats["graph_miss"] += sum(value is None for value in cached)
             nodes = encoded[DOMAIN["map_node"]][node_source]
+            if not self.training and node_source.device.type == "cpu":
+                ranges = offsets.tolist()
+                for graph, value in enumerate(cached):
+                    if value is not None:
+                        nodes[ranges[graph]:ranges[graph + 1]] = value
             edges = encoded[DOMAIN["map_edge"]][edge_source]
             for parents, children, edge_rows, sequence, degree, count, _edge_count in levels:
                 attended = self.attend(
@@ -1052,7 +1168,8 @@ class Agent(nn.Module):
             if not self.training and node_source.device.type == "cpu":
                 offsets = offsets.tolist()
                 for index, key in enumerate(keys):
-                    self._graph_cache[key] = nodes[offsets[index]:offsets[index + 1]].detach()
+                    if cached[index] is None:
+                        self._graph_cache[key] = nodes[offsets[index]:offsets[index + 1]].detach()
                 while len(self._graph_cache) > 8192:
                     self._graph_cache.pop(next(iter(self._graph_cache)))
         selected = nodes[current]
@@ -1083,22 +1200,26 @@ class Agent(nn.Module):
         return values
 
     def encode_state(self, globals_, domains, encoded, index):
-        cards, actors, entities, continuation_index, continuation_roots, continuation_rows, map_ = index
+        cards, actors, entities, continuation_index, continuation_roots, map_ = index
         card = self.encode_cards(encoded[DOMAIN["card"]], domains[DOMAIN["card"]], cards)
-        base_source, actor_rows, actor_kinds, history, effects = actors
-        history_domain, history_source, history_group, history_count = history
+        base_source, actor_groups, history, effects = actors
+        history_domain, history_source, history_group, history_count, history_source_count = history
         history = self.pool(
             encoded[history_domain], history_source, history_group, history_count, len(base_source),
-            self.actor_state[0], self.history_tuple, self.actor_pool,
+            self.actor_state[0], self.history_tuple, self.actor_pool, history_source_count,
         )
         effect_values, effect_groups = [], []
-        for domain, source, group in effects:
+        effect_count = None
+        for domain, source, group, count, source_count in effects:
             if len(source):
-                effect_values.append(torch.relu(self.effect_tuple(encoded[domain][source])))
+                values = torch.relu(self.effect_tuple(encoded[domain][source]))
+                if len(source) > source_count:
+                    values = values.clone(); values[source_count:] = 0
+                effect_values.append(values)
                 effect_groups.append(group)
+            effect_count = count if effect_count is None else effect_count + count
         effect_values = torch.cat(effect_values) if effect_values else encoded[0].new_empty((0, self.width))
-        effect_groups = torch.cat(effect_groups) if effect_groups else actor_rows.new_empty(0)
-        effect_count = torch.bincount(effect_groups, minlength=len(base_source)).to(effect_values.dtype)
+        effect_groups = torch.cat(effect_groups) if effect_groups else base_source.new_empty(0)
         effects = self.pool(
             effect_values, torch.arange(len(effect_values), device=effect_values.device),
             effect_groups, effect_count, len(base_source), self.actor_state[1], None, self.actor_pool,
@@ -1113,27 +1234,25 @@ class Agent(nn.Module):
         current, nodes = self.encode_map(encoded, map_)
         batch = len(globals_)
         summaries = []
-        for collection, (domain, source, group, count) in enumerate(entities[:2]):
+        for collection, (domain, source, group, count, source_count) in enumerate(entities[:2]):
             summaries.append(self.pool(
                 encoded[domain], source, group, count, batch,
-                self.entity_state[collection], self.entity_tuple, self.entity_pool,
+                self.entity_state[collection], self.entity_tuple, self.entity_pool, source_count,
             ))
-        for collection, selected in enumerate((actor_kinds < 2, actor_kinds == 2), 2):
-            source = selected.nonzero().squeeze(1)
-            rows = actor_rows[source]
+        for collection, (source, rows, count, source_count) in enumerate(actor_groups, 2):
             summaries.append(self.pool(
-                actor, source, rows, torch.bincount(rows, minlength=batch).to(actor.dtype), batch,
-                self.entity_state[collection], self.entity_tuple, self.entity_pool,
+                actor, source, rows, count, batch,
+                self.entity_state[collection], self.entity_tuple, self.entity_pool, source_count,
             ))
-        for collection, (domain, source, group, count) in enumerate(entities[2:], 4):
+        for collection, (domain, source, group, count, source_count) in enumerate(entities[2:], 4):
             summaries.append(self.pool(
                 encoded[domain], source, group, count, batch,
-                self.entity_state[collection], self.entity_tuple, self.entity_pool,
+                self.entity_state[collection], self.entity_tuple, self.entity_pool, source_count,
             ))
+        roots, root_rows, root_count, root_source_count = continuation_roots
         summaries.append(self.pool(
-            continuation, continuation_roots, continuation_rows,
-            torch.bincount(continuation_rows, minlength=batch).to(continuation.dtype), batch,
-            self.entity_state[-1], self.entity_tuple, self.entity_pool,
+            continuation, roots, root_rows, root_count, batch,
+            self.entity_state[-1], self.entity_tuple, self.entity_pool, root_source_count,
         ))
         card = nn.functional.layer_norm(card, (self.width,))
         summaries = [nn.functional.layer_norm(summary, (self.width,)) for summary in summaries]
@@ -1146,12 +1265,14 @@ class Agent(nn.Module):
     def encode_actions(self, encoded, continuation, actor, values, index, nodes):
         semantic, numeric = values
         action_row, action_flat, legal, sequence, actions, sources, path, target, _menu = index
-        base = self.action_encoder(semantic, numeric, self.semantic)[:len(action_row)]
+        base = self.action_encoder(semantic, numeric, self.semantic)
         pooled = base.new_zeros(base.shape); count = base.new_ones(len(base))
-        for domain, (source, group, domain_count, inverse, groups) in enumerate(sources):
+        for domain, (source, group, domain_count, inverse, groups, source_count) in enumerate(sources):
             summed = pooled.new_zeros((groups, self.width))
             if len(source):
                 values = continuation[source] if domain == DOMAIN["continuation"] else encoded[domain][source]
+                if len(source) > source_count:
+                    values = values.clone(); values[source_count:] = 0
                 summed = summed.index_add(0, group, values.to(summed.dtype))
             pooled = pooled + (
                 summed * self.candidate_scale[domain] + domain_count[:, None] * self.candidate_bias[domain]
@@ -1173,10 +1294,12 @@ class Agent(nn.Module):
             base + self.action_legal(legal.long()), pooled / count.clamp_min(1).sqrt()[:, None],
             exact / 64, exact.log1p() / 5,
         ), 1))
-        return torch.relu(self.action_norm(action)), action_row, action_flat, actions, legal, sequence
+        action = torch.relu(self.action_norm(action))
+        return action, action_row, action_flat, actions, legal, sequence
 
     def encode_menu(self, state, action, index):
         object_group, target_count, rows, sequence = index
+        action = action[:len(object_group)]
         objects = action.new_zeros((len(target_count), self.width)).index_add(0, object_group, action)
         exact = target_count[:, None].to(action.dtype)
         objects = torch.relu(self.menu_object(torch.cat((
@@ -1329,7 +1452,7 @@ def critic_only_step(model, optimizer, parameters=None):
     optimizer.step()
 
 
-def sequence_index(row, batch, target, pad=False):
+def sequence_index(row, batch, target, pad=False, items=None):
     counts = np.bincount(row, minlength=batch).astype(np.int32)
     lengths = counts + 1
     starts = np.repeat(np.cumsum(counts) - counts, counts)
@@ -1343,6 +1466,11 @@ def sequence_index(row, batch, target, pad=False):
         lengths[batch:] += extra // dummy
         lengths[batch:batch + extra % dummy] += 1
     offsets = np.r_[0, np.cumsum(lengths, dtype=np.int32)].astype(np.int32)
+    if items is not None and items > len(row):
+        extra = items - len(row)
+        destination = np.pad(destination, (0, extra), constant_values=offsets[batch])
+        row = np.pad(row, (0, extra), constant_values=batch)
+        position = np.pad(position, (0, extra))
     sequence = np.repeat(np.arange(len(lengths), dtype=np.int32), lengths)
     return tuple(torch.as_tensor(value, device=target) for value in (
         offsets, destination, sequence, row, position,
@@ -1356,7 +1484,9 @@ def candidate_index(row, batch, target, allow_empty=False):
         raise ValueError("state without represented candidate")
     offsets = np.r_[0, np.cumsum(lengths, dtype=np.int32)].astype(np.int32)
     starts = np.repeat(offsets[:-1], lengths)
-    position = np.arange(len(row), dtype=np.int32) - starts
+    order = np.argsort(row, kind="stable")
+    position = np.empty(len(row), np.int32)
+    position[order] = np.arange(len(row), dtype=np.int32) - starts
     return tuple(torch.as_tensor(value, device=target) for value in (
         offsets, row, position,
     )) + (int(lengths.max(initial=0)),)
@@ -1424,7 +1554,18 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
     if globals_.shape != (batch, model.layout["globals"]) or not np.isfinite(globals_).all():
         raise ValueError("invalid public globals")
     pad_sequences = model.training and model.card_state.device.type == "mps"
+    bucket = lambda count: 0 if not count else 1 << (count - 1).bit_length()
     tensor = lambda value: torch.as_tensor(value, dtype=torch.long, device=target)
+    def grouped(source, group, groups):
+        source, group = np.asarray(source, np.int32), np.asarray(group, np.int32)
+        count = len(source)
+        if pad_sequences and count:
+            size = bucket(count)
+            source = np.pad(source, (0, size - count))
+            group = np.pad(group, (0, size - count))
+        counts = np.bincount(group[:count], minlength=bucket(groups) if pad_sequences else groups)
+        return (torch.as_tensor(source, device=target), torch.as_tensor(group, device=target),
+                torch.as_tensor(counts.astype(np.float32), device=target), count)
     domain_tensors = []
     domain_inverse = []
     for (name, *_), (_u, _s, semantic, numeric, _row, _scope) in zip(DOMAIN_SPECS, domains):
@@ -1438,7 +1579,7 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
         count = len(first)
         size = 1 << (count - 1).bit_length() if model.training and count else count
         domain_tensors.append((
-            torch.as_tensor(np.pad(semantic[first], ((0, size - count), (0, 0))).astype(np.int64),
+            torch.as_tensor(np.pad(semantic[first], ((0, size - count), (0, 0))).astype(np.int32),
                             device=target),
             torch.as_tensor(np.pad(numeric[first], ((0, size - count), (0, 0))), device=target),
             count, semantic, numeric,
@@ -1497,18 +1638,15 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
             raise ValueError("actor child without actor")
         order = np.argsort(group, kind="stable")
         source, group = source[order], group[order]
-        children.append((domain, tensor(domain_inverse[domain][source]), tensor(group), torch.as_tensor(
-            np.bincount(group, minlength=len(base_source)).astype(np.float32), device=target,
+        children.append((domain, *grouped(
+            domain_inverse[domain][source], group, len(base_source),
         )))
     entities = []
     for name in ("run", "phase", "relic", "potion", "orb", "event", "encounter", "crystal"):
         domain = DOMAIN[name]; _u, _s, _c, _f, row, _scope = domains[domain]
         source = ordered(state_source[domain], row)
         group = row[source].astype(np.int32)
-        entities.append((
-            domain, tensor(domain_inverse[domain][source]), tensor(group),
-            torch.as_tensor(np.bincount(group, minlength=batch).astype(np.float32), device=target),
-        ))
+        entities.append((domain, *grouped(domain_inverse[domain][source], group, batch)))
     cont_u, _cont_s, _cont_c, _cont_f, cont_row, cont_scope = domains[DOMAIN["continuation"]]
     context = np.where(cont_scope < 0, cont_row, batch + cont_scope).astype(np.int64)
     cont_source = ordered(np.arange(len(cont_u), dtype=np.int32), context, cont_u[:, 5], cont_u[:, 2])
@@ -1550,7 +1688,7 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
     roots = np.flatnonzero(parent < 0)
     continuation_index = (tensor(domain_inverse[DOMAIN["continuation"]][cont_source]),
                           tuple(continuation_levels))
-    continuation_roots = tensor(roots[cont_scope[cont_source[roots]] < 0])
+    continuation_roots = roots[cont_scope[cont_source[roots]] < 0]
     continuation_rows = cont_row[cont_source[roots]][cont_scope[cont_source[roots]] < 0]
     node_u, _node_s, node_c, node_f, node_row, _node_scope = domains[DOMAIN["map_node"]]
     edge_u, _edge_s, edge_c, edge_f, edge_row, _edge_scope = domains[DOMAIN["map_edge"]]
@@ -1573,6 +1711,12 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
         inverse[row] = unique[key]
     node_source = np.concatenate([node_groups[row] for row in representatives])
     edge_source = np.concatenate([edge_groups[row] for row in representatives])
+    node_offsets = np.r_[0, np.cumsum([len(node_groups[row]) for row in representatives])]
+    graph_for_node = np.repeat(np.arange(len(representatives)), np.diff(node_offsets))
+    missing_graph = np.asarray([
+        model.training or target.type != "cpu" or graph_keys[row] not in model._graph_cache
+        for row in representatives
+    ])
     max_node = int(node_u[node_source, 0].max(initial=0))
     node_lookup = np.full((batch, max_node + 1), -1, np.int32)
     offset = 0
@@ -1596,10 +1740,14 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
         selected = np.flatnonzero(topo[edge_src] == level)
         order = np.argsort(edge_src[selected], kind="stable"); selected = selected[order]
         parents, group = np.unique(edge_src[selected], return_inverse=True)
+        selected = selected[missing_graph[graph_for_node[parents]][group]]
+        if not len(selected):
+            continue
+        parents, group = np.unique(edge_src[selected], return_inverse=True)
         levels.append((parents, edge_dst[selected], selected, group,
                        node_u[node_source[parents], 9].astype(np.float32)))
     if model.training and levels:
-        bucket = lambda count: min(
+        graph_bucket = lambda count: min(
             size for power in range(max(1, (count - 1).bit_length()), 32)
             for size in (3 * (1 << power) // 4, 1 << power) if size >= count
         )
@@ -1607,8 +1755,8 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
         for parents, destinations, edge_rows, group, degree in levels:
             count = len(parents)
             edge_count = len(destinations)
-            edge_size = bucket(edge_count)
-            parent_size = bucket(count + (edge_size > edge_count))
+            edge_size = graph_bucket(edge_count)
+            parent_size = graph_bucket(count + (edge_size > edge_count))
             extra = edge_size - len(destinations)
             padded.append((
                 tensor(np.pad(parents, (0, parent_size - count))),
@@ -1624,7 +1772,6 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
                    candidate_index(group, len(parents), target),
                    torch.as_tensor(degree, device=target), len(parents), len(destinations))
                   for parents, destinations, edge_rows, group, degree in levels]
-    node_offsets = np.r_[0, np.cumsum([len(node_groups[row]) for row in representatives])]
     run_u, _run_s, _run_c, _run_f, run_row, _run_scope = domains[DOMAIN["run"]]
     run_source = state_source[DOMAIN["run"]]
     current_id = np.full(batch, np.iinfo(np.uint32).max, np.uint32)
@@ -1653,24 +1800,36 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
                  tuple(graph_keys[row] for row in representatives))
     actor_rows = actor_rows[base_source].astype(np.int32)
     actor_kinds = actor_u[base_source, 1].astype(np.int32)
+    actor_groups = tuple(grouped(
+        source, actor_rows[source], batch,
+    ) for source in (np.flatnonzero(actor_kinds < 2), np.flatnonzero(actor_kinds == 2)))
+    continuation_roots = grouped(continuation_roots, continuation_rows, batch)
+    card_source_count = len(card_source)
+    card_size = bucket(card_source_count) if pad_sequences else card_source_count
     state_index = (
-        (tensor(domain_inverse[DOMAIN["card"]][card_source]), tensor(card_source),
-         sequence_index(card_group, card_groups, target, pad_sequences), tensor(card_zones),
-         tensor(card_inverse), torch.as_tensor(card_counts, device=target)),
-        (tensor(domain_inverse[DOMAIN["actor"]][base_source]), tensor(actor_rows), tensor(actor_kinds),
-         children[0], tuple(child[:3] for child in children[1:])),
-        tuple(entities), continuation_index, continuation_roots, tensor(continuation_rows), map_index,
+        (tensor(np.pad(domain_inverse[DOMAIN["card"]][card_source],
+                       (0, card_size - card_source_count))),
+         tensor(np.pad(card_source, (0, card_size - card_source_count))),
+         sequence_index(card_group, card_groups, target, pad_sequences, card_size),
+         tensor(card_zones), tensor(card_inverse), card_source_count,
+         torch.as_tensor(card_counts, device=target)),
+        (tensor(domain_inverse[DOMAIN["actor"]][base_source]), actor_groups,
+         children[0], tuple(children[1:])),
+        tuple(entities), continuation_index, continuation_roots, map_index,
     )
+    action_u, action_s, action_c, action_f = action
+    action_count = len(action_u)
+    action_size = bucket(action_count) if model.training else action_count
+    action_width = bucket(actions) if model.training else actions
     candidate_sources = []
     for domain, (u, s, _c, _f, _row, scope) in enumerate(domains):
         if domain == DOMAIN["continuation"]:
             selected = roots[cont_scope[cont_source[roots]] >= 0]
             group = cont_scope[cont_source[selected]]
+            source, group, domain_count, source_count = grouped(selected, group, action_size)
             candidate_sources.append((
-                tensor(selected), tensor(group),
-                torch.as_tensor(np.bincount(group, minlength=len(action_row)).astype(np.float32),
-                                device=target),
-                tensor(np.arange(len(action_row), dtype=np.int32)), len(action_row),
+                source, group, domain_count, tensor(np.arange(action_size, dtype=np.int32)),
+                len(domain_count), source_count,
             ))
             continue
         source = np.flatnonzero(scope >= 0).astype(np.int32)
@@ -1683,10 +1842,14 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
             )
             inverse = np.zeros(len(action_row), np.int32)
             inverse[group] = inverse_source + 1
+            groups = len(unique_source) + 1
+            source, group, domain_count, source_count = grouped(
+                unique_source, np.arange(1, groups), groups,
+            )
             candidate_sources.append((
-                tensor(unique_source), tensor(np.arange(1, len(unique_source) + 1)),
-                torch.as_tensor(np.r_[0, np.ones(len(unique_source), np.float32)], device=target),
-                tensor(inverse), len(unique_source) + 1,
+                source, group, domain_count,
+                tensor(np.pad(inverse, (0, action_size - len(inverse)))),
+                len(domain_count), source_count,
             ))
             continue
         positions = np.arange(len(group), dtype=np.int32) - np.repeat(np.cumsum(counts) - counts, counts)
@@ -1699,20 +1862,19 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
         representatives = first[first > 0].astype(np.int32) - 1
         keep = np.zeros(len(action_row), bool); keep[representatives] = True
         source, group = source[keep[group]], inverse[group[keep[group]]]
+        source, group, domain_count, source_count = grouped(
+            domain_inverse[domain][source], group, len(first),
+        )
         candidate_sources.append((
-            tensor(domain_inverse[domain][source]), tensor(group),
-            torch.as_tensor(np.bincount(group, minlength=len(first)).astype(np.float32),
-                            device=target),
-            tensor(inverse), len(first),
+            source, group, domain_count,
+            tensor(np.pad(inverse, (0, action_size - len(inverse)))),
+            len(domain_count), source_count,
         ))
-    action_u, action_s, action_c, action_f = action
-    action_count = len(action_u)
-    action_size = 1 << (action_count - 1).bit_length() if model.training and action_count else action_count
     if action_c.max(initial=0) >= model.semantic.num_embeddings:
         raise ValueError("invalid action semantic id")
     action_c = np.pad(action_c, ((0, action_size - action_count), (0, 0)))
     action_f = np.pad(action_f, ((0, action_size - action_count), (0, 0)))
-    action_legal = legal[action_row, action_position]
+    action_legal = np.pad(legal[action_row, action_position], (0, action_size - action_count))
     path = np.full(len(action_row), -1, np.int32)
     path_id = action_u[:, 4]
     present = path_id != np.iinfo(np.uint32).max
@@ -1721,6 +1883,7 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
     path[present] = node_lookup[action_row[present], path_id[present].astype(np.intp)]
     if np.any(path[present] < 0):
         raise ValueError("path candidate references missing node")
+    path = np.pad(path, (0, action_size - action_count), constant_values=-1)
     actor_target = np.full(len(action_row), -1, np.int32)
     owner = action_u[:, 1]
     present = (owner != 0) & (owner != np.iinfo(np.uint32).max)
@@ -1728,6 +1891,7 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
         actor_target[index] = actor_lookup.get((int(action_row[index]), int(owner[index])), -1)
     if np.any(actor_target[present] < 0):
         raise ValueError("candidate target references missing actor")
+    actor_target = np.pad(actor_target, (0, action_size - action_count), constant_values=-1)
     object_lookup, object_group, object_rows = {}, np.empty(len(action_row), np.int32), []
     for index, (row, verb, object_id) in enumerate(zip(action_row, action_u[:, 0], action_u[:, 14])):
         key = (int(row), int(verb), int(object_id))
@@ -1743,16 +1907,24 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
         tensor(object_group), torch.as_tensor(object_count, device=target),
         tensor(menu_rows), menu_sequence,
     )
+    action_flat = action_row * action_width + action_position
+    if action_size > action_count:
+        occupied = np.zeros(batch * action_width, bool); occupied[action_flat] = True
+        dummy_flat = np.flatnonzero(~occupied)[:action_size - action_count]
+        action_row = np.pad(action_row, (0, action_size - action_count))
+        action_row[action_count:] = dummy_flat // action_width
+        action_flat = np.r_[action_flat, dummy_flat]
+    padded_legal = np.pad(legal, ((0, 0), (0, action_width - actions)))
     action_index = tuple(torch.as_tensor(value, device=target) for value in (
-        action_row, action_row * actions + action_position, action_legal,
-    )) + (candidate_index(action_row, batch, target), actions, tuple(candidate_sources),
+        action_row, action_flat, action_legal,
+    )) + (candidate_index(action_row, batch, target), action_width, tuple(candidate_sources),
           tensor(path), tensor(actor_target), menu_index)
     return (
         torch.as_tensor(character, dtype=torch.long, device=target),
         torch.as_tensor(globals_, device=target), domain_tensors, state_index,
         tuple(torch.as_tensor(value, device=target) for value in (
-            action_c.astype(np.int64), action_f.astype(np.float32),
-        )), action_index, torch.as_tensor(legal, device=target),
+            action_c.astype(np.int32), action_f.astype(np.float32),
+        )), action_index, torch.as_tensor(padded_legal, device=target),
     )
 
 
@@ -2678,7 +2850,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
     rng = np.random.default_rng(args.seed + sampler_session + 1_000_000_000)
     context = multiprocessing.get_context("spawn")
     models = [context.Queue(maxsize=1) for _ in range(args.samplers)]
-    samples = context.Queue(maxsize=2)
+    sample_capacity = max(8, args.samplers * 2)
+    samples = context.Queue(maxsize=sample_capacity)
     results = context.Queue(); stop = context.Event()
     heartbeat = context.Array("d", [started] * args.samplers)
     progress = context.Array("q", [0] * args.samplers)
@@ -2763,11 +2936,38 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             pass
 
     def upload(value):
-        if torch.is_tensor(value):
-            return value.to(target, non_blocking=True)
-        if isinstance(value, tuple):
-            return tuple(upload(item) for item in value)
-        return value
+        marker = object()
+        tensors = []
+
+        def flatten(item):
+            if torch.is_tensor(item):
+                tensors.append(item)
+                return marker, len(tensors) - 1
+            if isinstance(item, tuple):
+                return tuple(flatten(child) for child in item)
+            return item
+
+        structure = flatten(value)
+        uploaded = [None] * len(tensors)
+        for dtype in {tensor.dtype for tensor in tensors}:
+            selected = [index for index, tensor in enumerate(tensors) if tensor.dtype == dtype]
+            sizes = [tensors[index].numel() for index in selected]
+            buffer = torch.cat([tensors[index].reshape(-1) for index in selected]).to(
+                target, non_blocking=True,
+            )
+            offset = 0
+            for index, size in zip(selected, sizes):
+                uploaded[index] = buffer[offset:offset + size].view(tensors[index].shape)
+                offset += size
+
+        def rebuild(item):
+            if isinstance(item, tuple) and len(item) == 2 and item[0] is marker:
+                return uploaded[item[1]]
+            if isinstance(item, tuple):
+                return tuple(rebuild(child) for child in item)
+            return item
+
+        return rebuild(structure)
 
     def reserve_batch(size):
         index = dataset.sample(size, rng)
@@ -2908,7 +3108,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             "sampler_heartbeats": [time.monotonic() - value for value in heartbeat[:]],
             "sampler_restarts": sampler_restarts, "sampler_wedges": sampler_wedges,
             "watchdog_dropped_steps": watchdog_dropped,
-            "sample_queue_capacity": 2, "sample_queue_peak": queue_peak,
+            "sample_queue_capacity": sample_capacity, "sample_queue_peak": queue_peak,
             "sample_queue_packets": queue_packets,
             "sample_queue_delay_mean": queue_delay_sum / max(1, queue_packets),
             "sample_queue_full_waits": queue_full_waits,
@@ -3406,7 +3606,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         "sampler_heartbeats": [time.monotonic() - value for value in heartbeat[:]],
         "sampler_restarts": sampler_restarts, "sampler_wedges": sampler_wedges,
         "watchdog_dropped_steps": watchdog_dropped,
-        "sample_queue_capacity": 2, "sample_queue_peak": queue_peak,
+        "sample_queue_capacity": sample_capacity, "sample_queue_peak": queue_peak,
         "sample_queue_packets": queue_packets,
         "sample_queue_delay_mean": queue_delay_sum / max(1, queue_packets),
         "sample_queue_full_waits": queue_full_waits,

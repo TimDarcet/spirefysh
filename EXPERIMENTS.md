@@ -2195,3 +2195,13 @@ All `181/181` Rust library tests pass. The full MPS probe passes with candidate 
 Conclusion: FEATURE55/MODEL62 is a fresh incompatible architecture and is ready for a new training run. MODEL61 artifacts remain immutable benchmarks and cannot seed MODEL62.
 
 Next: Start MODEL62 from random weights, optimizer, replay, and disjoint seeds. Treat partial graph-cache hits, removal of the obsolete candidate-token construction path, richer minibatch cost estimates, and Rust allocation reductions as performance follow-ups rather than launch blockers.
+
+## 2026-08-29 — MODEL62 throughput work
+
+Experiment: Preserve MODEL62 and PPO exactly while removing redundant legacy action-token construction, reusing partial actor graph caches, coalescing CPU-to-MPS transfers, buffering eight sampler packets, and bucketing variable training tensors. A fused Metal semantic encoder replaces the equivalent embedding, numeric projection, normalization, and ReLU graph. Release-mode Rust is required for training.
+
+Results: The first isolated canonical 32,768-decision gate, before shape bucketing and semantic fusion, reached `523.7` end-to-end decisions/s, actor `3,266.2`, learner `625.2`, and `100%` row utilization, with zero stale, ratio, pre-KL, or post-KL drops. It was `1.60x` the prior isolated `328` baseline. The final focused changing-shape B512 BF16 cycle, including forward, backward, fused Adam, and exact post-step KL verification, reached `1,394.8` actionable rows/s over its last four updates. Padded and unpadded MPS outputs are identical; maximum gradient difference is `7.5e-9`. All `181/181` Rust tests and the full MPS probe pass with candidate permutation error `1.49e-7` and Rust/Python value parity `5.96e-8`.
+
+Conclusion: The patch is semantically clean and ready for a final isolated canonical gate. A custom Metal scatter-sum path was rejected because it matched native `index_add` throughput.
+
+Next: Run the canonical four-sampler, 512-environment, BF16, batch-1,024, 32,768-decision gate from a release Rust extension and require at least `1,000` end-to-end decisions/s, `99%` utilization, and no freshness or trust-region regression.

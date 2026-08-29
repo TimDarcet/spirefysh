@@ -4356,6 +4356,93 @@ fn action_preview(game: &Game, content: &Content, action: &Action) -> Option<Car
     Some(preview)
 }
 
+fn action_preview_values(
+    game: &Game,
+    content: &Content,
+    action: &Action,
+    preview: Option<&CardPreview>,
+) -> [f32; 9] {
+    let mut values = [0.0; 9];
+    let Some(preview) = preview else {
+        return values;
+    };
+    let Some(combat) = game.combat() else {
+        return values;
+    };
+    let resolved = preview.outcome.hp_loss.as_deref().filter(|_| {
+        preview
+            .hits
+            .iter()
+            .all(|hit| hit.target != PreviewTarget::Random)
+    });
+    let target = match action {
+        Action::Play { target, .. } | Action::Potion { target, .. } => *target,
+        _ => None,
+    };
+    let Some(target) = target else {
+        values[5] = resolved.map_or_else(
+            || {
+                combat
+                    .enemies
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, enemy)| enemy.creature.hp > 0)
+                    .map(|(target, enemy)| {
+                        resolved_hits(game, content, target, None, true, false, &preview.hits)
+                            .2
+                            .min(enemy.creature.hp)
+                    })
+                    .fold(0i16, i16::saturating_add) as f32
+            },
+            |losses| losses.iter().sum(),
+        );
+        return values;
+    };
+    let Some(enemy) = combat.enemies.get(target) else {
+        return values;
+    };
+    let (damage, cap, actual, uncapped) = resolved_hits(
+        game,
+        content,
+        target,
+        Some(target),
+        false,
+        false,
+        &preview.hits,
+    );
+    let actual = resolved.map_or(actual as f32, |losses| losses[target]);
+    values = [
+        enemy.creature.kind(content, PowerKind::Vulnerable) as f32,
+        enemy.creature.block as f32,
+        cap as f32,
+        damage as f32,
+        actual,
+        combat
+            .enemies
+            .iter()
+            .enumerate()
+            .filter(|(_, enemy)| enemy.creature.hp > 0)
+            .map(|(other, enemy)| {
+                resolved_hits(
+                    game,
+                    content,
+                    other,
+                    Some(target),
+                    true,
+                    false,
+                    &preview.hits,
+                )
+                .2
+                .min(enemy.creature.hp)
+            })
+            .fold(0i16, i16::saturating_add) as f32,
+        (enemy.creature.hp > 0 && actual >= enemy.creature.hp as f32) as u8 as f32,
+        enemy.creature.hp.max(0) as f32,
+        uncapped as f32,
+    ];
+    values
+}
+
 fn action_card_tokens(
     game: &Game,
     content: &Content,
@@ -4592,70 +4679,12 @@ fn action_card_tokens(
             out.push(row);
         }
     }
-    let Some(target) = target else {
-        values[53] = resolved.map_or_else(
-            || {
-                combat
-                    .enemies
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, enemy)| enemy.creature.hp > 0)
-                    .map(|(target, enemy)| {
-                        resolved_hits(game, content, target, None, true, false, &preview.hits)
-                            .2
-                            .min(enemy.creature.hp)
-                    })
-                    .fold(0i16, i16::saturating_add) as f32
-            },
-            |losses| losses.iter().sum(),
-        );
-        out.sort_by(|left, right| token_cmp(left, right));
-        return;
-    };
-    let selected = target;
-    let Some(enemy) = combat.enemies.get(target) else {
-        out.sort_by(|left, right| token_cmp(left, right));
-        return;
-    };
-    let (damage, cap, actual, uncapped) = resolved_hits(
+    values[48..57].copy_from_slice(&action_preview_values(
         game,
         content,
-        target,
-        Some(selected),
-        false,
-        false,
-        &preview.hits,
-    );
-    let actual = resolved.map_or(actual as f32, |losses| losses[target]);
-    values[48..56].copy_from_slice(&[
-        enemy.creature.kind(content, PowerKind::Vulnerable) as f32,
-        enemy.creature.block as f32,
-        cap as f32,
-        damage as f32,
-        actual,
-        combat
-            .enemies
-            .iter()
-            .enumerate()
-            .filter(|(_, enemy)| enemy.creature.hp > 0)
-            .map(|(target, enemy)| {
-                resolved_hits(
-                    game,
-                    content,
-                    target,
-                    Some(selected),
-                    true,
-                    false,
-                    &preview.hits,
-                )
-                .2
-                .min(enemy.creature.hp)
-            })
-            .fold(0i16, i16::saturating_add) as f32,
-        (enemy.creature.hp > 0 && actual >= enemy.creature.hp as f32) as u8 as f32,
-        enemy.creature.hp.max(0) as f32,
-    ]);
-    values[56] = uncapped as f32;
+        action,
+        Some(&preview),
+    ));
     out.sort_by(|left, right| token_cmp(left, right));
 }
 
@@ -9223,23 +9252,24 @@ fn action_row(
         semantic.push(layout.semantic(Semantic::RunKind, 28));
     }
     row.c[..semantic.len()].copy_from_slice(&semantic);
-    let values = tokenized_candidate(game, content, layout, action, legal).0;
+    let preview = action_preview(game, content, action);
+    let values = action_preview_values(game, content, action, preview.as_ref());
     let (energy, stars) = game
         .combat()
         .map_or((0, 0), |combat| (combat.energy, combat.stars));
     row.s[1..7].copy_from_slice(&[
-        values[48].round() as i32,
-        values[49].round() as i32,
-        values[50].round() as i32,
-        values[51].round() as i32,
-        values[55].round() as i32,
-        values[56].round() as i32,
+        values[0].round() as i32,
+        values[1].round() as i32,
+        values[2].round() as i32,
+        values[3].round() as i32,
+        values[7].round() as i32,
+        values[8].round() as i32,
     ]);
     row.s[10] = energy as i32;
     row.s[11] = stars as i32;
-    row.u[8] = values[52].to_bits();
-    row.u[9] = values[53].to_bits();
-    if let Some(preview) = action_preview(game, content, action) {
+    row.u[8] = values[4].to_bits();
+    row.u[9] = values[5].to_bits();
+    if let Some(preview) = preview {
         row.s[7] = preview.player_hp_delta as i32;
         let (energy_cost, star_cost) = preview.costs.unwrap_or((0, 0));
         row.s[8] = energy_cost as i32;
