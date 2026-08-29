@@ -12,7 +12,7 @@ use std::{
 
 const MAGIC: &[u8; 8] = b"STSVALUE";
 const VERSION: u32 = 55;
-const VALUE_MODEL_VERSION: u32 = 66;
+const VALUE_MODEL_VERSION: u32 = 67;
 const TOKEN_CATEGORICAL: usize = 10;
 const TOKEN_NUMERIC: usize = 24;
 const TOKEN_VALUES: usize = TOKEN_CATEGORICAL + TOKEN_NUMERIC;
@@ -9120,23 +9120,19 @@ fn packed_observation_digest(
     actions: &[u32],
 ) -> u64 {
     let mut digest = 0xcbf2_9ce4_8422_2325u64;
-    let mut update = |bytes: &[u8]| {
-        for &byte in bytes {
-            digest = (digest ^ byte as u64).wrapping_mul(0x100_0000_01b3);
-        }
+    let mut update = |value: u32| {
+        digest = (digest ^ value as u64).wrapping_mul(0x100_0000_01b3);
     };
-    update(&VERSION.to_le_bytes());
-    update(&VALUE_MODEL_VERSION.to_le_bytes());
-    update(&[character]);
-    update(&(globals.len() as u64).to_le_bytes());
+    update(VERSION);
+    update(VALUE_MODEL_VERSION);
+    update(character as u32);
+    update(globals.len() as u32);
     for value in globals {
-        update(&value.to_bits().to_le_bytes());
+        update(value.to_bits());
     }
     for values in [counts, exact, actions] {
-        update(&(values.len() as u64).to_le_bytes());
-        for value in values {
-            update(&value.to_le_bytes());
-        }
+        update(values.len() as u32);
+        values.iter().copied().for_each(&mut update);
     }
     digest
 }

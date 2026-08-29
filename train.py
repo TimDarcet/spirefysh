@@ -22,10 +22,10 @@ import sts2_sim
 
 
 FEATURE_VERSION = 55
-MODEL_VERSION = 66
+MODEL_VERSION = 67
 PRECISIONS = ("fp32", "bf16")
 WINNING_CAPACITY = 0
-CHANGE = "V66: reusable priority-decay dataset with prefiltered policy batches."
+CHANGE = "V67: screened reusable batches with full-model updates."
 STAGES = [(0, bonus) for bonus in (24, 20, 16, 12, 8, 4, 0)] + [
     (ascension, 0) for ascension in range(1, 11)
 ]
@@ -1361,18 +1361,21 @@ def predict(model, inputs, precision, temperature=1, policy_only=False):
 
 def trust_region_step(model, optimizer, inputs, action, old, fresh, denominator, precision, limit,
                       temperature=1, attempts=3):
-    nn.utils.clip_grad_norm_(model.parameters(), .5)
-    parameters = list(model.parameters())
-    state = [value for values in optimizer.state.values() for value in values.values()
+    parameters = [parameter for parameter in model.parameters() if parameter.grad is not None]
+    nn.utils.clip_grad_norm_(parameters, .5)
+    state = [value for parameter in parameters for value in optimizer.state.get(parameter, {}).values()
              if torch.is_tensor(value)]
     optimizer_state = copy.deepcopy(optimizer.state_dict()) if any(
         parameter.grad is not None and parameter not in optimizer.state for parameter in parameters
     ) else None
-    saved = getattr(optimizer, "_trust_region_saved", None)
+    cache = getattr(optimizer, "_trust_region_saved", {})
+    key = tuple(map(id, parameters))
+    saved = cache.get(key)
     if saved is None or len(saved[1]) != len(state):
         saved = ([value.detach().clone() for value in parameters],
                  [value.detach().clone() for value in state])
-        optimizer._trust_region_saved = saved
+        cache[key] = saved
+        optimizer._trust_region_saved = cache
     else:
         torch._foreach_copy_(saved[0], parameters)
         for dtype in {value.dtype for value in state}:
@@ -1408,14 +1411,13 @@ def trust_region_step(model, optimizer, inputs, action, old, fresh, denominator,
                     logits = model(
                         *inputs[:6], policy_only=True, temperature=temperature,
                     ).float()[:len(action)]
-                logits = logits.masked_fill(~inputs[6][:len(action)], -torch.inf)
-                log_ratio = logits.log_softmax(-1).gather(1, action[:, None]).squeeze(1) - old
+                log_ratio = logits.gather(1, action[:, None]).squeeze(1) - old
                 post_kl = (((log_ratio.exp() - 1 - log_ratio) * fresh).sum() / denominator).float()
             proposals.append(float(post_kl))
             if torch.isfinite(post_kl) and proposals[-1] <= limit:
-                return True, proposals
+                return True, proposals, log_ratio
         restore()
-        return False, proposals
+        return False, proposals, None
     except Exception:
         restore()
         raise
@@ -2021,12 +2023,13 @@ def _pack_batch(observation):
     return rows
 
 
-def pack_batch(observation):
+def pack_batch(observation, validate=True):
     rows = _pack_batch(observation)
     if len(rows) != len(observation[0]):
         raise ValueError("packed observation row count mismatch")
-    for row in rows:
-        validate_packed(row)
+    if validate:
+        for row in rows:
+            validate_packed(row)
     return rows
 
 
@@ -2034,9 +2037,10 @@ def pack(observation, index, model):
     return pack_batch(observation)[index]
 
 
-def unpack(rows, target, model):
-    for row in rows:
-        validate_packed(row)
+def unpack(rows, target, model, validate=True):
+    if validate:
+        for row in rows:
+            validate_packed(row)
     batch = len(rows); lengths = np.asarray([len(row[4]) for row in rows], np.int32)
     actions = max(1, int(lengths.max()))
     domains = []
@@ -2220,14 +2224,13 @@ def act(model, observation, target, sample, precision, generator=None, temperatu
         legal = inputs[6].clone()
         legal[~legal.any(1), 0] = True
         masked = logits.masked_fill(~legal, -torch.inf)
-        distribution = torch.distributions.Categorical(logits=masked)
         choice = (
-            torch.multinomial(masked.softmax(-1).cpu(), 1, generator=generator).squeeze(1).to(target)
+            torch.multinomial(masked.exp().cpu(), 1, generator=generator).squeeze(1).to(target)
             if sample else masked.argmax(1)
         )
         assert legal.gather(1, choice[:, None]).all()
-    return (choice.cpu().numpy(), distribution.log_prob(choice).cpu().numpy(),
-            distribution.logits.cpu().numpy(), value_logit.sigmoid().cpu().numpy(),
+    return (choice.cpu().numpy(), masked.gather(1, choice[:, None]).squeeze(1).cpu().numpy(),
+            masked.cpu().numpy(), value_logit.sigmoid().cpu().numpy(),
             progress_value.cpu().numpy())
 
 
@@ -2639,8 +2642,9 @@ class ExperienceDataset:
             "advantage": np.empty(0, np.float32), "progress_advantage": np.empty(0, np.float32),
             "returns": np.empty(0, np.float32), "progress_returns": np.empty(0, np.float32),
             "character": np.empty(0, np.int8), "priority": np.empty(0, np.float32),
-            "version": np.empty(0, np.int64),
+            "version": np.empty(0, np.int64), "id": np.empty(0, np.int64),
         }
+        self.next_id = 0
         self.seen = self.admitted = self.uses = self.retired = self.forced_dropped = 0
         self.stale_dropped = self.ratio_dropped = self.kl_dropped = self.post_kl_dropped = 0
 
@@ -2726,7 +2730,9 @@ class ExperienceDataset:
             "version": np.asarray([
                 item for trajectory in trajectories for item in trajectory["versions"]
             ], np.int64),
+            "id": np.arange(self.next_id, self.next_id + len(rows), dtype=np.int64),
         }
+        self.next_id += len(rows)
         self.rows.extend(row for row, keep in zip(rows, actionable) if keep)
         for key, value in values.items():
             self.data[key] = np.concatenate((self.data[key], value[actionable]))
@@ -2751,6 +2757,11 @@ class ExperienceDataset:
         self.rows = [row for row, selected in zip(self.rows, keep) if selected]
         for key in self.data:
             self.data[key] = self.data[key][keep]
+
+    def discard_ids(self, ids):
+        indices = np.flatnonzero(np.isin(self.data["id"], ids))
+        self.discard(indices)
+        return len(indices)
 
     def sample(self, size, rng):
         size = min(size, len(self))
@@ -2782,9 +2793,9 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         "Bounded queue → policy-lag and action-ratio freshness filters",
         "Uniform reusable rows; prefilter forced/stale/ratio-invalid; priority −3 per use",
         f"{model.layers}-layer card encoder + party/enemy/map summaries + action-object menu → heads",
-        f"Asynchronous clipped PPO + weights published every {args.publish_updates} updates",
+        f"Asynchronous clipped PPO; full model updated every iteration; "
+        f"weights published every {args.publish_updates} updates",
     ]
-    last_batch = None
     winning_behavior_drift = 0
     decisions = discarded_steps = handled = sampled = attempted = forced = trained = updates = windows = 0
     segmented_trajectories = 0
@@ -2805,6 +2816,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
     forward_durations = []
     backward_durations = []
     collect_seconds = update_seconds = screen_seconds = 0.0
+    screen_unpack_seconds = screen_forward_seconds = 0.0
     collector_seconds = [0.0] * args.samplers
     worker_accounted = [0] * args.samplers
     sampler_generations = [0] * args.samplers
@@ -2829,12 +2841,12 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
     rng = np.random.default_rng(args.seed + sampler_session + 1_000_000_000)
     context = multiprocessing.get_context("spawn")
     models = [context.Queue(maxsize=1) for _ in range(args.samplers)]
-    sample_capacity = max(8, args.samplers * 2)
+    sample_capacity = max(8, args.samplers * 16)
     samples = context.Queue(maxsize=sample_capacity)
     results = context.Queue(); stop = context.Event()
     heartbeat = context.Array("d", [started] * args.samplers)
     progress = context.Array("q", [0] * args.samplers)
-    packer = ThreadPoolExecutor(max_workers=2)
+    packer = ThreadPoolExecutor(max_workers=4)
     workers = [None] * args.samplers
 
     def start_worker(worker):
@@ -2953,43 +2965,17 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
 
         return rebuild(structure)
 
+    def prepare(rows):
+        prepared = time.monotonic()
+        return unpack(rows, torch.device("cpu"), model, False), time.monotonic() - prepared
+
     def reserve_batch(size):
-        nonlocal screen_seconds
-        order = dataset.sample(len(dataset), rng)
-        selected = []
-        rejected = []
-        cursor = 0
-        while len(selected) < size and cursor < len(order):
-            index = order[cursor:cursor + size - len(selected)]
-            cursor += len(index)
-            rows = [dataset.rows[i] for i in index]
-            values = {key: dataset.data[key][index] for key in dataset.data}
-            started = time.monotonic()
-            inputs = upload(unpack(rows, torch.device("cpu"), model))
-            if not (inputs[6].sum(1) > 1).all():
-                raise RuntimeError("forced action entered the dataset")
-            with torch.inference_mode():
-                logits = predict(model, inputs, args.precision, args.policy_temperature, True)
-                distribution = torch.distributions.Categorical(
-                    logits=logits.masked_fill(~inputs[6], -torch.inf)
-                )
-                valid = (
-                    distribution.log_prob(torch.as_tensor(values["action"], device=target))
-                    - torch.as_tensor(values["old"], device=target)
-                ).abs() <= args.max_log_ratio
-            screen_seconds += time.monotonic() - started
-            valid = valid.cpu().numpy()
-            selected.extend(index[valid].tolist())
-            rejected.extend(index[~valid].tolist())
-        selected = np.asarray(selected, np.int64)
-        rows = [dataset.rows[i] for i in selected]
+        selected = dataset.sample(size, rng)
+        rows = [dataset.rows[index] for index in selected]
         values = {key: dataset.data[key][selected].copy() for key in dataset.data}
         expired = dataset.use(selected)
-        removed = np.asarray(rejected + expired.tolist(), np.int64)
-        dataset.ratio_dropped += len(rejected)
-        dataset.discard(np.unique(removed))
-        packed = packer.submit(unpack, rows, torch.device("cpu"), model) if rows else None
-        return rows, values, [], packed, len(removed)
+        dataset.discard(expired)
+        return rows, values, [], packer.submit(prepare, rows), len(expired)
 
     def optimizer_metrics():
         return {
@@ -3016,23 +3002,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         }
 
     def report():
-        nonlocal observed_kl, observed_clip, reported_steps, reported_seconds, reported_trajectories
-        if last_batch:
-            rows, action, old = last_batch
-            inputs = unpack(rows, target, model)
-            action = torch.as_tensor(action, device=target)
-            old = torch.as_tensor(old, device=target)
-            model.eval()
-            with torch.no_grad():
-                logits = predict(model, inputs, args.precision, args.policy_temperature)[0]
-                distribution = torch.distributions.Categorical(
-                    logits=logits.masked_fill(~inputs[6], -torch.inf)
-                )
-                log_ratio = distribution.log_prob(action) - old
-                ratio = log_ratio.exp()
-                observed_kl = float((ratio - 1 - log_ratio).mean())
-                observed_clip = float(((ratio - 1).abs() > args.clip).float().mean())
-            model.train()
+        nonlocal reported_steps, reported_seconds, reported_trajectories
         recent_by_character = [rows[reported_episodes[index]:] for index, rows in enumerate(episodes)]
         recent = [episode for rows in recent_by_character for episode in rows]
         recent_summary = episode_summary(recent)
@@ -3076,6 +3046,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             "step_caps": sum(row[2] for row in recent), "combat_caps": sum(row[3] for row in recent),
             "empty_actions": sum(row[4] for row in recent),
             "collect_seconds": collect_seconds, "screen_seconds": screen_seconds,
+            "screen_unpack_seconds": screen_unpack_seconds,
+            "screen_forward_seconds": screen_forward_seconds,
             "update_seconds": update_seconds,
             "actor_decisions_per_second": sampled / max(1e-9, collect_seconds),
             "learner_decisions_per_second": trained / max(1e-9, update_seconds),
@@ -3245,7 +3217,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     continue
                 if len(dataset) < args.batch and not sampler_done:
                     continue
-            while len(pending) < 1:
+            while len(pending) < 4:
                 if not sampler_done:
                     try:
                         ingest(samples.get_nowait())
@@ -3268,8 +3240,11 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             policy_lags.extend((updates - values["version"]).tolist())
             if not rows:
                 continue
+            screen_started = time.monotonic()
             unpack_started = time.monotonic()
-            inputs = upload(packed.result())
+            cpu_inputs, unpack_elapsed = packed.result()
+            screen_unpack_seconds += unpack_elapsed
+            inputs = upload(cpu_inputs)
             unpack_seconds = time.monotonic() - unpack_started
             unpack_durations.append(unpack_seconds)
             action = torch.as_tensor(values["action"], device=target)
@@ -3279,20 +3254,22 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 model, inputs, args.precision, args.policy_temperature,
             )
             forward_seconds = time.monotonic() - forward_started
+            screen_forward_seconds += forward_seconds
+            screen_seconds += time.monotonic() - screen_started
             forward_durations.append(forward_seconds)
             backward_seconds = 0.0
             logits = all_logits[:len(rows)]
             prediction = all_prediction[:len(rows)]
             progress_prediction = all_progress_prediction[:len(rows)]
             legal = inputs[6][:len(rows)]
-            distribution = torch.distributions.Categorical(
-                logits=logits.masked_fill(~legal, -torch.inf)
-            )
-            log_ratio = distribution.log_prob(action) - old
-            if not (log_ratio.abs() <= args.max_log_ratio).all() or not (legal.sum(1) > 1).all():
-                raise RuntimeError("batch eligibility changed after screening")
-            fresh = torch.ones_like(log_ratio, dtype=torch.bool)
-            critic_mask = mask = torch.ones_like(log_ratio)
+            log_ratio = logits.gather(1, action[:, None]).squeeze(1) - old
+            if not (legal.sum(1) > 1).all():
+                raise RuntimeError("forced action entered the dataset")
+            fresh = log_ratio.abs() <= args.max_log_ratio
+            invalid = ~fresh.detach().cpu().numpy()
+            dataset.ratio_dropped += int(invalid.sum())
+            handled += dataset.discard_ids(values["id"][invalid])
+            critic_mask = mask = fresh.to(log_ratio.dtype)
             critic_count = critic_mask.sum()
             fresh_count = mask.sum()
             critic_denominator = critic_count.clamp_min(1)
@@ -3301,8 +3278,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             ratio = safe_log_ratio.exp()
             kl = ((ratio - 1 - safe_log_ratio) * mask).sum().div(denominator).detach()
             fresh_cpu = fresh.detach().cpu().numpy()
-            fresh_rows = len(rows)
-            attempted += fresh_rows
+            fresh_rows = int(fresh_count)
+            attempted += len(rows)
             kl_value = float(kl)
             progress_beta, entropy_weight, _ = curriculum_weights(
                 stage, stage_decisions + handled, auxiliary_decisions + handled, args, progress_active
@@ -3369,7 +3346,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 ratio * batch_advantage,
                 ratio.clamp(1 - args.clip, 1 + args.clip) * batch_advantage,
             ) * mask).sum() / denominator
-            entropy = (distribution.entropy() * mask).sum() / denominator
+            entropy = (-(logits.exp() * logits * legal).sum(1) * mask).sum() / denominator
             loss = policy_loss + critic_loss - entropy_weight * entropy
             replay_valid = replay_eligible = eligible_cpu = valid_cpu = None
             if replay:
@@ -3415,7 +3392,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 replay_kl_mean = (replay_kl * replay_weight).sum() / replay_denominator
             backward_started = time.monotonic()
             optimizer.zero_grad(set_to_none=True); loss.backward()
-            accepted, proposals = trust_region_step(
+            accepted, proposals, post_log_ratio = trust_region_step(
                 model, optimizer, inputs, action, old, fresh, denominator,
                 args.precision, args.target_kl, args.policy_temperature,
             )
@@ -3452,6 +3429,11 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 backward_durations.append(time.monotonic() - backward_started)
                 continue
             post_kl = proposals[-1]
+            post_ratio = post_log_ratio.exp()
+            observed_kl = post_kl
+            observed_clip = float(
+                (((post_ratio - 1).abs() > args.clip) * fresh).sum() / denominator
+            )
             losses["post_kl"].append(post_kl)
             accepted_pre_kl_sum += kl_value
             accepted_post_kl_sum += post_kl
@@ -3467,10 +3449,6 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             losses["entropy_weight"].append(entropy_weight)
             losses["kl"].append(kl); losses["clip_fraction"].append(clip_fraction)
             trained += fresh_rows; updates += 1
-            last_batch = (
-                [row for row, selected in zip(rows, fresh_cpu) if selected],
-                values["action"][fresh_cpu], values["old"][fresh_cpu],
-            )
             if replay_valid is not None:
                 replay_characters = [int(sample[0][0]) for sample in replay]
                 for character, eligible, keep in zip(
@@ -3559,6 +3537,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         "decisions_per_second": decisions / (time.monotonic() - started),
         "seconds": time.monotonic() - started,
         "collect_seconds": collect_seconds, "screen_seconds": screen_seconds,
+        "screen_unpack_seconds": screen_unpack_seconds,
+        "screen_forward_seconds": screen_forward_seconds,
         "update_seconds": update_seconds,
         "actor_decisions_per_second": sampled / max(1e-9, collect_seconds),
         "learner_decisions_per_second": trained / max(1e-9, update_seconds),
@@ -3667,10 +3647,10 @@ def evaluate(model, args, target, seed=None, runs=None, stage=None, max_steps=No
                 if not active.any():
                     break
                 indices = np.flatnonzero(active)
-                rows = pack_batch(observation)
+                rows = pack_batch(observation, False)
                 if len(rows) != count:
                     raise ValueError("packed observation row count mismatch")
-                inputs = unpack([rows[index] for index in indices], target, model)
+                inputs = unpack([rows[index] for index in indices], target, model, False)
                 with torch.inference_mode():
                     logits = predict(model, inputs, args.precision, policy_only=True)
                     selected = logits.masked_fill(~inputs[6], -torch.inf).argmax(1).cpu().numpy()
@@ -3965,20 +3945,20 @@ def dashboard(target):
     data = json.dumps({name: run | {"run": name} for name, run in runs.items()}, separators=(",", ":")).replace("</", "<\\/")
     content = """<!doctype html><meta charset=utf-8><title>Spirefysh dashboard</title><script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script><style>
 body{font:14px system-ui;margin:24px;background:#101319;color:#e8ecf2}h1,h2{margin-bottom:6px}.controls{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:22px}select,input{padding:7px;background:#202938;color:#e8ecf2;border:1px solid #526176;border-radius:5px}.charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(440px,1fr));gap:14px}.panel{margin:22px 0;padding:16px;background:#171d28;border:1px solid #303a49;border-radius:10px}.charts .panel{margin:0}.plot{height:340px;min-width:0}table{border-collapse:collapse;width:100%}th,td{padding:7px;border-bottom:1px solid #303a49;text-align:left}.yes{color:#75db91}.no{color:#ee7b7b}
-</style><h1 id=title>Spirefysh dashboard</h1><div class=controls><label>Run <select id=version></select></label><label>X axis <select id=xaxis><option value=iteration>Iteration</option><option value=decisions selected># decisions</option><option value=time>Wall-clock time</option></select></label><label><input id=smooth type=checkbox checked> EMA</label><label>EMA α <input id=ema type=number min=.01 max=1 step=.01 value=.2></label><span>Auto-refresh 15s</span></div><div class=charts><section class=panel><h2>Mean advantage</h2><div id=advantage class=plot></div></section><section class=panel><h2>Decisions / second</h2><div id=throughput class=plot></div></section><section class=panel><h2>Terminal floor</h2><div id=floor class=plot></div></section><section class=panel><h2>Ascension</h2><div id=ascension class=plot></div></section><section class=panel><h2>Bonus strength</h2><div id=bonus class=plot></div></section><section class=panel><h2>Win proportion</h2><div id=wins class=plot></div></section><section class=panel><h2>Clip fraction</h2><div id=clip class=plot></div></section><section class=panel><h2>KL</h2><div id=kl class=plot></div></section><section class=panel><h2>Entropy</h2><div id=entropy class=plot></div></section></div><section class=panel><h2>Promotion</h2><div id=promotion></div></section><script>const versions=""" + data + r""",versionSelect=document.querySelector('#version'),xaxis=document.querySelector('#xaxis'),smooth=document.querySelector('#smooth'),ema=document.querySelector('#ema');
-const characterNames=['Ironclad','Defect','Silent','Regent','Necrobinder'],characterColors=['#ef4444','#38bdf8','#22c55e','#f59e0b','#a78bfa'],names=Object.keys(versions),config={responsive:true,displaylogo:false},refreshKey='spirefysh-dashboard',saved=(()=>{try{return JSON.parse(sessionStorage.getItem(refreshKey))}catch{return null}})();let timeOrigin=0;versionSelect.innerHTML=names.map(name=>`<option value="${name}">V${versions[name].version} · ${name}</option>`).join('');versionSelect.value=saved?.followLatest?names.at(-1):names.includes(saved?.version)?saved.version:names.at(-1)||'';if(saved?.xaxis)xaxis.value=saved.xaxis;if(typeof saved?.smooth==='boolean')smooth.checked=saved.smooth;if(saved?.ema)ema.value=saved.ema;
-function x(report){return xaxis.value==='time'?(Number.isFinite(Number(report._written))?(report._written-timeOrigin)/60:(report.metrics.seconds||0)/60):xaxis.value==='decisions'?report.step:report.iteration}function series(history,key){return history.map(report=>({x:x(report),y:Number(report.metrics[key])})).filter(point=>Number.isFinite(point.y))}
+</style><h1 id=title>Spirefysh dashboard</h1><div class=controls><label>Run <select id=version></select></label><label>X axis <select id=xaxis><option value=updates>Optimizer steps</option><option value=decisions selected># decisions</option><option value=time>Wall-clock time</option></select></label><label><input id=smooth type=checkbox checked> EMA</label><label>EMA α <input id=ema type=number min=.01 max=1 step=.01 value=.2></label><span>Auto-refresh 15s</span></div><div class=charts><section class=panel><h2>Mean advantage</h2><div id=advantage class=plot></div></section><section class=panel><h2>Decisions / second</h2><div id=throughput class=plot></div></section><section class=panel><h2>Terminal floor</h2><div id=floor class=plot></div></section><section class=panel><h2>Ascension</h2><div id=ascension class=plot></div></section><section class=panel><h2>Bonus strength</h2><div id=bonus class=plot></div></section><section class=panel><h2>Win proportion</h2><div id=wins class=plot></div></section><section class=panel><h2>Clip fraction</h2><div id=clip class=plot></div></section><section class=panel><h2>KL</h2><div id=kl class=plot></div></section><section class=panel><h2>Entropy</h2><div id=entropy class=plot></div></section></div><section class=panel><h2>Promotion</h2><div id=promotion></div></section><script>const versions=""" + data + r""",versionSelect=document.querySelector('#version'),xaxis=document.querySelector('#xaxis'),smooth=document.querySelector('#smooth'),ema=document.querySelector('#ema');
+const characterNames=['Ironclad','Defect','Silent','Regent','Necrobinder'],characterColors=['#ef4444','#38bdf8','#22c55e','#f59e0b','#a78bfa'],names=Object.keys(versions),config={responsive:true,displaylogo:false},refreshKey='spirefysh-dashboard',saved=(()=>{try{return JSON.parse(sessionStorage.getItem(refreshKey))}catch{return null}})();let timeOrigin=0;versionSelect.innerHTML=names.map(name=>`<option value="${name}">V${versions[name].version} · ${name}</option>`).join('');versionSelect.value=saved?.followLatest?names.at(-1):names.includes(saved?.version)?saved.version:names.at(-1)||'';if(saved?.xaxis)xaxis.value=saved.xaxis==='iteration'?'updates':saved.xaxis;if(typeof saved?.smooth==='boolean')smooth.checked=saved.smooth;if(saved?.ema)ema.value=saved.ema;
+function updateSteps(history,run){const starts=(run.manifest.sessions||[]).map(session=>Number(session.step)).sort((left,right)=>left-right);let offset=0,last=0,previous=-Infinity,index=0;for(const report of history){let boundary=false;while(starts[index]<report.step){boundary||=starts[index]>previous;index++}const updates=Number(report.metrics.updates)||0;if(boundary||updates<last){offset+=last;last=0}report._updates=offset+updates;last=Math.max(last,updates);previous=report.step}}function x(report){return xaxis.value==='time'?(Number.isFinite(Number(report._written))?(report._written-timeOrigin)/60:(report.metrics.seconds||0)/60):xaxis.value==='decisions'?report.step:report._updates}function series(history,key){return history.map(report=>({x:x(report),y:Number(report.metrics[key])})).filter(point=>Number.isFinite(point.y))}
 function emaLine(points){const alpha=Math.max(.01,Math.min(1,Number(ema.value)||.2));let value;return points.map((point,index)=>({x:point.x,y:value=index?alpha*point.y+(1-alpha)*value:point.y}))}
-function stageTransitions(history,run){const promotions=(run?.promotions||[]).filter(row=>row.promoted);if(promotions.length)return promotions.map(promotion=>{const report=history.find(row=>row.step===promotion.step)||history.filter(row=>row.step<=promotion.step).at(-1),after=history.find(row=>row.step>promotion.step),next=run.manifest.stages?.[(promotion.stage?.index??-1)+1]||after?.stage,position=xaxis.value==='decisions'?promotion.step:report&&xaxis.value==='iteration'?report.metrics.iteration:Number.isFinite(Number(promotion._written))?(promotion._written-timeOrigin)/60:Number.isFinite(Number(promotion.seconds))?promotion.seconds/60:report?x(report):NaN;return{x:position,stage:next}}).filter(point=>Number.isFinite(Number(point.x)));return history.slice(1).flatMap((row,index)=>Number.isFinite(Number(row.stage?.ascension))&&Number.isFinite(Number(history[index].stage?.ascension))&&(row.stage.ascension!==history[index].stage.ascension||row.stage.bonus!==history[index].stage.bonus)?[{x:x(row),stage:row.stage}]:[])}
+function stageTransitions(history,run){const promotions=(run?.promotions||[]).filter(row=>row.promoted);if(promotions.length)return promotions.map(promotion=>{const report=history.find(row=>row.step===promotion.step)||history.filter(row=>row.step<=promotion.step).at(-1),after=history.find(row=>row.step>promotion.step),next=run.manifest.stages?.[(promotion.stage?.index??-1)+1]||after?.stage,position=xaxis.value==='decisions'?promotion.step:report&&xaxis.value==='updates'?report._updates:Number.isFinite(Number(promotion._written))?(promotion._written-timeOrigin)/60:Number.isFinite(Number(promotion.seconds))?promotion.seconds/60:report?x(report):NaN;return{x:position,stage:next}}).filter(point=>Number.isFinite(Number(point.x)));return history.slice(1).flatMap((row,index)=>Number.isFinite(Number(row.stage?.ascension))&&Number.isFinite(Number(history[index].stage?.ascension))&&(row.stage.ascension!==history[index].stage.ascension||row.stage.bonus!==history[index].stage.bonus)?[{x:x(row),stage:row.stage}]:[])}
 function stageLines(history,run){return stageTransitions(history,run).map(point=>({type:'line',xref:'x',yref:'paper',x0:point.x,x1:point.x,y0:0,y1:1,layer:'below',line:{color:'rgba(232,236,242,.38)',width:1,dash:'dash'}}))}
-function layout(percent=false,range,history=[],run){const title=xaxis.value==='time'?'Wall-clock time (minutes)':xaxis.value==='decisions'?'# decisions':'Iteration';return{template:'plotly_dark',paper_bgcolor:'rgba(0,0,0,0)',plot_bgcolor:'rgba(0,0,0,0)',margin:{l:62,r:18,t:12,b:52},hovermode:'closest',showlegend:true,shapes:stageLines(history,run),xaxis:{title,gridcolor:'#303a49'},yaxis:{gridcolor:'#303a49',tickformat:percent?'.0%':undefined,range,zerolinecolor:'#8794a8'}}}
+function layout(percent=false,range,history=[],run){const title=xaxis.value==='time'?'Wall-clock time (minutes)':xaxis.value==='decisions'?'# decisions':'Optimizer steps';return{template:'plotly_dark',paper_bgcolor:'rgba(0,0,0,0)',plot_bgcolor:'rgba(0,0,0,0)',margin:{l:62,r:18,t:12,b:52},hovermode:'closest',showlegend:true,shapes:stageLines(history,run),xaxis:{title,gridcolor:'#303a49'},yaxis:{gridcolor:'#303a49',tickformat:percent?'.0%':undefined,range,zerolinecolor:'#8794a8'}}}
 function plot(id,points,{range,percent=false,tozero=false,history=[],run}={}){const traces=[{x:points.map(point=>point.x),y:points.map(point=>point.y),mode:'lines+markers',name:'raw',line:{color:'#6fb1ff',width:2},marker:{color:'#6fb1ff',size:6,opacity:.8},hovertemplate:'x %{x}<br>y %{y:.5g}<extra></extra>'}];if(smooth.checked&&points.length>1){const line=emaLine(points);traces.push({x:line.map(point=>point.x),y:line.map(point=>point.y),mode:'lines',name:`EMA α=${Number(ema.value)||.2}`,line:{color:'#ffb454',width:4},hovertemplate:'EMA %{y:.5g}<extra></extra>'})}const options=layout(percent,range,history,run);if(tozero)options.yaxis.rangemode='tozero';Plotly.react(id,traces,options,config)}
-function floorPlot(history,run){const training=run.manifest.sessions?.at(-1)?.training||run.manifest.training||{},envs=training.envs||1,points=[];for(const report of history){let inferred=0,last=-Infinity;for(const row of report.metrics.trajectory_floors||[]){const [iteration,floor,stored]=row;if(stored===undefined&&iteration<last)inferred++;const character=stored??Math.min(inferred,4);points.push({x:xaxis.value==='iteration'?iteration:xaxis.value==='decisions'?iteration*envs:(report.metrics.seconds||0)/60,y:floor,character,iteration,step:report.step});last=iteration}}for(let i=points.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[points[i],points[j]]=[points[j],points[i]]}const trajectory={x:points.map(point=>point.x),y:points.map(point=>point.y),customdata:points.map(point=>[characterNames[point.character],point.iteration,point.step]),mode:'markers',showlegend:false,marker:{color:points.map(point=>characterColors[point.character]),size:6,opacity:.5},hovertemplate:'%{customdata[0]}<br>floor %{y}<br>iteration %{customdata[1]:,}<br>report decisions %{customdata[2]:,}<extra></extra>'},legend=characterNames.map((name,character)=>({x:[null],y:[null],mode:'markers',name,hoverinfo:'skip',marker:{color:characterColors[character],size:7,opacity:.5}})),options=layout(false,[0,52],history,run);options.yaxis.title='Terminal floor';Plotly.react('floor',[trajectory,...legend],options,config)}
+function floorPlot(history,run){const training=run.manifest.sessions?.at(-1)?.training||run.manifest.training||{},envs=training.envs||1,points=[];for(const report of history){let inferred=0,last=-Infinity;for(const row of report.metrics.trajectory_floors||[]){const [iteration,floor,stored]=row;if(stored===undefined&&iteration<last)inferred++;const character=stored??Math.min(inferred,4);points.push({x:xaxis.value==='updates'?report._updates:xaxis.value==='decisions'?iteration*envs:(report.metrics.seconds||0)/60,y:floor,character,updates:report._updates,step:report.step});last=iteration}}for(let i=points.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[points[i],points[j]]=[points[j],points[i]]}const trajectory={x:points.map(point=>point.x),y:points.map(point=>point.y),customdata:points.map(point=>[characterNames[point.character],point.updates,point.step]),mode:'markers',showlegend:false,marker:{color:points.map(point=>characterColors[point.character]),size:6,opacity:.5},hovertemplate:'%{customdata[0]}<br>floor %{y}<br>optimizer steps %{customdata[1]:,}<br>report decisions %{customdata[2]:,}<extra></extra>'},legend=characterNames.map((name,character)=>({x:[null],y:[null],mode:'markers',name,hoverinfo:'skip',marker:{color:characterColors[character],size:7,opacity:.5}})),options=layout(false,[0,52],history,run);options.yaxis.title='Terminal floor';Plotly.react('floor',[trajectory,...legend],options,config)}
 function stagePlot(id,history,key,color,run){const rows=history.filter(row=>Number.isFinite(Number(row.stage?.[key]))).map(row=>({x:x(row),y:row.stage[key]}));for(const transition of stageTransitions(history,run))if(Number.isFinite(Number(transition.stage?.[key])))rows.push({x:transition.x,y:transition.stage[key]});rows.sort((left,right)=>left.x-right.x);const options=layout(false,undefined,history,run);options.yaxis={...options.yaxis,title:key==='ascension'?'Ascension':'Bonus strength',rangemode:'tozero',dtick:key==='ascension'?1:4};Plotly.react(id,[{x:rows.map(row=>row.x),y:rows.map(row=>row.y),mode:'lines+markers',name:key==='ascension'?'Ascension':'Bonus strength',line:{color,width:3,shape:'hv'},marker:{color,size:6},hovertemplate:`${key==='ascension'?'ascension':'bonus'} %{y}<extra></extra>`}],options,config)}
 function promotionSummary(row){if(!row)return '<p>No promotion check yet.</p>';const characters=row.result?.characters||[],rows=characters.map(item=>`<tr><td>${characterNames[item.character]??`Character ${item.character}`}</td><td>${item.wins}/${item.runs}</td><td>${(100*item.wins/item.runs).toFixed(1)}%</td><td>${Number(item.floor_mean).toFixed(2)}</td><td>${item.caps}</td></tr>`).join('');return `<p class="${row.promoted?'yes':'no'}">${row.promoted?'Promoted':'Stayed at current stage'} · threshold ${(100*row.threshold).toFixed(0)}% per character · seed ${row.seed}</p><table><thead><tr><th>Character</th><th>Wins</th><th>Rate</th><th>Mean floor</th><th>Caps</th></tr></thead><tbody>${rows}</tbody></table>`}
 function saveDashboardState(){const views={};document.querySelectorAll('.plot').forEach(node=>{const view={};if(node._fullLayout?.xaxis?.autorange===false)view.x=[...node._fullLayout.xaxis.range];if(node._fullLayout?.yaxis?.autorange===false)view.y=[...node._fullLayout.yaxis.range];if(view.x||view.y)views[node.id]=view});try{sessionStorage.setItem(refreshKey,JSON.stringify({version:versionSelect.value,followLatest:versionSelect.value===names.at(-1),xaxis:xaxis.value,smooth:smooth.checked,ema:ema.value,scroll:[scrollX,scrollY],views}))}catch{}}
 function restoreDashboardState(){if(saved?.version===versionSelect.value&&saved.xaxis===xaxis.value)for(const [id,view] of Object.entries(saved.views||{})){const update={};if(view.x)update['xaxis.range']=view.x;if(view.y)update['yaxis.range']=view.y;if(Object.keys(update).length)Plotly.relayout(id,update)}if(saved?.scroll)scrollTo(...saved.scroll)}
-function showVersion(){const run=versions[versionSelect.value],reports=run.reports,timed=reports.find(row=>Number.isFinite(Number(row._written))&&Number.isFinite(Number(row.metrics.seconds)));timeOrigin=timed?timed._written-timed.metrics.seconds:0;document.querySelector('#title').textContent=`Spirefysh V${run.version} · ${run.run}`;plot('advantage',series(reports,'mean_advantage'),{history:reports,run});plot('throughput',series(reports,'decisions_per_second'),{tozero:true,history:reports,run});floorPlot(reports,run);stagePlot('ascension',reports,'ascension','#fb7185',run);stagePlot('bonus',reports,'bonus','#f59e0b',run);plot('wins',reports.map(row=>({x:x(row),y:row.metrics.wins/Math.max(1,row.metrics.episodes)})),{range:[0,1],percent:true,history:reports,run});plot('clip',series(reports,'clip_fraction'),{range:[0,1],percent:true,history:reports,run});plot('kl',series(reports,'kl'),{tozero:true,history:reports,run});plot('entropy',series(reports,'entropy'),{tozero:true,history:reports,run});document.querySelector('#promotion').innerHTML=promotionSummary(run.promotions.at(-1))}versionSelect.onchange=showVersion;xaxis.onchange=showVersion;smooth.onchange=showVersion;ema.oninput=showVersion;showVersion();setTimeout(restoreDashboardState,100);window.addEventListener('beforeunload',saveDashboardState);setInterval(()=>{saveDashboardState();location.reload()},15000)</script>"""
+function showVersion(){const run=versions[versionSelect.value],reports=run.reports;updateSteps(reports,run);const timed=reports.find(row=>Number.isFinite(Number(row._written))&&Number.isFinite(Number(row.metrics.seconds)));timeOrigin=timed?timed._written-timed.metrics.seconds:0;document.querySelector('#title').textContent=`Spirefysh V${run.version} · ${run.run}`;plot('advantage',series(reports,'mean_advantage'),{history:reports,run});plot('throughput',series(reports,'decisions_per_second'),{tozero:true,history:reports,run});floorPlot(reports,run);stagePlot('ascension',reports,'ascension','#fb7185',run);stagePlot('bonus',reports,'bonus','#f59e0b',run);plot('wins',reports.map(row=>({x:x(row),y:row.metrics.wins/Math.max(1,row.metrics.episodes)})),{range:[0,1],percent:true,history:reports,run});plot('clip',series(reports,'clip_fraction'),{range:[0,1],percent:true,history:reports,run});plot('kl',series(reports,'kl'),{tozero:true,history:reports,run});plot('entropy',series(reports,'entropy'),{tozero:true,history:reports,run});document.querySelector('#promotion').innerHTML=promotionSummary(run.promotions.at(-1))}versionSelect.onchange=showVersion;xaxis.onchange=showVersion;smooth.onchange=showVersion;ema.oninput=showVersion;showVersion();setTimeout(restoreDashboardState,100);window.addEventListener('beforeunload',saveDashboardState);setInterval(()=>{saveDashboardState();location.reload()},15000)</script>"""
     content = content.replace(
         "<section class=panel><h2>Entropy</h2><div id=entropy class=plot></div></section></div><section class=panel><h2>Promotion</h2>",
         "<section class=panel><h2>Entropy</h2><div id=entropy class=plot></div></section><section class=panel><h2>Dataset size</h2><div id=dataset class=plot></div></section></div><section class=panel><h2>Promotion</h2>",
@@ -3998,7 +3978,7 @@ function showVersion(){const run=versions[versionSelect.value],reports=run.repor
     )
     floor_start = content.index("function floorPlot(")
     floor_end = content.index("function stagePlot(", floor_start)
-    content = content[:floor_start] + r"""function floorPlot(history,run){const completed=history.filter(report=>Number(report.metrics.episodes)>0||(report.metrics.trajectory_floors?.length??0)>0),points=[],traces=[],bands=[['min','max','min–max','.04'],['p01','p99','p1–p99','.06'],['p05','p95','p5–p95','.09'],['p10','p90','p10–p90','.13'],['p25','p75','p25–p75','.20']];for(const [low,high,name,alpha] of bands){const rows=completed.map(report=>({x:x(report),low:report.metrics.floor_bands?.[low],high:report.metrics.floor_bands?.[high]})).filter(row=>Number.isFinite(row.low)&&Number.isFinite(row.high));traces.push({x:rows.map(row=>row.x),y:rows.map(row=>row.low),mode:'lines',showlegend:false,hoverinfo:'skip',line:{width:0}},{x:rows.map(row=>row.x),y:rows.map(row=>row.high),mode:'lines',name,line:{width:0},fill:'tonexty',fillcolor:`rgba(111,177,255,${alpha})`,hovertemplate:`${name}<br>upper %{y:.2f}<extra></extra>`})}for(const report of completed){let inferred=0,last=-Infinity;for(const row of report.metrics.trajectory_floors||[]){const [iteration,floor,stored]=row;if(stored===undefined&&iteration<last)inferred++;const character=stored??Math.min(inferred,4);points.push({x:xaxis.value==='iteration'?iteration:xaxis.value==='decisions'?report.step:(report.metrics.seconds||0)/60,y:floor,character,iteration,step:report.step});last=iteration}}for(let i=points.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[points[i],points[j]]=[points[j],points[i]]}traces.push({x:points.map(point=>point.x),y:points.map(point=>point.y),customdata:points.map(point=>[characterNames[point.character],point.iteration,point.step]),mode:'markers',name:'trajectories',marker:{color:points.map(point=>characterColors[point.character]),size:5,opacity:.28},hovertemplate:'%{customdata[0]}<br>floor %{y}<br>iteration %{customdata[1]:,}<br>report decisions %{customdata[2]:,}<extra></extra>'});const means=completed.map(report=>({x:x(report),y:report.metrics.floor_bands?.mean??report.metrics.floor_mean})).filter(point=>Number.isFinite(point.y));traces.push({x:means.map(point=>point.x),y:means.map(point=>point.y),mode:'lines+markers',name:'mean',line:{color:'#ffb454',width:3},marker:{size:5},hovertemplate:'mean %{y:.2f}<extra></extra>'});if(smooth.checked&&means.length>1){const line=emaLine(means);traces.push({x:line.map(point=>point.x),y:line.map(point=>point.y),mode:'lines',name:`mean EMA α=${Number(ema.value)||.2}`,line:{color:'#f97316',width:2,dash:'dot'},hovertemplate:'mean EMA %{y:.2f}<extra></extra>'})}for(const [character,name] of characterNames.entries())traces.push({x:[null],y:[null],mode:'markers',name,hoverinfo:'skip',marker:{color:characterColors[character],size:7,opacity:.6}});const options=layout(false,[0,52],history,run);options.yaxis.title='Terminal floor';Plotly.react('floor',traces,options,config)}
+    content = content[:floor_start] + r"""function floorPlot(history,run){const completed=history.filter(report=>Number(report.metrics.episodes)>0||(report.metrics.trajectory_floors?.length??0)>0),points=[],traces=[],bands=[['min','max','min–max','.04'],['p01','p99','p1–p99','.06'],['p05','p95','p5–p95','.09'],['p10','p90','p10–p90','.13'],['p25','p75','p25–p75','.20']];for(const [low,high,name,alpha] of bands){const rows=completed.map(report=>({x:x(report),low:report.metrics.floor_bands?.[low],high:report.metrics.floor_bands?.[high]})).filter(row=>Number.isFinite(row.low)&&Number.isFinite(row.high));traces.push({x:rows.map(row=>row.x),y:rows.map(row=>row.low),mode:'lines',showlegend:false,hoverinfo:'skip',line:{width:0}},{x:rows.map(row=>row.x),y:rows.map(row=>row.high),mode:'lines',name,line:{width:0},fill:'tonexty',fillcolor:`rgba(111,177,255,${alpha})`,hovertemplate:`${name}<br>upper %{y:.2f}<extra></extra>`})}for(const report of completed){let inferred=0,last=-Infinity;for(const row of report.metrics.trajectory_floors||[]){const [iteration,floor,stored]=row;if(stored===undefined&&iteration<last)inferred++;const character=stored??Math.min(inferred,4);points.push({x:xaxis.value==='updates'?report._updates:xaxis.value==='decisions'?report.step:(report.metrics.seconds||0)/60,y:floor,character,updates:report._updates,step:report.step});last=iteration}}for(let i=points.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[points[i],points[j]]=[points[j],points[i]]}traces.push({x:points.map(point=>point.x),y:points.map(point=>point.y),customdata:points.map(point=>[characterNames[point.character],point.updates,point.step]),mode:'markers',name:'trajectories',marker:{color:points.map(point=>characterColors[point.character]),size:5,opacity:.28},hovertemplate:'%{customdata[0]}<br>floor %{y}<br>optimizer steps %{customdata[1]:,}<br>report decisions %{customdata[2]:,}<extra></extra>'});const means=completed.map(report=>({x:x(report),y:report.metrics.floor_bands?.mean??report.metrics.floor_mean})).filter(point=>Number.isFinite(point.y));traces.push({x:means.map(point=>point.x),y:means.map(point=>point.y),mode:'lines+markers',name:'mean',line:{color:'#ffb454',width:3},marker:{size:5},hovertemplate:'mean %{y:.2f}<extra></extra>'});if(smooth.checked&&means.length>1){const line=emaLine(means);traces.push({x:line.map(point=>point.x),y:line.map(point=>point.y),mode:'lines',name:`mean EMA α=${Number(ema.value)||.2}`,line:{color:'#f97316',width:2,dash:'dot'},hovertemplate:'mean EMA %{y:.2f}<extra></extra>'})}for(const [character,name] of characterNames.entries())traces.push({x:[null],y:[null],mode:'markers',name,hoverinfo:'skip',marker:{color:characterColors[character],size:7,opacity:.6}});const options=layout(false,[0,52],history,run);options.yaxis.title='Terminal floor';Plotly.react('floor',traces,options,config)}
 """ + content[floor_end:]
     target.mkdir(parents=True, exist_ok=True)
     temporary = target / "dashboard.html.tmp"
