@@ -22,10 +22,10 @@ import sts2_sim
 
 
 FEATURE_VERSION = 55
-MODEL_VERSION = 62
+MODEL_VERSION = 63
 PRECISIONS = ("fp32", "bf16")
 WINNING_CAPACITY = 4096
-CHANGE = "V62: normalized compact state, whole-map current context, and explicit action-object menu."
+CHANGE = "V63: release-optimized V62 architecture with stable-shape training and batch 4096."
 STAGES = [(0, bonus) for bonus in (24, 20, 16, 12, 8, 4, 0)] + [
     (ascension, 0) for ascension in range(1, 11)
 ]
@@ -5218,7 +5218,7 @@ def parser():
     root = argparse.ArgumentParser()
     commands = root.add_subparsers(dest="command", required=True)
     run = commands.add_parser("train")
-    run.add_argument("--output", default="target/v62")
+    run.add_argument("--output", default="target/v63")
     run.add_argument("--checkpoint")
     run.add_argument("--width", type=int)
     run.add_argument("--layers", type=int)

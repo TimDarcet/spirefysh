@@ -2207,3 +2207,11 @@ The isolated two-window batch-`4,096` gate reached `659.4` end-to-end decisions/
 Conclusion: The patch is semantically clean and clears the `1,000` end-to-end decisions/s gate at batch `4,096`. A custom Metal scatter-sum path was rejected because it matched native `index_add` throughput.
 
 Next: Use batch `4,096` and a release Rust extension for MODEL62 training. Keep the 32,768-decision report window; treat its first complete-trajectory window as startup and require subsequent windows to remain above `1,000` end-to-end decisions/s without utilization or trust-region regression.
+
+## 2026-08-29 — MODEL63 optimized batch-4096 launch
+
+Experiment: Promote the exact MODEL62 throughput patch into a fresh model identity. Keep FEATURE55 and the 920,611-parameter architecture unchanged, build the Rust extension in release mode, increase batch size from `1,024` to `4,096`, and increase learning rate from `3e-4` to `6e-4`. Start from random weights, optimizer, and replay with new seed namespaces.
+
+Rationale: The isolated second 32,768-decision window reached `1,228.9` end-to-end decisions/s with `100%` utilization, zero stale, ratio, pre-KL, or post-KL drops, and `4.117 GiB` peak MPS driver allocation. The larger batch performs eight optimizer/trust-region cycles per report instead of 32; the doubled learning rate partially compensates for the lower update frequency without applying full linear scaling.
+
+Next: Require the live second window to reproduce at least `1,000` end-to-end decisions/s. Monitor KL utilization and early learning separately because the batch and learning-rate change alters optimization cadence despite identical model outputs and PPO equations.

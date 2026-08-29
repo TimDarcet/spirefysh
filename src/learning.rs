@@ -12,7 +12,7 @@ use std::{
 
 const MAGIC: &[u8; 8] = b"STSVALUE";
 const VERSION: u32 = 55;
-const VALUE_MODEL_VERSION: u32 = 62;
+const VALUE_MODEL_VERSION: u32 = 63;
 const TOKEN_CATEGORICAL: usize = 10;
 const TOKEN_NUMERIC: usize = 24;
 const TOKEN_VALUES: usize = TOKEN_CATEGORICAL + TOKEN_NUMERIC;
