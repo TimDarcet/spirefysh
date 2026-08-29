@@ -2227,3 +2227,9 @@ Rationale: The prior promotion panel duplicated evaluation work, blocked trainin
 Experiment: Continue the MODEL63 weights and optimizer with the same FEATURE55 architecture, batch `4,096`, and learning rate `6e-4`, but remove every batching dependency on estimated compute cost or learning priority. Fresh rows and winning replay are sampled uniformly without replacement from their complete available pools.
 
 Rationale: Cost-homogeneous batches can align game phase and action complexity across an update, creating avoidable gradient oscillation. MODEL64 deliberately mixes short and long states, menus, and card zones in every batch. Character balance, advantage priority, terminal bonuses, cost scores, cost buckets, and replay cost compatibility no longer affect selection.
+
+## 2026-08-29 — MODEL65 controlled fresh comparison
+
+Experiment: Restart the MODEL64 uniform-random batching design from scratch for a controlled comparison with MODEL63. Reuse MODEL63's model seed `6301`, training seed `3,200,000,000`, architecture, batch `4,096`, learning rate `6e-4`, PPO settings, curriculum, and reporting cadence. Initialize new weights, Adam state, replay, curriculum counters, and decision counter at A0/+24.
+
+Rationale: MODEL64 continued trained MODEL63 weights and therefore measured a before/after timeline rather than a controlled batching comparison. MODEL65 changes only minibatch selection: MODEL63 used character-balanced advantage-prioritized sampling, whereas MODEL65 samples every queued fresh row and replay row uniformly without replacement.

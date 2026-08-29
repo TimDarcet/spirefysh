@@ -22,10 +22,10 @@ import sts2_sim
 
 
 FEATURE_VERSION = 55
-MODEL_VERSION = 64
+MODEL_VERSION = 65
 PRECISIONS = ("fp32", "bf16")
 WINNING_CAPACITY = 4096
-CHANGE = "V64: uniformly random minibatches across all compute costs."
+CHANGE = "V65: fresh controlled run with uniformly random minibatches."
 STAGES = [(0, bonus) for bonus in (24, 20, 16, 12, 8, 4, 0)] + [
     (ascension, 0) for ascension in range(1, 11)
 ]
@@ -4088,19 +4088,19 @@ function showVersion(){const run=versions[versionSelect.value],reports=run.repor
     )
     content = content.replace(
         "['Priority',`1+|Awin|+|Aprogress|+terminal/win bonuses`,`Each row gets priority 1 + |policy advantage| + |progress advantage| + 4×terminal + 4×winning-return. Sampling uses the square root of priority.",
-        "[manifest.model_version>=64?'Uniform random sampling':'Priority',manifest.model_version>=64?'equal probability for every queued row':`1+|Awin|+|Aprogress|+terminal/win bonuses`,manifest.model_version>=64?'Fresh rows are selected uniformly without replacement; advantage, terminal status, character and compute cost do not affect selection.':'Each row gets priority 1 + |policy advantage| + |progress advantage| + 4×terminal + 4×winning-return. Sampling uses the square root of priority.",
+        "[manifest.model_version>=64?'Uniform random sampling':'Priority',manifest.model_version>=64?'equal probability for every queued row':`1+|Awin|+|Aprogress|+terminal/win bonuses`,manifest.model_version>=64?`Fresh rows are selected uniformly without replacement; advantage, terminal status, character and compute cost do not affect selection.`:`Each row gets priority 1 + |policy advantage| + |progress advantage| + 4×terminal + 4×winning-return. Sampling uses the square root of priority.",
     ).replace(
-        "['Token-cost bucket',`one bucket per batch`,`Rows are bucketed by floor(log2(estimated token/attention cost)). A bucket is chosen by total priority to reduce padding and attention waste.",
-        "[manifest.model_version>=64?'Mixed compute costs':'Token-cost bucket',manifest.model_version>=64?'one uniform random pool':`one bucket per batch`,manifest.model_version>=64?'Every minibatch freely mixes short and long states, action menus and card zones. No compute-cost score or bucket exists.':'Rows are bucketed by floor(log2(estimated token/attention cost)). A bucket is chosen by total priority to reduce padding and attention waste.",
+        "['Full minibatch',`up to ${n(batch)} rows`,`Rows are sampled across action counts because the direct policy head has no quadratic action-set attention.",
+        "[manifest.model_version>=64?'Mixed compute costs':'Full minibatch',manifest.model_version>=64?'one uniform random pool':`up to ${n(batch)} rows`,manifest.model_version>=64?`Every minibatch freely mixes short and long states, action menus and card zones. No compute-cost score or bucket exists.`:`Rows are sampled across action counts because the direct policy head has no quadratic action-set attention.",
     ).replace(
         "['Balanced one-pass batch',`up to ${n(batch)} rows`,`Each batch draws evenly across the five characters when possible, without replacement, then deletes those rows from the dataset.",
-        "[manifest.model_version>=64?'Uniform one-pass batch':'Balanced one-pass batch',`up to ${n(batch)} rows`,manifest.model_version>=64?'Each batch is a uniform sample of all queued rows without replacement, then deletes those rows from the dataset.':'Each batch draws evenly across the five characters when possible, without replacement, then deletes those rows from the dataset.",
+        "[manifest.model_version>=64?'Uniform one-pass batch':'Balanced one-pass batch',`up to ${n(batch)} rows`,manifest.model_version>=64?`Each batch is a uniform sample of all queued rows without replacement, then deletes those rows from the dataset.`:`Each batch draws evenly across the five characters when possible, without replacement, then deletes those rows from the dataset.",
     ).replace(
-        "Only candidates no more expensive than the fresh token-cost bucket are packed.",
-        "${manifest.model_version>=64?'Replay candidates are sampled without any compute-cost compatibility filter.':'Only candidates no more expensive than the fresh token-cost bucket are packed.'}",
+        "Replay candidates are sampled independently and remain capped at 10% of update rows.",
+        "${manifest.model_version>=64?'Replay candidates are sampled without any compute-cost compatibility filter.':'Replay candidates are sampled independently and remain capped at 10% of update rows.'}",
     ).replace(
         "['Balanced compatible sample','≤10% of update data',`Candidates are round-robin balanced across characters.",
-        "[manifest.model_version>=64?'Uniform replay sample':'Balanced compatible sample','≤10% of update data',manifest.model_version>=64?'Reservoir rows are selected uniformly without replacement.':'Candidates are round-robin balanced across characters.",
+        "[manifest.model_version>=64?'Uniform replay sample':'Balanced compatible sample','≤10% of update data',manifest.model_version>=64?`Reservoir rows are selected uniformly without replacement.`:`Candidates are round-robin balanced across characters.",
     )
     target.mkdir(parents=True, exist_ok=True)
     temporary = target / "dashboard.html.tmp"
@@ -4454,7 +4454,7 @@ def load(path, target):
     live = sts2_sim.Batch(1, 0, None, ascension=0)
     layout = dict(live.token_layout())
     version = checkpoint.get("model_version")
-    if checkpoint.get("schema") != 1 or version not in (63, MODEL_VERSION):
+    if checkpoint.get("schema") != 1 or version != MODEL_VERSION:
         raise ValueError("incompatible checkpoint")
     if checkpoint.get("feature_version") != FEATURE_VERSION or layout["version"] != FEATURE_VERSION:
         raise ValueError("incompatible feature version")
