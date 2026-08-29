@@ -50,6 +50,15 @@ struct TurnHistory {
 struct ReplayState {
     episode: String,
     act: u8,
+    encounter_act: Option<Id>,
+    encounters: Vec<Id>,
+    elites: Vec<Id>,
+    weak_encounters_left: u8,
+    regular_encounters_left: u8,
+    elite_encounters_left: u8,
+    last_encounter: Option<Id>,
+    last_elite: Option<Id>,
+    seen_encounter: Option<(u8, bool, Id)>,
     unknown_odds: [i16; 4],
     rarity_offset: i16,
     potion_odds: i8,
@@ -92,6 +101,15 @@ impl Default for ReplayState {
         Self {
             episode: String::new(),
             act: 0,
+            encounter_act: None,
+            encounters: vec![],
+            elites: vec![],
+            weak_encounters_left: 0,
+            regular_encounters_left: 0,
+            elite_encounters_left: 0,
+            last_encounter: None,
+            last_elite: None,
+            seen_encounter: None,
             unknown_odds: [1000, -10_000, 200, 300],
             rarity_offset: -500,
             potion_odds: 40,
@@ -132,6 +150,50 @@ impl Default for ReplayState {
 }
 
 impl ReplayState {
+    fn encounter_bag(
+        &self,
+        content: &Content,
+        act: Id,
+        elite: bool,
+        forced: Option<Id>,
+    ) -> Vec<Id> {
+        let def = &content.acts[act as usize];
+        let full = if elite {
+            def.elites.to_vec()
+        } else {
+            def.encounters
+                .iter()
+                .copied()
+                .filter(|&id| {
+                    let weak = content.encounters[id as usize].id.contains("_WEAK");
+                    if self.weak_encounters_left > 0 {
+                        weak
+                    } else if self.regular_encounters_left > 0 {
+                        !weak
+                    } else {
+                        true
+                    }
+                })
+                .collect()
+        };
+        let mut bag = if elite {
+            self.elites.clone()
+        } else {
+            self.encounters.clone()
+        };
+        if bag.is_empty() || forced.is_some_and(|id| !bag.contains(&id) && full.contains(&id)) {
+            bag = full;
+        }
+        if let Some(id) = forced {
+            if let Some(index) = bag.iter().position(|&candidate| candidate == id) {
+                bag.swap(0, index);
+            } else {
+                bag.insert(0, id);
+            }
+        }
+        bag
+    }
+
     fn prepare(&mut self, content: &Content, record: &Value) {
         let state = &record["before"];
         let episode = record["episode_id"].as_str().unwrap_or_default();
@@ -178,6 +240,119 @@ impl ReplayState {
             self.act = act;
             self.unknown_odds = [1000, -10_000, 200, 300];
         }
+        let Some(encounter_act) = trace_act(content, state) else {
+            return;
+        };
+        if self.encounter_act != Some(encounter_act) {
+            let def = &content.acts[encounter_act as usize];
+            let weak = def
+                .encounters
+                .iter()
+                .copied()
+                .filter(|&id| content.encounters[id as usize].id.contains("_WEAK"))
+                .collect::<Vec<_>>();
+            let regular = def
+                .encounters
+                .iter()
+                .copied()
+                .filter(|&id| !content.encounters[id as usize].id.contains("_WEAK"))
+                .collect::<Vec<_>>();
+            let weak_count = if act == 3 { 2 } else { 3 };
+            let room_count = if act == 2 {
+                14
+            } else if act == 3 {
+                13
+            } else {
+                15
+            };
+            self.encounter_act = Some(encounter_act);
+            self.weak_encounters_left = if weak.is_empty() { 0 } else { weak_count };
+            self.regular_encounters_left = if regular.is_empty() {
+                0
+            } else {
+                room_count - weak_count
+            };
+            self.elite_encounters_left = if def.elites.is_empty() { 0 } else { 15 };
+            self.encounters = if self.weak_encounters_left > 0 {
+                weak
+            } else {
+                regular
+            };
+            self.elites = def.elites.to_vec();
+            self.last_encounter = None;
+            self.last_elite = None;
+            self.seen_encounter = None;
+        }
+        let def = &content.acts[encounter_act as usize];
+        let room = trace_room(state["room_type"].as_str().unwrap_or("Map"));
+        let Some(id) = trace_encounter(content, state) else {
+            return;
+        };
+        let elite = match room {
+            Room::Combat if def.encounters.contains(&id) => false,
+            Room::Elite if def.elites.contains(&id) => true,
+            _ => return,
+        };
+        let seen = (
+            state["act_floor"].as_u64().unwrap_or_default() as u8,
+            elite,
+            id,
+        );
+        if self.seen_encounter == Some(seen) {
+            return;
+        }
+        self.seen_encounter = Some(seen);
+        if elite {
+            if self.elites.is_empty() {
+                self.elites = def.elites.to_vec();
+            }
+            self.elites.retain(|&candidate| candidate != id);
+            self.elite_encounters_left = self.elite_encounters_left.saturating_sub(1);
+            self.last_elite = Some(id);
+            if self.elite_encounters_left == 0 {
+                self.elites.clear();
+                self.last_elite = None;
+            }
+            return;
+        }
+        let weak = content.encounters[id as usize].id.contains("_WEAK");
+        let pool = def
+            .encounters
+            .iter()
+            .copied()
+            .filter(|&candidate| {
+                content.encounters[candidate as usize].id.contains("_WEAK") == weak
+            })
+            .collect::<Vec<_>>();
+        if self.encounters.is_empty()
+            || self.encounters.iter().any(|&candidate| {
+                content.encounters[candidate as usize].id.contains("_WEAK") != weak
+            })
+        {
+            self.encounters = pool;
+        }
+        self.encounters.retain(|&candidate| candidate != id);
+        if weak {
+            self.weak_encounters_left = self.weak_encounters_left.saturating_sub(1);
+            if self.weak_encounters_left == 0 {
+                self.encounters = def
+                    .encounters
+                    .iter()
+                    .copied()
+                    .filter(|&id| !content.encounters[id as usize].id.contains("_WEAK"))
+                    .collect();
+            }
+        } else {
+            self.weak_encounters_left = 0;
+            self.regular_encounters_left = self.regular_encounters_left.saturating_sub(1);
+            if self.regular_encounters_left == 0 {
+                self.encounters.clear();
+            }
+        }
+        self.last_encounter = Some(id);
+        if self.weak_encounters_left == 0 && self.regular_encounters_left == 0 {
+            self.last_encounter = None;
+        }
     }
 }
 
@@ -213,7 +388,7 @@ pub(crate) fn game_from_live_snapshot(
     if state["phase"] == "combat" {
         update_history(&mut history, state, oracle);
     }
-    game_from_snapshot(
+    let mut game = game_from_snapshot(
         content,
         state,
         oracle,
@@ -223,7 +398,12 @@ pub(crate) fn game_from_live_snapshot(
         &history,
         &replay_state,
         0,
-    )
+    )?;
+    game.replaying = false;
+    game.encounters.clear();
+    game.elites.clear();
+    game.events.clear();
+    Ok(game)
 }
 
 fn observe_happy_flower(
@@ -1140,11 +1320,14 @@ fn game_from_snapshot(
         }
         _ => None,
     };
+    let act = replay_state
+        .encounter_act
+        .unwrap_or(number(state, "act")? as Id);
     Ok(Game {
         run,
         map: Map::default(),
         phase: Phase::Combat(Box::new(combat)),
-        act: number(state, "act")? as Id,
+        act,
         room: match state["room_type"].as_str().unwrap_or("Monster") {
             "Elite" => Room::Elite,
             "Boss" => Room::Boss,
@@ -1175,13 +1358,13 @@ fn game_from_snapshot(
         potion_odds: replay_state.potion_odds,
         bosses: [None; 2],
         bosses_visited: 0,
-        encounters: vec![],
-        elites: vec![],
-        weak_encounters_left: 0,
-        regular_encounters_left: 0,
-        elite_encounters_left: 0,
-        last_encounter: None,
-        last_elite: None,
+        encounters: replay_state.encounter_bag(content, act, false, None),
+        elites: replay_state.encounter_bag(content, act, true, None),
+        weak_encounters_left: replay_state.weak_encounters_left,
+        regular_encounters_left: replay_state.regular_encounters_left,
+        elite_encounters_left: replay_state.elite_encounters_left,
+        last_encounter: replay_state.last_encounter,
+        last_elite: replay_state.last_elite,
         events: vec![],
         visited_events: replay_state.visited_events.clone(),
         enemy_starts: vec![],
@@ -1266,6 +1449,7 @@ fn game_from_snapshot(
             .map_or(0, |amount| 5u8.saturating_sub(amount.min(5))),
         sword_of_stone: relic_amount(player, "RELIC.SWORD_OF_STONE"),
         replaying: true,
+        expectation: None,
     })
 }
 
@@ -1521,21 +1705,27 @@ fn run_game_from_snapshot(
             [None; 2]
         },
         bosses_visited: 0,
-        encounters: (next_room == Room::Combat)
-            .then_some(next_encounter)
-            .flatten()
-            .into_iter()
-            .collect(),
-        elites: (next_room == Room::Elite)
-            .then_some(next_encounter)
-            .flatten()
-            .into_iter()
-            .collect(),
-        weak_encounters_left: 0,
-        regular_encounters_left: 0,
-        elite_encounters_left: 0,
-        last_encounter: None,
-        last_elite: None,
+        encounters: replay_state.encounter_bag(
+            content,
+            act,
+            false,
+            (next_room == Room::Combat)
+                .then_some(next_encounter)
+                .flatten(),
+        ),
+        elites: replay_state.encounter_bag(
+            content,
+            act,
+            true,
+            (next_room == Room::Elite)
+                .then_some(next_encounter)
+                .flatten(),
+        ),
+        weak_encounters_left: replay_state.weak_encounters_left,
+        regular_encounters_left: replay_state.regular_encounters_left,
+        elite_encounters_left: replay_state.elite_encounters_left,
+        last_encounter: replay_state.last_encounter,
+        last_elite: replay_state.last_elite,
         events: (next_room == Room::Event)
             .then_some(next_event)
             .flatten()
@@ -1624,6 +1814,7 @@ fn run_game_from_snapshot(
             .map_or(0, |amount| 5u8.saturating_sub(amount.min(5))),
         sword_of_stone: relic_amount(player, "RELIC.SWORD_OF_STONE"),
         replaying: true,
+        expectation: None,
     })
 }
 
@@ -2629,7 +2820,7 @@ fn powers(content: &Content, values: &Value) -> Result<Vec<Power>, String> {
             Ok(Power {
                 id: find_id(&content.powers, text(value, "model_id")?, |x| x.id)?,
                 amount: number(value, "amount")? as i16,
-                skip_duration: false,
+                skip_next_decay: false,
                 value: 0,
             })
         })
@@ -3021,4 +3212,77 @@ fn instance_id(id: &str) -> u32 {
         .and_then(|x| x.parse::<u32>().ok())
         .unwrap_or_default()
         + 1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replay_reconstructs_distinct_a_b_and_c_b_encounter_bags() {
+        let content = foundation_content();
+        let (act, run_act, first, shared, second) = content
+            .acts
+            .iter()
+            .enumerate()
+            .find_map(|(act, def)| {
+                let pool = def
+                    .encounters
+                    .iter()
+                    .copied()
+                    .filter(|&id| !content.encounters[id as usize].id.contains("_WEAK"))
+                    .collect::<Vec<_>>();
+                pool.iter().copied().find_map(|shared| {
+                    let compatible = pool
+                        .iter()
+                        .copied()
+                        .filter(|&id| {
+                            id != shared
+                                && encounter_tags(content.encounters[id as usize].id)
+                                    & encounter_tags(content.encounters[shared as usize].id)
+                                    == 0
+                        })
+                        .collect::<Vec<_>>();
+                    (compatible.len() >= 2).then_some((
+                        act as Id,
+                        match def.id {
+                            "ACT.THE_HIVE" => 2,
+                            "ACT.THE_GLORY" => 3,
+                            _ => 1,
+                        },
+                        compatible[0],
+                        shared,
+                        compatible[1],
+                    ))
+                })
+            })
+            .unwrap();
+        let record = |episode: &str, floor: u8, id: Id| {
+            serde_json::json!({
+                "episode_id": episode,
+                "before": {
+                    "act": run_act,
+                    "act_floor": floor,
+                    "room_type": "Monster",
+                    "room_model_id": content.encounters[id as usize].id,
+                    "players": [{"relics": []}],
+                },
+                "oracle_before": {"rng_seeds": {"run.UpFront": 0}},
+            })
+        };
+        let history = |episode, first| {
+            let mut state = ReplayState::default();
+            state.prepare(&content, &record(episode, 1, first));
+            state.prepare(&content, &record(episode, 2, shared));
+            state
+        };
+        let left = history("left", first);
+        let right = history("right", second);
+        assert_eq!(left.last_encounter, right.last_encounter);
+        assert_eq!(left.regular_encounters_left, right.regular_encounters_left);
+        assert_ne!(left.encounters, right.encounters);
+        assert!(left.encounters.contains(&second) && !left.encounters.contains(&first));
+        assert!(right.encounters.contains(&first) && !right.encounters.contains(&second));
+        assert_eq!(left.encounter_act, Some(act));
+    }
 }

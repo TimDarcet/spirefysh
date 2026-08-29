@@ -33,8 +33,8 @@ verify_exact_install_directory() {
   local directory=$1
   local entries
   entries=("$directory"/*(DN))
-  if (( ${#entries} != 3 && ${#entries} != 5 )); then
-    print -u2 "bridge install must contain exactly three telemetry files or five advisor files"
+  if (( ${#entries} != 3 && ${#entries} != 6 )); then
+    print -u2 "bridge install must contain exactly three telemetry files or six advisor files"
     return 1
   fi
   local expected
@@ -61,7 +61,7 @@ verify_exact_install_directory() {
       return 1
     fi
   else
-    for expected in Spirefysh.Bridge.advisor-config Spirefysh.Bridge.model.pt advisor.py; do
+    for expected in Spirefysh.Bridge.advisor-config Spirefysh.Bridge.model.pt advisor.py model.py; do
       if [[ ! -f "$directory/$expected" || -L "$directory/$expected" ]]; then
         print -u2 "installed advisor file is missing or not regular: $expected"
         return 1

@@ -4,6 +4,17 @@ use crate::foundation::{
 };
 use crate::*;
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct ActionOutcome {
+    pub block: Option<f32>,
+    pub draw: Option<f32>,
+    pub discard: Option<f32>,
+    pub exhaust: Option<f32>,
+    pub hp_loss: Option<Vec<f32>>,
+}
+
+const MAX_EXPECTATION_BRANCHES: usize = 64;
+
 impl Combat {
     fn remove_draw(&mut self, index: usize) -> Card {
         let len = self.draw.len();
@@ -54,6 +65,129 @@ impl Combat {
 }
 
 impl Game {
+    fn expectation_choice(&mut self, count: usize) -> Option<usize> {
+        if count == 1 {
+            return Some(0);
+        }
+        let expectation = self.expectation.as_mut()?;
+        if expectation.next.is_some() {
+            return None;
+        }
+        if expectation.used < expectation.choices.len() {
+            let choice = expectation.choices[expectation.used];
+            expectation.used += 1;
+            return (choice < count).then_some(choice);
+        }
+        expectation.next = Some(count);
+        None
+    }
+
+    fn expectation_unknown(&mut self) {
+        if let Some(expectation) = &mut self.expectation {
+            expectation.unknown = true;
+        }
+    }
+
+    fn expectation_discard(&mut self, count: usize) {
+        if let Some(expectation) = &mut self.expectation {
+            expectation.discarded = expectation.discarded.saturating_add(count as i16);
+        }
+    }
+
+    fn expectation_draw(&mut self) {
+        if let Some(expectation) = &mut self.expectation {
+            expectation.drawn = expectation.drawn.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn expected_action_outcome(
+        &self,
+        content: &Content,
+        action: &Action,
+    ) -> ActionOutcome {
+        let Some(before) = self.combat() else {
+            return ActionOutcome::default();
+        };
+        let turn = before.turn;
+        let enemy_turn = before.enemy_turn;
+        let block = before.player.block;
+        let exhausted = before.history.exhausted;
+        let enemies: Vec<_> = before
+            .enemies
+            .iter()
+            .map(|enemy| (enemy.instance, enemy.creature.hp.max(0)))
+            .collect();
+        let mut pending = vec![(Vec::new(), 1.0f32)];
+        let mut total = 0.0;
+        let mut outcome = ActionOutcome {
+            block: Some(0.0),
+            draw: Some(0.0),
+            discard: Some(0.0),
+            exhaust: Some(0.0),
+            hp_loss: Some(vec![0.0; enemies.len()]),
+        };
+        let mut leaves = 0;
+        while let Some((choices, probability)) = pending.pop() {
+            let mut next = self.clone();
+            next.rngs = Rngs::from_seed(0);
+            next.expectation = Some(Expectation {
+                choices: choices.clone(),
+                ..Expectation::default()
+            });
+            if next.step(content, action.clone()).is_err() {
+                return ActionOutcome::default();
+            }
+            let expectation = next.expectation.take().unwrap();
+            if let Some(count) = expectation.next {
+                if count == 0 || pending.len() + leaves + count > MAX_EXPECTATION_BRANCHES {
+                    return ActionOutcome::default();
+                }
+                for choice in 0..count {
+                    let mut choices = choices.clone();
+                    choices.push(choice);
+                    pending.push((choices, probability / count as f32));
+                }
+                continue;
+            }
+            let Some(after) = next.combat().filter(|combat| {
+                combat.turn == turn && combat.enemy_turn == enemy_turn && combat.choice.is_none()
+            }) else {
+                return ActionOutcome::default();
+            };
+            if expectation.unknown || expectation.used != expectation.choices.len() {
+                return ActionOutcome::default();
+            }
+            *outcome.block.as_mut().unwrap() +=
+                after.player.block.saturating_sub(block).max(0) as f32 * probability;
+            *outcome.draw.as_mut().unwrap() += expectation.drawn as f32 * probability;
+            *outcome.discard.as_mut().unwrap() += expectation.discarded as f32 * probability;
+            *outcome.exhaust.as_mut().unwrap() +=
+                after.history.exhausted.saturating_sub(exhausted).max(0) as f32 * probability;
+            for (index, (loss, (instance, hp))) in outcome
+                .hp_loss
+                .as_mut()
+                .unwrap()
+                .iter_mut()
+                .zip(&enemies)
+                .enumerate()
+            {
+                let after = after
+                    .enemies
+                    .get(index)
+                    .filter(|enemy| enemy.instance == *instance)
+                    .map_or(0, |enemy| enemy.creature.hp.max(0));
+                *loss += hp.saturating_sub(after).max(0) as f32 * probability;
+            }
+            total += probability;
+            leaves += 1;
+        }
+        if leaves == 0 || (total - 1.0).abs() > 1e-4 {
+            ActionOutcome::default()
+        } else {
+            outcome
+        }
+    }
+
     pub fn run(&self) -> &Run {
         &self.run
     }
@@ -193,6 +327,7 @@ impl Game {
             ember_tea: 0,
             sword_of_stone: 0,
             replaying: false,
+            expectation: None,
         }
     }
 
@@ -546,7 +681,7 @@ impl Game {
                 .map(|(id, amount)| Power {
                     id,
                     amount,
-                    skip_duration: false,
+                    skip_next_decay: false,
                     value: 0,
                 })
                 .collect();
@@ -8958,7 +9093,7 @@ impl Game {
             .filter(|&&move_index| move_index == 3)
             .count();
         let mut rat_summon_queued = false;
-        for enemy in &mut combat.enemies {
+        for (slot, enemy) in combat.enemies.iter_mut().enumerate() {
             if enemy.creature.hp <= 0 {
                 continue;
             }
@@ -8969,7 +9104,7 @@ impl Game {
             let moves = content.enemies[enemy.creature.id as usize].moves;
             if content.enemies[enemy.creature.id as usize].id == "MONSTER.WRIGGLER" {
                 let chosen = match enemy.last_move {
-                    0 if (enemy.instance - 1) % 2 == 0 => 1,
+                    0 if slot % 2 == 0 => 1,
                     0 => 2,
                     1 => 2,
                     _ => 1,
@@ -9151,7 +9286,7 @@ impl Game {
                 }
             }
             let mut chosen = choices[0];
-            if random {
+            if random && self.expectation.is_none() {
                 let total: u16 = choices.iter().map(|&i| moves[i].weight as u16).sum();
                 let mut roll = self.rngs.monster_ai.below(total.max(1) as u32) as u16;
                 for &i in &choices {
@@ -9207,15 +9342,26 @@ impl Game {
             self.shuffle_discard_into_draw(content);
             self.trigger(content, Trigger::Shuffle, Actor::Player, 0);
         }
-        let mut card = self.combat_mut().unwrap().pop_draw().unwrap();
+        let mut card = self.take_draw().unwrap();
+        self.expectation_draw();
         if card.enchantment == Some(Enchantment::Slither) {
-            card.cost_override = Some(self.rngs.combat_energy_costs.below(4) as i8);
+            self.expectation_unknown();
+            card.cost_override = Some(if self.expectation.is_some() {
+                0
+            } else {
+                self.rngs.combat_energy_costs.below(4) as i8
+            });
         }
         if (self.has_relic(content, "RELIC.SNECKO_EYE")
             || self.has_relic(content, "RELIC.FAKE_SNECKO_EYE"))
             && content.cards[card.id as usize].cost[card.upgrades.min(1) as usize] >= 0
         {
-            card.cost_override = Some(self.rngs.combat_energy_costs.below(4) as i8);
+            self.expectation_unknown();
+            card.cost_override = Some(if self.expectation.is_some() {
+                0
+            } else {
+                self.rngs.combat_energy_costs.below(4) as i8
+            });
         }
         card.turn_flags |= draw_flags;
         let combat = self.combat_mut().unwrap();
@@ -9575,7 +9721,7 @@ impl Game {
                 self.creature_mut(Actor::Player).powers.push(Power {
                     id: power_id::TORIC_TOUGHNESS,
                     amount: 2,
-                    skip_duration: false,
+                    skip_next_decay: false,
                     value: amount,
                 });
             }
@@ -9667,23 +9813,31 @@ impl Game {
                     .add_power(power_id::ROLLING_BOULDER, amount);
             }
             Effect::RandomPotion => {
-                let pool = self.potion_pool(content);
-                let potion = self.random_potions(&pool, 1, true, true).pop();
-                if !self.has_relic(content, "RELIC.SOZU")
-                    && let Some(slot) = self.run.potions.iter().position(Option::is_none)
-                {
-                    self.run.potions[slot] = potion;
+                self.expectation_unknown();
+                if self.expectation.is_none() {
+                    let pool = self.potion_pool(content);
+                    let potion = self.random_potions(&pool, 1, true, true).pop();
+                    if !self.has_relic(content, "RELIC.SOZU")
+                        && let Some(slot) = self.run.potions.iter().position(Option::is_none)
+                    {
+                        self.run.potions[slot] = potion;
+                    }
                 }
                 self.sync_belt_buckle(content);
             }
             Effect::RandomizeHandCosts => {
+                self.expectation_unknown();
                 let len = self.combat().unwrap().hand.len();
                 for index in 0..len {
                     let card = self.combat().unwrap().hand[index];
                     let def = content.cards[card.id as usize];
                     if def.cost[card.upgrades.min(1) as usize] >= 0 {
-                        self.combat_mut().unwrap().hand[index].cost_override =
-                            Some(self.rngs.combat_energy_costs.below(4) as i8);
+                        let cost = if self.expectation.is_some() {
+                            0
+                        } else {
+                            self.rngs.combat_energy_costs.below(4) as i8
+                        };
+                        self.combat_mut().unwrap().hand[index].cost_override = Some(cost);
                     }
                 }
             }
@@ -9707,6 +9861,7 @@ impl Game {
                 }
             }
             Effect::DistinctColorless(pile, count, upgraded) => {
+                self.expectation_unknown();
                 let mut pool = content.colorless.clone();
                 pool.retain(|&id| {
                     !matches!(
@@ -9715,7 +9870,9 @@ impl Game {
                     )
                 });
                 pool.sort_unstable_by_key(|&id| content.cards[id as usize].id);
-                self.rngs.combat_card_generation.shuffle(&mut pool);
+                if self.expectation.is_none() {
+                    self.rngs.combat_card_generation.shuffle(&mut pool);
+                }
                 for id in pool.into_iter().take(count as usize) {
                     self.add_generated(
                         content,
@@ -9973,6 +10130,7 @@ impl Game {
                 }
             }
             Effect::RandomCard(pile, kind, count, free) => {
+                self.expectation_unknown();
                 let pool: Vec<_> = content.characters[self.run.character as usize]
                     .cards
                     .iter()
@@ -9991,8 +10149,11 @@ impl Game {
                     if pool.is_empty() {
                         break;
                     }
-                    let id =
-                        pool[self.rngs.combat_card_generation.below(pool.len() as u32) as usize];
+                    let id = if self.expectation.is_some() {
+                        pool[0]
+                    } else {
+                        pool[self.rngs.combat_card_generation.below(pool.len() as u32) as usize]
+                    };
                     self.add_generated(
                         content,
                         pile,
@@ -10005,13 +10166,16 @@ impl Game {
                 }
             }
             Effect::RandomColorless(pile, _, upgrade) => {
+                self.expectation_unknown();
                 let mut pool: Vec<_> = content
                     .colorless
                     .iter()
                     .copied()
                     .filter(|&id| content.cards[id as usize].flags[0] & NO_GENERATE == 0)
                     .collect();
-                self.rngs.combat_card_generation.shuffle(&mut pool);
+                if self.expectation.is_none() {
+                    self.rngs.combat_card_generation.shuffle(&mut pool);
+                }
                 pool.truncate(amount.max(0) as usize);
                 for id in pool {
                     self.add_generated(
@@ -10026,6 +10190,7 @@ impl Game {
                 }
             }
             Effect::RandomColorlessOther(pile, _) => {
+                self.expectation_unknown();
                 let mut pool: Vec<_> = content
                     .colorless
                     .iter()
@@ -10036,7 +10201,9 @@ impl Game {
                     })
                     .collect();
                 pool.sort_by_key(|&id| content.cards[id as usize].id);
-                self.rngs.combat_card_generation.shuffle(&mut pool);
+                if self.expectation.is_none() {
+                    self.rngs.combat_card_generation.shuffle(&mut pool);
+                }
                 pool.truncate(amount.max(0) as usize);
                 for id in pool {
                     self.add_generated(
@@ -10050,6 +10217,7 @@ impl Game {
                 }
             }
             Effect::OfferColorless(count, upgrade, free) => {
+                self.expectation_unknown();
                 let mut pool: Vec<_> = content
                     .colorless
                     .iter()
@@ -10063,7 +10231,9 @@ impl Game {
                     })
                     .collect();
                 pool.sort_by_key(|&id| content.cards[id as usize].id);
-                self.rngs.combat_card_generation.shuffle(&mut pool);
+                if self.expectation.is_none() {
+                    self.rngs.combat_card_generation.shuffle(&mut pool);
+                }
                 pool.truncate(count as usize);
                 self.combat_mut().unwrap().offer = pool
                     .into_iter()
@@ -10085,6 +10255,7 @@ impl Game {
                 );
             }
             Effect::OfferCharacter(count, free) => {
+                self.expectation_unknown();
                 let mut pool: Vec<_> = content.characters[self.run.character as usize]
                     .cards
                     .iter()
@@ -10098,7 +10269,9 @@ impl Game {
                     })
                     .collect();
                 pool.sort_by_key(|&id| content.cards[id as usize].id);
-                self.rngs.combat_card_generation.shuffle(&mut pool);
+                if self.expectation.is_none() {
+                    self.rngs.combat_card_generation.shuffle(&mut pool);
+                }
                 pool.truncate(count as usize);
                 self.combat_mut().unwrap().offer = pool
                     .into_iter()
@@ -10119,6 +10292,7 @@ impl Game {
                 );
             }
             Effect::OfferCharacterRetain(count) => {
+                self.expectation_unknown();
                 let mut pool: Vec<_> = content.characters[self.run.character as usize]
                     .cards
                     .iter()
@@ -10132,7 +10306,9 @@ impl Game {
                     })
                     .collect();
                 pool.sort_by_key(|&id| content.cards[id as usize].id);
-                self.rngs.combat_card_generation.shuffle(&mut pool);
+                if self.expectation.is_none() {
+                    self.rngs.combat_card_generation.shuffle(&mut pool);
+                }
                 pool.truncate(count as usize);
                 self.combat_mut().unwrap().offer = pool
                     .into_iter()
@@ -10153,6 +10329,7 @@ impl Game {
                 );
             }
             Effect::OfferCharacterType(kind, count) => {
+                self.expectation_unknown();
                 let mut pool: Vec<_> = content.characters[self.run.character as usize]
                     .cards
                     .iter()
@@ -10168,7 +10345,9 @@ impl Game {
                     })
                     .collect();
                 pool.sort_by_key(|&id| content.cards[id as usize].id);
-                self.rngs.combat_card_generation.shuffle(&mut pool);
+                if self.expectation.is_none() {
+                    self.rngs.combat_card_generation.shuffle(&mut pool);
+                }
                 pool.truncate(count as usize);
                 self.combat_mut().unwrap().offer = pool
                     .into_iter()
@@ -10189,6 +10368,7 @@ impl Game {
                 );
             }
             Effect::OfferOtherCharacter(kind, count, upgrade) => {
+                self.expectation_unknown();
                 let mut pool: Vec<_> = [0, 2, 3, 4, 1]
                     .into_iter()
                     .filter(|&index| index != self.run.character as usize)
@@ -10207,7 +10387,9 @@ impl Game {
                             && def.flags[0] & NO_GENERATE == 0
                     })
                     .collect();
-                self.rngs.combat_card_generation.shuffle(&mut pool);
+                if self.expectation.is_none() {
+                    self.rngs.combat_card_generation.shuffle(&mut pool);
+                }
                 pool.truncate(count as usize);
                 self.combat_mut().unwrap().offer = pool
                     .into_iter()
@@ -10229,6 +10411,7 @@ impl Game {
                 );
             }
             Effect::RandomCharacter(pile, _, flags) => {
+                self.expectation_unknown();
                 let pool: Vec<_> = content.characters[self.run.character as usize]
                     .cards
                     .iter()
@@ -10245,8 +10428,11 @@ impl Game {
                     if pool.is_empty() {
                         break;
                     }
-                    let id =
-                        pool[self.rngs.combat_card_generation.below(pool.len() as u32) as usize];
+                    let id = if self.expectation.is_some() {
+                        pool[0]
+                    } else {
+                        pool[self.rngs.combat_card_generation.below(pool.len() as u32) as usize]
+                    };
                     self.add_generated(
                         content,
                         pile,
@@ -10259,6 +10445,7 @@ impl Game {
                 }
             }
             Effect::DistinctCharacter(pile, count, free) => {
+                self.expectation_unknown();
                 let mut pool: Vec<_> = content.characters[self.run.character as usize]
                     .cards
                     .iter()
@@ -10272,7 +10459,9 @@ impl Game {
                             )
                     })
                     .collect();
-                self.rngs.combat_card_generation.shuffle(&mut pool);
+                if self.expectation.is_none() {
+                    self.rngs.combat_card_generation.shuffle(&mut pool);
+                }
                 for id in pool.into_iter().take(count as usize) {
                     self.add_generated(
                         content,
@@ -10286,6 +10475,7 @@ impl Game {
                 }
             }
             Effect::RandomCharacterCost0(pile, _, upgrade) => {
+                self.expectation_unknown();
                 let pool: Vec<_> = content.characters[self.run.character as usize]
                     .cards
                     .iter()
@@ -10299,8 +10489,11 @@ impl Game {
                     if pool.is_empty() {
                         break;
                     }
-                    let id =
-                        pool[self.rngs.combat_card_generation.below(pool.len() as u32) as usize];
+                    let id = if self.expectation.is_some() {
+                        pool[0]
+                    } else {
+                        pool[self.rngs.combat_card_generation.below(pool.len() as u32) as usize]
+                    };
                     self.add_generated(
                         content,
                         pile,
@@ -10320,14 +10513,23 @@ impl Game {
                     .map(|(index, _)| index)
                     .collect();
                 let count = amount.max(0) as usize;
-                if count == 1 && !candidates.is_empty() {
+                if self.expectation.is_some() && count < candidates.len() {
+                    let mut selected = Vec::new();
+                    for _ in 0..count {
+                        let choice = self.expectation_choice(candidates.len()).unwrap_or(0);
+                        selected.push(candidates.swap_remove(choice));
+                    }
+                    candidates = selected;
+                } else if count == 1 && !candidates.is_empty() {
                     let selected = self
                         .rngs
                         .combat_card_selection
                         .below(candidates.len() as u32) as usize;
                     candidates = vec![candidates[selected]];
                 } else {
-                    self.rngs.combat_card_selection.shuffle(&mut candidates);
+                    if self.expectation.is_none() {
+                        self.rngs.combat_card_selection.shuffle(&mut candidates);
+                    }
                     candidates.truncate(count);
                 }
                 candidates.sort_unstable_by(|a, b| b.cmp(a));
@@ -10349,8 +10551,18 @@ impl Game {
                         .enumerate()
                         .collect();
                 }
-                self.rngs.combat_card_selection.shuffle(&mut candidates);
-                candidates.truncate(amount.max(0) as usize);
+                let count = amount.max(0) as usize;
+                if self.expectation.is_some() {
+                    let mut selected = Vec::new();
+                    for _ in 0..count.min(candidates.len()) {
+                        let choice = self.expectation_choice(candidates.len()).unwrap_or(0);
+                        selected.push(candidates.swap_remove(choice));
+                    }
+                    candidates = selected;
+                } else {
+                    self.rngs.combat_card_selection.shuffle(&mut candidates);
+                    candidates.truncate(count);
+                }
                 let selected: Vec<_> = candidates.iter().map(|(_, card)| *card).collect();
                 candidates.sort_unstable_by_key(|candidate| std::cmp::Reverse(candidate.0));
                 for (index, _) in candidates {
@@ -10364,6 +10576,7 @@ impl Game {
                 }
             }
             Effect::ChooseRandomDraw(count) => {
+                self.expectation_unknown();
                 let mut candidates: Vec<_> = (0..self.combat().unwrap().draw.len()).collect();
                 self.rngs.combat_card_selection.shuffle(&mut candidates);
                 candidates.truncate(count as usize);
@@ -10417,6 +10630,7 @@ impl Game {
                 }
             }
             Effect::Aggression(_) => {
+                self.expectation_unknown();
                 let mut attacks: Vec<_> = self
                     .combat()
                     .unwrap()
@@ -10447,9 +10661,10 @@ impl Game {
                         self.shuffle_discard_into_draw(content);
                         self.trigger(content, Trigger::Shuffle, Actor::Player, 0);
                     }
-                    let Some(mut card) = self.combat_mut().unwrap().pop_draw() else {
+                    let Some(mut card) = self.take_draw() else {
                         break;
                     };
+                    self.expectation_draw();
                     if exhaust {
                         card.flags |= EXHAUST;
                     }
@@ -10463,6 +10678,7 @@ impl Game {
                 }
             }
             Effect::Stoke => {
+                self.expectation_unknown();
                 let count = self.combat().unwrap().hand.len();
                 while !self.combat().unwrap().hand.is_empty() {
                     self.apply_card_op(content, Pile::Hand, 0, CardOp::Move(Pile::Exhaust));
@@ -10498,6 +10714,7 @@ impl Game {
                 }
             }
             Effect::Stampede => {
+                self.expectation_unknown();
                 let count = self
                     .creature(Actor::Player)
                     .power(power_id::STAMPEDE)
@@ -10820,7 +11037,11 @@ impl Game {
             Effect::Random(count, effects) => {
                 for _ in 0..count {
                     if !effects.is_empty() {
-                        let i = self.rngs.niche.below(effects.len() as u32) as usize;
+                        let i = if self.expectation.is_some() {
+                            self.expectation_choice(effects.len()).unwrap_or(0)
+                        } else {
+                            self.rngs.niche.below(effects.len() as u32) as usize
+                        };
                         self.combat_mut().unwrap().queue.push(Pending {
                             effect: effects[i],
                             context: pending.context,
@@ -10834,6 +11055,7 @@ impl Game {
                 }
             }
             Effect::RandomOrb(count) => {
+                self.expectation_unknown();
                 for _ in 0..count[pending.context.upgraded as usize] {
                     let combat = self.combat().unwrap();
                     if combat.enemies.iter().all(|enemy| enemy.creature.hp <= 0)
@@ -11161,6 +11383,95 @@ impl Game {
         }
     }
 
+    pub(crate) fn incoming_damage_amount(
+        &self,
+        content: &Content,
+        source: Actor,
+        base: i16,
+        kind: DamageKind,
+    ) -> i16 {
+        let attack = matches!(kind, DamageKind::Attack);
+        let powered = matches!(kind, DamageKind::Attack | DamageKind::Move);
+        let target = Actor::Player;
+        let mut amount = base.max(0);
+        if powered {
+            amount =
+                amount.saturating_add(self.creature(source).kind(content, PowerKind::Strength));
+            if attack {
+                amount = amount.saturating_add(self.creature(target).power(power_id::TAINTED));
+            }
+            if self.creature(target).kind(content, PowerKind::Vulnerable) > 0 {
+                let vulnerable = if self.creature(target).power(power_id::DEBILITATE) > 0 {
+                    200
+                } else {
+                    150
+                };
+                amount = amount.saturating_mul(vulnerable) / 100;
+            }
+            if self.creature(source).kind(content, PowerKind::Weak) > 0 {
+                let multiplier = if self.creature(source).power(power_id::DEBILITATE) > 0 {
+                    50
+                } else {
+                    75
+                };
+                let paper_krane = 15
+                    * (matches!(source, Actor::Enemy(_))
+                        && self.has_relic(content, "RELIC.PAPER_KRANE"))
+                        as i16;
+                amount = amount.saturating_mul(multiplier - paper_krane) / 100;
+            }
+            if matches!(source, Actor::Enemy(_))
+                && self.creature(source).hp <= self.creature(source).power(power_id::DOOM)
+                && self.has_relic(content, "RELIC.UNDYING_SIGIL")
+            {
+                amount /= 2;
+            }
+            if self.combat().unwrap().diamond_diadem {
+                amount /= 2;
+            }
+            amount = amount.saturating_mul(100 + self.creature(target).power(power_id::SLOW)) / 100;
+            for _ in 0..self.creature(source).power(power_id::DOUBLE_DAMAGE).max(0) {
+                amount = amount.saturating_mul(2);
+            }
+            if let Actor::Enemy(index) = source
+                && let Some(surrounded) = self
+                    .creature(target)
+                    .powers
+                    .iter()
+                    .find(|power| power.id == power_id::SURROUNDED)
+            {
+                let back = if surrounded.value == 0 {
+                    power_id::BACK_ATTACK_LEFT
+                } else {
+                    power_id::BACK_ATTACK_RIGHT
+                };
+                if self.creature(Actor::Enemy(index)).power(back) > 0 {
+                    amount = amount.saturating_mul(3) / 2;
+                }
+            }
+            if matches!(source, Actor::Enemy(_))
+                && self.creature(source).kind(content, PowerKind::Vulnerable) > 0
+                && self.creature(target).power(power_id::COLOSSUS) > 0
+            {
+                amount /= 2;
+            }
+            if self.creature(source).power(power_id::SHRINK) != 0 {
+                amount = amount.saturating_mul(70) / 100;
+            }
+        }
+        if attack && self.creature(target).power(power_id::FLUTTER) > 0 {
+            amount /= 2;
+        }
+        let cap = self.creature(target).power(power_id::HARD_TO_KILL);
+        if cap > 0 {
+            amount = amount.min(cap);
+        }
+        if self.creature(target).kind(content, PowerKind::Intangible) > 0 {
+            amount = amount.min(1);
+        }
+        amount
+    }
+
     fn damage(
         &mut self,
         content: &Content,
@@ -11419,6 +11730,10 @@ impl Game {
         }
         if self.creature(target).kind(content, PowerKind::Intangible) > 0 {
             amount = amount.min(1);
+        }
+        if target == Actor::Player && matches!(source, Actor::Enemy(_)) {
+            let expected = self.incoming_damage_amount(content, source, base, kind);
+            debug_assert_eq!(amount, expected);
         }
         let blocked = if matches!(kind, DamageKind::Unblockable) {
             0
@@ -12189,7 +12504,7 @@ impl Game {
             .map(|(id, amount)| Power {
                 id,
                 amount,
-                skip_duration: false,
+                skip_next_decay: false,
                 value: 0,
             })
             .collect();
@@ -12503,7 +12818,7 @@ impl Game {
                 self.creature_mut(actor).powers.push(Power {
                     id,
                     amount,
-                    skip_duration: false,
+                    skip_next_decay: false,
                     value: 0,
                 });
             } else {
@@ -12561,12 +12876,12 @@ impl Game {
                 self.creature_mut(actor).powers.push(Power {
                     id,
                     amount: 0,
-                    skip_duration: false,
+                    skip_next_decay: false,
                     value: 0,
                 });
                 return true;
             }
-            let skip_duration = actor == Actor::Player
+            let skip_next_decay = actor == Actor::Player
                 && self.combat().unwrap().enemy_turn
                 && matches!(
                     content.powers[id as usize].kind,
@@ -12574,7 +12889,7 @@ impl Game {
                 );
             let new = self.creature(actor).power(id) == 0;
             self.creature_mut(actor)
-                .add_power_with_skip(id, amount, skip_duration);
+                .add_power_with_skip_next_decay(id, amount, skip_next_decay);
             if actor == Actor::Player && id == power_id::DAMPEN && new {
                 let combat = self.combat_mut().unwrap();
                 for pile in [
@@ -12821,7 +13136,7 @@ impl Game {
                         | PowerKind::Intangible
                 ) || x.id == power_id::SHRINK && x.amount > 0
             })
-            .map(|power| (power.id, power.skip_duration))
+            .map(|power| (power.id, power.skip_next_decay))
             .collect();
         for (id, skip) in powers {
             if skip {
@@ -12830,7 +13145,7 @@ impl Game {
                     .iter_mut()
                     .find(|power| power.id == id)
                     .unwrap()
-                    .skip_duration = false;
+                    .skip_next_decay = false;
             } else {
                 self.creature_mut(actor).consume_power(id);
             }
@@ -13314,7 +13629,12 @@ impl Game {
                 if alive.is_empty() {
                     vec![]
                 } else {
-                    vec![alive[self.rngs.combat_targets.below(alive.len() as u32) as usize]]
+                    let choice = if self.expectation.is_some() {
+                        self.expectation_choice(alive.len()).unwrap_or(0)
+                    } else {
+                        self.rngs.combat_targets.below(alive.len() as u32) as usize
+                    };
+                    vec![alive[choice]]
                 }
             }
             Target::LowestHpEnemy => self
@@ -13352,10 +13672,13 @@ impl Game {
         if random {
             let mut candidates = candidates;
             for _ in 0..count {
-                let at = self
-                    .rngs
-                    .combat_card_selection
-                    .below(candidates.len() as u32) as usize;
+                let at = if self.expectation.is_some() {
+                    self.expectation_choice(candidates.len()).unwrap_or(0)
+                } else {
+                    self.rngs
+                        .combat_card_selection
+                        .below(candidates.len() as u32) as usize
+                };
                 let index = candidates.remove(at);
                 let moved = self.apply_card_op(content, pile, index, op);
                 if moved {
@@ -13387,6 +13710,7 @@ impl Game {
                 let card = self.remove_pile(pile, index);
                 let sly = pile == Pile::Hand && to == Pile::Discard && self.is_sly(content, card);
                 if pile == Pile::Hand && to == Pile::Discard {
+                    self.expectation_discard(1);
                     self.combat_mut().unwrap().history.discarded += 1;
                     self.after_discard(content, 1);
                 }
@@ -13487,6 +13811,7 @@ impl Game {
                 return true;
             }
             CardOp::TransformRandom => {
+                self.expectation_unknown();
                 let old = self.pile_mut(pile)[index];
                 let pool: Vec<_> = content.characters[self.run.character as usize]
                     .cards
@@ -13508,6 +13833,7 @@ impl Game {
             }
             CardOp::DiscardDraw => {
                 let card = self.remove_pile(pile, index);
+                self.expectation_discard(1);
                 self.combat_mut().unwrap().discard.push(card);
                 self.combat_mut().unwrap().history.discarded += 1;
                 self.after_discard(content, 1);
@@ -13537,6 +13863,7 @@ impl Game {
 
     fn discard_hand(&mut self, content: &Content) {
         let hand = std::mem::take(&mut self.combat_mut().unwrap().hand);
+        self.expectation_discard(hand.len());
         self.combat_mut().unwrap().history.discarded += hand.len() as i16;
         self.after_discard(content, hand.len());
         let discarded: Vec<_> = hand
@@ -13657,8 +13984,12 @@ impl Game {
                 .map(|(index, _)| index)
                 .collect();
             if !alive.is_empty() {
-                context.target =
-                    Some(alive[self.rngs.combat_targets.below(alive.len() as u32) as usize]);
+                let choice = if self.expectation.is_some() {
+                    self.expectation_choice(alive.len()).unwrap_or(0)
+                } else {
+                    self.rngs.combat_targets.below(alive.len() as u32) as usize
+                };
+                context.target = Some(alive[choice]);
             }
         }
         context.source = Actor::Player;
@@ -14088,6 +14419,9 @@ impl Game {
     }
 
     fn add_to_hand(&mut self, card: Card) {
+        if self.combat().unwrap().hand.len() >= 10 {
+            self.expectation_discard(1);
+        }
         let combat = self.combat_mut().unwrap();
         if combat.hand.len() < 10 {
             combat.hand.push(card);
@@ -14119,6 +14453,7 @@ impl Game {
     }
 
     fn add_random(&mut self, content: &Content, pile: Pile, mut card: Card) {
+        self.expectation_unknown();
         card.instance = self.next_card;
         self.next_card = self.next_card.saturating_add(1);
         let len = cards(self.combat().unwrap(), pile).len();
@@ -14163,7 +14498,9 @@ impl Game {
         let Phase::Combat(combat) = &mut self.phase else {
             return;
         };
-        self.rngs.shuffle.shuffle(&mut combat.draw);
+        if self.expectation.is_none() {
+            self.rngs.shuffle.shuffle(&mut combat.draw);
+        }
         combat.forget_draw_order();
     }
 
@@ -14175,7 +14512,9 @@ impl Game {
             .discard
             .sort_by_key(|card| (content.cards[card.id as usize].id, card.upgrades));
         combat.draw.append(&mut combat.discard);
-        self.rngs.shuffle.shuffle(&mut combat.draw);
+        if self.expectation.is_none() {
+            self.rngs.shuffle.shuffle(&mut combat.draw);
+        }
         combat.draw.reverse();
         combat.forget_draw_order();
         if let Some(index) = combat
@@ -14186,6 +14525,21 @@ impl Game {
             let card = combat.draw.remove(index);
             combat.draw.push(card);
             combat.known_draw_top = 1;
+        }
+    }
+
+    fn take_draw(&mut self) -> Option<Card> {
+        let combat = self.combat()?;
+        let unknown = combat
+            .draw
+            .len()
+            .saturating_sub(combat.known_draw_bottom + combat.known_draw_top);
+        if self.expectation.is_some() && combat.known_draw_top == 0 && unknown > 0 {
+            let bottom = combat.known_draw_bottom;
+            let choice = self.expectation_choice(unknown).unwrap_or(0);
+            Some(self.combat_mut().unwrap().remove_draw(bottom + choice))
+        } else {
+            self.combat_mut().unwrap().pop_draw()
         }
     }
 
@@ -15341,7 +15695,7 @@ mod tests {
         combat.enemy_power_snapshot = vec![vec![Power {
             id: power_id::STRENGTH,
             amount: 2,
-            skip_duration: false,
+            skip_next_decay: false,
             value: 0,
         }]];
 
@@ -15383,7 +15737,7 @@ mod tests {
             vec![Power {
                 id: power_id::STRENGTH,
                 amount: 1,
-                skip_duration: false,
+                skip_next_decay: false,
                 value: 0,
             }];
             3
@@ -15395,13 +15749,13 @@ mod tests {
             Power {
                 id: power_id::SURPRISE,
                 amount: 1,
-                skip_duration: false,
+                skip_next_decay: false,
                 value: 0,
             },
             Power {
                 id: power_id::THIEVERY,
                 amount: 1,
-                skip_duration: false,
+                skip_next_decay: false,
                 value: 17,
             },
         ];

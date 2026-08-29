@@ -23,7 +23,7 @@ mkdir -p "$mods_dir" "$stage" "$backup_dir"
 for stale in "$mods_dir"/spirefysh-bridge.backup.*(N); do
   mv "$stale" "$backup_dir/"
 done
-cp "$output"/Spirefysh.Bridge.{dll,json,advisor-config,model.pt} "$output/advisor.py" "$stage/"
+cp "$output"/Spirefysh.Bridge.{dll,json,advisor-config,model.pt} "$output"/{advisor,model}.py "$stage/"
 if [[ -e "$install_dir" ]]; then
   backup="$backup_dir/spirefysh-bridge.backup.$(date +%Y%m%d-%H%M%S)"
   mv "$install_dir" "$backup"

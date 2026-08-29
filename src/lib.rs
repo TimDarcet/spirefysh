@@ -1499,7 +1499,7 @@ impl Card {
 pub struct Power {
     pub id: Id,
     pub amount: i16,
-    pub skip_duration: bool,
+    pub skip_next_decay: bool,
     pub value: i16,
 }
 
@@ -1529,7 +1529,7 @@ impl Creature {
     }
 
     fn add_power(&mut self, id: Id, amount: i16) {
-        self.add_power_with_skip(id, amount, false);
+        self.add_power_with_skip_next_decay(id, amount, false);
     }
 
     fn consume_power(&mut self, id: Id) {
@@ -1538,7 +1538,7 @@ impl Creature {
         }
     }
 
-    fn add_power_with_skip(&mut self, id: Id, amount: i16, skip_duration: bool) {
+    fn add_power_with_skip_next_decay(&mut self, id: Id, amount: i16, skip_next_decay: bool) {
         if let Some(power) = self.powers.iter_mut().find(|x| x.id == id) {
             power.amount = power.amount.saturating_add(amount);
             if power.amount == 0 {
@@ -1548,7 +1548,7 @@ impl Creature {
             self.powers.push(Power {
                 id,
                 amount,
-                skip_duration,
+                skip_next_decay,
                 value: 0,
             });
         }
@@ -2019,6 +2019,16 @@ fn encounter_entry(id: &str) -> &str {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct Expectation {
+    choices: Vec<usize>,
+    used: usize,
+    next: Option<usize>,
+    unknown: bool,
+    drawn: i16,
+    discarded: i16,
+}
+
 #[derive(Clone, Debug)]
 pub struct Game {
     run: Run,
@@ -2110,6 +2120,7 @@ pub struct Game {
     ember_tea: u8,
     sword_of_stone: u8,
     replaying: bool,
+    expectation: Option<Expectation>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
