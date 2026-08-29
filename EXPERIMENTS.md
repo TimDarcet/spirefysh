@@ -2181,3 +2181,17 @@ The repaired full continuation drained cleanly to step `525,390` with `107,631/1
 Conclusion: The positional correction is learning better than the MODEL60 benchmark. The marginal utilization miss and fixed-panel caps warrant another unchanged evidence block, not a confounded hyperparameter change.
 
 Next: Keep the canonical rolling trigger authoritative. Do not manually promote from the development panel; continue unchanged until it launches the fresh 256-run-per-character promotion gate.
+
+## 2026-08-29 — FEATURE55/MODEL62 compact action-aware state
+
+Experiment: Replace MODEL61's 5,141-dimensional direct state with a compact typed state. Keep only deck, hand, draw, discard, and exhaust card zones. Encode powers and statuses through their existing domain encoders and pool them as unified owner-bound actor effects. Pool player with optional Osty and pool enemies separately. Replace the global map summary with a whole-map-aware contextual current or entry node. Remove raw globals and offers from state; summarize every visible legal or visible-illegal action through explicit target-independent object IDs and one state-conditioned attention query.
+
+The resulting model has `920,611` parameters. Seventeen independently normalized 64-dimensional blocks form a `1,088`-dimensional base state: five card zones; run, phase, party, enemies, relics, potions, orbs, events, encounters, crystal, and continuations; and the current map node. A 64-dimensional action-object menu produces the final `1,152`-dimensional state. Card, collection, continuation, candidate, target, and object counts use `count/64` and `log1p(count)/5` features.
+
+Results: The first adversarial review found unbalanced state blocks, premature verb-level menu averaging, a state residual that overwhelmed menu content, target-dependent grouping, missing object counts, off-route Winged Boots map aliases, and incomplete active or potion-suspended reward state. The corrected design normalizes every base block, attends directly over target-averaged objects, removes the menu query residual, uses simulator-supplied object IDs, includes count features, lets the selected node query every public contextual map node, and preserves ordered active and suspended rewards. Actor-side duplicate digest validation was also removed while learner-boundary validation remains mandatory, reducing a measured heterogeneous 128-state actor cycle from about `268 ms` to `174 ms`.
+
+All `181/181` Rust library tests pass. The full MPS probe passes with candidate permutation error `1.19e-7` and Rust/Python value parity `5.96e-8`. A second adversarial pass found no leakage, public-state collision, indexing, parity, or scaling blocker; an A10 sweep covered `8,192` live decisions and 131 resets. A fresh FP32 training smoke reached 719 accepted decisions, 12 accepted optimizer updates, 100% attempted-row utilization, zero KL/ratio/stale/post-KL drops, finite losses, and a `91.6%` graph-cache hit rate.
+
+Conclusion: FEATURE55/MODEL62 is a fresh incompatible architecture and is ready for a new training run. MODEL61 artifacts remain immutable benchmarks and cannot seed MODEL62.
+
+Next: Start MODEL62 from random weights, optimizer, replay, and disjoint seeds. Treat partial graph-cache hits, removal of the obsolete candidate-token construction path, richer minibatch cost estimates, and Rust allocation reductions as performance follow-ups rather than launch blockers.

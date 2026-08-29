@@ -11,8 +11,8 @@ use std::{
 };
 
 const MAGIC: &[u8; 8] = b"STSVALUE";
-const VERSION: u32 = 54;
-const VALUE_MODEL_VERSION: u32 = 61;
+const VERSION: u32 = 55;
+const VALUE_MODEL_VERSION: u32 = 62;
 const TOKEN_CATEGORICAL: usize = 10;
 const TOKEN_NUMERIC: usize = 24;
 const TOKEN_VALUES: usize = TOKEN_CATEGORICAL + TOKEN_NUMERIC;
@@ -30,12 +30,13 @@ const STATE_COLLECTION: usize = 10;
 const CARD_COLLECTION: usize = 11;
 const ACTION_CARD_COLLECTION: usize = 12;
 const EVENT_COLLECTION: usize = 13;
-const CARD_ZONES: usize = 13;
+const CARD_ZONES: usize = 5;
 const DECK_ZONE: usize = 0;
 const HAND_ZONE: usize = 1;
 const DRAW_ZONE: usize = 2;
 const DISCARD_ZONE: usize = 3;
 const EXHAUST_ZONE: usize = 4;
+const ATTACHED_CARD_ZONE: usize = CARD_ZONES;
 const COMBAT_OFFER_ZONE: usize = 5;
 const OFFER_ZONE: usize = 6;
 const HISTORY_COURSE_ZONE: usize = 7;
@@ -44,6 +45,7 @@ const SLIPPERY_PREVIOUS_ZONE: usize = 9;
 const SLIPPERY_CANDIDATE_ZONE: usize = 10;
 const PLAYING_ZONE: usize = 11;
 const AUTOPLAY_ZONE: usize = 12;
+const HISTORY_COURSE_STATUS: u32 = 6;
 const PARASOL_CARD_KIND: usize = 6;
 const ANCIENT_RELIC_KIND: usize = 16;
 const NIGHTMARE_CARD_KIND: usize = 17;
@@ -69,23 +71,17 @@ fn token(collection: usize, kind: usize, id: usize, owner: usize, position: usiz
     token
 }
 const PHASES: usize = 14;
-const ROOMS: usize = 8;
 const ENCHANTMENTS: usize = 22;
-const GLOBAL_STATE_KINDS: usize = 24;
-const GLOBAL_STATE_VALUES: usize = TOKEN_NUMERIC + 6;
 const MAP_FLOORS: usize = 18;
-const MAP_LANES: usize = 8;
-const MAP_VALUES: usize = 4 + ROOMS + MAP_LANES;
-const PUBLIC_GLOBALS: usize =
-    5 + GLOBAL_STATE_KINDS * GLOBAL_STATE_VALUES + MAP_FLOORS * MAP_LANES * MAP_VALUES;
+const PUBLIC_GLOBALS: usize = 0;
 const MODEL_WIDTH: usize = 64;
 const MODEL_LAYERS: usize = 2;
 const MODEL_HEADS: usize = 4;
 const MODEL_FEEDFORWARD: usize = 128;
-const MODEL_ENTITY_SUMMARIES: usize = 10;
+const MODEL_ENTITY_SUMMARIES: usize = 11;
 const MODEL_HEAD_WIDTH: usize = 112;
-const MODEL_STATE_WIDTH: usize =
-    PUBLIC_GLOBALS + (CARD_ZONES + MODEL_ENTITY_SUMMARIES + 1) * MODEL_WIDTH;
+const MODEL_BASE_STATE_WIDTH: usize = (CARD_ZONES + MODEL_ENTITY_SUMMARIES + 1) * MODEL_WIDTH;
+const MODEL_STATE_WIDTH: usize = MODEL_BASE_STATE_WIDTH + MODEL_WIDTH;
 #[cfg(test)]
 const ENEMY_SLOTS: usize = 8;
 const KNOWN_DRAW_SLOTS: usize = u8::MAX as usize;
@@ -147,7 +143,7 @@ const MAP_NODE_DOMAIN: usize = 14;
 const MAP_EDGE_DOMAIN: usize = 15;
 const NO_NODE: u32 = u32::MAX;
 const STATE_SCOPE: i32 = -1;
-const ACTION_U: usize = 14;
+const ACTION_U: usize = 15;
 const ACTION_S: usize = 12;
 const ACTION_C: usize = 8;
 const ACTION_F: usize = 20;
@@ -373,7 +369,7 @@ impl Layout {
             (Semantic::TagBit, 16),
             (Semantic::RunKind, 32),
             (Semantic::PhaseKind, 32),
-            (Semantic::CardZone, 14),
+            (Semantic::CardZone, CARD_ZONES + 1),
             (Semantic::CardRole, 16),
             (Semantic::OrderKind, 4),
             (Semantic::ActorKind, 4),
@@ -1108,7 +1104,7 @@ fn populate_domain_features(
         STATUS_DOMAIN => {
             push_semantic(row, layout, Semantic::ActorSlot, row.u[0]);
             push_semantic(row, layout, Semantic::StatusKind, row.u[1]);
-            if row.u[1] == 1 {
+            if matches!(row.u[1], 1 | HISTORY_COURSE_STATUS) {
                 push_semantic(row, layout, Semantic::Card, row.u[3]);
                 push_semantic(row, layout, Semantic::CardType, row.u[12]);
                 push_semantic(row, layout, Semantic::Rarity, row.u[13]);
@@ -1127,7 +1123,7 @@ fn populate_domain_features(
             row.f[8] = row.u[2] as f32 / 64.0;
             row.f[9] = (row.u[2] as f32).ln_1p() / 5.0;
             row.f[10] = row.s[0] as f32 / 20.0;
-            if row.u[1] == 1 {
+            if matches!(row.u[1], 1 | HISTORY_COURSE_STATUS) {
                 row.f[11..16].copy_from_slice(&[
                     row.u[4] as f32 / 10.0,
                     row.u[7] as f32 / 10.0,
@@ -1413,6 +1409,7 @@ fn populate_domain_features(
                     },
                     _ => {}
                 },
+                9 if row.u[1] == 10 => push_semantic(row, layout, Semantic::Relic, row.u[11]),
                 _ => {}
             }
             for index in 0..16 {
@@ -6202,80 +6199,18 @@ fn state_tokens_with_bonuses(
     out
 }
 
-fn globals_len(layout: Layout) -> usize {
-    let globals = layout.characters
-        + GLOBAL_STATE_KINDS * GLOBAL_STATE_VALUES
-        + MAP_FLOORS * MAP_LANES * MAP_VALUES;
-    assert_eq!(globals, PUBLIC_GLOBALS);
-    globals
+fn globals_len(_: Layout) -> usize {
+    PUBLIC_GLOBALS
 }
 
 fn observation_globals_with_bonuses(
-    game: &Game,
-    content: &Content,
-    layout: Layout,
-    bonuses: (i16, i16),
-    active: bool,
+    _: &Game,
+    _: &Content,
+    _: Layout,
+    _: (i16, i16),
+    _: bool,
 ) -> Vec<f32> {
-    let mut out = vec![0.0; globals_len(layout)];
-    if !active {
-        return out;
-    }
-    out[game.run.character as usize] = 1.0;
-    let mut tokens = Vec::new();
-    state_summary_tokens(game, content, bonuses, &mut tokens);
-    for token in tokens {
-        let kind = token[1] as usize;
-        if !(2..=25).contains(&kind) || kind == 23 {
-            continue;
-        }
-        let start = layout.characters + (kind - 2) * GLOBAL_STATE_VALUES;
-        let target = &mut out[start..start + GLOBAL_STATE_VALUES];
-        target[..6].copy_from_slice(&token[2..8]);
-        for (value, scale) in
-            target[..6]
-                .iter_mut()
-                .zip(
-                    [u16::MAX as f32 + 1.0; 3]
-                        .into_iter()
-                        .chain([6.0, ENCHANTMENTS as f32, 3.0]),
-                )
-        {
-            *value /= scale;
-        }
-        target[6..].copy_from_slice(&token[TOKEN_CATEGORICAL..]);
-    }
-    let map_start = layout.characters + GLOBAL_STATE_KINDS * GLOBAL_STATE_VALUES;
-    for node in &game.map.nodes {
-        let floor = node.floor.saturating_sub(1) as usize;
-        let lane = node.lane as usize;
-        if floor >= MAP_FLOORS || lane >= MAP_LANES {
-            continue;
-        }
-        let start = map_start + (floor * MAP_LANES + lane) * MAP_VALUES;
-        out[start] = 1.0;
-        out[start + 2 + room_index(node.room)] = 1.0;
-        for &next in &node.next {
-            if let Some(next) = game.map.nodes.get(next)
-                && (next.lane as usize) < MAP_LANES
-            {
-                out[start + 2 + ROOMS + next.lane as usize] = 1.0;
-            }
-        }
-        out[start + 2 + ROOMS + MAP_LANES] = (game.fur_coat_act == Some(game.run.act)
-            && game.fur_coat.contains(&(node.lane, node.floor)))
-            as u8 as f32;
-        out[start + 3 + ROOMS + MAP_LANES] =
-            (game.spoils == Some((node.lane, node.floor))) as u8 as f32;
-    }
-    if let Some(node) = game.map.current.and_then(|index| game.map.nodes.get(index)) {
-        let floor = node.floor.saturating_sub(1) as usize;
-        let lane = node.lane as usize;
-        if floor < MAP_FLOORS && lane < MAP_LANES {
-            out[map_start + (floor * MAP_LANES + lane) * MAP_VALUES + 1] = 1.0;
-        }
-    }
-    out
+    Vec::new()
 }
 
 #[cfg(test)]
@@ -6928,15 +6863,6 @@ fn state_card_domains(game: &Game, content: &Content, domains: &mut [Vec<DomainR
         0,
         game.run.deck.iter().copied().map(|card| (0, 0, card, 0)),
     );
-    push_cards(
-        domains,
-        game,
-        content,
-        STATE_SCOPE,
-        PAEL_ZONE as u32,
-        0,
-        game.paels_cards.iter().copied().map(|card| (0, 0, card, 0)),
-    );
     match &game.phase {
         Phase::Combat(combat) => {
             for (zone, cards) in [
@@ -6980,176 +6906,6 @@ fn state_card_domains(game: &Game, content: &Content, domains: &mut [Vec<DomainR
                             (0, 0, card, 0)
                         }
                     }),
-            );
-            push_cards(
-                domains,
-                game,
-                content,
-                STATE_SCOPE,
-                COMBAT_OFFER_ZONE as u32,
-                0,
-                combat
-                    .offer
-                    .iter()
-                    .copied()
-                    .enumerate()
-                    .map(|(order, card)| (1, order as u32 + 1, card, 0)),
-            );
-            if let Some(card) = combat.history_course {
-                push_cards(
-                    domains,
-                    game,
-                    content,
-                    STATE_SCOPE,
-                    HISTORY_COURSE_ZONE as u32,
-                    0,
-                    [(0, 0, card, 0)],
-                );
-            }
-            if let Some(card) = combat.playing {
-                push_cards(
-                    domains,
-                    game,
-                    content,
-                    STATE_SCOPE,
-                    PLAYING_ZONE as u32,
-                    0,
-                    [(0, 0, card, 0)],
-                );
-            }
-            push_cards(
-                domains,
-                game,
-                content,
-                STATE_SCOPE,
-                AUTOPLAY_ZONE as u32,
-                1,
-                combat
-                    .auto_plays
-                    .iter()
-                    .rev()
-                    .enumerate()
-                    .map(|(order, play)| (1, order as u32 + 1, play.card, play.plays as i32)),
-            );
-            push_cards(
-                domains,
-                game,
-                content,
-                STATE_SCOPE,
-                AUTOPLAY_ZONE as u32,
-                2,
-                combat
-                    .queue
-                    .iter()
-                    .rev()
-                    .filter_map(|pending| match pending.effect {
-                        Effect::AutoPlay(card) => Some(card),
-                        _ => None,
-                    })
-                    .enumerate()
-                    .map(|(order, card)| (1, order as u32 + 1, card, 0)),
-            );
-        }
-        Phase::Event(id, _) if content.events[*id as usize].id == "EVENT.SLIPPERY_BRIDGE" => {
-            push_cards(
-                domains,
-                game,
-                content,
-                STATE_SCOPE,
-                SLIPPERY_PREVIOUS_ZONE as u32,
-                0,
-                game.event_cards
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(order, instance)| {
-                        game.run
-                            .deck
-                            .iter()
-                            .find(|card| card.instance == *instance)
-                            .copied()
-                            .map(|card| (1, order as u32 + 1, card, 0))
-                    }),
-            );
-            if let Some(card) = game
-                .run
-                .deck
-                .iter()
-                .find(|card| card.instance == game.event_data[1] as u32)
-                .copied()
-            {
-                push_cards(
-                    domains,
-                    game,
-                    content,
-                    STATE_SCOPE,
-                    SLIPPERY_CANDIDATE_ZONE as u32,
-                    0,
-                    [(0, 0, card, 0)],
-                );
-            }
-        }
-        Phase::Rewards(rewards) => push_cards(
-            domains,
-            game,
-            content,
-            STATE_SCOPE,
-            OFFER_ZONE as u32,
-            0,
-            rewards
-                .cards
-                .iter()
-                .copied()
-                .enumerate()
-                .map(|(order, card)| (1, order as u32 + 1, card, 0)),
-        ),
-        Phase::Shop(items) => push_cards(
-            domains,
-            game,
-            content,
-            STATE_SCOPE,
-            OFFER_ZONE as u32,
-            0,
-            items
-                .iter()
-                .enumerate()
-                .filter_map(|(order, item)| match item {
-                    ShopItem::Card(card, price) => Some((1, order as u32 + 1, *card, *price)),
-                    _ => None,
-                }),
-        ),
-        Phase::ChooseCards(cards, ..) => push_cards(
-            domains,
-            game,
-            content,
-            STATE_SCOPE,
-            OFFER_ZONE as u32,
-            0,
-            cards
-                .iter()
-                .copied()
-                .enumerate()
-                .map(|(order, card)| (1, order as u32 + 1, card, 0)),
-        ),
-        Phase::ChooseBundles(bundles) => {
-            let cards = bundles
-                .iter()
-                .enumerate()
-                .flat_map(|(bundle, cards)| {
-                    cards
-                        .iter()
-                        .copied()
-                        .map(move |card| (bundle as i32 + 1, card))
-                })
-                .enumerate()
-                .map(|(order, (bundle, card))| (1, order as u32 + 1, card, bundle));
-            push_cards(
-                domains,
-                game,
-                content,
-                STATE_SCOPE,
-                OFFER_ZONE as u32,
-                0,
-                cards,
             );
         }
         _ => {}
@@ -7580,41 +7336,24 @@ fn push_actor_domains(game: &Game, content: &Content, domains: &mut [Vec<DomainR
         push_status_domain(&mut domains[STATUS_DOMAIN], 0, 0, &[1]);
     }
     for (order, &(card, count)) in combat.nightmares.iter().enumerate() {
-        let def = content.cards[card.id as usize];
-        let masters = master_cards(&game.run.deck);
-        let (master, dampened) = card_relation(card, &game.run.deck, &masters, &combat.dampened);
-        let mut row = DomainRow::new(STATUS_DOMAIN, STATE_SCOPE);
-        row.u.copy_from_slice(&[
+        domains[STATUS_DOMAIN].push(card_status_domain_row(
+            game,
+            content,
             1,
-            1,
-            order as u32 + 1,
-            card.id as u32,
-            card.upgrades as u32,
-            card.flags as u32,
-            card.turn_flags as u32,
-            card.replays as u32,
-            card.free as u32,
-            card.cost_override.is_some() as u32,
-            card.enchantment.map_or(0, |value| value as u32 + 1),
-            card.variant as u32,
-            card.card_type(def) as u32,
-            def.rarity as u32,
-            target_index(card.target(def)),
-            card.flags(def) as u32,
-            def.tags as u32,
-            master as u32,
-            dampened as u32,
-            0,
-        ]);
-        row.s[..6].copy_from_slice(&[
+            order,
+            card,
             count as i32,
-            card.cost_delta as i32,
-            card.value as i32,
-            card.cost_override.unwrap_or_default() as i32,
-            card.enchantment_amount as i32,
-            card.enchantment_value as i32,
-        ]);
-        domains[STATUS_DOMAIN].push(row);
+        ));
+    }
+    if let Some(card) = combat.history_course {
+        domains[STATUS_DOMAIN].push(card_status_domain_row(
+            game,
+            content,
+            HISTORY_COURSE_STATUS,
+            0,
+            card,
+            1,
+        ));
     }
     for (order, &(turns, amount)) in combat.bombs.iter().enumerate() {
         push_status_domain(
@@ -7643,6 +7382,52 @@ fn push_actor_domains(game: &Game, content: &Content, domains: &mut [Vec<DomainR
     for (order, &amount) in combat.boulders.iter().enumerate() {
         push_status_domain(&mut domains[STATUS_DOMAIN], 5, order, &[amount as i32]);
     }
+}
+
+fn card_status_domain_row(
+    game: &Game,
+    content: &Content,
+    kind: u32,
+    order: usize,
+    card: Card,
+    count: i32,
+) -> DomainRow {
+    let def = content.cards[card.id as usize];
+    let combat = game.combat().unwrap();
+    let masters = master_cards(&game.run.deck);
+    let (master, dampened) = card_relation(card, &game.run.deck, &masters, &combat.dampened);
+    let mut row = DomainRow::new(STATUS_DOMAIN, STATE_SCOPE);
+    row.u.copy_from_slice(&[
+        1,
+        kind,
+        order as u32 + 1,
+        card.id as u32,
+        card.upgrades as u32,
+        card.flags as u32,
+        card.turn_flags as u32,
+        card.replays as u32,
+        card.free as u32,
+        card.cost_override.is_some() as u32,
+        card.enchantment.map_or(0, |value| value as u32 + 1),
+        card.variant as u32,
+        card.card_type(def) as u32,
+        def.rarity as u32,
+        target_index(card.target(def)),
+        card.flags(def) as u32,
+        def.tags as u32,
+        master as u32,
+        dampened as u32,
+        0,
+    ]);
+    row.s[..6].copy_from_slice(&[
+        count,
+        card.cost_delta as i32,
+        card.value as i32,
+        card.cost_override.unwrap_or_default() as i32,
+        card.enchantment_amount as i32,
+        card.enchantment_value as i32,
+    ]);
+    row
 }
 
 fn push_power_domains(
@@ -8465,6 +8250,22 @@ impl ContinuationBuilder {
         ]);
     }
 
+    fn card_reward(&mut self, reward: CardReward, parent: u32, path: u32, order: u32) {
+        let child = self.row(8, 2, parent, 1, path, 0, order, 0);
+        match reward {
+            CardReward::Standard(room) => {
+                self.rows[child].u[11..13].copy_from_slice(&[0, room_index(room) as u32]);
+            }
+            CardReward::Fixed(id, rarity) => {
+                self.rows[child].u[11..14].copy_from_slice(&[1, id as u32, rarity as u32]);
+            }
+            CardReward::Kaleidoscope => self.rows[child].u[11] = 2,
+            CardReward::Crystal(rarity) => {
+                self.rows[child].u[11..13].copy_from_slice(&[3, rarity as u32]);
+            }
+        }
+    }
+
     fn run_effect(
         &mut self,
         effect: RunEffect,
@@ -8654,24 +8455,7 @@ impl ContinuationBuilder {
                     order += 1;
                 }
                 for reward in &rewards.card_rewards {
-                    let child = self.row(8, 2, frame, 1, 2, 0, order, 0);
-                    match reward {
-                        CardReward::Standard(room) => {
-                            self.rows[child].u[11..13]
-                                .copy_from_slice(&[0, room_index(*room) as u32]);
-                        }
-                        CardReward::Fixed(id, rarity) => {
-                            self.rows[child].u[11..14].copy_from_slice(&[
-                                1,
-                                *id as u32,
-                                *rarity as u32,
-                            ]);
-                        }
-                        CardReward::Kaleidoscope => self.rows[child].u[11] = 2,
-                        CardReward::Crystal(rarity) => {
-                            self.rows[child].u[11..13].copy_from_slice(&[3, *rarity as u32]);
-                        }
-                    }
+                    self.card_reward(*reward, frame, 2, order);
                     order += 1;
                 }
                 for &id in &rewards.relics {
@@ -8760,6 +8544,43 @@ impl ContinuationBuilder {
 
 fn continuation_domains(game: &Game, content: &Content) -> Vec<DomainRow> {
     let mut out = ContinuationBuilder::for_game(game, STATE_SCOPE);
+    if let Phase::Rewards(rewards) = &game.phase {
+        let full = game.replacing_potion;
+        let arity = rewards.card_rewards.len()
+            + full
+                .then_some(rewards.cards.len() + rewards.relics.len() + rewards.potions.len())
+                .unwrap_or(0);
+        if arity > 0 {
+            let list = out.row(9, 11 + full as u32, NO_NODE, 0, 0, 11, 0, arity as u32);
+            let parent = out.rows[list].u[2];
+            if full {
+                out.rows[list].s[..2].copy_from_slice(&[rewards.gold, rewards.removals as i32]);
+            }
+            let mut order = 0;
+            if full {
+                for &card in &rewards.cards {
+                    out.card(card, parent, 1, order);
+                    order += 1;
+                }
+            }
+            for &reward in &rewards.card_rewards {
+                out.card_reward(reward, parent, 1, order);
+                order += 1;
+            }
+            if full {
+                for &id in &rewards.relics {
+                    let child = out.row(8, 3, parent, 1, 1, 0, order, 0);
+                    out.rows[child].u[11] = id as u32;
+                    order += 1;
+                }
+                for &id in &rewards.potions {
+                    let child = out.row(8, 4, parent, 1, 1, 0, order, 0);
+                    out.rows[child].u[11] = id as u32;
+                    order += 1;
+                }
+            }
+        }
+    }
     let run_list = out.row(9, 0, NO_NODE, 0, 0, 0, 0, game.run_queue.len() as u32);
     let run_frame = out.rows[run_list].u[2];
     for (order, &effect) in game.run_queue.iter().rev().enumerate() {
@@ -8795,6 +8616,10 @@ fn continuation_domains(game: &Game, content: &Content) -> Vec<DomainRow> {
                 (1 + play.powers.len() + play.enemy_powers.iter().map(Vec::len).sum::<usize>())
                     as u32;
             out.rows[index].u[10] = 0;
+        }
+        let playing = out.row(9, 8, NO_NODE, 0, 0, 8, 0, combat.playing.is_some() as u32);
+        if let Some(card) = combat.playing {
+            out.card(card, out.rows[playing].u[2], 1, 0);
         }
     }
     let resume_list = out.row(9, 3, NO_NODE, 0, 0, 3, 0, game.resume.is_some() as u32);
@@ -8850,6 +8675,33 @@ fn continuation_domains(game: &Game, content: &Content) -> Vec<DomainRow> {
             out.rows[child].s[0] = value;
         }
     }
+    if matches!(&game.phase, Phase::Event(id, _) if content.events[*id as usize].id == "EVENT.SLIPPERY_BRIDGE")
+    {
+        let cards = game
+            .event_cards
+            .iter()
+            .filter_map(|instance| {
+                game.run
+                    .deck
+                    .iter()
+                    .find(|card| card.instance == *instance)
+                    .copied()
+            })
+            .collect::<Vec<_>>();
+        let list = out.row(9, 9, NO_NODE, 0, 0, 9, 0, cards.len() as u32);
+        let parent = out.rows[list].u[2];
+        for (order, card) in cards.into_iter().enumerate() {
+            out.card(card, parent, 1, order as u32);
+        }
+    }
+    if !game.paels_cards.is_empty() {
+        let list = out.row(9, 10, NO_NODE, 0, 0, 10, 0, game.paels_cards.len() as u32);
+        out.rows[list].u[11] = content.relic_id("RELIC.PAELS_TOOTH").unwrap() as u32;
+        let parent = out.rows[list].u[2];
+        for (order, &card) in game.paels_cards.iter().enumerate() {
+            out.card(card, parent, 1, order as u32);
+        }
+    }
     out.rows
 }
 
@@ -8879,7 +8731,7 @@ fn candidate_card(game: &Game, content: &Content, scope: i32, action: &Action) -
                         Pile::Hand => 1,
                         Pile::Discard => 3,
                         Pile::Exhaust => 4,
-                        Pile::Offer => CARD_ZONES as u32,
+                        Pile::Offer => ATTACHED_CARD_ZONE as u32,
                     };
                     let (kind, order) = match choice.pile {
                         Pile::Draw if *index < combat.known_draw_bottom => (2, *index as u32 + 1),
@@ -8897,7 +8749,7 @@ fn candidate_card(game: &Game, content: &Content, scope: i32, action: &Action) -
                     Phase::ChooseCards(cards, ..) => cards
                         .get(*index)
                         .copied()
-                        .map(|card| (CARD_ZONES as u32, 3, 0, *index as u32 + 1, card, 0)),
+                        .map(|card| (ATTACHED_CARD_ZONE as u32, 3, 0, *index as u32 + 1, card, 0)),
                     _ => None,
                 }
             }
@@ -8907,14 +8759,19 @@ fn candidate_card(game: &Game, content: &Content, scope: i32, action: &Action) -
                 .cards
                 .get(*index)
                 .copied()
-                .map(|card| (CARD_ZONES as u32, 4, 0, *index as u32 + 1, card, 0)),
+                .map(|card| (ATTACHED_CARD_ZONE as u32, 4, 0, *index as u32 + 1, card, 0)),
             _ => None,
         },
         Action::Buy(index) => match &game.phase {
             Phase::Shop(items) => items.get(*index).and_then(|item| match item {
-                ShopItem::Card(card, price) => {
-                    Some((CARD_ZONES as u32, 5, 0, *index as u32 + 1, *card, *price))
-                }
+                ShopItem::Card(card, price) => Some((
+                    ATTACHED_CARD_ZONE as u32,
+                    5,
+                    0,
+                    *index as u32 + 1,
+                    *card,
+                    *price,
+                )),
                 _ => None,
             }),
             _ => None,
@@ -8926,7 +8783,7 @@ fn candidate_card(game: &Game, content: &Content, scope: i32, action: &Action) -
             .copied()
             .map(|card| (0, 6, 0, 0, card, 0)),
         Action::EventCard(index, card) => {
-            Some((CARD_ZONES as u32, 7, 0, *index as u32 + 1, *card, 0))
+            Some((ATTACHED_CARD_ZONE as u32, 7, 0, *index as u32 + 1, *card, 0))
         }
         Action::Event(_) if matches!(&game.phase, Phase::Event(id, _) if Some(*id) == Layout::new(content).slippery_bridge) => {
             game.run
@@ -8934,7 +8791,7 @@ fn candidate_card(game: &Game, content: &Content, scope: i32, action: &Action) -
                 .iter()
                 .find(|card| card.instance == game.event_data[1] as u32)
                 .copied()
-                .map(|card| (CARD_ZONES as u32, 8, 0, 0, card, 0))
+                .map(|card| (ATTACHED_CARD_ZONE as u32, 8, 0, 0, card, 0))
         }
         _ => None,
     }) else {
@@ -8963,7 +8820,7 @@ fn candidate_domain_rows(
                 game,
                 content,
                 scope,
-                CARD_ZONES as u32,
+                ATTACHED_CARD_ZONE as u32,
                 9,
                 1,
                 order as u32 + 1,
@@ -9273,6 +9130,25 @@ fn action_row(
     };
     row.u[4] = NO_NODE;
     row.u[0] = action_kind(action) as u32;
+    row.u[14] = match action {
+        Action::Play { hand, .. } => *hand as u32 + 1,
+        Action::Potion { slot, .. } | Action::DiscardPotion(slot) => *slot as u32 + 1,
+        Action::Choose(index)
+        | Action::RewardCard(index)
+        | Action::RewardRelic(index)
+        | Action::RewardPotion(index)
+        | Action::Buy(index)
+        | Action::Smith(index)
+        | Action::Event(index)
+        | Action::EventRelic(index, _)
+        | Action::EventCard(index, _)
+        | Action::Enchant(index)
+        | Action::RemoveCard(index) => *index as u32 + 1,
+        Action::Path(index) => map_ids.get(*index).copied().unwrap_or(NO_NODE),
+        Action::CrystalCell(x, y) => (*x * 11 + *y) as u32 + 1,
+        Action::CrystalTool(big) => *big as u32 + 1,
+        _ => 1,
+    };
     row.u[1] = match action {
         Action::Play { target, .. } | Action::Potion { target, .. } => {
             target.map_or(0, |target| target as u32 + 3)
@@ -10317,13 +10193,17 @@ fn card_count_features(rows: &[&DomainRow]) -> [f32; 6] {
     let top = rows.iter().filter(|row| row.u[2] == 1).count() as f32;
     let bottom = rows.iter().filter(|row| row.u[2] == 2).count() as f32;
     [
-        count,
-        count.ln_1p(),
-        top,
-        top.ln_1p(),
-        bottom,
-        bottom.ln_1p(),
+        count / 64.0,
+        count.ln_1p() / 5.0,
+        top / 64.0,
+        top.ln_1p() / 5.0,
+        bottom / 64.0,
+        bottom.ln_1p() / 5.0,
     ]
+}
+
+fn count_features(count: usize) -> [f32; 2] {
+    [count as f32 / 64.0, (count as f32).ln_1p() / 5.0]
 }
 
 pub struct ValueModel<'a> {
@@ -10331,17 +10211,18 @@ pub struct ValueModel<'a> {
     layout: Layout,
     width: usize,
     heads: usize,
-    globals: usize,
     state_width: usize,
     head_width: usize,
     semantic_embedding: Vec<f32>,
     encoders: Vec<SemanticEncoderWeights>,
+    action_encoder: SemanticEncoderWeights,
     card_state: Vec<f32>,
     card_count: LinearWeights,
     card_layers: Vec<TransformerLayer>,
-    child_tuple: LinearWeights,
-    child_pool: LinearWeights,
-    child_state: Vec<f32>,
+    effect_tuple: LinearWeights,
+    history_tuple: LinearWeights,
+    actor_pool: LinearWeights,
+    actor_state: Vec<f32>,
     actor_linear: LinearWeights,
     actor_norm_w: Vec<f32>,
     actor_norm_b: Vec<f32>,
@@ -10359,13 +10240,28 @@ pub struct ValueModel<'a> {
     graph_ff_norm_b: Vec<f32>,
     graph_ff1: LinearWeights,
     graph_ff2: LinearWeights,
-    graph_global: Vec<f32>,
     continuation_relation: LinearWeights,
     continuation_tuple: LinearWeights,
     continuation_pool: LinearWeights,
     continuation_parent: LinearWeights,
     continuation_norm_w: Vec<f32>,
     continuation_norm_b: Vec<f32>,
+    candidate_scale: Vec<f32>,
+    candidate_bias: Vec<f32>,
+    candidate_combine: LinearWeights,
+    path_adapter: LinearWeights,
+    target_adapter: LinearWeights,
+    action_legal: Vec<f32>,
+    action_norm_w: Vec<f32>,
+    action_norm_b: Vec<f32>,
+    menu_object: LinearWeights,
+    menu_query: LinearWeights,
+    menu_key_value: LinearWeights,
+    menu_out: LinearWeights,
+    menu_count: LinearWeights,
+    menu_norm_w: Vec<f32>,
+    menu_norm_b: Vec<f32>,
+    menu_empty: Vec<f32>,
     value_hidden: LinearWeights,
     value: LinearWeights,
     temperature: f32,
@@ -10374,11 +10270,7 @@ pub struct ValueModel<'a> {
     map_cache: Mutex<std::collections::BTreeMap<Vec<u8>, MapEncoding>>,
 }
 
-type MapEncoding = (
-    Vec<f32>,
-    Vec<f32>,
-    std::collections::BTreeMap<u32, Vec<f32>>,
-);
+type MapEncoding = std::collections::BTreeMap<u32, Vec<f32>>;
 
 impl<'a> ValueModel<'a> {
     pub fn load(path: impl AsRef<Path>, content: &'a Content) -> io::Result<Self> {
@@ -10424,7 +10316,7 @@ impl<'a> ValueModel<'a> {
             || card_zones != CARD_ZONES
             || domains != DOMAIN_NAMES.len()
             || globals != PUBLIC_GLOBALS
-            || actor_families != 8
+            || actor_families != 2
             || entity_summaries != MODEL_ENTITY_SUMMARIES
             || head_width != MODEL_HEAD_WIDTH
             || (action_u, action_s, action_f) != (ACTION_U, ACTION_S, ACTION_F)
@@ -10449,12 +10341,14 @@ impl<'a> ValueModel<'a> {
                 &mut input, semantic, numeric, width,
             )?);
         }
+        let action_encoder = SemanticEncoderWeights::read(&mut input, ACTION_C, ACTION_F, width)?;
         let card_state = read_f32s(&mut input, card_zones * width)?;
         let card_count = LinearWeights::read_without_bias(&mut input, 6, width)?;
         let card_layers = read_transformer_layers(&mut input, layers, width, feedforward)?;
-        let child_tuple = LinearWeights::read(&mut input, width, width)?;
-        let child_pool = LinearWeights::read(&mut input, width + 2, width)?;
-        let child_state = read_f32s(&mut input, actor_families * width)?;
+        let effect_tuple = LinearWeights::read(&mut input, width, width)?;
+        let history_tuple = LinearWeights::read(&mut input, width, width)?;
+        let actor_pool = LinearWeights::read(&mut input, width + 2, width)?;
+        let actor_state = read_f32s(&mut input, actor_families * width)?;
         let actor_linear = LinearWeights::read(&mut input, (actor_families + 1) * width, width)?;
         let actor_norm_w = read_f32s(&mut input, width)?;
         let actor_norm_b = read_f32s(&mut input, width)?;
@@ -10472,13 +10366,28 @@ impl<'a> ValueModel<'a> {
         let graph_ff_norm_b = read_f32s(&mut input, width)?;
         let graph_ff1 = LinearWeights::read(&mut input, width, feedforward)?;
         let graph_ff2 = LinearWeights::read(&mut input, feedforward, width)?;
-        let graph_global = read_f32s(&mut input, width)?;
         let continuation_relation = LinearWeights::read_without_bias(&mut input, 6, width)?;
         let continuation_tuple = LinearWeights::read(&mut input, 2 * width, width)?;
         let continuation_pool = LinearWeights::read(&mut input, width + 2, width)?;
         let continuation_parent = LinearWeights::read(&mut input, 2 * width, width)?;
         let continuation_norm_w = read_f32s(&mut input, width)?;
         let continuation_norm_b = read_f32s(&mut input, width)?;
+        let candidate_scale = read_f32s(&mut input, domains * width)?;
+        let candidate_bias = read_f32s(&mut input, domains * width)?;
+        let candidate_combine = LinearWeights::read(&mut input, 2 * width + 2, width)?;
+        let path_adapter = LinearWeights::read_without_bias(&mut input, width, width)?;
+        let target_adapter = LinearWeights::read_without_bias(&mut input, width, width)?;
+        let action_legal = read_f32s(&mut input, 2 * width)?;
+        let action_norm_w = read_f32s(&mut input, width)?;
+        let action_norm_b = read_f32s(&mut input, width)?;
+        let menu_object = LinearWeights::read(&mut input, width + 2, width)?;
+        let menu_query = LinearWeights::read(&mut input, MODEL_BASE_STATE_WIDTH, width)?;
+        let menu_key_value = LinearWeights::read(&mut input, width, 2 * width)?;
+        let menu_out = LinearWeights::read(&mut input, width, width)?;
+        let menu_count = LinearWeights::read_without_bias(&mut input, 2, width)?;
+        let menu_norm_w = read_f32s(&mut input, width)?;
+        let menu_norm_b = read_f32s(&mut input, width)?;
+        let menu_empty = read_f32s(&mut input, width)?;
         let value_hidden = LinearWeights::read(&mut input, state_width, head_width)?;
         let value = LinearWeights::read(&mut input, head_width, 1)?;
         if !input.is_empty() {
@@ -10489,17 +10398,18 @@ impl<'a> ValueModel<'a> {
             layout: Layout::new(content),
             width,
             heads,
-            globals,
             state_width,
             head_width,
             semantic_embedding,
             encoders,
+            action_encoder,
             card_state,
             card_count,
             card_layers,
-            child_tuple,
-            child_pool,
-            child_state,
+            effect_tuple,
+            history_tuple,
+            actor_pool,
+            actor_state,
             actor_linear,
             actor_norm_w,
             actor_norm_b,
@@ -10517,13 +10427,28 @@ impl<'a> ValueModel<'a> {
             graph_ff_norm_b,
             graph_ff1,
             graph_ff2,
-            graph_global,
             continuation_relation,
             continuation_tuple,
             continuation_pool,
             continuation_parent,
             continuation_norm_w,
             continuation_norm_b,
+            candidate_scale,
+            candidate_bias,
+            candidate_combine,
+            path_adapter,
+            target_adapter,
+            action_legal,
+            action_norm_w,
+            action_norm_b,
+            menu_object,
+            menu_query,
+            menu_key_value,
+            menu_out,
+            menu_count,
+            menu_norm_w,
+            menu_norm_b,
+            menu_empty,
             value_hidden,
             value,
             temperature,
@@ -10657,7 +10582,7 @@ impl<'a> ValueModel<'a> {
     fn pool(
         &self,
         encoded: impl IntoIterator<Item = Vec<f32>>,
-        tuple: &LinearWeights,
+        tuple: Option<&LinearWeights>,
         pool: &LinearWeights,
         state: Option<&[f32]>,
     ) -> Vec<f32> {
@@ -10665,14 +10590,17 @@ impl<'a> ValueModel<'a> {
         let mut count = 0usize;
         for value in encoded {
             count += 1;
-            for (sum, value) in sum.iter_mut().zip(tuple.apply(&value)) {
+            let value = match tuple {
+                Some(tuple) => tuple.apply(&value),
+                None => value,
+            };
+            for (sum, value) in sum.iter_mut().zip(value) {
                 *sum += value.max(0.0);
             }
         }
         let divisor = (count.max(1) as f32).sqrt();
         sum.iter_mut().for_each(|value| *value /= divisor);
-        sum.push(count as f32);
-        sum.push((count as f32).ln_1p());
+        sum.extend(count_features(count));
         let mut out = pool.apply(&sum);
         if let Some(state) = state {
             out.iter_mut()
@@ -10731,8 +10659,7 @@ impl ValueModel<'_> {
             child_sum
                 .iter_mut()
                 .for_each(|value| *value /= divisor.sqrt());
-            child_sum.push(child_count as f32);
-            child_sum.push((child_count as f32).ln_1p());
+            child_sum.extend(count_features(child_count));
             let pooled = self.continuation_pool.apply(&child_sum);
             let mut joined = self.encode(CONTINUATION_DOMAIN, row);
             joined.extend(pooled);
@@ -10757,7 +10684,7 @@ impl ValueModel<'_> {
             .collect()
     }
 
-    fn map(&self, domains: &[Vec<DomainRow>; 16], current: u32) -> MapEncoding {
+    fn map(&self, domains: &[Vec<DomainRow>; 16], current: u32) -> (Vec<f32>, MapEncoding) {
         let node_rows = domains[MAP_NODE_DOMAIN]
             .iter()
             .filter(|row| row.scope == STATE_SCOPE)
@@ -10765,7 +10692,6 @@ impl ValueModel<'_> {
         let mut key = Vec::new();
         key.extend(VERSION.to_le_bytes());
         key.extend(VALUE_MODEL_VERSION.to_le_bytes());
-        key.extend(current.to_le_bytes());
         for domain in [MAP_NODE_DOMAIN, MAP_EDGE_DOMAIN] {
             key.extend((domains[domain].len() as u32).to_le_bytes());
             for row in domains[domain]
@@ -10780,110 +10706,249 @@ impl ValueModel<'_> {
                     .for_each(|value| key.extend(value.to_le_bytes()));
             }
         }
-        if let Some(value) = self.map_cache.lock().unwrap().get(&key).cloned() {
-            return value;
-        }
-        let mut nodes = node_rows
-            .iter()
-            .map(|row| (row.u[0], self.encode(MAP_NODE_DOMAIN, row)))
-            .collect::<std::collections::BTreeMap<_, _>>();
-        let edges = domains[MAP_EDGE_DOMAIN]
-            .iter()
-            .filter(|row| row.scope == STATE_SCOPE)
-            .map(|row| (row, self.encode(MAP_EDGE_DOMAIN, row)))
-            .collect::<Vec<_>>();
-        let mut levels = node_rows.iter().map(|row| row.u[8]).collect::<Vec<_>>();
-        levels.sort_unstable();
-        levels.dedup();
-        for level in levels.into_iter().rev() {
-            let parents = node_rows
+        let cached = self.map_cache.lock().unwrap().get(&key).cloned();
+        let nodes = cached.unwrap_or_else(|| {
+            let mut nodes = node_rows
                 .iter()
-                .filter(|row| row.u[8] == level && row.u[9] > 0)
-                .collect::<Vec<_>>();
-            if parents.is_empty() {
-                continue;
-            }
-            let normalized_nodes = nodes
-                .iter()
-                .map(|(&id, value)| {
-                    (
-                        id,
-                        normalized(value, &self.graph_norm_w, &self.graph_norm_b),
-                    )
-                })
+                .map(|row| (row.u[0], self.encode(MAP_NODE_DOMAIN, row)))
                 .collect::<std::collections::BTreeMap<_, _>>();
-            let updates = parents
-                .into_iter()
-                .map(|parent| {
-                    let id = parent.u[0];
-                    let query = self.graph_query.apply(&normalized_nodes[&id]);
-                    let keys_values = edges
-                        .iter()
-                        .filter(|(edge, _)| edge.u[0] == id)
-                        .map(|(edge, encoded)| {
-                            self.graph_key_value
-                                .apply(&normalized_nodes[&edge.u[1]])
-                                .into_iter()
-                                .zip(self.graph_edge.apply(encoded))
-                                .map(|(value, edge)| value + edge)
-                                .collect::<Vec<_>>()
-                        })
-                        .collect::<Vec<_>>();
-                    let mut value = nodes[&id].clone();
-                    let attended = self.attention(&query, &keys_values);
-                    let projected = self.graph_out.apply(&attended);
-                    let degree = self
-                        .graph_degree
-                        .apply(&[parent.u[9] as f32 / 8.0, (parent.u[9] as f32).ln_1p() / 3.0]);
-                    for column in 0..self.width {
-                        value[column] += projected[column] + degree[column];
-                    }
-                    let hidden = dense_relu(
-                        &normalized(&value, &self.graph_ff_norm_w, &self.graph_ff_norm_b),
-                        &self.graph_ff1.w,
-                        &self.graph_ff1.b,
-                    );
-                    for (value, residual) in value.iter_mut().zip(self.graph_ff2.apply(&hidden)) {
-                        *value += residual;
-                    }
-                    (id, value)
-                })
+            let edges = domains[MAP_EDGE_DOMAIN]
+                .iter()
+                .filter(|row| row.scope == STATE_SCOPE)
+                .map(|row| (row, self.encode(MAP_EDGE_DOMAIN, row)))
                 .collect::<Vec<_>>();
-            for (id, value) in updates {
-                nodes.insert(id, value);
+            let mut levels = node_rows.iter().map(|row| row.u[8]).collect::<Vec<_>>();
+            levels.sort_unstable();
+            levels.dedup();
+            for level in levels.into_iter().rev() {
+                let parents = node_rows
+                    .iter()
+                    .filter(|row| row.u[8] == level && row.u[9] > 0)
+                    .collect::<Vec<_>>();
+                if parents.is_empty() {
+                    continue;
+                }
+                let normalized_nodes = nodes
+                    .iter()
+                    .map(|(&id, value)| {
+                        (
+                            id,
+                            normalized(value, &self.graph_norm_w, &self.graph_norm_b),
+                        )
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>();
+                let updates = parents
+                    .into_iter()
+                    .map(|parent| {
+                        let id = parent.u[0];
+                        let query = self.graph_query.apply(&normalized_nodes[&id]);
+                        let keys_values = edges
+                            .iter()
+                            .filter(|(edge, _)| edge.u[0] == id)
+                            .map(|(edge, encoded)| {
+                                self.graph_key_value
+                                    .apply(&normalized_nodes[&edge.u[1]])
+                                    .into_iter()
+                                    .zip(self.graph_edge.apply(encoded))
+                                    .map(|(value, edge)| value + edge)
+                                    .collect::<Vec<_>>()
+                            })
+                            .collect::<Vec<_>>();
+                        let mut value = nodes[&id].clone();
+                        let attended = self.attention(&query, &keys_values);
+                        let projected = self.graph_out.apply(&attended);
+                        let degree = self
+                            .graph_degree
+                            .apply(&[parent.u[9] as f32 / 8.0, (parent.u[9] as f32).ln_1p() / 3.0]);
+                        for column in 0..self.width {
+                            value[column] += projected[column] + degree[column];
+                        }
+                        let hidden = dense_relu(
+                            &normalized(&value, &self.graph_ff_norm_w, &self.graph_ff_norm_b),
+                            &self.graph_ff1.w,
+                            &self.graph_ff1.b,
+                        );
+                        for (value, residual) in value.iter_mut().zip(self.graph_ff2.apply(&hidden))
+                        {
+                            *value += residual;
+                        }
+                        (id, value)
+                    })
+                    .collect::<Vec<_>>();
+                for (id, value) in updates {
+                    nodes.insert(id, value);
+                }
             }
-        }
+            let mut cache = self.map_cache.lock().unwrap();
+            if cache.len() == 1_024 {
+                cache.clear();
+            }
+            cache.insert(key, nodes.clone());
+            nodes
+        });
         let normalized_nodes = nodes
             .values()
             .map(|value| normalized(value, &self.graph_norm_w, &self.graph_norm_b))
             .collect::<Vec<_>>();
-        let mut global = self.graph_global.clone();
+        let mut position = nodes[&current].clone();
+        let query = self.graph_query.apply(&normalized(
+            &position,
+            &self.graph_norm_w,
+            &self.graph_norm_b,
+        ));
         let attended = self.attention(
-            &self.graph_query.apply(&self.graph_global),
+            &query,
             &normalized_nodes
                 .iter()
                 .map(|value| self.graph_key_value.apply(value))
                 .collect::<Vec<_>>(),
         );
-        for (value, residual) in global.iter_mut().zip(self.graph_out.apply(&attended)) {
+        for (value, residual) in position.iter_mut().zip(self.graph_out.apply(&attended)) {
             *value += residual;
         }
         let hidden = dense_relu(
-            &normalized(&global, &self.graph_ff_norm_w, &self.graph_ff_norm_b),
+            &normalized(&position, &self.graph_ff_norm_w, &self.graph_ff_norm_b),
             &self.graph_ff1.w,
             &self.graph_ff1.b,
         );
-        for (value, residual) in global.iter_mut().zip(self.graph_ff2.apply(&hidden)) {
+        for (value, residual) in position.iter_mut().zip(self.graph_ff2.apply(&hidden)) {
             *value += residual;
         }
-        let position = nodes[&current].clone();
-        let value = (position, global, nodes);
-        let mut cache = self.map_cache.lock().unwrap();
-        if cache.len() == 1_024 {
-            cache.clear();
+        (position, nodes)
+    }
+
+    fn actors(
+        &self,
+        observation: &ObservationV53,
+    ) -> std::collections::BTreeMap<u32, (u32, Vec<f32>)> {
+        let rows = |domain: usize| {
+            observation.domains[domain]
+                .iter()
+                .filter(|row| row.scope == STATE_SCOPE)
+        };
+        rows(ACTOR_DOMAIN)
+            .map(|actor| {
+                let owner = actor.u[0];
+                let history = self.pool(
+                    rows(HISTORY_DOMAIN)
+                        .filter(|row| row.u[0] == owner)
+                        .map(|row| self.encode(HISTORY_DOMAIN, row)),
+                    Some(&self.history_tuple),
+                    &self.actor_pool,
+                    Some(&self.actor_state[..self.width]),
+                );
+                let effects = rows(POWER_DOMAIN)
+                    .filter(|row| row.u[0] == owner)
+                    .map(|row| self.encode(POWER_DOMAIN, row))
+                    .chain(
+                        rows(STATUS_DOMAIN)
+                            .filter(|row| row.u[0] == owner)
+                            .map(|row| self.encode(STATUS_DOMAIN, row)),
+                    )
+                    .map(|value| {
+                        self.effect_tuple
+                            .apply(&value)
+                            .into_iter()
+                            .map(|value| value.max(0.0))
+                            .collect()
+                    });
+                let effects = self.pool(
+                    effects,
+                    None,
+                    &self.actor_pool,
+                    Some(&self.actor_state[self.width..2 * self.width]),
+                );
+                let mut joined = self.encode(ACTOR_DOMAIN, actor);
+                joined.extend(history);
+                joined.extend(effects);
+                let mut value = self.actor_linear.apply(&joined);
+                layer_norm(&mut value, &self.actor_norm_w, &self.actor_norm_b);
+                value.iter_mut().for_each(|value| *value = value.max(0.0));
+                (owner, (actor.u[1], value))
+            })
+            .collect()
+    }
+
+    fn candidate(
+        &self,
+        observation: &ObservationV53,
+        index: usize,
+        actors: &std::collections::BTreeMap<u32, (u32, Vec<f32>)>,
+        nodes: &MapEncoding,
+    ) -> Vec<f32> {
+        let candidate = &observation.candidates[index];
+        let mut base = self.action_encoder.encode(
+            &candidate.c,
+            &candidate.f,
+            &self.semantic_embedding,
+            self.width,
+        );
+        for (value, legal) in base
+            .iter_mut()
+            .zip(&self.action_legal[candidate.legal as usize * self.width..][..self.width])
+        {
+            *value += legal;
         }
-        cache.insert(key, value.clone());
+        let mut pooled = vec![0.0; self.width];
+        let mut count = 1usize;
+        for domain in 0..DOMAIN_NAMES.len() {
+            let values = if domain == CONTINUATION_DOMAIN {
+                self.continuations(
+                    observation.domains[domain]
+                        .iter()
+                        .filter(|row| row.scope == index as i32)
+                        .collect(),
+                )
+            } else {
+                observation.domains[domain]
+                    .iter()
+                    .filter(|row| row.scope == index as i32)
+                    .map(|row| self.encode(domain, row))
+                    .collect()
+            };
+            let domain_count = values.len();
+            let mut sum = vec![0.0; self.width];
+            for value in values {
+                for (sum, value) in sum.iter_mut().zip(value) {
+                    *sum += value;
+                }
+            }
+            for column in 0..self.width {
+                pooled[column] += sum[column] * self.candidate_scale[domain * self.width + column]
+                    + domain_count as f32 * self.candidate_bias[domain * self.width + column];
+            }
+            count += domain_count;
+        }
+        if candidate.u[4] != NO_NODE {
+            let path = self.path_adapter.apply(&nodes[&candidate.u[4]]);
+            pooled
+                .iter_mut()
+                .zip(path)
+                .for_each(|(sum, value)| *sum += value);
+            count += 1;
+        }
+        if candidate.u[1] != 0 {
+            let target = self.target_adapter.apply(&actors[&candidate.u[1]].1);
+            pooled
+                .iter_mut()
+                .zip(target)
+                .for_each(|(sum, value)| *sum += value);
+            count += 1;
+        }
+        let divisor = (count as f32).sqrt();
+        pooled.iter_mut().for_each(|value| *value /= divisor);
+        let mut joined = base;
+        joined.extend(pooled);
+        joined.extend(count_features(count));
+        let mut value = self.candidate_combine.apply(&joined);
+        layer_norm(&mut value, &self.action_norm_w, &self.action_norm_b);
+        value.iter_mut().for_each(|value| *value = value.max(0.0));
         value
+    }
+
+    fn candidate_object_key(observation: &ObservationV53, index: usize) -> (u32, u32) {
+        let candidate = &observation.candidates[index];
+        (candidate.u[0], candidate.u[14])
     }
 
     fn state(&self, observation: &ObservationV53) -> Vec<f32> {
@@ -10893,8 +10958,8 @@ impl ValueModel<'_> {
                 .filter(|row| row.scope == STATE_SCOPE)
                 .collect::<Vec<_>>()
         };
-        let mut state = observation.globals.clone();
-        assert_eq!(state.len(), self.globals);
+        assert!(observation.globals.is_empty());
+        let mut state = Vec::with_capacity(self.state_width);
         let run = state_rows(RUN_DOMAIN);
         let phase = state_rows(PHASE_DOMAIN);
         assert_eq!((run.len(), phase.len()), (1, 1));
@@ -10920,7 +10985,7 @@ impl ValueModel<'_> {
                     .for_each(|value| key.extend(value.to_le_bytes()));
             }
             let cached = self.card_cache.lock().unwrap().get(&key).cloned();
-            let summary = cached.unwrap_or_else(|| {
+            let mut summary = cached.unwrap_or_else(|| {
                 let mut state = self.card_state[zone * self.width..][..self.width].to_vec();
                 let count = self.card_count.apply(&card_count_features(&rows));
                 state
@@ -10937,37 +11002,10 @@ impl ValueModel<'_> {
                 cache.insert(key, summary.clone());
                 summary
             });
+            normalize_block(&mut summary);
             state.extend(summary);
         }
-        let actors = state_rows(ACTOR_DOMAIN);
-        let mut actor_contexts = Vec::new();
-        for actor in actors {
-            let owner = actor.u[0];
-            let mut joined = self.encode(ACTOR_DOMAIN, actor);
-            for family in 0..8 {
-                let (domain, kind) = if family == 0 {
-                    (POWER_DOMAIN, None)
-                } else if family == 1 {
-                    (HISTORY_DOMAIN, None)
-                } else {
-                    (STATUS_DOMAIN, Some((family - 2) as u32))
-                };
-                let rows = state_rows(domain)
-                    .into_iter()
-                    .filter(|row| row.u[0] == owner && kind.is_none_or(|kind| row.u[1] == kind))
-                    .map(|row| self.encode(domain, row));
-                joined.extend(self.pool(
-                    rows,
-                    &self.child_tuple,
-                    &self.child_pool,
-                    Some(&self.child_state[family * self.width..][..self.width]),
-                ));
-            }
-            let mut actor = self.actor_linear.apply(&joined);
-            layer_norm(&mut actor, &self.actor_norm_w, &self.actor_norm_b);
-            actor.iter_mut().for_each(|value| *value = value.max(0.0));
-            actor_contexts.push(actor);
-        }
+        let actors = self.actors(observation);
         let groups = [
             run.into_iter()
                 .map(|row| self.encode(RUN_DOMAIN, row))
@@ -10976,7 +11014,16 @@ impl ValueModel<'_> {
                 .into_iter()
                 .map(|row| self.encode(PHASE_DOMAIN, row))
                 .collect(),
-            actor_contexts,
+            actors
+                .values()
+                .filter(|(kind, _)| *kind < 2)
+                .map(|(_, value)| value.clone())
+                .collect(),
+            actors
+                .values()
+                .filter(|(kind, _)| *kind == 2)
+                .map(|(_, value)| value.clone())
+                .collect(),
             state_rows(RELIC_DOMAIN)
                 .into_iter()
                 .map(|row| self.encode(RELIC_DOMAIN, row))
@@ -11004,14 +11051,65 @@ impl ValueModel<'_> {
             self.continuations(state_rows(CONTINUATION_DOMAIN)),
         ];
         for (slot, rows) in groups.into_iter().enumerate() {
-            state.extend(self.pool(
+            let mut summary = self.pool(
                 rows,
-                &self.entity_tuple,
+                Some(&self.entity_tuple),
                 &self.entity_pool,
                 Some(&self.entity_state[slot * self.width..][..self.width]),
-            ));
+            );
+            normalize_block(&mut summary);
+            state.extend(summary);
         }
-        state.extend(self.map(&observation.domains, current_id).1);
+        let (mut current, nodes) = self.map(&observation.domains, current_id);
+        normalize_block(&mut current);
+        state.extend(current);
+        assert_eq!(state.len(), MODEL_BASE_STATE_WIDTH);
+        let actions = (0..observation.candidates.len())
+            .map(|index| self.candidate(observation, index, &actors, &nodes))
+            .collect::<Vec<_>>();
+        let mut objects = std::collections::BTreeMap::<(u32, u32), (Vec<f32>, usize)>::new();
+        for (index, action) in actions.iter().enumerate() {
+            let entry = objects
+                .entry(Self::candidate_object_key(observation, index))
+                .or_insert_with(|| (vec![0.0; self.width], 0));
+            entry
+                .0
+                .iter_mut()
+                .zip(action)
+                .for_each(|(sum, value)| *sum += value);
+            entry.1 += 1;
+        }
+        let object_count = objects.len();
+        let objects = objects
+            .into_values()
+            .map(|(mut object, count)| {
+                object.iter_mut().for_each(|value| *value /= count as f32);
+                object.extend(count_features(count));
+                self.menu_object
+                    .apply(&object)
+                    .into_iter()
+                    .map(|value| value.max(0.0))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let menu = if objects.is_empty() {
+            let mut menu = self.menu_empty.clone();
+            layer_norm(&mut menu, &self.menu_norm_w, &self.menu_norm_b);
+            menu
+        } else {
+            let keys_values = objects
+                .iter()
+                .map(|value| self.menu_key_value.apply(value))
+                .collect::<Vec<_>>();
+            let query = self.menu_query.apply(&state);
+            let mut menu = self.menu_out.apply(&self.attention(&query, &keys_values));
+            menu.iter_mut()
+                .zip(self.menu_count.apply(&count_features(object_count)))
+                .for_each(|(value, count)| *value += count);
+            layer_norm(&mut menu, &self.menu_norm_w, &self.menu_norm_b);
+            menu
+        };
+        state.extend(menu);
         assert_eq!(state.len(), self.state_width);
         state
     }
@@ -11060,6 +11158,13 @@ fn normalized(input: &[f32], weight: &[f32], bias: &[f32]) -> Vec<f32> {
 }
 
 fn layer_norm(input: &mut [f32], weight: &[f32], bias: &[f32]) {
+    normalize_block(input);
+    for ((value, weight), bias) in input.iter_mut().zip(weight).zip(bias) {
+        *value = *value * weight + bias;
+    }
+}
+
+fn normalize_block(input: &mut [f32]) {
     let mean = input.iter().sum::<f32>() / input.len() as f32;
     let variance = input
         .iter()
@@ -11067,9 +11172,9 @@ fn layer_norm(input: &mut [f32], weight: &[f32], bias: &[f32]) {
         .sum::<f32>()
         / input.len() as f32;
     let scale = (variance + 1e-5).sqrt().recip();
-    for ((value, weight), bias) in input.iter_mut().zip(weight).zip(bias) {
-        *value = (*value - mean) * scale * weight + bias;
-    }
+    input
+        .iter_mut()
+        .for_each(|value| *value = (*value - mean) * scale);
 }
 
 fn sigmoid(value: f32) -> f32 {
@@ -13106,19 +13211,10 @@ mod python {
                 ("model_heads".into(), MODEL_HEADS),
                 ("model_feedforward".into(), MODEL_FEEDFORWARD),
                 ("entity_summaries".into(), MODEL_ENTITY_SUMMARIES),
+                ("base_state_width".into(), MODEL_BASE_STATE_WIDTH),
                 ("state_width".into(), MODEL_STATE_WIDTH),
                 ("action_width".into(), MODEL_WIDTH),
                 ("head_width".into(), MODEL_HEAD_WIDTH),
-                ("global_state_start".into(), self.layout.characters),
-                ("global_state_kinds".into(), GLOBAL_STATE_KINDS),
-                ("global_state_values".into(), GLOBAL_STATE_VALUES),
-                (
-                    "global_map_start".into(),
-                    self.layout.characters + GLOBAL_STATE_KINDS * GLOBAL_STATE_VALUES,
-                ),
-                ("global_map_floors".into(), MAP_FLOORS),
-                ("global_map_lanes".into(), MAP_LANES),
-                ("global_map_values".into(), MAP_VALUES),
                 ("domain_count".into(), DOMAIN_NAMES.len()),
                 ("action_u".into(), ACTION_U),
                 ("action_s".into(), ACTION_S),
@@ -13127,6 +13223,7 @@ mod python {
                 ("absent_node".into(), u32::MAX as usize),
                 ("run_current_node".into(), 23),
                 ("action_path_node".into(), 4),
+                ("action_object".into(), 14),
                 ("actor_owner".into(), 0),
                 ("child_owner".into(), 0),
                 ("child_kind".into(), 1),
@@ -13158,7 +13255,11 @@ mod python {
                 ("osty_owner".into(), 2),
                 ("enemy_owner_start".into(), 3),
                 ("card_zones".into(), CARD_ZONES),
-                ("card_candidate_zone".into(), CARD_ZONES),
+                ("card_candidate_zone".into(), ATTACHED_CARD_ZONE),
+                (
+                    "history_course_status".into(),
+                    HISTORY_COURSE_STATUS as usize,
+                ),
                 ("normal_encounters".into(), 58),
                 ("elite_encounters".into(), 14),
                 ("boss_encounters".into(), 14),
@@ -19804,6 +19905,111 @@ mod tests {
     }
 
     #[test]
+    fn v62_active_card_reward_variants_are_ordered_state() {
+        let content = foundation_content();
+        let layout = Layout::new(&content);
+        let mut first = Game::new_character_ascension(&content, 620, 0, 10).unwrap();
+        first.begin_act(&content, 0).unwrap();
+        let offered = first.run.deck[0];
+        first.phase = Phase::Rewards(Rewards {
+            gold: 0,
+            cards: vec![offered],
+            card_rewards: vec![
+                CardReward::Standard(Room::Combat),
+                CardReward::Fixed(1, CardRarity::Rare),
+            ],
+            relics: vec![],
+            potions: vec![],
+            removals: 0,
+        });
+        let mut second = first.clone();
+        let Phase::Rewards(rewards) = &mut second.phase else {
+            unreachable!()
+        };
+        rewards.card_rewards.swap(0, 1);
+        let first_observation = observation_v53(&first, &content, layout, (0, 0));
+        let second_observation = observation_v53(&second, &content, layout, (0, 0));
+        assert_ne!(
+            v53_bytes(&first_observation),
+            v53_bytes(&second_observation)
+        );
+        let rewards = first_observation.domains[CONTINUATION_DOMAIN]
+            .iter()
+            .filter(|row| row.u[0] == 8 && row.u[1] == 2 && row.scope == STATE_SCOPE)
+            .collect::<Vec<_>>();
+        assert_eq!(rewards.len(), 2);
+        assert_eq!(
+            (rewards[0].u[11], rewards[0].u[12]),
+            (0, room_index(Room::Combat) as u32)
+        );
+        assert_eq!(
+            (rewards[1].u[11], rewards[1].u[12], rewards[1].u[13]),
+            (1, 1, CardRarity::Rare as u32)
+        );
+        first.step(&content, Action::RewardCard(0)).unwrap();
+        second.step(&content, Action::RewardCard(0)).unwrap();
+        assert_ne!(
+            v53_bytes(&observation_v53(&first, &content, layout, (0, 0))),
+            v53_bytes(&observation_v53(&second, &content, layout, (0, 0)))
+        );
+    }
+
+    #[test]
+    fn v62_potion_replacement_preserves_the_suspended_reward() {
+        let content = foundation_content();
+        let layout = Layout::new(&content);
+        let mut first = Game::new_character_ascension(&content, 621, 0, 10).unwrap();
+        first.begin_act(&content, 0).unwrap();
+        let first_card = first.run.deck[0];
+        let second_card = *first
+            .run
+            .deck
+            .iter()
+            .find(|card| card.id != first_card.id)
+            .unwrap();
+        first.phase = Phase::Rewards(Rewards {
+            gold: 17,
+            cards: vec![first_card],
+            card_rewards: vec![CardReward::Kaleidoscope],
+            relics: vec![content.acts[0].relics[0]],
+            potions: vec![content.acts[0].potions[0]],
+            removals: 1,
+        });
+        first.run.potions[0] = Some(content.acts[0].potions[0]);
+        first.pending_potion = Some(content.acts[0].potions[1]);
+        first.replacing_potion = true;
+        let mut second = first.clone();
+        let Phase::Rewards(rewards) = &mut second.phase else {
+            unreachable!()
+        };
+        rewards.cards[0] = second_card;
+        let first_observation = observation_v53(&first, &content, layout, (0, 0));
+        let second_observation = observation_v53(&second, &content, layout, (0, 0));
+        assert_eq!(
+            first_observation
+                .candidates
+                .iter()
+                .map(|row| &row.action)
+                .collect::<Vec<_>>(),
+            second_observation
+                .candidates
+                .iter()
+                .map(|row| &row.action)
+                .collect::<Vec<_>>()
+        );
+        assert_ne!(
+            v53_bytes(&first_observation),
+            v53_bytes(&second_observation)
+        );
+        first.step(&content, Action::DiscardPotion(0)).unwrap();
+        second.step(&content, Action::DiscardPotion(0)).unwrap();
+        assert_ne!(
+            v53_bytes(&observation_v53(&first, &content, layout, (0, 0))),
+            v53_bytes(&observation_v53(&second, &content, layout, (0, 0)))
+        );
+    }
+
+    #[test]
     fn features_cover_tinker_time_visible_offers() {
         let content = foundation_content();
         let layout = Layout::new(&content);
@@ -19990,7 +20196,7 @@ mod tests {
             MODEL_HEAD_WIDTH,
             MODEL_STATE_WIDTH,
         );
-        assert_eq!(state_width, 5_141);
+        assert_eq!((MODEL_BASE_STATE_WIDTH, state_width), (1_088, 1_152));
         let mut bytes = Vec::new();
         bytes.extend(MAGIC);
         bytes.extend(VALUE_MODEL_VERSION.to_le_bytes());
@@ -20004,7 +20210,7 @@ mod tests {
             CARD_ZONES,
             DOMAIN_NAMES.len(),
             PUBLIC_GLOBALS,
-            8,
+            2,
             MODEL_ENTITY_SUMMARIES,
             head_width,
             ACTION_U,
@@ -20040,13 +20246,15 @@ mod tests {
             .map(|&(_, _, semantic, numeric)| encoder(semantic, numeric))
             .sum::<usize>()
             + Layout::new(&content).semantic_vocab() * width
+            + encoder(ACTION_C, ACTION_F)
             + CARD_ZONES * width
             + 6 * width
             + layers * layer
             + (width * width + width)
+            + (width * width + width)
             + (width * (width + 2) + width)
-            + 8 * width
-            + (width * 9 * width + width)
+            + 2 * width
+            + (width * 3 * width + width)
             + 2 * width
             + (width * width + width)
             + (width * (width + 2) + width)
@@ -20060,12 +20268,23 @@ mod tests {
             + 2 * width
             + (feedforward * width + feedforward)
             + (width * feedforward + width)
-            + width
             + 6 * width
             + (2 * width * width + width)
             + (width * (width + 2) + width)
             + (2 * width * width + width)
             + 2 * width
+            + 2 * DOMAIN_NAMES.len() * width
+            + (width * (2 * width + 2) + width)
+            + 2 * width * width
+            + 2 * width
+            + 2 * width
+            + (width * (width + 2) + width)
+            + (width * MODEL_BASE_STATE_WIDTH + width)
+            + (2 * width * width + 2 * width)
+            + (width * width + width)
+            + 2 * width
+            + 2 * width
+            + width
             + head_width * state_width
             + head_width
             + head_width
@@ -20334,21 +20553,19 @@ mod tests {
         let layout = Layout::new(&content);
         let game = Game::new_character_ascension(&content, 40, 0, 10).unwrap();
         let rows = [true, false].map(|active| observation_globals(&game, &content, layout, active));
-        assert_eq!(PUBLIC_GLOBALS, 3_605);
+        assert_eq!(PUBLIC_GLOBALS, 0);
         assert_eq!(globals_len(layout), PUBLIC_GLOBALS);
-        assert!(rows[0].iter().all(|value| value.is_finite()));
-        assert!(rows[1].iter().all(|&value| value == 0.0));
-        assert_eq!(rows.into_iter().flatten().count(), 2 * globals_len(layout));
+        assert!(rows.into_iter().all(|row| row.is_empty()));
     }
 
     #[test]
-    fn v60_public_globals_are_packed_and_digest_protected() {
+    fn v62_packed_observation_has_no_direct_globals_and_is_digest_protected() {
         let content = foundation_content();
         let layout = Layout::new(&content);
         let mut game = Game::new_character_ascension(&content, 600, 0, 10).unwrap();
         game.begin_act(&content, 0).unwrap();
         let observation = observation_v53(&game, &content, layout, (3, 4));
-        let (mut globals, counts, exact, actions, digest) = packed_observation(&observation);
+        let (globals, counts, mut exact, actions, digest) = packed_observation(&observation);
         assert_eq!(globals, observation.globals);
         assert_eq!(globals.len(), PUBLIC_GLOBALS);
         assert!(globals.iter().all(|value| value.is_finite()));
@@ -20356,7 +20573,7 @@ mod tests {
             packed_observation_digest(observation.character, &globals, &counts, &exact, &actions),
             digest
         );
-        globals[layout.characters + 6 * GLOBAL_STATE_VALUES + 1] += 0.25;
+        exact[0] ^= 1;
         assert_ne!(
             packed_observation_digest(observation.character, &globals, &counts, &exact, &actions),
             digest
@@ -20364,7 +20581,7 @@ mod tests {
     }
 
     #[test]
-    fn v46_map_tokens_keep_the_public_grid() {
+    fn v62_map_uses_the_contextual_current_node_without_direct_globals() {
         let content = foundation_content();
         let layout = Layout::new(&content);
         let mut game = Game::new_character_ascension(&content, 82, 0, 10).unwrap();
@@ -20390,20 +20607,22 @@ mod tests {
         game.fur_coat = vec![(2, 1)];
         game.spoils = Some((2, 1));
         let globals = observation_globals(&game, &content, layout, true);
-        assert_eq!(globals.len(), PUBLIC_GLOBALS);
-        let map = layout.characters + GLOBAL_STATE_KINDS * GLOBAL_STATE_VALUES;
-        let first = map + 2 * MAP_VALUES;
-        assert_eq!(globals[first], 1.0);
-        assert_eq!(globals[first + 1], 1.0);
-        assert_eq!(globals[first + 2 + room_index(Room::Shop)], 1.0);
-        assert_eq!(globals[first + 2 + ROOMS + 4], 1.0);
+        assert!(globals.is_empty());
+        let observation = observation_v53(&game, &content, layout, (0, 0));
+        let run = &observation.domains[RUN_DOMAIN][0];
+        let current = observation.domains[MAP_NODE_DOMAIN]
+            .iter()
+            .find(|row| row.u[0] == run.u[23])
+            .unwrap();
         assert_eq!(
-            &globals[first + MAP_VALUES - 2..first + MAP_VALUES],
-            &[1.0, 1.0]
+            &current.u[1..8],
+            &[0, 1, 2, room_index(Room::Shop) as u32, 0, 1, 1]
         );
-        let last = map + (17 * MAP_LANES + 4) * MAP_VALUES;
-        assert_eq!(globals[last], 1.0);
-        assert_eq!(globals[last + 2 + room_index(Room::Elite)], 1.0);
+        assert!(
+            observation.domains[MAP_EDGE_DOMAIN]
+                .iter()
+                .any(|row| row.u[0] == current.u[0])
+        );
         let tokens = state_tokens(&game, &content, layout);
         let node = tokens
             .iter()
@@ -21661,7 +21880,7 @@ mod tests {
     }
 
     #[test]
-    fn v60_cards_use_thirteen_state_zones_and_keep_offers_in_state_and_menu() {
+    fn v62_cards_use_five_state_zones_and_move_special_cards_to_their_owners() {
         let content = foundation_content();
         let layout = Layout::new(&content);
         let mut game = Game::new_character_ascension(&content, 402, 0, 10).unwrap();
@@ -21685,14 +21904,14 @@ mod tests {
         assert_eq!(
             observation.domains[CARD_DOMAIN]
                 .iter()
-                .filter(|row| row.scope == STATE_SCOPE && row.u[0] == OFFER_ZONE as u32)
+                .filter(|row| row.scope == STATE_SCOPE)
                 .count(),
-            2
+            game.run.deck.len()
         );
         let offers = observation.domains[CARD_DOMAIN]
             .iter()
             .filter(|row| row.scope >= 0 && row.u[1] == 4)
-            .inspect(|row| assert_eq!(row.u[0], CARD_ZONES as u32))
+            .inspect(|row| assert_eq!(row.u[0], ATTACHED_CARD_ZONE as u32))
             .count();
         assert_eq!(offers, 2);
         assert_eq!(
@@ -21700,7 +21919,10 @@ mod tests {
             CARD_ZONES as u32 + 1
         );
 
-        game.paels_cards.push(card);
+        let mut special = card;
+        special.upgrades = 1;
+        special.value = 7;
+        game.paels_cards.push(special);
         game.start_combat(&content, content.acts[0].encounters[0])
             .unwrap();
         let Phase::Combat(combat) = &mut game.phase else {
@@ -21711,11 +21933,18 @@ mod tests {
         combat.known_draw_top = 1;
         combat.discard = vec![card];
         combat.exhaust = vec![card];
-        combat.offer = vec![card];
-        combat.history_course = Some(card);
-        combat.playing = Some(card);
+        combat.offer = vec![special];
+        combat.history_course = Some(special);
+        combat.playing = Some(special);
+        combat.choice = Some(Choice {
+            pile: Pile::Offer,
+            filter: CardFilter::Any,
+            op: CardOp::TakeOffer,
+            remaining: 1,
+            optional: false,
+        });
         combat.auto_plays.push(AutoPlay {
-            card,
+            card: special,
             powers: vec![],
             enemy_powers: vec![vec![]; combat.enemies.len()],
             plays: 1,
@@ -21726,20 +21955,35 @@ mod tests {
             .filter(|row| row.scope == STATE_SCOPE)
             .map(|row| row.u[0])
             .collect::<std::collections::HashSet<_>>();
-        for zone in [
-            DECK_ZONE,
-            HAND_ZONE,
-            DRAW_ZONE,
-            DISCARD_ZONE,
-            EXHAUST_ZONE,
-            COMBAT_OFFER_ZONE,
-            HISTORY_COURSE_ZONE,
-            PAEL_ZONE,
-            PLAYING_ZONE,
-            AUTOPLAY_ZONE,
-        ] {
+        for zone in [DECK_ZONE, HAND_ZONE, DRAW_ZONE, DISCARD_ZONE, EXHAUST_ZONE] {
             assert!(zones.contains(&(zone as u32)));
         }
+        assert!(zones.iter().all(|&zone| zone < CARD_ZONES as u32));
+        assert!(
+            observation.domains[CARD_DOMAIN]
+                .iter()
+                .any(|row| row.scope >= 0 && row.u[0] == ATTACHED_CARD_ZONE as u32)
+        );
+        assert!(observation.domains[STATUS_DOMAIN].iter().any(|row| row.u[1]
+            == HISTORY_COURSE_STATUS
+            && row.u[3] == special.id as u32
+            && row.u[4] == 1
+            && row.s[2] == 7));
+        for variant in [2, 8, 10] {
+            assert!(
+                observation.domains[CONTINUATION_DOMAIN]
+                    .iter()
+                    .any(|row| row.u[0] == 9 && row.u[1] == variant)
+            );
+        }
+        assert!(
+            observation.domains[CONTINUATION_DOMAIN]
+                .iter()
+                .any(|row| row.u[0] == 5
+                    && row.u[11] == special.id as u32
+                    && row.u[12] == 1
+                    && row.s[1] == 7)
+        );
 
         let first = game.run.deck[0];
         let second = *game
@@ -21748,17 +21992,29 @@ mod tests {
             .iter()
             .find(|candidate| candidate.instance != first.instance)
             .unwrap();
-        game.phase = Phase::Event(layout.slippery_bridge.unwrap(), vec![]);
+        let slippery = layout.slippery_bridge.unwrap();
+        game.phase = Phase::Event(slippery, content.events[slippery as usize].options.to_vec());
         game.event_cards = vec![first.instance];
         game.event_data[1] = second.instance as i64;
         let observation = observation_v53(&game, &content, layout, (0, 0));
-        let zones = observation.domains[CARD_DOMAIN]
-            .iter()
-            .filter(|row| row.scope == STATE_SCOPE)
-            .map(|row| row.u[0])
-            .collect::<std::collections::HashSet<_>>();
-        assert!(zones.contains(&(SLIPPERY_PREVIOUS_ZONE as u32)));
-        assert!(zones.contains(&(SLIPPERY_CANDIDATE_ZONE as u32)));
+        assert!(
+            observation.domains[CARD_DOMAIN]
+                .iter()
+                .filter(|row| row.scope == STATE_SCOPE)
+                .all(|row| row.u[0] < CARD_ZONES as u32)
+        );
+        assert!(
+            observation.domains[CONTINUATION_DOMAIN]
+                .iter()
+                .any(|row| row.u[0] == 9 && row.u[1] == 9 && row.u[9] == 1)
+        );
+        assert!(
+            observation.domains[CARD_DOMAIN]
+                .iter()
+                .any(|row| row.scope >= 0
+                    && row.u[0] == ATTACHED_CARD_ZONE as u32
+                    && row.u[1] == 8)
+        );
     }
 
     #[test]
@@ -22017,6 +22273,42 @@ mod tests {
         let entered = observation_v53(&game, &content, layout, (0, 0));
         assert_eq!(entered.domains[RUN_DOMAIN][0].u[23], path.1);
         assert_ne!(path.1, 0);
+
+        let current = game
+            .map
+            .nodes
+            .iter()
+            .enumerate()
+            .find(|(_, node)| {
+                !node.next.is_empty()
+                    && game.map.nodes.iter().enumerate().any(|(candidate, next)| {
+                        next.floor == node.floor + 1 && !node.next.contains(&candidate)
+                    })
+            })
+            .map(|(index, _)| index)
+            .unwrap();
+        game.map.current = Some(current);
+        game.run
+            .relics
+            .push(content.relic_id("RELIC.WINGED_BOOTS").unwrap());
+        game.winged_boots = 0;
+        let observation = observation_v53(&game, &content, layout, (0, 0));
+        let paths = observation
+            .candidates
+            .iter()
+            .filter(|row| matches!(row.action, Action::Path(_)))
+            .collect::<Vec<_>>();
+        assert!(paths.iter().any(|row| row.u[5] == 1));
+        assert!(paths.iter().any(|row| row.u[5] == 2));
+        assert!(paths.iter().all(|row| row.u[14] == row.u[4]));
+        assert_eq!(
+            paths
+                .iter()
+                .map(|row| row.u[14])
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            paths.len()
+        );
     }
 
     #[test]
@@ -22315,13 +22607,13 @@ mod tests {
             (Semantic::TurnFlagBit, 15),
             (Semantic::TagBit, 15),
             (Semantic::RunKind, 28),
-            (Semantic::CardZone, 10),
+            (Semantic::CardZone, ATTACHED_CARD_ZONE as u32),
             (Semantic::CardRole, 9),
             (Semantic::OrderKind, 2),
             (Semantic::ActorKind, 2),
             (Semantic::PowerSource, 1),
             (Semantic::HistoryKind, 1),
-            (Semantic::StatusKind, 5),
+            (Semantic::StatusKind, HISTORY_COURSE_STATUS),
             (Semantic::RelicKind, 10),
             (Semantic::PotionKind, 4),
             (Semantic::OrbKind, 0),
@@ -22332,7 +22624,7 @@ mod tests {
             (Semantic::EncounterBoss, 12),
             (Semantic::CrystalKind, 8),
             (Semantic::ContinuationKind, 9),
-            (Semantic::ContinuationVariant, 7),
+            (Semantic::ContinuationVariant, 10),
             (Semantic::MapNodeKind, 2),
             (Semantic::MapEdgeKind, 0),
             (Semantic::RouteKind, 2),
@@ -22917,6 +23209,14 @@ mod tests {
             observation.candidates[targets[0]].u,
             observation.candidates[targets[1]].u
         );
+        assert_eq!(
+            observation.candidates[targets[0]].u[14],
+            observation.candidates[targets[1]].u[14]
+        );
+        assert_eq!(
+            ValueModel::candidate_object_key(&observation, targets[0]),
+            ValueModel::candidate_object_key(&observation, targets[1])
+        );
     }
 
     #[test]
@@ -22931,18 +23231,11 @@ mod tests {
         for candidate in &observation.candidates {
             assert_eq!(candidate.f, action_features(&candidate.u, &candidate.s));
         }
-        let (mut globals, counts, mut exact, mut actions, digest) =
-            packed_observation(&observation);
+        let (globals, counts, mut exact, mut actions, digest) = packed_observation(&observation);
         assert_eq!(
             packed_observation_digest(observation.character, &globals, &counts, &exact, &actions,),
             digest
         );
-        globals[0] = 1.0 - globals[0];
-        assert_ne!(
-            packed_observation_digest(observation.character, &globals, &counts, &exact, &actions,),
-            digest
-        );
-        globals[0] = 1.0 - globals[0];
         exact[0] ^= 1;
         assert_ne!(
             packed_observation_digest(observation.character, &globals, &counts, &exact, &actions,),
@@ -23199,12 +23492,12 @@ mod tests {
         assert_eq!(
             card_count_features(&rows),
             [
-                5.0,
-                5.0f32.ln_1p(),
-                2.0,
-                2.0f32.ln_1p(),
-                1.0,
-                1.0f32.ln_1p()
+                5.0 / 64.0,
+                5.0f32.ln_1p() / 5.0,
+                2.0 / 64.0,
+                2.0f32.ln_1p() / 5.0,
+                1.0 / 64.0,
+                1.0f32.ln_1p() / 5.0
             ]
         );
     }

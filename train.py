@@ -21,11 +21,11 @@ from torch import nn
 import sts2_sim
 
 
-FEATURE_VERSION = 54
-MODEL_VERSION = 61
+FEATURE_VERSION = 55
+MODEL_VERSION = 62
 PRECISIONS = ("fp32", "bf16")
 WINNING_CAPACITY = 4096
-CHANGE = "V61: add bounded public draw, map, and continuation position embeddings."
+CHANGE = "V62: normalized compact state, whole-map current context, and explicit action-object menu."
 STAGES = [(0, bonus) for bonus in (24, 20, 16, 12, 8, 4, 0)] + [
     (ascension, 0) for ascension in range(1, 11)
 ]
@@ -695,7 +695,7 @@ DOMAIN_SPECS = (
     ("map_node", 12, 0, 7, 8), ("map_edge", 8, 0, 2, 4),
 )
 DOMAIN = {name: index for index, (name, *_shape) in enumerate(DOMAIN_SPECS)}
-ACTION_FIELDS = (14, 12, 8, 20)
+ACTION_FIELDS = (15, 12, 8, 20)
 SEMANTIC_NAMES = (
     "character", "card", "power", "relic", "potion", "enemy", "enemy_move", "orb",
     "event", "encounter_normal", "encounter_elite", "encounter_boss", "enchantment",
@@ -737,7 +737,10 @@ class Agent(nn.Module):
                                           ("_c", semantic), ("_f", numeric))}
         expected |= {"domain_count": len(DOMAIN_SPECS), "action_u": ACTION_FIELDS[0],
                      "action_s": ACTION_FIELDS[1], "action_c": ACTION_FIELDS[2],
-                     "action_f": ACTION_FIELDS[3], "card_zones": 13, "globals": 3605,
+                     "action_f": ACTION_FIELDS[3], "card_zones": 5, "globals": 0,
+                     "entity_summaries": 11, "base_state_width": 1088, "state_width": 1152,
+                     "model_width": 64, "model_layers": 2, "model_heads": 4,
+                     "model_feedforward": 128, "action_width": 64, "head_width": 112,
                      "card_known_position_semantic": 7,
                      "continuation_branch_semantic": 3, "continuation_path_semantic": 4,
                      "continuation_list_semantic": 5, "continuation_order_semantic": 6,
@@ -755,9 +758,10 @@ class Agent(nn.Module):
             raise ValueError("invalid architecture")
         self.width, self.layers, self.heads, self.feedforward = width, layers, heads, feedforward
         self.character_start = 0
-        self.card_zones = 13
-        self.entity_collections = 10
-        self.state_width = self.layout["globals"] + (self.card_zones + self.entity_collections + 1) * width
+        self.card_zones = 5
+        self.entity_collections = 11
+        self.base_state_width = (self.card_zones + self.entity_collections + 1) * width
+        self.state_width = self.base_state_width + width
         self.semantic = nn.Embedding(self.layout["semantic_vocab"], width, padding_idx=0)
         self.encoders = nn.ModuleDict({
             name: SemanticEncoder(semantic, numeric, width)
@@ -770,10 +774,11 @@ class Agent(nn.Module):
             width, heads, feedforward, dropout=0, batch_first=True, norm_first=True, activation="relu"
         )
         self.card_transformer = nn.TransformerEncoder(card_layer, layers, enable_nested_tensor=False)
-        self.child_tuple = nn.Linear(width, width)
-        self.child_pool = nn.Linear(width + 2, width)
-        self.child_state = nn.Parameter(torch.randn(8, width) * .02)
-        self.actor_mlp = nn.Sequential(nn.Linear(9 * width, width), nn.LayerNorm(width), nn.ReLU())
+        self.effect_tuple = nn.Linear(width, width)
+        self.history_tuple = nn.Linear(width, width)
+        self.actor_pool = nn.Linear(width + 2, width)
+        self.actor_state = nn.Parameter(torch.randn(2, width) * .02)
+        self.actor_mlp = nn.Sequential(nn.Linear(3 * width, width), nn.LayerNorm(width), nn.ReLU())
         self.entity_tuple = nn.Linear(width, width)
         self.entity_pool = nn.Linear(width + 2, width)
         self.entity_state = nn.Parameter(torch.randn(self.entity_collections, width) * .02)
@@ -785,7 +790,6 @@ class Agent(nn.Module):
         self.graph_degree = nn.Linear(2, width, bias=False)
         self.graph_ff_norm = nn.LayerNorm(width)
         self.graph_ff = nn.Sequential(nn.Linear(width, feedforward), nn.ReLU(), nn.Linear(feedforward, width))
-        self.graph_global = nn.Parameter(torch.randn(width) * .02)
         self.continuation_relation = nn.Linear(6, width, bias=False)
         self.continuation_tuple = nn.Linear(2 * width, width)
         self.continuation_pool = nn.Linear(width + 2, width)
@@ -801,6 +805,13 @@ class Agent(nn.Module):
         self.target_adapter = nn.Linear(width, width, bias=False)
         self.action_legal = nn.Embedding(2, width)
         self.action_norm = nn.LayerNorm(width)
+        self.menu_object = nn.Linear(width + 2, width)
+        self.menu_query = nn.Linear(self.base_state_width, width)
+        self.menu_key_value = nn.Linear(width, 2 * width)
+        self.menu_out = nn.Linear(width, width)
+        self.menu_count = nn.Linear(2, width, bias=False)
+        self.menu_norm = nn.LayerNorm(width)
+        self.menu_empty = nn.Parameter(torch.randn(width) * .02)
         self.head_width = head_width or 112
         self.policy = nn.Sequential(
             nn.Linear(self.state_width + width, self.head_width), nn.ReLU(), nn.Linear(self.head_width, 1),
@@ -921,7 +932,7 @@ class Agent(nn.Module):
             pooled = pooled.index_add(0, group, values.to(pooled.dtype))
         pooled = pooled / count.clamp_min(1).sqrt()[:, None]
         exact = count[:, None].to(pooled.dtype)
-        pooled = pool_linear(torch.cat((pooled, exact, exact.log1p()), 1))
+        pooled = pool_linear(torch.cat((pooled, exact / 64, exact.log1p() / 5), 1))
         return torch.relu(pooled + state.to(pooled.dtype))
 
     def encode_cards(self, encoded, raw, cards):
@@ -1017,12 +1028,11 @@ class Agent(nn.Module):
         return policy
 
     def encode_map(self, encoded, index):
-        node_source, edge_source, levels, global_sequence, current, entry, inverse, keys = index
+        node_source, edge_source, levels, offsets, current, current_inverse, current_source, current_sequence, keys = index
         cached = [self._graph_cache.get(key) for key in keys]
         if not self.training and node_source.device.type == "cpu" and all(value is not None for value in cached):
             self.cache_stats["graph_hit"] += len(keys)
-            nodes = torch.cat([value[0] for value in cached])
-            global_map = torch.stack([value[1] for value in cached])
+            nodes = torch.cat(cached)
         else:
             if not self.training and node_source.device.type == "cpu":
                 self.cache_stats["graph_miss"] += len(keys)
@@ -1039,22 +1049,20 @@ class Agent(nn.Module):
                 updated = nodes[parents] + self.graph_out(attended) + self.graph_degree(features)
                 updated = updated + self.graph_ff(self.graph_ff_norm(updated))
                 nodes.index_copy_(0, parents[:count], updated[:count])
-            normalized = self.graph_norm(nodes)
-            query = self.graph_global.repeat(len(global_sequence[0]) - 1, 1)
-            global_map = query + self.graph_out(self.attend(
-                self.graph_query(query), self.graph_key_value(normalized), global_sequence,
-            ))
-            global_map = global_map + self.graph_ff(self.graph_ff_norm(global_map))
             if not self.training and node_source.device.type == "cpu":
-                offsets = global_sequence[0].tolist()
+                offsets = offsets.tolist()
                 for index, key in enumerate(keys):
-                    self._graph_cache[key] = (
-                        nodes[offsets[index]:offsets[index + 1]].detach(), global_map[index].detach(),
-                    )
+                    self._graph_cache[key] = nodes[offsets[index]:offsets[index + 1]].detach()
                 while len(self._graph_cache) > 8192:
                     self._graph_cache.pop(next(iter(self._graph_cache)))
-        position = torch.where(current >= 0, current, entry)
-        return nodes[position], global_map[inverse], nodes
+        selected = nodes[current]
+        attended = self.attend(
+            self.graph_query(self.graph_norm(selected)),
+            self.graph_key_value(self.graph_norm(nodes[current_source])), current_sequence,
+        )
+        selected = selected + self.graph_out(attended)
+        selected = selected + self.graph_ff(self.graph_ff_norm(selected))
+        return selected[current_inverse], nodes
 
     def encode_continuations(self, encoded, index):
         source, levels = index
@@ -1067,7 +1075,7 @@ class Agent(nn.Module):
                 pooled = pooled.index_add(0, group, messages.to(values.dtype))
             pooled = pooled / count.clamp_min(1).sqrt()[:, None]
             exact = count[:, None].to(values.dtype)
-            pooled = self.continuation_pool(torch.cat((pooled, exact, exact.log1p()), 1))
+            pooled = self.continuation_pool(torch.cat((pooled, exact / 64, exact.log1p() / 5), 1))
             parent = self.continuation_parent(torch.cat((values[parents], pooled), 1))
             values = values.index_copy(
                 0, parents, torch.relu(self.continuation_norm(parent)).to(values.dtype),
@@ -1077,23 +1085,32 @@ class Agent(nn.Module):
     def encode_state(self, globals_, domains, encoded, index):
         cards, actors, entities, continuation_index, continuation_roots, continuation_rows, map_ = index
         card = self.encode_cards(encoded[DOMAIN["card"]], domains[DOMAIN["card"]], cards)
-        base_source, actor_rows, children = actors
-        child_encoded = {
-            domain: torch.relu(self.child_tuple(encoded[domain]))
-            for domain in {domain for domain, *_ in children}
-        } if self.training else {}
-        child = [self.pool(
-            child_encoded.get(domain, encoded[domain]), source, group, count, len(base_source),
-            self.child_state[family], None if self.training else self.child_tuple, self.child_pool,
-        ) for family, (domain, source, group, count) in enumerate(children)]
+        base_source, actor_rows, actor_kinds, history, effects = actors
+        history_domain, history_source, history_group, history_count = history
+        history = self.pool(
+            encoded[history_domain], history_source, history_group, history_count, len(base_source),
+            self.actor_state[0], self.history_tuple, self.actor_pool,
+        )
+        effect_values, effect_groups = [], []
+        for domain, source, group in effects:
+            if len(source):
+                effect_values.append(torch.relu(self.effect_tuple(encoded[domain][source])))
+                effect_groups.append(group)
+        effect_values = torch.cat(effect_values) if effect_values else encoded[0].new_empty((0, self.width))
+        effect_groups = torch.cat(effect_groups) if effect_groups else actor_rows.new_empty(0)
+        effect_count = torch.bincount(effect_groups, minlength=len(base_source)).to(effect_values.dtype)
+        effects = self.pool(
+            effect_values, torch.arange(len(effect_values), device=effect_values.device),
+            effect_groups, effect_count, len(base_source), self.actor_state[1], None, self.actor_pool,
+        )
         actor = (
-            self.actor_mlp(torch.cat((encoded[DOMAIN["actor"]][base_source], *child), 1))
+            self.actor_mlp(torch.cat((encoded[DOMAIN["actor"]][base_source], history, effects), 1))
             if len(base_source) else encoded[DOMAIN["actor"]].new_empty((0, self.width))
         )
         continuation = self.encode_continuations(
             encoded[DOMAIN["continuation"]], continuation_index,
         )
-        _position, global_map, nodes = self.encode_map(encoded, map_)
+        current, nodes = self.encode_map(encoded, map_)
         batch = len(globals_)
         summaries = []
         for collection, (domain, source, group, count) in enumerate(entities[:2]):
@@ -1101,12 +1118,14 @@ class Agent(nn.Module):
                 encoded[domain], source, group, count, batch,
                 self.entity_state[collection], self.entity_tuple, self.entity_pool,
             ))
-        summaries.append(self.pool(
-            actor, torch.arange(len(actor), device=actor.device), actor_rows,
-            torch.bincount(actor_rows, minlength=batch).to(actor.dtype), batch,
-            self.entity_state[2], self.entity_tuple, self.entity_pool,
-        ))
-        for collection, (domain, source, group, count) in enumerate(entities[2:], 3):
+        for collection, selected in enumerate((actor_kinds < 2, actor_kinds == 2), 2):
+            source = selected.nonzero().squeeze(1)
+            rows = actor_rows[source]
+            summaries.append(self.pool(
+                actor, source, rows, torch.bincount(rows, minlength=batch).to(actor.dtype), batch,
+                self.entity_state[collection], self.entity_tuple, self.entity_pool,
+            ))
+        for collection, (domain, source, group, count) in enumerate(entities[2:], 4):
             summaries.append(self.pool(
                 encoded[domain], source, group, count, batch,
                 self.entity_state[collection], self.entity_tuple, self.entity_pool,
@@ -1116,14 +1135,17 @@ class Agent(nn.Module):
             torch.bincount(continuation_rows, minlength=batch).to(continuation.dtype), batch,
             self.entity_state[-1], self.entity_tuple, self.entity_pool,
         ))
-        state = torch.cat((globals_.float(), card.reshape(batch, -1), *summaries, global_map), 1)
-        if state.shape[1] != self.state_width:
-            raise ValueError("invalid state width")
+        card = nn.functional.layer_norm(card, (self.width,))
+        summaries = [nn.functional.layer_norm(summary, (self.width,)) for summary in summaries]
+        current = nn.functional.layer_norm(current, (self.width,))
+        state = torch.cat((card.reshape(batch, -1), *summaries, current), 1)
+        if state.shape[1] != self.base_state_width:
+            raise ValueError("invalid base state width")
         return state, nodes, actor, continuation
 
     def encode_actions(self, encoded, continuation, actor, values, index, nodes):
         semantic, numeric = values
-        action_row, action_flat, legal, sequence, actions, sources, path, target = index
+        action_row, action_flat, legal, sequence, actions, sources, path, target, _menu = index
         base = self.action_encoder(semantic, numeric, self.semantic)[:len(action_row)]
         pooled = base.new_zeros(base.shape); count = base.new_ones(len(base))
         for domain, (source, group, domain_count, inverse, groups) in enumerate(sources):
@@ -1149,9 +1171,25 @@ class Agent(nn.Module):
         exact = count[:, None].to(pooled.dtype)
         action = self.candidate_combine(torch.cat((
             base + self.action_legal(legal.long()), pooled / count.clamp_min(1).sqrt()[:, None],
-            exact, exact.log1p(),
+            exact / 64, exact.log1p() / 5,
         ), 1))
         return torch.relu(self.action_norm(action)), action_row, action_flat, actions, legal, sequence
+
+    def encode_menu(self, state, action, index):
+        object_group, target_count, rows, sequence = index
+        objects = action.new_zeros((len(target_count), self.width)).index_add(0, object_group, action)
+        exact = target_count[:, None].to(action.dtype)
+        objects = torch.relu(self.menu_object(torch.cat((
+            objects / exact.clamp_min(1), exact / 64, exact.log1p() / 5,
+        ), 1)))
+        menu = self.menu_norm(self.menu_empty.to(state.dtype)).repeat(len(state), 1)
+        if len(rows):
+            query = self.menu_query(state[rows])
+            count = (sequence[0][1:] - sequence[0][:-1])[:, None].to(state.dtype)
+            value = self.menu_out(self.attend(query, self.menu_key_value(objects), sequence)) \
+                + self.menu_count(torch.cat((count / 64, count.log1p() / 5), 1))
+            menu = menu.index_copy(0, rows, self.menu_norm(value).to(menu.dtype))
+        return menu
 
     def forward(self, _character, globals_, domains, state_index, action_values, action_index,
                 return_state=False, policy_only=False, temperature=1):
@@ -1160,6 +1198,9 @@ class Agent(nn.Module):
         action, action_row, action_flat, actions, legal, sequence = self.encode_actions(
             encoded, continuation, actor, action_values, action_index, nodes,
         )
+        state = torch.cat((state, self.encode_menu(state, action, action_index[-1])), 1)
+        if state.shape[1] != self.state_width:
+            raise ValueError("invalid state width")
         policy = self.decide(state, action, action_row, action_flat, actions, legal, sequence, temperature)
         if policy_only:
             return policy
@@ -1175,18 +1216,26 @@ def architecture(model):
         "feedforward": model.feedforward, "head_width": model.head_width,
         "domains": [name for name, *_ in DOMAIN_SPECS], "card_zones": model.card_zones,
         "globals": model.layout["globals"], "entity_collections": model.entity_collections,
-        "state_width": model.state_width, "policy_input": model.state_width + model.width,
+        "base_state_width": model.base_state_width, "state_width": model.state_width,
+        "policy_input": model.state_width + model.width,
         "map_layers": 1, "fusion_layers": 0,
-        "final_attention": "query_only", "actor_hierarchy": "DeepSets",
-        "tuple_pool": "sum/sqrt(count)+count+log1p(count)",
-        "candidate_attention": "none; direct state+candidate scorer",
+        "final_attention": "query_only",
+        "actor_hierarchy": "player+optional Osty party pool; separate enemy pool",
+        "actor_effects": "power/status encoders -> one owner-grouped effect pool",
+        "tuple_pool": "sum/sqrt(count)+count/64+log1p(count)/5",
+        "state_block_norm": "parameterless LayerNorm per 64-d block before concatenation",
+        "candidate_attention": "target leaves -> mean action objects -> state-query attention",
         "policy_factorization": "one shared direct candidate scorer",
-        "menu_invariance": "target-cardinality and candidate-permutation invariant",
+        "menu_invariance": "explicit object IDs; target means; candidate-permutation invariant",
         "policy_entropy": ["candidate", "normalized", "effective_actions"],
-        "map": "reverse-topological sparse edge-conditioned attention",
+        "map": "reverse-topological sparse attention; current/entry query over all contextual nodes",
         "integer_encoding": "namespaced semantic IDs + field-specific float32 auxiliaries",
         "continuations": "bottom-up parent/branch/path relational pooling",
         "candidate_context": "complete public payload, Path context, and contextual target actor",
+        "card_zone_names": ["deck", "hand", "draw", "discard", "exhaust"],
+        "state_summaries": ["run", "phase", "party", "enemies", "relics", "potions", "orbs",
+                            "events", "encounters", "crystal", "continuations", "current_map_node",
+                            "available_actions"],
         "semantic_vocab": model.semantic.num_embeddings, "candidate_numeric": ACTION_FIELDS[3],
         "value_heads": ["win_logit", "progress"],
         "winning_reservoir": WINNING_CAPACITY,
@@ -1310,7 +1359,7 @@ def candidate_index(row, batch, target, allow_empty=False):
     position = np.arange(len(row), dtype=np.int32) - starts
     return tuple(torch.as_tensor(value, device=target) for value in (
         offsets, row, position,
-    )) + (int(lengths.max()),)
+    )) + (int(lengths.max(initial=0)),)
 
 
 def observation_legal(observation):
@@ -1428,8 +1477,9 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
     card_source, card_group = card_source[keep[card_group]], card_inverse[card_group[keep[card_group]]]
     card_zones = np.r_[np.arange(model.card_zones),
                        np.arange(batch * model.card_zones) % model.card_zones][first]
-    card_counts = np.stack((card_counts, np.log1p(card_counts), card_top, np.log1p(card_top),
-                            card_bottom, np.log1p(card_bottom)), 1).astype(np.float32)
+    card_counts = np.stack((card_counts / 64, np.log1p(card_counts) / 5,
+                            card_top / 64, np.log1p(card_top) / 5,
+                            card_bottom / 64, np.log1p(card_bottom) / 5), 1).astype(np.float32)
     card_counts = np.concatenate((np.zeros((model.card_zones, 6), np.float32), card_counts))[first]
     card_groups = len(first)
     actor_u, _actor_s, _actor_c, _actor_f, actor_rows, _actor_scope = domains[DOMAIN["actor"]]
@@ -1439,12 +1489,9 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
         raise ValueError("duplicate actor")
     actor_lookup = {owner: index for index, owner in enumerate(owners)}
     children = []
-    for domain, kind in ((DOMAIN["power"], None), (DOMAIN["history"], None),
-                         *((DOMAIN["status"], value) for value in range(6))):
+    for domain in (DOMAIN["history"], DOMAIN["power"], DOMAIN["status"]):
         u, _s, _c, _f, row, scope = domains[domain]
         source = state_source[domain]
-        if kind is not None:
-            source = source[u[source, 1] == kind]
         group = np.asarray([actor_lookup.get((int(row[i]), int(u[i, 0])), -1) for i in source], np.int32)
         if np.any(group < 0):
             raise ValueError("actor child without actor")
@@ -1577,9 +1624,7 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
                    candidate_index(group, len(parents), target),
                    torch.as_tensor(degree, device=target), len(parents), len(destinations))
                   for parents, destinations, edge_rows, group, degree in levels]
-    node_rows = np.repeat(np.arange(len(representatives), dtype=np.int32),
-                          [len(node_groups[row]) for row in representatives])
-    global_sequence = candidate_index(node_rows, len(representatives), target)
+    node_offsets = np.r_[0, np.cumsum([len(node_groups[row]) for row in representatives])]
     run_u, _run_s, _run_c, _run_f, run_row, _run_scope = domains[DOMAIN["run"]]
     run_source = state_source[DOMAIN["run"]]
     current_id = np.full(batch, np.iinfo(np.uint32).max, np.uint32)
@@ -1592,16 +1637,28 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
     entry = node_lookup[:, 0]
     if np.any(current[present] < 0) or np.any(entry < 0):
         raise ValueError("current map node is missing")
+    position = np.where(current >= 0, current, entry)
+    current, current_inverse = np.unique(position, return_inverse=True)
+    current_graph = np.searchsorted(node_offsets[1:], current, side="right")
+    current_count = np.diff(node_offsets)[current_graph]
+    current_source = np.concatenate([
+        np.arange(node_offsets[graph], node_offsets[graph + 1], dtype=np.int32)
+        for graph in current_graph
+    ])
+    current_group = np.repeat(np.arange(len(current), dtype=np.int32), current_count)
     map_index = (tensor(domain_inverse[DOMAIN["map_node"]][node_source]),
-                 tensor(domain_inverse[DOMAIN["map_edge"]][edge_source]), tuple(levels), global_sequence,
-                 tensor(current), tensor(entry), tensor(inverse),
+                 tensor(domain_inverse[DOMAIN["map_edge"]][edge_source]), tuple(levels),
+                 tensor(node_offsets), tensor(current), tensor(current_inverse), tensor(current_source),
+                 candidate_index(current_group, len(current), target),
                  tuple(graph_keys[row] for row in representatives))
     actor_rows = actor_rows[base_source].astype(np.int32)
+    actor_kinds = actor_u[base_source, 1].astype(np.int32)
     state_index = (
         (tensor(domain_inverse[DOMAIN["card"]][card_source]), tensor(card_source),
          sequence_index(card_group, card_groups, target, pad_sequences), tensor(card_zones),
          tensor(card_inverse), torch.as_tensor(card_counts, device=target)),
-        (tensor(domain_inverse[DOMAIN["actor"]][base_source]), tensor(actor_rows), tuple(children)),
+        (tensor(domain_inverse[DOMAIN["actor"]][base_source]), tensor(actor_rows), tensor(actor_kinds),
+         children[0], tuple(child[:3] for child in children[1:])),
         tuple(entities), continuation_index, continuation_roots, tensor(continuation_rows), map_index,
     )
     candidate_sources = []
@@ -1671,10 +1728,25 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
         actor_target[index] = actor_lookup.get((int(action_row[index]), int(owner[index])), -1)
     if np.any(actor_target[present] < 0):
         raise ValueError("candidate target references missing actor")
+    object_lookup, object_group, object_rows = {}, np.empty(len(action_row), np.int32), []
+    for index, (row, verb, object_id) in enumerate(zip(action_row, action_u[:, 0], action_u[:, 14])):
+        key = (int(row), int(verb), int(object_id))
+        if key not in object_lookup:
+            object_lookup[key] = len(object_rows); object_rows.append(int(row))
+        object_group[index] = object_lookup[key]
+    object_count = np.bincount(object_group, minlength=len(object_rows)).astype(np.float32)
+    object_rows = np.asarray(object_rows, np.int32)
+    menu_rows = np.unique(object_rows)
+    menu_lookup = np.full(batch, -1, np.int32); menu_lookup[menu_rows] = np.arange(len(menu_rows))
+    menu_sequence = candidate_index(menu_lookup[object_rows], len(menu_rows), target, True)
+    menu_index = (
+        tensor(object_group), torch.as_tensor(object_count, device=target),
+        tensor(menu_rows), menu_sequence,
+    )
     action_index = tuple(torch.as_tensor(value, device=target) for value in (
         action_row, action_row * actions + action_position, action_legal,
     )) + (candidate_index(action_row, batch, target), actions, tuple(candidate_sources),
-          tensor(path), tensor(actor_target))
+          tensor(path), tensor(actor_target), menu_index)
     return (
         torch.as_tensor(character, dtype=torch.long, device=target),
         torch.as_tensor(globals_, device=target), domain_tensors, state_index,
@@ -1710,7 +1782,7 @@ def validate_packed(row):
         raise ValueError("packed observation lacks its Rust digest")
     character, globals_, counts, exact, actions, digest = row
     globals_, counts, exact, actions = map(np.asarray, (globals_, counts, exact, actions))
-    if globals_.dtype != np.float32 or globals_.shape != (3605,) or not np.isfinite(globals_).all() \
+    if globals_.dtype != np.float32 or globals_.shape != (0,) or not np.isfinite(globals_).all() \
             or counts.dtype != np.uint32 or counts.ndim != 1 or exact.dtype != np.uint32 or exact.ndim != 1 \
             or actions.dtype != np.uint32 or actions.ndim != 2:
         raise ValueError("invalid packed observation arrays")
@@ -1726,7 +1798,6 @@ def validate_packed(row):
 
 
 def tensors(observation, target, model):
-    pack_batch(observation)
     return _tensors(observation, target, model)
 
 
@@ -1741,7 +1812,7 @@ def _pack_batch(observation):
     represented = np.asarray(observation[3][4], bool)
     legal = np.asarray(observation[3][5], bool)
     batch = len(character)
-    if globals_.shape != (batch, 3605) or not np.isfinite(globals_).all() \
+    if globals_.shape != (batch, 0) or not np.isfinite(globals_).all() \
             or digests.dtype != np.uint64 or digests.shape != (batch,):
         raise ValueError("invalid observation digests")
     action_row, action_position = np.nonzero(represented)
@@ -2207,7 +2278,7 @@ class RolloutCollector:
             progress_floor = self.max_floor / 52
             for index, action in enumerate(choice):
                 self.action_history[index].append(int(action))
-            step_rows = pack_batch(self.observation)
+            step_rows = _pack_batch(self.observation)
             self.reservoir.record(step_rows, choice, log_probability, policy, value, self.rng)
             in_combat = np.asarray([row[4] == 1 for row in self.env.stats()])
             self.combat_steps = np.where(in_combat, self.combat_steps + 1, 0)
@@ -2559,7 +2630,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
            else "complete terminal trajectories"),
         "Bounded queue → policy-lag and action-ratio freshness filters",
         "CPU-prefetched, character-balanced, advantage-prioritized full batches",
-        f"{model.layers}-layer card encoder + sparse actor/map summaries → direct state heads",
+        f"{model.layers}-layer card encoder + party/enemy/map summaries + action-object menu → heads",
         f"Asynchronous clipped PPO + weights published every {args.publish_updates} updates",
     ]
     last_batch = None
@@ -3752,7 +3823,8 @@ function renderHierarchicalState(run){const target=document.querySelector('#stat
 const renderLegacyState=renderState;renderState=run=>run.manifest.model_version>=44?renderZoneState(run):run.manifest.feature_version>=37?renderUnifiedState(run):renderLegacyState(run);
 const renderPreHierarchyState=renderState;renderState=run=>run.manifest.model_version>=51?renderHierarchicalState(run):renderPreHierarchyState(run);
 function renderDomainState(run){const target=document.querySelector('#stateDiagram'),a=run.manifest.architecture,n=value=>Number(value).toLocaleString(),v=run.manifest.model_version;if(v<55){target.innerHTML=`<div class=state-flow><div class=state-node><b>16 exact domains</b>field-specific u32/i32 byte limbs</div><div class=state-plus>→</div><div class=state-node><b>W${a.width}</b>V${v} domain encoders</div><div class=state-plus>→</div><div class=state-node><b>Typed hierarchy</b>card zones · Actor DeepSets · sparse map · continuation rows</div></div><div class="state-flow action-flow"><div class=state-node><b>Visible candidates</b>legal + illegal</div><div class=state-plus>→</div><div class=state-node><b>Independent menus</b>candidate-conditioned policy and value</div></div>`;return}target.innerHTML=`<div class=state-flow><div class=state-node><b>16 typed domains</b>exact u32/i32 replay fields · namespaced semantic IDs · normalized f32 auxiliaries</div><div class=state-plus>→</div><div class=state-node><b>W${a.width}</b>shared semantic table + multiplicative field-role and domain numeric encoders</div><div class=state-plus>→</div><div class=state-node><b>Typed hierarchy</b>10 card zones · ordered powers · Actor DeepSets · bottom-up continuation trees</div></div><div class=state-flow><div class=state-node><b>Sparse map DAG</b>reverse-topological edge-conditioned H${a.heads} update</div><div class=state-plus>→</div><div class=state-node><b>CURRENT or ENTRY + GLOBAL</b>one positional context; Path candidates reuse destination context</div><div class=state-plus>→</div><div class=state-node><b>s ∈ ℝ${a.width}</b>[STATE] ragged L${a.fusion_layers}; final query only</div></div><div class="state-flow action-flow"><div class=state-node><b>Visible candidates</b>legal + illegal · target actor joins · 20 transition/resource auxiliaries</div><div class=state-plus>→</div><div class=state-node><b>a ∈ ℝ${a.width}</b>shared semantic/numeric encoder + payload count/log pooling</div><div class=state-plus>→</div><div class=state-node><b>hπ and hv</b>independent one-query menus over every present candidate</div></div><div class=module-grid><div class=state-node><b>${n(run.manifest.parameters)}</b>total parameters</div><div class=state-node><b>384→128→1</b>policy on [hπ,a,hπ×a]</div><div class=state-node><b>128→1</b>candidate-conditioned win critic on hv</div><div class=state-node><b>128→1</b>training-only progress head on hv</div><div class=state-node><b>0 dense globals</b>exact identity never passes through fp16</div></div><details class=state-box open><summary>Representation contract</summary><p>One shared CardId namespace is reused in state, status, continuation, and candidate rows. Multiplicative field-role scales prevent same-namespace slot swaps from aliasing. Unordered collections use nonlinear sum/√count pooling with count and log-count; continuation payloads are combined bottom-up through explicit parent, branch, path, list, order, arity, and empty relations. Actor targets and map destinations are gathered into candidates before both menus. Candidate outcomes include cost, resource-after values, damage ratio, lethal, signed HP-after/overkill, player HP, block, energy, stars, draw, discard, and exhaust deltas. Both menus include every represented legal or visible-illegal candidate; only padding is excluded, and illegal policy logits are masked after scoring.</p></details>`}
-const renderPreDomainState=renderState;renderState=run=>run.manifest.model_version>=61?renderDirectState(run):run.manifest.model_version>=60?renderZoneState(run):run.manifest.model_version>=53?renderDomainState(run):renderPreDomainState(run);
+function renderCompactMenuState(run){const target=document.querySelector('#stateDiagram'),a=run.manifest.architecture,n=value=>Number(value).toLocaleString(),section=(title,nodes)=>`<div class=training-diagram><h3>${title}</h3>${flowRow(nodes)}</div>`;target.innerHTML=`<div class=training-diagrams>${section('Cards',[['Exact cards','Ncard × 64','Exact identity, instance metadata and public order.','#e879f9'],['Five zones','5B ragged sequences','Deck, hand, draw, discard and exhaust. Offers exist only on their actions.','#e879f9'],['Card Transformer','W64 · H4 · FF128 · L2','Shared within-zone attention; one summary per zone.','#a78bfa'],['Card state','B × 320','Five independently normalized 64-dimensional zone summaries.','#f59e0b']])}${section('Actors and actor effects',[['Actor effects','Npower + Nstatus vectors','Powers and specialized statuses retain their encoders, then enter one owner-grouped effect pool.','#34d399'],['Actor context','P × 192 → P × 64','Actor base + combat history + unified actor effects.','#34d399'],['Party','B × 64','Player pooled only with optional Osty; role identity and normalized count features are retained.','#22c55e'],['Enemies','B × 64','All contextual enemy vectors pooled separately.','#22c55e']])}${section('Map',[['Map nodes and edges','V × 64 + E × 64','Reverse-topological edge-conditioned sparse attention.','#60a5fa'],['Current or entry query','B × 64','The selected contextual node queries every public node, including off-route Winged-Boots futures.','#38bdf8']])}${section('Base state',[['Five card zones','B × 320','Deck, hand, draw, discard and exhaust.','#e879f9'],['Run · phase · party · enemies','B × 4 × 64','Each named summary connects directly to the state.','#34d399'],['Relics · potions · orbs','B × 3 × 64','Each named summary connects directly to the state.','#f59e0b'],['Events · encounters · crystal','B × 3 × 64','Each named summary connects directly to the state.','#f59e0b'],['Continuations · current node','B × 2 × 64','Queued public resolution state and whole-map-aware current context.','#60a5fa'],['Block normalization','17 × LayerNorm(64)','Every card, named summary and map block is normalized independently without learned parameters.','#f59e0b'],['Base state','B × 1,088','Direct concatenation; zero raw global floats.','#ef4444']])}${section('Available actions and outputs',[['Action leaves','A × 64','Every visible legal or visible-illegal action keeps target actor and path destination context.','#e879f9'],['Explicit objects','O × 64','Group only by state, verb and simulator-supplied object ID; mean unequal target leaves and append target count.','#c084fc'],['Menu attention','B × 64','The base state supplies only the query weights over objects; object-count features are added after attention.','#f59e0b'],['Final state','B × 1,152','Base state plus available-action summary.','#ef4444'],['Policy and critics',`A × ${n(a.policy_input)} → 1 · B × 1,152 → 1`,'Candidate policy plus state-only win and progress critics.','#f472b6']])}</div><details class=state-box open><summary>Representation contract</summary><p>The state contains no raw global vector, no dense map grid and no global-map pool. Offers are represented only through explicitly identified action objects. All count features use count/64 and log1p(count)/5. Individual actors and contextual map destinations remain available to candidate encoders even though the state pools party and enemies separately.</p></details>`}
+const renderPreDomainState=renderState;renderState=run=>run.manifest.model_version>=62?renderCompactMenuState(run):run.manifest.model_version>=61?renderDirectState(run):run.manifest.model_version>=60?renderZoneState(run):run.manifest.model_version>=53?renderDomainState(run):renderPreDomainState(run);
 function flowNode([title,summary,details,color]){return `<div class=flow-node style="--cell:${color}" data-tip="${escapeAttribute(`${title}\n${details}`)}" tabindex=0><b>${title}</b><small>${summary}</small></div>`}function flowRow(nodes){return `<div class=flow-row>${nodes.map(flowNode).join('<div class=flow-arrow>→</div>')}</div>`}
 function renderTraining(run){const target=document.querySelector('#trainingDiagram'),manifest=run.manifest,report=run.reports.at(-1),training=manifest.sessions?.at(-1)?.training||manifest.training||{},metrics=report.metrics||{},architecture=manifest.architecture||{},stage=report.stage||{},stages=manifest.stages||[],n=(value,digits=0)=>Number.isFinite(Number(value))?Number(value).toLocaleString(undefined,{maximumFractionDigits:digits}):'—',percent=value=>Number.isFinite(Number(value))?`${(100*Number(value)).toFixed(1)}%`:'—',envs=training.envs||0,samplerSteps=training.sampler_steps??training.rollout_steps??0,slice=envs&&samplerSteps?envs*samplerSteps:0,batch=training.batch||0,replay=architecture.winning_reservoir||0,progress=architecture.value_heads?.includes('progress'),actionLayers=architecture.action_layers||0,current=`A${stage.ascension??'?'} / +${stage.bonus??'?'}`,stageIndex=stage.index??0,next=stages[stageIndex+1],promotion=run.promotions.at(-1),diagrams=[];if(!('sampler_steps' in training)){const steps=report.pipeline||[];target.innerHTML=`<p><strong>Archived training design:</strong> this run predates the continuous asynchronous pipeline.</p><div class=training-diagrams><div class=training-diagram><h3>Reported pipeline</h3>${flowRow(steps.map((step,index)=>[`Step ${index+1}`,step,`${step}\nConfiguration is preserved in this run's manifest.`,['#38bdf8','#818cf8','#a78bfa','#e879f9','#22c55e'][index%5]]))}</div></div>`;return}diagrams.push(`<div class=training-diagram><h3>1. Asynchronous experience collection</h3>${flowRow([['Curriculum',`${current} · stage ${stageIndex+1}/${stages.length||'?'}`,`The collector creates environments at ascension ${stage.ascension??'?'} with training bonus ${stage.bonus??'?'}. Five characters share the same learner. Next stage: ${next?`A${next.ascension}/+${next.bonus}`:'none'}.`,'#38bdf8'],['CPU actor',`${n(envs)} parallel environments`,`One CPU collector thread runs ${n(envs)} simulator environments in fp32. Actions are sampled from the legal-action-masked categorical policy at temperature ${training.policy_temperature??1}. Training seed: ${training.training_seed??'?'}.`,'#60a5fa'],['Sampler slice',slice?`≤${n(slice)} decisions/call`:`${n(samplerSteps)} steps/environment`,`At most ${n(samplerSteps)} synchronous simulator steps are taken per environment, so a call produces at most ${n(slice)} decisions. Collection stops earlier when a complete episode becomes available. This is not a fixed-length rollout.`,'#818cf8'],['Complete trajectories',`${n(metrics.completed_trajectories)} accepted`,`Per-environment partial trajectories stay with the actor until terminal. Max ${n(training.max_steps)} steps/run and ${n(training.max_combat_steps)} steps/combat; truncated or empty-action trajectories are discarded. Latest discarded fraction: ${percent(metrics.discarded_step_fraction)}.`,'#a78bfa'],['Bounded queues',`weights 1 · samples 2`,`The learner publishes only when the one-slot model queue is empty; the actor drains to the newest version. Complete-trajectory packets cross a two-slot sample queue. Actor and accelerator learner run asynchronously.`,'#c084fc'],['Experience dataset',`peak ${n(metrics.dataset_peak)} rows`,`Latest accepted ${n(metrics.accepted_decisions)} of ${n(metrics.sampled_decisions)} sampled decisions. The transient dataset reached ${n(metrics.dataset_peak)} rows and is drained exactly once.`,'#e879f9']])}</div>`);diagrams.push(`<div class=training-diagram><h3>2. Returns, priorities, and minibatch selection</h3>${flowRow([['Three reward streams','win · shaped · progress',`Win reward is the terminal simulator reward. Policy reward adds the potential difference Vpotential(next) − Vpotential(current). Progress reward is the increase in maximum floor reached, divided by 52.`,'#22c55e'],['GAE and targets',`λ=${training.gae_lambda??'?'} · γprogress=${training.progress_gamma??'?'}`,`Policy advantage uses shaped reward with γ=1. Win-value return uses raw terminal reward with γ=1 and is clipped to [0,1]. Progress advantage and target use γ=${training.progress_gamma??'?'}; all use GAE λ=${training.gae_lambda??'?'}.`,'#14b8a6'],['Priority',`1+|Awin|+|Aprogress|+terminal/win bonuses`,`Each row gets priority 1 + |policy advantage| + |progress advantage| + 4×terminal + 4×winning-return. Sampling uses the square root of priority.`,'#06b6d4'],['Token-cost bucket',`one bucket per batch`,`Rows are bucketed by floor(log2(estimated token/attention cost)). A bucket is chosen by total priority to reduce padding and attention waste.`,'#0ea5e9'],['Balanced one-pass batch',`up to ${n(batch)} rows`,`Each batch draws evenly across the five characters when possible, without replacement, then deletes those rows from the dataset. Latest attempted/trained: ${n(metrics.dataset_attempted)} / ${n(metrics.dataset_trained)}.`,'#38bdf8'],['Freshness filters',`lag ≤${n(training.max_policy_lag)} · |log ratio| ≤${training.max_log_ratio??'?'}`,`Rows older than ${n(training.max_policy_lag)} learner updates are pruned. After forward evaluation, rows with |new logπ(a) − old logπ(a)| > ${training.max_log_ratio??'?'} are masked. Latest stale/ratio drops: ${n(metrics.dataset_stale_dropped)} / ${n(metrics.dataset_ratio_dropped)}.`,'#818cf8']])}</div>`);diagrams.push(`<div class=training-diagram><h3>3. PPO learner update</h3>${flowRow([['Model forward',`${architecture.layers??'?'} card layer${actionLayers?` + ${actionLayers} action-set layer`:''}`,`The selected model encodes the state and every represented action, then emits one masked policy logit per action, a win logit, and ${progress?'a progress value':'no progress head'}. Precision: ${training.precision??manifest.precision??'?'}.`,'#a78bfa'],['Normalize advantages',`per character · β=${n(metrics.progress_beta,3)}`,`Fresh win and progress advantages are independently z-normalized inside each character. Policy advantage = z(Awin) + β·z(Aprogress). β decays from 1 to 0.1 over ${n(training.progress_decisions)} decisions while the progress curriculum remains active.`,'#c084fc'],['Combined loss',`PPO ε=${training.clip??'?'} · value weight ${training.value_weight??'?'}`,`Loss = clipped PPO policy loss + ${training.value_weight??'?'}×win BCE${progress?` + ${training.value_weight??'?'}×progress MSE`:''} − entropy_weight×entropy. Entropy decays ${training.entropy_start??'?'} → ${training.entropy_end??'?'} over ${n(training.progress_decisions)} decisions.`,'#e879f9'],['Batch KL gate',`KL ≤ ${training.target_kl??'?'}`,`Mean sampled-action KL estimate is ratio − 1 − log_ratio over fresh rows. If it exceeds ${training.target_kl??'?'}, the entire optimizer step is skipped. Latest KL: ${n(metrics.kl,6)}; KL-dropped rows: ${n(metrics.dataset_kl_dropped)}.`,'#f472b6'],['Backpropagation',`global gradient norm ≤ 0.5`,`Gradients from fresh PPO rows and accepted winning replay are accumulated together, then clipped to global norm 0.5.`,'#f97316'],['Adam + publish',`lr ${training.learning_rate??'?'}`,`Adam uses learning rate ${training.learning_rate??'?'} and eps 1e-5. After a successful step, policy version increments and weights are offered to the actor. Latest learner/sampler versions: ${n(metrics.policy_version)} / ${n(metrics.sampler_version)}; mean lag ${n(metrics.policy_lag_mean,2)}.`,'#f59e0b']])}</div>`);if(replay)diagrams.push(`<div class=training-diagram><h3>4. Terminal winning replay</h3>${flowRow([['Pending episode sample',`per-env reservoir sampling`,`During each live episode, candidate decisions are reservoir-sampled into a bounded per-environment pending set. Stored data includes the chosen action, behavior log-probability, win value, and full behavior policy.`,'#84cc16'],['Admit winning rows',`${n(metrics.winning_reservoir)}/${n(replay)} stored`,`Only completed wins are admitted, and rows with advantage 1−Vwin ≤0 are skipped. Global capacity is ${n(replay)} with reservoir replacement. Latest wins/seen/skipped: ${n(metrics.winning_episodes)} / ${n(metrics.winning_seen)} / ${n(metrics.winning_skipped)}.`,'#22c55e'],['Balanced compatible sample','≤10% of update data',`Candidates are round-robin balanced across characters. At most fresh_batch/9 rows survive, making replay at most 10% of fresh+replay data. Only candidates no more expensive than the fresh token-cost bucket are packed.`,'#14b8a6'],['Categorical KL check',`≤${training.target_kl??'?'}`,`The stored full behavior distribution is compared with the current masked policy. Eligible rows above KL ${training.target_kl??'?'} are rejected and their reference policy is re-anchored to the current model. Latest accepted/rejected: ${n(metrics.winning_replayed)} / ${n(metrics.winning_rejected_kl)}.`,'#06b6d4'],['Replay PPO term',`weight ${metrics.winning_loss_weight??.1}`,`Replay advantage is stop_gradient(1 − sigmoid(win logit)). The selected-action ratio uses the stored reference policy and the same PPO clip ε=${training.clip??'?'}. Its loss is multiplied by ${metrics.winning_loss_weight??.1}.`,'#0ea5e9']])}</div>`);diagrams.push(`<div class=training-diagram><h3>${replay?'5':'4'}. Reporting, checkpoints, and promotion</h3>${flowRow([['Live report',`every ${n(training.report_decisions)} decisions`,`At each handled-decision boundary, metrics are aggregated, live.json and an immutable report are written, latest.pt is refreshed, and this dashboard is regenerated. Latest step: ${n(report.step)}.`,'#38bdf8'],['Best checkpoint',`score improves lexicographically`,`A report becomes best when it improves: characters with any win; then worst per-character floor penalized by caps; then mean floor; then aggregate win rate.`,'#60a5fa'],['Periodic checkpoint',`every ${n(training.save_decisions)} decisions`,`An immutable numbered checkpoint plus latest.pt and SHA-256 metadata are written every ${n(training.save_decisions)} handled decisions.`,'#818cf8'],['Promotion trigger',`${n(training.promotion_window)} episodes/character`,`The last ${n(training.promotion_window)} training episodes for every character must each reach at least ${percent(training.promote_win_rate)} wins. This stops the actor and starts deterministic evaluation.`,'#a78bfa'],['Greedy evaluation',`${n(training.promotion_runs)} runs × 5 characters`,`Argmax actions run in batches of ${n(training.evaluation_batch)}, with ${n(training.evaluation_max_steps)}-step run and ${n(training.evaluation_max_combat_steps)}-step combat caps. Promotion seed advances independently.`,'#c084fc'],['Stage outcome',promotion?`${promotion.promoted?'promoted':'stayed'} at ${n(promotion.step)}`:'no check yet',`Every character must win at least ${percent(training.promote_win_rate)} of all evaluation runs. Pass: advance to ${next?`A${next.ascension}/+${next.bonus}`:'the final stage'} and clear winning replay. Once every character reaches 10%, the auxiliary progress advantage is permanently disabled. Training stops at ${training.hours?`${training.hours} hour${training.hours===1?'':'s'}`:'no time cap'} or ${training.decisions?n(training.decisions)+' decisions':'no decision cap'}, whichever comes first.`,'#e879f9']])}</div>`);target.innerHTML=`<p><strong>Latest report:</strong> ${n(report.step)} decisions · ${n(metrics.updates)} optimizer updates · ${n(metrics.decisions_per_second,1)} decisions/s</p><div class=training-diagrams>${diagrams.join('')}</div>`}
 const stateTip=document.querySelector('#stateTip');function showStateTip(cell,x,y){stateTip.textContent=cell.dataset.tip;stateTip.style.display='block';stateTip.style.left=Math.min(x+14,innerWidth-stateTip.offsetWidth-12)+'px';stateTip.style.top=Math.min(y+14,innerHeight-stateTip.offsetHeight-12)+'px'}document.addEventListener('pointerover',event=>{const cell=event.target.closest('[data-tip]');if(cell)showStateTip(cell,event.clientX,event.clientY)});document.addEventListener('pointermove',event=>{const cell=event.target.closest('[data-tip]');if(cell)showStateTip(cell,event.clientX,event.clientY)});document.addEventListener('pointerout',event=>{if(event.target.closest('[data-tip]'))stateTip.style.display='none'});document.addEventListener('focusin',event=>{const cell=event.target.closest('[data-tip]');if(cell){const rect=cell.getBoundingClientRect();showStateTip(cell,rect.right,rect.bottom)}});document.addEventListener('focusout',event=>{if(event.target.closest('[data-tip]'))stateTip.style.display='none'});
@@ -4364,7 +4436,7 @@ def export_value_model(path, model, fingerprint, temperature, bias):
     parts = [
         b"STSVALUE", struct.pack("<IIQ", MODEL_VERSION, FEATURE_VERSION, fingerprint),
         struct.pack("<18I", model.width, model.layers, model.heads, model.feedforward,
-                    model.card_zones, len(DOMAIN_SPECS), model.layout["globals"], 8,
+                    model.card_zones, len(DOMAIN_SPECS), model.layout["globals"], 2,
                     model.entity_collections, model.head_width,
                     ACTION_FIELDS[0], ACTION_FIELDS[1], ACTION_FIELDS[3],
                     model.semantic.num_embeddings, ACTION_FIELDS[2], ACTION_FIELDS[3],
@@ -4401,11 +4473,12 @@ def export_value_model(path, model, fingerprint, temperature, bias):
     add(model.semantic.weight)
     for name, *_shape in DOMAIN_SPECS:
         add_encoder(model.encoders[name])
+    add_encoder(model.action_encoder)
     add(model.card_state); add(model.card_count.weight)
     add_transformer(model.card_transformer)
-    for module in (model.child_tuple, model.child_pool):
+    for module in (model.effect_tuple, model.history_tuple, model.actor_pool):
         add_linear(module)
-    add(model.child_state); add_linear(model.actor_mlp[0]); add_norm(model.actor_mlp[1])
+    add(model.actor_state); add_linear(model.actor_mlp[0]); add_norm(model.actor_mlp[1])
     for module in (model.entity_tuple, model.entity_pool):
         add_linear(module)
     add(model.entity_state); add_norm(model.graph_norm)
@@ -4413,10 +4486,16 @@ def export_value_model(path, model, fingerprint, temperature, bias):
                    model.graph_degree):
         add_linear(module)
     add_norm(model.graph_ff_norm); add_linear(model.graph_ff[0]); add_linear(model.graph_ff[2])
-    add(model.graph_global)
     add(model.continuation_relation.weight); add_linear(model.continuation_tuple)
     add_linear(model.continuation_pool); add_linear(model.continuation_parent)
     add_norm(model.continuation_norm)
+    add(model.candidate_scale); add(model.candidate_bias); add_linear(model.candidate_combine)
+    add_linear(model.path_adapter); add_linear(model.target_adapter); add(model.action_legal.weight)
+    add_norm(model.action_norm)
+    for module in (model.menu_object, model.menu_query, model.menu_key_value, model.menu_out,
+                   model.menu_count):
+        add_linear(module)
+    add_norm(model.menu_norm); add(model.menu_empty)
     add_linear(model.value[0]); add_linear(model.value[2])
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_bytes(b"".join(parts)); temporary.replace(path)
@@ -4541,6 +4620,50 @@ def probe_candidate_policy(model, target):
     assert single.item() == 0
 
 
+def probe_action_menu(model, target):
+    state = torch.randn(1, model.base_state_width, device=target)
+    actions = torch.randn(2, model.width, device=target)
+    grouped = (
+        torch.zeros(2, dtype=torch.long, device=target), torch.full((1,), 2., device=target),
+        torch.zeros(1, dtype=torch.long, device=target),
+        candidate_index(np.zeros(1, np.int32), 1, target),
+    )
+    assert torch.allclose(
+        model.encode_menu(state, actions, grouped), model.encode_menu(state, actions.flip(0), grouped),
+        atol=1e-6, rtol=1e-6,
+    )
+    assert not torch.allclose(
+        model.encode_menu(state, actions, grouped),
+        model.encode_menu(state, torch.stack((actions[0], actions[1] + 1)), grouped),
+    )
+    single = (
+        torch.zeros(1, dtype=torch.long, device=target), torch.ones(1, device=target),
+        torch.zeros(1, dtype=torch.long, device=target),
+        candidate_index(np.zeros(1, np.int32), 1, target),
+    )
+    assert torch.allclose(
+        model.encode_menu(state, actions[:1], single),
+        model.encode_menu(state + torch.randn_like(state), actions[:1], single),
+        atol=1e-6, rtol=1e-6,
+    )
+    separate = (
+        torch.arange(2, device=target), torch.ones(2, device=target),
+        torch.zeros(1, dtype=torch.long, device=target),
+        candidate_index(np.zeros(2, np.int32), 1, target),
+    )
+    assert not torch.allclose(
+        model.encode_menu(state, actions, separate),
+        model.encode_menu(state + torch.randn_like(state), actions, separate),
+    )
+    empty = (
+        torch.empty(0, dtype=torch.long, device=target), torch.empty(0, device=target),
+        torch.empty(0, dtype=torch.long, device=target), candidate_index([], 0, target, True),
+    )
+    assert torch.allclose(
+        model.encode_menu(state, actions[:0], empty)[0], model.menu_norm(model.menu_empty),
+    )
+
+
 def probe():
     torch.manual_seed(7); np.random.seed(7)
     assert bands([])["mean"] is None
@@ -4569,7 +4692,7 @@ def probe():
     assert (layout["model_width"], layout["model_layers"], layout["model_heads"],
             layout["model_feedforward"], layout["card_zones"], layout["entity_summaries"],
             layout["globals"], layout["state_width"], layout["action_width"],
-            layout["head_width"]) == (64, 2, 4, 128, 13, 10, 3605, 5141, 64, 112)
+            layout["head_width"]) == (64, 2, 4, 128, 5, 11, 0, 1152, 64, 112)
     for name, unsigned, signed, semantic, numeric in DOMAIN_SPECS:
         assert tuple(layout[name + suffix] for suffix in ("_u", "_s", "_c", "_f")) == (
             unsigned, signed, semantic, numeric,
@@ -4583,11 +4706,13 @@ def probe():
     assert ranges[-1][0] + ranges[-1][1] == layout["semantic_vocab"]
 
     model = Agent(layout).eval()
-    assert model.state_width == 5141 and not hasattr(model, "fusion_transformer")
+    assert model.base_state_width == 1088 and model.state_width == 1152
+    assert not hasattr(model, "fusion_transformer")
     probe_candidate_policy(model, target)
+    probe_action_menu(model, target)
     observation = env.observe_tokens()
     flat_observation = env.observe_tokens(flat=True)
-    assert np.asarray(observation[1]).shape == (8, 3605)
+    assert np.asarray(observation[1]).shape == (8, 0)
     python_rows, rust_rows = pack_batch(observation), pack_batch(flat_observation)
     assert all(int(left[0]) == int(right[0]) and all(
         np.array_equal(np.asarray(a), np.asarray(b)) for a, b in zip(left[1:], right[1:])
@@ -4612,7 +4737,7 @@ def probe():
         raise AssertionError("accepted inconsistent action auxiliaries")
     except ValueError:
         pass
-    for field in (1, 3, 4):
+    for field in (3, 4):
         corrupted = list(row); corrupted[field] = np.array(row[field], copy=True)
         words = corrupted[field].view(np.uint32)
         words.flat[0] ^= np.uint32(1)
@@ -4644,11 +4769,13 @@ def probe():
         pass
 
     inputs = tensors(observation, target, model)
+    object_group, object_count, menu_rows, _menu_sequence = inputs[5][8]
+    assert torch.equal(torch.bincount(object_group).float(), object_count)
+    assert torch.equal(menu_rows, torch.arange(8))
     card_counts = inputs[3][0][-1]
     assert card_counts.shape[1] == 6
-    assert torch.allclose(card_counts[:, 1], card_counts[:, 0].log1p())
-    assert torch.allclose(card_counts[:, 3], card_counts[:, 2].log1p())
-    assert torch.allclose(card_counts[:, 5], card_counts[:, 4].log1p())
+    for count, logarithm in ((0, 1), (2, 3), (4, 5)):
+        assert torch.allclose(card_counts[:, logarithm], (card_counts[:, count] * 64).log1p() / 5)
     codes = torch.zeros((2, DOMAIN_SPECS[DOMAIN["phase"]][3]), dtype=torch.long)
     codes[:, 0] = torch.tensor((layout["phase_semantic_start"],
                                 layout["phase_semantic_start"] + 1))
@@ -4699,8 +4826,9 @@ def probe():
         model.progress_value[-1].weight.normal_(std=.1); model.progress_value[-1].bias.fill_(-.02)
         full = model(*inputs[:6], return_state=True)
         output, state = full[:3], full[3]
-        assert torch.equal(state[:, :layout["globals"]], inputs[1].float())
-        assert state.shape == (8, 5141)
+        assert state.shape == (8, 1152)
+        blocks = state[:, :model.base_state_width].reshape(8, -1, model.width)
+        assert torch.allclose(blocks.mean(2), torch.zeros_like(blocks[:, :, 0]), atol=1e-5)
         assert torch.equal(output[0], predict(model, inputs, "fp32", policy_only=True))
         flat_output = predict(model, tensors(flat_observation, target, model), "fp32")
         replay_output = predict(model, unpack([row, row], target, model), "fp32")
@@ -4749,11 +4877,13 @@ def probe():
     padded_actions[3][candidate_batch, candidate] = np.inf
     padded = (padded[0], padded[1], padded[2], tuple(padded_actions))
     with torch.no_grad():
-        illegal_output = predict(model, _tensors(illegal, target, model), "fp32")
-        absent_output = predict(model, _tensors(absent, target, model), "fp32")
+        illegal_inputs = _tensors(illegal, target, model)
+        absent_inputs = _tensors(absent, target, model)
+        illegal_full = model(*illegal_inputs[:6], return_state=True)
+        absent_full = model(*absent_inputs[:6], return_state=True)
+        illegal_output, absent_output = illegal_full[:3], absent_full[:3]
         padded_output = predict(model, _tensors(padded, target, model), "fp32")
-    assert all(torch.allclose(left, right, atol=1e-6, rtol=1e-6)
-               for left, right in zip(illegal_output, absent_output))
+    assert not torch.allclose(illegal_full[3], absent_full[3])
     assert all(torch.allclose(left, right, atol=1e-6, rtol=1e-6)
                for left, right in zip(absent_output, padded_output))
 
@@ -4769,6 +4899,7 @@ def probe():
                for left, right in zip(output, unordered))
 
     target_env = sts2_sim.Batch(4, 911, 0)
+    target_group = None
     for _ in range(256):
         target_observation = target_env.observe_tokens()
         target_u = np.asarray(target_observation[3][0])
@@ -4777,12 +4908,22 @@ def probe():
         target_present = target_represented & (target_u[:, :, 1] != 0) & (
             target_u[:, :, 1] != np.iinfo(np.uint32).max
         )
-        if target_present.any():
+        for batch_row in range(len(target_u)):
+            groups = {}
+            for column in np.flatnonzero(target_present[batch_row]):
+                groups.setdefault((int(target_u[batch_row, column, 0]), int(target_u[batch_row, column, 14])), []).append(column)
+            target_group = next((
+                (batch_row, columns) for columns in groups.values()
+                if len(columns) > 1 and len(set(target_u[batch_row, columns, 1])) > 1
+            ), None)
+            if target_group:
+                break
+        if target_group:
             break
         target_env.step(target_legal.argmax(1).tolist())
-    assert target_present.any()
+    assert target_group is not None
     target_inputs = tensors(target_observation, target, model)
-    assert np.array_equal(target_inputs[5][-1].numpy() >= 0, target_present[target_represented])
+    assert np.array_equal(target_inputs[5][7].numpy() >= 0, target_present[target_represented])
     encoded = model.encode_domains(target_inputs[2])
     _state, nodes, actors, continuations = model.encode_state(
         target_inputs[1], target_inputs[2], encoded, target_inputs[3],
@@ -4790,14 +4931,21 @@ def probe():
     joined = model.encode_actions(
         encoded, continuations, actors, target_inputs[4], target_inputs[5], nodes,
     )[0]
-    detached_index = (*target_inputs[5][:-1], torch.full_like(target_inputs[5][-1], -1))
+    detached_index = (*target_inputs[5][:7], torch.full_like(target_inputs[5][7], -1),
+                      target_inputs[5][8])
     detached = model.encode_actions(
         encoded, continuations, actors, target_inputs[4], detached_index, nodes,
     )[0]
-    selected = target_inputs[5][-1] >= 0
+    selected = target_inputs[5][7] >= 0
     assert not torch.allclose(joined[selected], detached[selected])
     if (~selected).any():
         assert torch.allclose(joined[~selected], detached[~selected])
+    target_row, columns = target_group
+    flat = np.full(target_represented.shape, -1, np.int32)
+    flat[target_represented] = np.arange(target_represented.sum())
+    leaves = torch.as_tensor(flat[target_row, columns], device=target)
+    assert target_inputs[5][8][0][leaves].unique().numel() == 1
+    assert not torch.allclose(joined[leaves[0]], joined[leaves[1]])
 
     dense = copy.deepcopy(model).cpu()
     sequence_row = np.repeat(np.arange(4), (0, 1, 2, 16))
@@ -4872,7 +5020,7 @@ def probe():
     parity_error = float(np.max(np.abs(rust_value - python_value)))
     assert parity_error <= 1e-5, parity_error
     parameters = sum(parameter.numel() for parameter in model.parameters())
-    assert 2_000_000 <= parameters <= 2_300_000
+    assert 800_000 <= parameters <= 1_500_000
     print(json.dumps({
         "device": str(accelerator), "layout": layout, "parameters": parameters,
         "state_width": model.state_width,
@@ -4888,7 +5036,7 @@ def parser():
     root = argparse.ArgumentParser()
     commands = root.add_subparsers(dest="command", required=True)
     run = commands.add_parser("train")
-    run.add_argument("--output", default="target/v61")
+    run.add_argument("--output", default="target/v62")
     run.add_argument("--checkpoint")
     run.add_argument("--width", type=int)
     run.add_argument("--layers", type=int)
