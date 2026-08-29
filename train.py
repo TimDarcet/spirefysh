@@ -22,10 +22,10 @@ import sts2_sim
 
 
 FEATURE_VERSION = 55
-MODEL_VERSION = 63
+MODEL_VERSION = 64
 PRECISIONS = ("fp32", "bf16")
 WINNING_CAPACITY = 4096
-CHANGE = "V63: release-optimized V62 architecture with stable-shape training and batch 4096."
+CHANGE = "V64: uniformly random minibatches across all compute costs."
 STAGES = [(0, bonus) for bonus in (24, 20, 16, 12, 8, 4, 0)] + [
     (ascension, 0) for ascension in range(1, 11)
 ]
@@ -2079,14 +2079,6 @@ def unpack(rows, target, model):
     )
 
 
-def minibatch_scores(rows, model):
-    return [
-        (int(row[2].sum()) + len(row[4])) * model.width
-        + model.heads * (len(row[4]) + 1)
-        for row in rows
-    ]
-
-
 class WinningReservoir:
     def __init__(self, capacity, envs, pending_capacity=None):
         self.capacity = capacity
@@ -2211,19 +2203,9 @@ class WinningReservoir:
         self.wins = self.skipped = self.forced = 0
         return result
 
-    def sample(self, count, rng, character_start):
-        groups = self.by_character(character_start)
-        pools = [rng.permutation([
-            index for index in group if self.rows[index][4] is not None
-        ]).tolist() for group in groups]
-        count = min(count, sum(map(len, pools)))
-        selected = []
-        while len(selected) < count:
-            for character in rng.permutation(5):
-                if pools[character]:
-                    selected.append(pools[character].pop())
-                    if len(selected) == count:
-                        break
+    def sample(self, count, rng):
+        pool = [index for index, row in enumerate(self.rows) if row[4] is not None]
+        selected = rng.choice(pool, min(count, len(pool)), replace=False)
         return [self.rows[index] for index in selected]
 
 
@@ -2652,15 +2634,14 @@ class ExperienceDataset:
             "action": np.empty(0, np.int64), "old": np.empty(0, np.float32),
             "advantage": np.empty(0, np.float32), "progress_advantage": np.empty(0, np.float32),
             "returns": np.empty(0, np.float32), "progress_returns": np.empty(0, np.float32),
-            "character": np.empty(0, np.int8), "priority": np.empty(0, np.float32),
-            "version": np.empty(0, np.int64),
+            "character": np.empty(0, np.int8), "version": np.empty(0, np.int64),
         }
         self.seen = self.stale_dropped = self.ratio_dropped = self.kl_dropped = self.post_kl_dropped = 0
 
     def __len__(self):
         return len(self.rows)
 
-    def add(self, result, args, model, progress_active=True):
+    def add(self, result, args):
         trajectories = result["trajectories"]
         if not trajectories:
             return 0
@@ -2720,8 +2701,6 @@ class ExperienceDataset:
                 next_value = value[step]; next_progress = remaining_progress[step]
         returns = np.clip(advantage + value, 0, 1)
         progress_returns = progress_value_advantage + remaining_progress + progress_floor
-        priority = 1 + np.abs(advantage) + progress_active * np.abs(progress_advantage) \
-            + 4 * terminal + 4 * (returns > .5)
         values = {
             "action": np.asarray([
                 item for trajectory in trajectories for item in trajectory["choices"]
@@ -2734,7 +2713,6 @@ class ExperienceDataset:
             "character": np.asarray([
                 item for trajectory in trajectories for item in trajectory["characters"]
             ], np.int8),
-            "priority": priority.astype(np.float32),
             "version": np.asarray([
                 item for trajectory in trajectories for item in trajectory["versions"]
             ], np.int64),
@@ -2763,23 +2741,7 @@ class ExperienceDataset:
 
     def sample(self, size, rng):
         size = min(size, len(self))
-        pool = np.arange(len(self))
-        selected = []
-        for rank, character in enumerate(rng.permutation(5)):
-            count = size // 5 + (rank < size % 5)
-            group = pool[self.data["character"][pool] == character]
-            take = min(count, len(group))
-            if take:
-                priority = np.sqrt(self.data["priority"][group])
-                selected.extend(rng.choice(group, take, False, priority / priority.sum()).tolist())
-        if len(selected) < size:
-            remaining = np.setdiff1d(pool, selected, assume_unique=False)
-            priority = np.sqrt(self.data["priority"][remaining])
-            selected.extend(rng.choice(
-                remaining, size - len(selected), False, priority / priority.sum()
-            ).tolist())
-        rng.shuffle(selected)
-        return np.asarray(selected)
+        return rng.choice(len(self), size, replace=False)
 
 
 def train_stream(model, optimizer, args, sampler_session, stage, target, deadline, budget,
@@ -2798,7 +2760,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         + (f"{args.segment_steps}-decision bootstrapped segments" if args.segment_steps
            else "complete terminal trajectories"),
         "Bounded queue → policy-lag and action-ratio freshness filters",
-        "CPU-prefetched, character-balanced, advantage-prioritized full batches",
+        "CPU-prefetched uniform random full batches across all compute costs",
         f"{model.layers}-layer card encoder + party/enemy/map summaries + action-object menu → heads",
         f"Asynchronous clipped PPO + weights published every {args.publish_updates} updates",
     ]
@@ -2893,7 +2855,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         sampler_iterations[worker] = result["iteration"]
         latest_sampler_version = min(sampler_versions)
         latest_sampler_iteration = max(sampler_iterations)
-        decisions += dataset.add(result, args, model, progress_active)
+        decisions += dataset.add(result, args)
         if decisions >= budget:
             stop.set()
         sampled += result["sampled_steps"]
@@ -2974,7 +2936,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         values = {key: dataset.data[key][index].copy() for key in dataset.data}
         dataset.discard(index)
         replay_limit = len(index) // 9
-        replay = reservoir.sample(replay_limit, rng, model.character_start) if replay_limit else []
+        replay = reservoir.sample(replay_limit, rng) if replay_limit else []
         packed = packer.submit(
             unpack, rows + [sample[0] for sample in replay], torch.device("cpu"), model
         )
@@ -3494,12 +3456,10 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             update_durations.append(update_elapsed)
             if update_elapsed > 5:
                 packed = rows + [sample[0] for sample in replay]
-                scores = minibatch_scores(packed, model)
                 represented_actions = max(len(row[4]) for row in packed)
                 print(json.dumps({"slow_update": {
                     "seconds": update_elapsed,
                     "fresh": len(rows), "replay": len(replay),
-                    "score_min": int(min(scores)), "score_max": int(max(scores)),
                     "state_tokens_max": max(int(row[2].sum()) for row in packed),
                     "represented_actions_max": represented_actions,
                     "state_attention_pairs": sum((int(row[2].sum()) + 1) ** 2 for row in packed),
@@ -4126,6 +4086,22 @@ function showVersion(){const run=versions[versionSelect.value],reports=run.repor
         "${report.pipeline.map(step=>`<span>${step}</span>`).join('')}",
         "${report.pipeline.map(step=>`<span>${manifest.model_version>=51&&step.includes('shared card-zone Transformer')?`${architecture.layers}-layer card/actor/map fusion → candidate-conditioned policy and critic`:step}</span>`).join('')}",
     )
+    content = content.replace(
+        "['Priority',`1+|Awin|+|Aprogress|+terminal/win bonuses`,`Each row gets priority 1 + |policy advantage| + |progress advantage| + 4×terminal + 4×winning-return. Sampling uses the square root of priority.",
+        "[manifest.model_version>=64?'Uniform random sampling':'Priority',manifest.model_version>=64?'equal probability for every queued row':`1+|Awin|+|Aprogress|+terminal/win bonuses`,manifest.model_version>=64?'Fresh rows are selected uniformly without replacement; advantage, terminal status, character and compute cost do not affect selection.':'Each row gets priority 1 + |policy advantage| + |progress advantage| + 4×terminal + 4×winning-return. Sampling uses the square root of priority.",
+    ).replace(
+        "['Token-cost bucket',`one bucket per batch`,`Rows are bucketed by floor(log2(estimated token/attention cost)). A bucket is chosen by total priority to reduce padding and attention waste.",
+        "[manifest.model_version>=64?'Mixed compute costs':'Token-cost bucket',manifest.model_version>=64?'one uniform random pool':`one bucket per batch`,manifest.model_version>=64?'Every minibatch freely mixes short and long states, action menus and card zones. No compute-cost score or bucket exists.':'Rows are bucketed by floor(log2(estimated token/attention cost)). A bucket is chosen by total priority to reduce padding and attention waste.",
+    ).replace(
+        "['Balanced one-pass batch',`up to ${n(batch)} rows`,`Each batch draws evenly across the five characters when possible, without replacement, then deletes those rows from the dataset.",
+        "[manifest.model_version>=64?'Uniform one-pass batch':'Balanced one-pass batch',`up to ${n(batch)} rows`,manifest.model_version>=64?'Each batch is a uniform sample of all queued rows without replacement, then deletes those rows from the dataset.':'Each batch draws evenly across the five characters when possible, without replacement, then deletes those rows from the dataset.",
+    ).replace(
+        "Only candidates no more expensive than the fresh token-cost bucket are packed.",
+        "${manifest.model_version>=64?'Replay candidates are sampled without any compute-cost compatibility filter.':'Only candidates no more expensive than the fresh token-cost bucket are packed.'}",
+    ).replace(
+        "['Balanced compatible sample','≤10% of update data',`Candidates are round-robin balanced across characters.",
+        "[manifest.model_version>=64?'Uniform replay sample':'Balanced compatible sample','≤10% of update data',manifest.model_version>=64?'Reservoir rows are selected uniformly without replacement.':'Candidates are round-robin balanced across characters.",
+    )
     target.mkdir(parents=True, exist_ok=True)
     temporary = target / "dashboard.html.tmp"
     temporary.write_text(content)
@@ -4246,7 +4222,7 @@ def train(args):
     promotions_dir = output / "promotions"; promotions_dir.mkdir(exist_ok=continuing)
     stage = source["stage"] if source else 0
     reservoir = WinningReservoir(WINNING_CAPACITY, args.envs)
-    if source and source.get("winning_reservoir"):
+    if source and source.get("_source_model_version") == MODEL_VERSION and source.get("winning_reservoir"):
         reservoir.load_state_dict(source["winning_reservoir"])
         missing = [index for index, row in enumerate(reservoir.rows) if row[4] is None]
         for start in range(0, len(missing), 128):
@@ -4478,7 +4454,7 @@ def load(path, target):
     live = sts2_sim.Batch(1, 0, None, ascension=0)
     layout = dict(live.token_layout())
     version = checkpoint.get("model_version")
-    if checkpoint.get("schema") != 1 or version != MODEL_VERSION:
+    if checkpoint.get("schema") != 1 or version not in (63, MODEL_VERSION):
         raise ValueError("incompatible checkpoint")
     if checkpoint.get("feature_version") != FEATURE_VERSION or layout["version"] != FEATURE_VERSION:
         raise ValueError("incompatible feature version")
@@ -4493,12 +4469,13 @@ def load(path, target):
         raise ValueError("invalid checkpoint architecture") from error
     if config != architecture(model):
         raise ValueError("incompatible model architecture")
-    missing, unexpected = model.load_state_dict(checkpoint["model"], strict=version == MODEL_VERSION)
+    missing, unexpected = model.load_state_dict(checkpoint["model"], strict=True)
     if missing or unexpected:
         raise ValueError("incompatible model migration")
     checkpoint["_optimizer_compatible"] = migrate_optimizer(
         checkpoint["optimizer"], len(tuple(model.parameters()))
     )
+    checkpoint["_source_model_version"] = version
     checkpoint["model_version"] = MODEL_VERSION
     checkpoint["architecture"] = architecture(model)
     return model, checkpoint
@@ -4975,14 +4952,20 @@ def probe():
         "terminals": [False, False], "characters": [0, 0], "versions": [3, 3],
         "bootstrap_value": .25, "bootstrap_progress": .2, "bootstrap_version": 3,
     }
-    assert ExperienceDataset().add(
-        {"trajectories": [segment]}, argparse.Namespace(gae_lambda=1., progress_gamma=1.), model,
+    dataset = ExperienceDataset()
+    assert dataset.add(
+        {"trajectories": [segment]}, argparse.Namespace(gae_lambda=1., progress_gamma=1.),
     ) == 2
+    assert "priority" not in dataset.data
+    assert np.array_equal(
+        dataset.sample(2, np.random.default_rng(19)),
+        np.random.default_rng(19).choice(2, 2, replace=False),
+    )
     mismatched = copy.deepcopy(segment); mismatched["bootstrap_version"] = 4
     try:
         ExperienceDataset().add(
             {"trajectories": [mismatched]},
-            argparse.Namespace(gae_lambda=1., progress_gamma=1.), model,
+            argparse.Namespace(gae_lambda=1., progress_gamma=1.),
         )
         raise AssertionError("accepted mixed-version bootstrap")
     except ValueError:

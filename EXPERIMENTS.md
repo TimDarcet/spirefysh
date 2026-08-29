@@ -2221,3 +2221,9 @@ Next: Require the live second window to reproduce at least `1,000` end-to-end de
 Experiment: Remove the separate 256-run-per-character promotion panel. After every report, inspect the latest 200 completed training trajectories as one chronological window, group them by character, and advance immediately when every character appears and has a win rate strictly above `20%`. Manual `--promote-now` now advances unconditionally. Fixed development panels remain diagnostic and continue selecting stage champions.
 
 Rationale: The prior promotion panel duplicated evaluation work, blocked training for tens of minutes, and retained excessive memory. The rolling rule reacts directly to current sampled-policy performance while still requiring success from all five characters.
+
+## 2026-08-29 — MODEL64 uniform random batching
+
+Experiment: Continue the MODEL63 weights and optimizer with the same FEATURE55 architecture, batch `4,096`, and learning rate `6e-4`, but remove every batching dependency on estimated compute cost or learning priority. Fresh rows and winning replay are sampled uniformly without replacement from their complete available pools.
+
+Rationale: Cost-homogeneous batches can align game phase and action complexity across an update, creating avoidable gradient oscillation. MODEL64 deliberately mixes short and long states, menus, and card zones in every batch. Character balance, advantage priority, terminal bonuses, cost scores, cost buckets, and replay cost compatibility no longer affect selection.
