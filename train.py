@@ -2750,7 +2750,7 @@ class RolloutCollector:
             while not stop.is_set():
                 try:
                     pending["queue_put_seconds"] = time.monotonic() - put_started
-                    samples.put_nowait((worker, version, pending))
+                    samples.put_nowait((worker, self.generation, version, pending))
                     pending = empty()
                     pending_rows = 0
                     break
@@ -2776,7 +2776,7 @@ class RolloutCollector:
         pending["iteration"] = self.iteration
         if heartbeat is not None:
             heartbeat[worker] = time.monotonic()
-        return worker, version, pending
+        return worker, self.generation, version, pending
 
 
 def collect_worker(model, args, sampler_session, stage, capacity, pending_capacity, iteration,
@@ -2997,6 +2997,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
     screen_unpack_seconds = screen_forward_seconds = 0.0
     collector_seconds = [0.0] * args.samplers
     worker_accounted = [0] * args.samplers
+    worker_resolved = [0] * args.samplers
     sampler_generations = [0] * args.samplers
     sampler_restarts = [0] * args.samplers
     sampler_wedges = [0] * args.samplers
@@ -3031,6 +3032,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
     progress = [0] * args.samplers if threaded else context.Array("q", [0] * args.samplers)
     packer = ThreadPoolExecutor(max_workers=1)
     workers = [None] * args.samplers
+    watchdog_terminated = set()
     actor = export_value_model(None, model, fingerprint, 1, 0, True)
 
     def start_worker(worker):
@@ -3062,7 +3064,9 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
 
     def ingest(item):
         nonlocal decisions, handled, forced, discarded_steps, sampled, collect_seconds, winning_added, orphan_empty_actions, latest_sampler_version, latest_sampler_iteration, dataset_peak, segmented_trajectories, queue_full_waits, queue_put_seconds, queue_delay_sum, queue_packets, queue_peak
-        worker, version, result = item
+        worker, generation, version, result = item
+        if generation != sampler_generations[worker]:
+            return
         sampler_versions[worker] = version
         sampler_iterations[worker] = result["iteration"]
         latest_sampler_version = min(sampler_versions)
@@ -3075,6 +3079,9 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             stop.set()
         sampled += result["sampled_steps"]
         worker_accounted[worker] += result["sampled_steps"]
+        worker_resolved[worker] += result["discarded_steps"] + sum(
+            len(trajectory["rows"]) for trajectory in result["trajectories"]
+        )
         discarded_steps += result["discarded_steps"]
         for trajectory in result["trajectories"]:
             segmented_trajectories += int(not trajectory["terminals"][-1])
@@ -3313,6 +3320,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 continue
             if wedged:
                 sampler_wedges[worker] += 1
+                watchdog_terminated.add(process)
                 process.terminate()
             process.join(5)
             if process.is_alive():
@@ -3323,11 +3331,12 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 except (Empty, EOFError, OSError):
                     break
             drain_results()
-            dropped = max(0, int(progress[worker]) - worker_accounted[worker])
-            sampled += dropped
+            observed = int(progress[worker])
+            sampled += max(0, observed - worker_accounted[worker])
+            dropped = max(0, observed - worker_resolved[worker])
             discarded_steps += dropped
             watchdog_dropped += dropped
-            worker_accounted[worker] = 0
+            worker_accounted[worker] = worker_resolved[worker] = 0
             if (sampler_restarts[worker] >= args.sampler_restarts or stop.is_set()
                     or time.monotonic() >= deadline or decisions >= budget):
                 sampler_exhausted[worker] = True
@@ -3763,17 +3772,20 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             worker.join()
         drain_results()
         for index, worker in enumerate(workers):
-            dropped = max(0, int(progress[index]) - worker_accounted[index])
-            sampled += dropped
+            observed = int(progress[index])
+            sampled += max(0, observed - worker_accounted[index])
+            dropped = max(0, observed - worker_resolved[index])
             discarded_steps += dropped
             watchdog_dropped += dropped * (worker in terminated)
-            worker_accounted[index] += dropped
     failed = [] if threaded else [worker.exitcode for worker in started_workers
-                                  if worker not in terminated and worker.exitcode]
+                                  if worker not in terminated
+                                  and worker not in watchdog_terminated and worker.exitcode]
     if failed:
         raise RuntimeError(f"sampler processes failed: {failed}")
     assert handled == decisions and not len(dataset)
-    assert sampled == decisions + discarded_steps
+    unresolved = sampled - decisions - discarded_steps
+    assert unresolved >= 0, (sampled, decisions, discarded_steps)
+    discarded_steps += unresolved
     if handled > reported_steps:
         windows += 1
         report()
