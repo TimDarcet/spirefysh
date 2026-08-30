@@ -3393,7 +3393,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     if sampler_done or not ingested:
                         break
                     continue
-                pending.append(reserve_batch(min(args.batch, boundary)))
+                pending.append(reserve_batch(min(args.batch, len(dataset)) if sampler_done else args.batch))
             if not pending:
                 if sampler_done and not len(dataset):
                     break
@@ -3508,7 +3508,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 drain_samples()
                 boundary = min(next_report, next_save) - (base_decisions + handled)
                 if boundary > 0 and len(dataset) >= args.batch:
-                    pending.append(reserve_batch(min(args.batch, boundary)))
+                    pending.append(reserve_batch(args.batch))
             policy_lags.extend((updates - values["version"]).tolist())
             fresh = torch.ones_like(log_ratio, dtype=torch.bool)
             critic_mask = mask = torch.ones_like(log_ratio)
@@ -4420,7 +4420,6 @@ def train(args):
     training_seconds = promotion_seconds = 0.0
     best_path = output / "best.json"
     best = json.loads(best_path.read_text()) if best_path.exists() else {}
-    best_score = tuple(best.get("global_score", ()))
     stage_bests = load_stage_bests(output, development_dir, checkpoints_dir, best)
     for key, record in stage_bests.items():
         champion = champions_dir / f"{int(key):02}.pt"
@@ -4483,42 +4482,14 @@ def train(args):
         sampler_session += 1
         base = decisions
         budget = args.decisions - decisions if args.decisions else (1 << 62) // args.envs * args.envs
-        last_checkpoint = last_development = None
+        last_checkpoint = None
         def save_step(step):
-            nonlocal last_checkpoint, last_development, best_score
+            nonlocal last_checkpoint
             checkpoint = checkpoints_dir / f"{step:012}.pt"
             immutable_digest = save(checkpoint, step, False)
             link_checkpoint(checkpoint, latest)
             digest = immutable_digest
             last_checkpoint = step, checkpoint, immutable_digest
-            result = evaluate(
-                model, args, target, args.development_seed, args.development_runs, stage,
-                args.evaluation_max_steps, args.evaluation_max_combat_steps,
-            )
-            score = evaluation_score(result)
-            evaluation = {
-                "schema": 1, "step": step, "seed": args.development_seed,
-                "stage": {"index": stage, "ascension": STAGES[stage][0], "bonus": STAGES[stage][1]},
-                "score": score, "result": result,
-            }
-            immutable_json(development_dir / f"{step:012}.json", evaluation)
-            last_development = evaluation
-            record = {
-                "step": step, "score": score, "stage": evaluation["stage"],
-                "checkpoint": str(checkpoint.relative_to(output)),
-                "sha256": immutable_digest, "development": result,
-            }
-            if score > tuple(stage_bests.get(str(stage), {}).get("score", ())):
-                champion = champions_dir / f"{stage:02}.pt"
-                link_checkpoint(checkpoint, champion)
-                record["artifact"] = str(champion.relative_to(output))
-                stage_bests[str(stage)] = record
-            global_score = (stage, *score)
-            if global_score > best_score:
-                best_score = global_score
-                best.update(record | {"global_score": global_score})
-            best["stages"] = stage_bests
-            atomic_json(best_path, best)
             atomic_json(output / "latest.json", {
                 "step": step, "stage": stage, "sampler_session": sampler_session,
                 "checkpoint": latest.name,
@@ -4526,8 +4497,6 @@ def train(args):
                 "immutable_sha256": immutable_digest, "sha256": digest,
             })
         def save_report(point, pipeline, window):
-            if last_development and last_development["step"] == point["steps"]:
-                point["development"] = last_development["result"]
             row = {
                 "schema": 1, "step": point["steps"], "window": window,
                 "sampler_session": sampler_session,
@@ -4760,8 +4729,14 @@ def export_value_model(path, model, fingerprint, temperature, bias, actor=False)
         struct.pack("<2f", temperature, bias),
     ]
 
+    values = []
+
     def add(value):
-        parts.append(value.detach().float().cpu().contiguous().numpy().astype("<f4", copy=False).tobytes())
+        values.append(value.detach().reshape(-1))
+
+    def flush():
+        parts.append(torch.cat(values).float().cpu().numpy().astype("<f4", copy=False).tobytes())
+        values.clear()
 
     def add_linear(module):
         add(module.weight)
@@ -4812,9 +4787,11 @@ def export_value_model(path, model, fingerprint, temperature, bias, actor=False)
     add_norm(model.menu_norm); add(model.menu_empty)
     add_linear(model.value[0]); add_linear(model.value[2])
     if actor:
+        flush()
         parts.append(b"STSACTOR")
         for head in (model.policy, model.progress_value):
             add_linear(head[0]); add_linear(head[2])
+    flush()
     data = b"".join(parts)
     if path is None:
         return data

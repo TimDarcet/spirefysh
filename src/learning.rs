@@ -11783,6 +11783,7 @@ mod python {
     use pyo3::{
         exceptions::PyValueError,
         prelude::*,
+        pybacked::PyBackedBytes,
         types::{PyBytes, PyList, PyTuple},
     };
     use std::collections::{HashMap, HashSet};
@@ -12405,10 +12406,21 @@ mod python {
         Bound<'py, PyArray2<bool>>,
     )> {
         let batch = rows.len();
-        let packed = rows
+        let compact = rows
             .iter()
-            .map(|row| packed_data(&row))
-            .collect::<PyResult<Vec<_>>>()?;
+            .map(|row| row.extract::<PyBackedBytes>())
+            .collect::<PyResult<Vec<_>>>();
+        let packed = match compact {
+            Ok(rows) => py.allow_threads(|| {
+                rows.par_iter()
+                    .map(|row| compact_data(row))
+                    .collect::<PyResult<Vec<_>>>()
+            })?,
+            Err(_) => rows
+                .iter()
+                .map(|row| packed_data(&row))
+                .collect::<PyResult<Vec<_>>>()?,
+        };
         let mut characters = Vec::with_capacity(batch);
         let mut globals = Vec::with_capacity(batch * PUBLIC_GLOBALS);
         let mut lengths = Vec::with_capacity(batch);
