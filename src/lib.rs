@@ -2,6 +2,10 @@
 //!
 //! The learning module exposes an optional player-visible value model.
 
+#[cfg(feature = "python")]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::{collections::HashSet, ops::RangeInclusive};
 
 mod foundation;

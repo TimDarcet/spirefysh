@@ -1,5 +1,6 @@
 import argparse
 import copy
+import ctypes
 import fcntl
 import hashlib
 import json
@@ -9,10 +10,11 @@ import os
 import pickle
 import struct
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from queue import Empty, Full
+from queue import Empty, Full, Queue
 
 import numpy as np
 import torch
@@ -22,10 +24,10 @@ import sts2_sim
 
 
 FEATURE_VERSION = 55
-MODEL_VERSION = 67
+MODEL_VERSION = 68
 PRECISIONS = ("fp32", "bf16")
 WINNING_CAPACITY = 0
-CHANGE = "V67: screened reusable batches with full-model updates."
+CHANGE = "V68: native actors and compact transport with full-model updates."
 STAGES = [(0, bonus) for bonus in (24, 20, 16, 12, 8, 4, 0)] + [
     (ascension, 0) for ascension in range(1, 11)
 ]
@@ -578,6 +580,57 @@ kernel void semantic_forward(
     }
 }
 
+kernel void ragged_log_softmax(
+    device const float *score, device const int *offsets, device float *output,
+    constant uint& rows, uint row [[thread_position_in_grid]]) {
+    int begin = offsets[row], end = offsets[row + 1];
+    float maximum = -INFINITY;
+    for (int index = begin; index < end; ++index) maximum = max(maximum, score[index]);
+    float sum = 0.0f;
+    for (int index = begin; index < end; ++index) sum += exp(score[index] - maximum);
+    float normalizer = maximum + log(sum);
+    for (int index = begin; index < end; ++index)
+        output[index] = isfinite(score[index]) ? score[index] - normalizer : 0.0f;
+}
+
+kernel void ragged_log_softmax_bfloat(
+    device const bfloat *score, device const int *offsets, device bfloat *output,
+    constant uint& rows, uint row [[thread_position_in_grid]]) {
+    int begin = offsets[row], end = offsets[row + 1];
+    float maximum = -INFINITY;
+    for (int index = begin; index < end; ++index) maximum = max(maximum, float(score[index]));
+    float sum = 0.0f;
+    for (int index = begin; index < end; ++index) sum += exp(float(score[index]) - maximum);
+    float normalizer = maximum + log(sum);
+    for (int index = begin; index < end; ++index)
+        output[index] = isfinite(float(score[index])) ? bfloat(float(score[index]) - normalizer) : bfloat(0.0f);
+}
+
+kernel void ragged_log_softmax_backward(
+    device const float *score, device const float *output, device const float *grad_output,
+    device const int *offsets, device float *grad_score,
+    constant uint& rows, uint row [[thread_position_in_grid]]) {
+    int begin = offsets[row], end = offsets[row + 1];
+    float sum = 0.0f;
+    for (int index = begin; index < end; ++index)
+        if (isfinite(score[index])) sum += grad_output[index];
+    for (int index = begin; index < end; ++index)
+        grad_score[index] = isfinite(score[index]) ? grad_output[index] - exp(output[index]) * sum : 0.0f;
+}
+
+kernel void ragged_log_softmax_backward_bfloat(
+    device const bfloat *score, device const bfloat *output, device const bfloat *grad_output,
+    device const int *offsets, device bfloat *grad_score,
+    constant uint& rows, uint row [[thread_position_in_grid]]) {
+    int begin = offsets[row], end = offsets[row + 1];
+    float sum = 0.0f;
+    for (int index = begin; index < end; ++index)
+        if (isfinite(float(score[index]))) sum += float(grad_output[index]);
+    for (int index = begin; index < end; ++index)
+        grad_score[index] = isfinite(float(score[index]))
+            ? bfloat(float(grad_output[index]) - exp(float(output[index])) * sum) : bfloat(0.0f);
+}
+
 """
 
 
@@ -663,6 +716,33 @@ class _RaggedSummaryAttention(torch.autograd.Function):
         return grad_query, grad_key_value, None, None, None
 
 
+class _RaggedLogSoftmax(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, score, offsets):
+        if _RaggedAttention.library is None:
+            _RaggedAttention.library = torch.mps.compile_shader(_TRAINING_METAL)
+        library = _RaggedAttention.library
+        suffix = "_bfloat" if score.dtype == torch.bfloat16 else ""
+        output = torch.empty_like(score)
+        rows = len(offsets) - 1
+        getattr(library, f"ragged_log_softmax{suffix}")(
+            score, offsets, output, rows, threads=rows, group_size=256,
+        )
+        ctx.save_for_backward(score, offsets, output)
+        ctx.library, ctx.suffix, ctx.rows = library, suffix, rows
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        score, offsets, output = ctx.saved_tensors
+        grad_score = torch.empty_like(score)
+        getattr(ctx.library, f"ragged_log_softmax_backward{ctx.suffix}")(
+            score, output, grad_output.contiguous(), offsets, grad_score, ctx.rows,
+            threads=ctx.rows, group_size=256,
+        )
+        return grad_score, None
+
+
 class _FusedTokens(torch.autograd.Function):
     @staticmethod
     def forward(ctx, indices, offsets, numeric, numeric_index, numeric_row,
@@ -713,7 +793,7 @@ class _FusedTokens(torch.autograd.Function):
             grad_input, indices, offsets, occurrence, count, empty, len(embedding),
             False, 0, False, None, -1,
         )
-        grad_numeric = grad_input[numeric_index].T @ numeric
+        grad_numeric = grad_input[numeric_index].T @ numeric.to(grad_input.dtype)
         return None, None, None, None, None, grad_embedding, grad_numeric, grad_gamma, grad_beta
 
 
@@ -769,7 +849,7 @@ class _FusedSemantic(torch.autograd.Function):
         )
         grad_field = (scaled * nn.functional.embedding(ids, embedding) * mask).sum(0)
         return (
-            None, None, grad_embedding, grad_field, grad_input.T @ numeric,
+            None, None, grad_embedding, grad_field, grad_input.T @ numeric.to(grad_input.dtype),
             grad_input.sum(0), grad_gamma, grad_beta,
         )
 
@@ -923,7 +1003,7 @@ class Agent(nn.Module):
         self.progress_value = nn.Sequential(
             nn.Linear(self.state_width, self.head_width), nn.ReLU(), nn.Linear(self.head_width, 1),
         )
-        self._card_cache, self._graph_cache = {}, {}
+        self._graph_cache = {}
         self.cache_stats = {"card_hit": 0, "card_miss": 0, "graph_hit": 0, "graph_miss": 0}
         nn.init.normal_(self.policy[-1].weight, std=0.01)
         nn.init.zeros_(self.policy[-1].bias)
@@ -932,13 +1012,13 @@ class Agent(nn.Module):
             nn.init.zeros_(head[-1].bias)
 
     def load_state_dict(self, state_dict, strict=True, assign=False):
-        self._card_cache.clear(); self._graph_cache.clear()
+        self._graph_cache.clear()
         self.cache_stats = dict.fromkeys(self.cache_stats, 0)
         return super().load_state_dict(state_dict, strict, assign=assign)
 
     def train(self, mode=True):
         if mode:
-            self._card_cache.clear(); self._graph_cache.clear()
+            self._graph_cache.clear()
             self.cache_stats = dict.fromkeys(self.cache_stats, 0)
         return super().train(mode)
 
@@ -1041,47 +1121,13 @@ class Agent(nn.Module):
         pooled = pool_linear(torch.cat((pooled, exact / 64, exact.log1p() / 5), 1))
         return torch.relu(pooled + state.to(pooled.dtype))[:groups]
 
-    def encode_cards(self, encoded, raw, cards):
-        source, raw_source, sequence, zones, inverse, source_count, counts = cards
+    def encode_cards(self, encoded, cards):
+        source, sequence, zones, inverse, source_count, counts = cards
         states = self.card_state[zones] + self.card_count(counts.to(encoded.dtype))
-        if self.training or encoded.device.type != "cpu":
-            values = encoded[source]
-            if len(source) > source_count:
-                values = values.clone(); values[source_count:] = 0
-            return self.encode_sequence(
-                values, sequence, states, self.card_transformer, True,
-            )[0][inverse]
-        semantic, numeric = raw[-2:]
-        lengths = (sequence[0][1:] - sequence[0][:-1] - 1).tolist()
-        values = [None] * len(lengths)
-        missing = []
-        cursor = 0
-        for group, length in enumerate(lengths):
-            selected = source[cursor:cursor + length]
-            raw_selected = raw_source[cursor:cursor + length]
-            cursor += length
-            key = (int(zones[group]), semantic[raw_selected].tobytes(), numeric[raw_selected].tobytes())
-            value = self._card_cache.get(key)
-            if value is None:
-                self.cache_stats["card_miss"] += 1
-                missing.append((group, key, selected))
-            else:
-                self.cache_stats["card_hit"] += 1
-                values[group] = value
-        if missing:
-            selected = torch.cat([row[2] for row in missing])
-            row = np.repeat(np.arange(len(missing), dtype=np.int32), [len(item[2]) for item in missing])
-            summaries = self.encode_sequence(
-                encoded[selected], sequence_index(row, len(missing), encoded.device),
-                self.card_state[zones[[item[0] for item in missing]]]
-                + self.card_count(counts[[item[0] for item in missing]].to(encoded.dtype)),
-                self.card_transformer, True,
-            )[0]
-            for (group, key, _selected), value in zip(missing, summaries):
-                value = value.detach(); values[group] = value; self._card_cache[key] = value
-            while len(self._card_cache) > 8192:
-                self._card_cache.pop(next(iter(self._card_cache)))
-        return torch.stack(values)[inverse]
+        values = encoded[source]
+        if len(source) > source_count:
+            values = values.clone(); values[source_count:] = 0
+        return self.encode_sequence(values, sequence, states, self.card_transformer, True)[0][inverse]
 
     def attend(self, query, key_value, sequence):
         offsets, rows, position, max_length = sequence
@@ -1101,21 +1147,31 @@ class Agent(nn.Module):
     @staticmethod
     def group_log_softmax(score, legal, index):
         offsets, group, position, maximum = index
-        padded = score.new_full((len(offsets) - 1, maximum), -torch.inf)
-        padded[group, position] = score.masked_fill(~legal, -torch.inf)
-        normalizer = padded.logsumexp(1)
+        if score.device.type == "mps":
+            return _RaggedLogSoftmax.apply(score.masked_fill(~legal, -torch.inf), offsets)
+        score = score.masked_fill(~legal, -torch.inf)
+        normalizer = score.new_full((len(offsets) - 1,), -torch.inf).scatter_reduce_(
+            0, group, score, reduce="amax",
+        )
+        normalizer = normalizer + score.new_zeros(len(normalizer)).index_add(
+            0, group, (score - normalizer[group]).exp(),
+        ).log()
         value = score - torch.where(torch.isfinite(normalizer), normalizer, 0)[group]
         return torch.where(legal, value, torch.zeros_like(value))
 
     def score(self, state, action, row):
         return self.policy(torch.cat((state[row], action), 1)).squeeze(-1)
 
-    def decide(self, state, action, action_row, action_flat, actions, legal, sequence, temperature=1):
+    def decide(self, state, action, action_row, action_flat, actions, legal, sequence,
+               action_count, temperature=1, flat=False):
         scores = self.group_log_softmax(
-            self.score(state, action, action_row) / temperature, legal, sequence,
+            self.score(state, action, action_row)[:action_count] / temperature,
+            legal[:action_count], sequence,
         )
+        if flat:
+            return scores
         policy = scores.new_zeros(len(state) * actions).scatter(
-            0, action_flat, scores,
+            0, action_flat[:action_count], scores,
         ).reshape(len(state), actions)
         return policy
 
@@ -1183,7 +1239,7 @@ class Agent(nn.Module):
 
     def encode_state(self, globals_, domains, encoded, index):
         cards, actors, entities, continuation_index, continuation_roots, map_ = index
-        card = self.encode_cards(encoded[DOMAIN["card"]], domains[DOMAIN["card"]], cards)
+        card = self.encode_cards(encoded[DOMAIN["card"]], cards)
         base_source, actor_groups, history, effects = actors
         history_domain, history_source, history_group, history_count, history_source_count = history
         history = self.pool(
@@ -1246,7 +1302,8 @@ class Agent(nn.Module):
 
     def encode_actions(self, encoded, continuation, actor, values, index, nodes):
         semantic, numeric = values
-        action_row, action_flat, legal, sequence, actions, sources, path, target, _menu = index
+        action_row, action_flat, legal, _sequence, actions, sources, path, target, _menu, \
+            policy_sequence, action_count = index
         base = self.action_encoder(semantic, numeric, self.semantic)
         pooled = base.new_zeros(base.shape); count = base.new_ones(len(base))
         for domain, (source, group, domain_count, inverse, groups, source_count) in enumerate(sources):
@@ -1277,7 +1334,7 @@ class Agent(nn.Module):
             exact / 64, exact.log1p() / 5,
         ), 1))
         action = torch.relu(self.action_norm(action))
-        return action, action_row, action_flat, actions, legal, sequence
+        return action, action_row, action_flat, actions, legal, policy_sequence, action_count
 
     def encode_menu(self, state, action, index):
         object_group, target_count, rows, sequence = index
@@ -1297,16 +1354,19 @@ class Agent(nn.Module):
         return menu
 
     def forward(self, _character, globals_, domains, state_index, action_values, action_index,
-                return_state=False, policy_only=False, temperature=1):
+                return_state=False, policy_only=False, flat_policy=False, temperature=1):
         encoded = self.encode_domains(domains)
         state, nodes, actor, continuation = self.encode_state(globals_, domains, encoded, state_index)
-        action, action_row, action_flat, actions, legal, sequence = self.encode_actions(
+        action, action_row, action_flat, actions, legal, sequence, action_count = self.encode_actions(
             encoded, continuation, actor, action_values, action_index, nodes,
         )
-        state = torch.cat((state, self.encode_menu(state, action, action_index[-1])), 1)
+        state = torch.cat((state, self.encode_menu(state, action, action_index[8])), 1)
         if state.shape[1] != self.state_width:
             raise ValueError("invalid state width")
-        policy = self.decide(state, action, action_row, action_flat, actions, legal, sequence, temperature)
+        policy = self.decide(
+            state, action, action_row, action_flat, actions, legal, sequence, action_count,
+            temperature, flat_policy,
+        )
         if policy_only:
             return policy
         output = (
@@ -1347,7 +1407,7 @@ def architecture(model):
     }
 
 
-def predict(model, inputs, precision, temperature=1, policy_only=False):
+def predict(model, inputs, precision, temperature=1, policy_only=False, flat_policy=False):
     if precision not in PRECISIONS:
         raise ValueError("precision must be fp32 or bf16")
     kind = inputs[0].device.type
@@ -1355,63 +1415,100 @@ def predict(model, inputs, precision, temperature=1, policy_only=False):
         raise ValueError(f"{precision} requires MPS or CUDA")
     dtype = torch.bfloat16 if precision == "bf16" else torch.float16
     with torch.autocast(kind, dtype=dtype, enabled=precision != "fp32"):
-        output = model(*inputs[:6], temperature=temperature, policy_only=policy_only)
+        output = model(
+            *inputs[:6], temperature=temperature, policy_only=policy_only,
+            flat_policy=flat_policy,
+        )
     return output.float() if policy_only else tuple(value.float() for value in output)
 
 
+def upload(value, target):
+    marker = object()
+    tensors = []
+
+    def flatten(item):
+        if torch.is_tensor(item):
+            tensors.append(item)
+            return marker, len(tensors) - 1
+        if isinstance(item, tuple):
+            return tuple(flatten(child) for child in item)
+        return item
+
+    structure = flatten(value)
+    uploaded = [None] * len(tensors)
+    for dtype in {tensor.dtype for tensor in tensors}:
+        selected = [index for index, tensor in enumerate(tensors) if tensor.dtype == dtype]
+        sizes = [tensors[index].numel() for index in selected]
+        buffer = torch.cat([tensors[index].reshape(-1) for index in selected]).to(
+            target, non_blocking=True,
+        )
+        offset = 0
+        for index, size in zip(selected, sizes):
+            uploaded[index] = buffer[offset:offset + size].view(tensors[index].shape)
+            offset += size
+
+    def rebuild(item):
+        if isinstance(item, tuple) and len(item) == 2 and item[0] is marker:
+            return uploaded[item[1]]
+        if isinstance(item, tuple):
+            return tuple(rebuild(child) for child in item)
+        return item
+
+    return rebuild(structure)
+
+
 def trust_region_step(model, optimizer, inputs, action, old, fresh, denominator, precision, limit,
-                      temperature=1, attempts=3):
+                      temperature=1, attempts=3, choice_index=None):
     parameters = [parameter for parameter in model.parameters() if parameter.grad is not None]
     nn.utils.clip_grad_norm_(parameters, .5)
-    state = [value for parameter in parameters for value in optimizer.state.get(parameter, {}).values()
-             if torch.is_tensor(value)]
     optimizer_state = copy.deepcopy(optimizer.state_dict()) if any(
         parameter.grad is not None and parameter not in optimizer.state for parameter in parameters
     ) else None
     cache = getattr(optimizer, "_trust_region_saved", {})
     key = tuple(map(id, parameters))
     saved = cache.get(key)
-    if saved is None or len(saved[1]) != len(state):
-        saved = ([value.detach().clone() for value in parameters],
-                 [value.detach().clone() for value in state])
+    if saved is None:
+        saved = [value.detach().clone() for value in parameters]
         cache[key] = saved
         optimizer._trust_region_saved = cache
     else:
-        torch._foreach_copy_(saved[0], parameters)
-        for dtype in {value.dtype for value in state}:
-            selected = [index for index, value in enumerate(state) if value.dtype == dtype]
-            torch._foreach_copy_([saved[1][index] for index in selected],
-                                 [state[index] for index in selected])
-    lrs = [group["lr"] for group in optimizer.param_groups]
+        torch._foreach_copy_(saved, parameters)
 
     def restore():
         with torch.no_grad():
-            torch._foreach_copy_(parameters, saved[0])
+            torch._foreach_copy_(parameters, saved)
         if optimizer_state is not None:
             optimizer.load_state_dict(optimizer_state)
         else:
             with torch.no_grad():
-                for dtype in {value.dtype for value in state}:
-                    selected = [index for index, value in enumerate(state) if value.dtype == dtype]
-                    torch._foreach_copy_([state[index] for index in selected],
-                                         [saved[1][index] for index in selected])
+                for parameter in parameters:
+                    state = optimizer.state[parameter]
+                    beta1, beta2 = optimizer.param_groups[0]["betas"]
+                    state["exp_avg"].sub_(parameter.grad, alpha=1 - beta1).div_(beta1)
+                    state["exp_avg_sq"].addcmul_(
+                        parameter.grad, parameter.grad, value=beta2 - 1,
+                    ).div_(beta2)
+                    state["step"].sub_(1)
 
     proposals = []
     try:
+        optimizer.step()
         for attempt in range(attempts):
             if attempt:
-                restore()
-            for group, lr in zip(optimizer.param_groups, lrs):
-                group["lr"] = lr * .25 ** attempt
-            optimizer.step()
+                with torch.no_grad():
+                    for parameter, original in zip(parameters, saved):
+                        parameter.sub_(original).mul_(.25).add_(original)
             with torch.no_grad():
                 kind = inputs[0].device.type
                 dtype = torch.bfloat16 if precision == "bf16" else torch.float16
                 with torch.autocast(kind, dtype=dtype, enabled=precision != "fp32"):
                     logits = model(
-                        *inputs[:6], policy_only=True, temperature=temperature,
-                    ).float()[:len(action)]
-                log_ratio = logits.gather(1, action[:, None]).squeeze(1) - old
+                        *inputs[:6], policy_only=True, flat_policy=choice_index is not None,
+                        temperature=temperature,
+                    ).float()
+                selected = logits[choice_index] if choice_index is not None else \
+                    logits[:len(action)].gather(1, action[:, None]).squeeze(1)
+                log_ratio = selected - old
                 post_kl = (((log_ratio.exp() - 1 - log_ratio) * fresh).sum() / denominator).float()
             proposals.append(float(post_kl))
             if torch.isfinite(post_kl) and proposals[-1] <= limit:
@@ -1421,9 +1518,6 @@ def trust_region_step(model, optimizer, inputs, action, old, fresh, denominator,
     except Exception:
         restore()
         raise
-    finally:
-        for group, lr in zip(optimizer.param_groups, lrs):
-            group["lr"] = lr
 
 
 def critic_only_step(model, optimizer, parameters=None):
@@ -1446,9 +1540,8 @@ def sequence_index(row, batch, target, pad=False, items=None):
         padded_batch = (batch // 256 + 1) * 256
         lengths = np.pad(lengths, (0, padded_batch - batch), constant_values=1)
         extra = (-int(lengths.sum())) % 4096
-        dummy = padded_batch - batch
-        lengths[batch:] += extra // dummy
-        lengths[batch:batch + extra % dummy] += 1
+        lengths[batch:] += extra // (padded_batch - batch)
+        lengths[batch:batch + extra % (padded_batch - batch)] += 1
     offsets = np.r_[0, np.cumsum(lengths, dtype=np.int32)].astype(np.int32)
     if items is not None and items > len(row):
         extra = items - len(row)
@@ -1537,8 +1630,11 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
     globals_ = np.asarray(globals_, np.float32)
     if globals_.shape != (batch, model.layout["globals"]) or not np.isfinite(globals_).all():
         raise ValueError("invalid public globals")
-    pad_sequences = model.training and model.card_state.device.type == "mps"
-    bucket = lambda count: 0 if not count else 1 << (count - 1).bit_length()
+    pad_sequences = model.training and model.card_state.device.type == "mps" and batch <= 8192
+    bucket = lambda count: 0 if not count else min(
+        size for power in range(max(1, (count - 1).bit_length()), 64)
+        for size in (3 * (1 << power) // 4, 1 << power) if size >= count
+    )
     tensor = lambda value: torch.as_tensor(value, dtype=torch.long, device=target)
     def grouped(source, group, groups):
         source, group = np.asarray(source, np.int32), np.asarray(group, np.int32)
@@ -1555,18 +1651,19 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
     for (name, *_), (_u, _s, semantic, numeric, _row, _scope) in zip(DOMAIN_SPECS, domains):
         if semantic.max(initial=0) >= model.semantic.num_embeddings:
             raise ValueError(f"invalid {name} semantic id")
-        key = np.ascontiguousarray(np.concatenate((semantic, numeric.view(np.uint32)), 1))
-        if len(key):
-            first, inverse = map(np.asarray, sts2_sim.unique_rows(key))
+        if len(semantic):
+            first, inverse = map(
+                np.asarray, sts2_sim.unique_feature_rows(semantic, numeric.view(np.uint32)),
+            )
         else:
             first = inverse = np.empty(0, np.intp)
         count = len(first)
-        size = 1 << (count - 1).bit_length() if model.training and count else count
+        size = bucket(count) if pad_sequences else count
         domain_tensors.append((
             torch.as_tensor(np.pad(semantic[first], ((0, size - count), (0, 0))).astype(np.int32),
                             device=target),
             torch.as_tensor(np.pad(numeric[first], ((0, size - count), (0, 0))), device=target),
-            count, semantic, numeric,
+            count,
         ))
         domain_inverse.append(inverse)
     domain_tensors = tuple(domain_tensors)
@@ -1609,17 +1706,19 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
     card_groups = len(first)
     actor_u, _actor_s, _actor_c, _actor_f, actor_rows, _actor_scope = domains[DOMAIN["actor"]]
     base_source = ordered(state_source[DOMAIN["actor"]], actor_rows, actor_u[:, 0])
-    owners = [(int(actor_rows[source]), int(actor_u[source, 0])) for source in base_source]
-    if len(owners) != len(set(owners)):
+    actor_keys = (actor_rows[base_source].astype(np.uint64) << 32) | actor_u[base_source, 0]
+    if len(actor_keys) != len(np.unique(actor_keys)):
         raise ValueError("duplicate actor")
-    actor_lookup = {owner: index for index, owner in enumerate(owners)}
     children = []
     for domain in (DOMAIN["history"], DOMAIN["power"], DOMAIN["status"]):
         u, _s, _c, _f, row, scope = domains[domain]
         source = state_source[domain]
-        group = np.asarray([actor_lookup.get((int(row[i]), int(u[i, 0])), -1) for i in source], np.int32)
-        if np.any(group < 0):
+        keys = (row[source].astype(np.uint64) << 32) | u[source, 0]
+        group = np.searchsorted(actor_keys, keys)
+        valid = group < len(actor_keys)
+        if not valid.all() or np.any(actor_keys[group] != keys):
             raise ValueError("actor child without actor")
+        group = group.astype(np.int32)
         order = np.argsort(group, kind="stable")
         source, group = source[order], group[order]
         children.append((domain, *grouped(
@@ -1682,17 +1781,26 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
     edge_offsets = np.r_[0, np.cumsum(np.bincount(edge_row[edge_source], minlength=batch))]
     node_groups = [node_source[node_offsets[row]:node_offsets[row + 1]] for row in range(batch)]
     edge_groups = [edge_source[edge_offsets[row]:edge_offsets[row + 1]] for row in range(batch)]
-    graph_keys = tuple((node_u[nodes].tobytes(), node_c[nodes].tobytes(), node_f[nodes].tobytes(),
-                        edge_u[edges].tobytes(), edge_c[edges].tobytes(), edge_f[edges].tobytes())
-                       for nodes, edges in zip(node_groups, edge_groups))
-    unique = {}
-    representatives = []
-    inverse = np.empty(batch, np.int32)
-    for row, key in enumerate(graph_keys):
-        if key not in unique:
-            unique[key] = len(representatives)
-            representatives.append(row)
-        inverse[row] = unique[key]
+    if model.training:
+        representatives, inverse = map(np.asarray, sts2_sim.unique_graphs(
+            node_u, node_c, node_f, node_source, node_offsets,
+            edge_u, edge_c, edge_f, edge_source, edge_offsets,
+        ))
+        representatives = representatives.astype(np.int32)
+        inverse = inverse.astype(np.int32)
+        graph_keys = ()
+    else:
+        graph_keys = tuple((node_u[nodes].tobytes(), node_c[nodes].tobytes(), node_f[nodes].tobytes(),
+                            edge_u[edges].tobytes(), edge_c[edges].tobytes(), edge_f[edges].tobytes())
+                           for nodes, edges in zip(node_groups, edge_groups))
+        unique = {}
+        representatives = []
+        inverse = np.empty(batch, np.int32)
+        for row, key in enumerate(graph_keys):
+            if key not in unique:
+                unique[key] = len(representatives)
+                representatives.append(row)
+            inverse[row] = unique[key]
     node_source = np.concatenate([node_groups[row] for row in representatives])
     edge_source = np.concatenate([edge_groups[row] for row in representatives])
     node_offsets = np.r_[0, np.cumsum([len(node_groups[row]) for row in representatives])]
@@ -1730,17 +1838,13 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
         parents, group = np.unique(edge_src[selected], return_inverse=True)
         levels.append((parents, edge_dst[selected], selected, group,
                        node_u[node_source[parents], 9].astype(np.float32)))
-    if model.training and levels:
-        graph_bucket = lambda count: min(
-            size for power in range(max(1, (count - 1).bit_length()), 32)
-            for size in (3 * (1 << power) // 4, 1 << power) if size >= count
-        )
+    if pad_sequences and levels:
         padded = []
         for parents, destinations, edge_rows, group, degree in levels:
             count = len(parents)
             edge_count = len(destinations)
-            edge_size = graph_bucket(edge_count)
-            parent_size = graph_bucket(count + (edge_size > edge_count))
+            edge_size = bucket(edge_count)
+            parent_size = bucket(count + (edge_size > edge_count))
             extra = edge_size - len(destinations)
             padded.append((
                 tensor(np.pad(parents, (0, parent_size - count))),
@@ -1781,7 +1885,7 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
                  tensor(domain_inverse[DOMAIN["map_edge"]][edge_source]), tuple(levels),
                  tensor(node_offsets), tensor(current), tensor(current_inverse), tensor(current_source),
                  candidate_index(current_group, len(current), target),
-                 tuple(graph_keys[row] for row in representatives))
+                 tuple(graph_keys[row] for row in representatives) if graph_keys else ())
     actor_rows = actor_rows[base_source].astype(np.int32)
     actor_kinds = actor_u[base_source, 1].astype(np.int32)
     actor_groups = tuple(grouped(
@@ -1793,7 +1897,6 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
     state_index = (
         (tensor(np.pad(domain_inverse[DOMAIN["card"]][card_source],
                        (0, card_size - card_source_count))),
-         tensor(np.pad(card_source, (0, card_size - card_source_count))),
          sequence_index(card_group, card_groups, target, pad_sequences, card_size),
          tensor(card_zones), tensor(card_inverse), card_source_count,
          torch.as_tensor(card_counts, device=target)),
@@ -1803,8 +1906,9 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
     )
     action_u, action_s, action_c, action_f = action
     action_count = len(action_u)
-    action_size = bucket(action_count) if model.training else action_count
-    action_width = bucket(actions) if model.training else actions
+    policy_sequence = candidate_index(action_row, batch, target)
+    action_size = bucket(action_count) if pad_sequences else action_count
+    action_width = bucket(actions) if pad_sequences else actions
     candidate_sources = []
     for domain, (u, s, _c, _f, _row, scope) in enumerate(domains):
         if domain == DOMAIN["continuation"]:
@@ -1871,19 +1975,18 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
     actor_target = np.full(len(action_row), -1, np.int32)
     owner = action_u[:, 1]
     present = (owner != 0) & (owner != np.iinfo(np.uint32).max)
-    for index in np.flatnonzero(present):
-        actor_target[index] = actor_lookup.get((int(action_row[index]), int(owner[index])), -1)
-    if np.any(actor_target[present] < 0):
+    keys = (action_row[present].astype(np.uint64) << 32) | owner[present]
+    group = np.searchsorted(actor_keys, keys)
+    valid = group < len(actor_keys)
+    if not valid.all() or np.any(actor_keys[group] != keys):
         raise ValueError("candidate target references missing actor")
+    actor_target[present] = group
     actor_target = np.pad(actor_target, (0, action_size - action_count), constant_values=-1)
-    object_lookup, object_group, object_rows = {}, np.empty(len(action_row), np.int32), []
-    for index, (row, verb, object_id) in enumerate(zip(action_row, action_u[:, 0], action_u[:, 14])):
-        key = (int(row), int(verb), int(object_id))
-        if key not in object_lookup:
-            object_lookup[key] = len(object_rows); object_rows.append(int(row))
-        object_group[index] = object_lookup[key]
+    object_keys = np.column_stack((action_row.astype(np.uint32), action_u[:, 0], action_u[:, 14]))
+    object_first, object_group = map(np.asarray, sts2_sim.unique_rows(object_keys))
+    object_group = object_group.astype(np.int32)
+    object_rows = action_row[object_first].astype(np.int32)
     object_count = np.bincount(object_group, minlength=len(object_rows)).astype(np.float32)
-    object_rows = np.asarray(object_rows, np.int32)
     menu_rows = np.unique(object_rows)
     menu_lookup = np.full(batch, -1, np.int32); menu_lookup[menu_rows] = np.arange(len(menu_rows))
     menu_sequence = candidate_index(menu_lookup[object_rows], len(menu_rows), target, True)
@@ -1902,7 +2005,7 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
     action_index = tuple(torch.as_tensor(value, device=target) for value in (
         action_row, action_flat, action_legal,
     )) + (candidate_index(action_row, batch, target), action_width, tuple(candidate_sources),
-          tensor(path), tensor(actor_target), menu_index)
+          tensor(path), tensor(actor_target), menu_index, policy_sequence, action_count)
     return (
         torch.as_tensor(character, dtype=torch.long, device=target),
         torch.as_tensor(globals_, device=target), domain_tensors, state_index,
@@ -1934,12 +2037,19 @@ def _tensors(observation, target, model):
 
 
 def validate_packed(row):
+    if isinstance(row, bytes):
+        sts2_sim.validate_compact_observation(row)
+        return
     if len(row) != 6:
         raise ValueError("packed observation lacks its Rust digest")
     character, globals_, counts, exact, actions, digest = row
-    globals_, counts, exact, actions = map(np.asarray, (globals_, counts, exact, actions))
+    globals_, counts, actions = map(np.asarray, (globals_, counts, actions))
+    compressed = isinstance(exact, bytes)
+    if not compressed:
+        exact = np.asarray(exact)
     if globals_.dtype != np.float32 or globals_.shape != (0,) or not np.isfinite(globals_).all() \
-            or counts.dtype != np.uint32 or counts.ndim != 1 or exact.dtype != np.uint32 or exact.ndim != 1 \
+            or counts.dtype != np.uint32 or counts.ndim != 1 \
+            or not compressed and (exact.dtype != np.uint32 or exact.ndim != 1) \
             or actions.dtype != np.uint32 or actions.ndim != 2:
         raise ValueError("invalid packed observation arrays")
     character, digest = int(character), int(digest)
@@ -1951,6 +2061,24 @@ def validate_packed(row):
         raise ValueError("invalid observation character")
     else:
         sts2_sim.validate_packed_observation(character, globals_, counts, exact, actions, digest)
+
+
+def packed_character(row):
+    return row[4] if isinstance(row, bytes) else int(row[0])
+
+
+def packed_action_count(row):
+    return struct.unpack_from("<I", row, 16)[0] if isinstance(row, bytes) else len(row[4])
+
+
+def packed_legal_count(row):
+    return struct.unpack_from("<I", row, 20)[0] if isinstance(row, bytes) \
+        else int(np.count_nonzero(row[4][:, -1]))
+
+
+def packed_state_count(row):
+    return sum(struct.unpack_from(f"<{len(DOMAIN_SPECS)}I", row, 32)) \
+        if isinstance(row, bytes) else int(row[2].sum())
 
 
 def tensors(observation, target, model):
@@ -2041,45 +2169,13 @@ def unpack(rows, target, model, validate=True):
     if validate:
         for row in rows:
             validate_packed(row)
-    batch = len(rows); lengths = np.asarray([len(row[4]) for row in rows], np.int32)
-    actions = max(1, int(lengths.max()))
-    domains = []
-    offsets = np.cumsum(lengths) - lengths
-    counts_by_domain = np.stack([row[2] for row in rows]).astype(np.int32)
-    exact = np.concatenate([row[3] for row in rows])
-    widths = np.asarray([unsigned + signed + semantic + numeric + 1
-                         for _name, unsigned, signed, semantic, numeric in DOMAIN_SPECS])
-    words = counts_by_domain * widths
-    row_starts = np.cumsum(words.sum(1)) - words.sum(1)
-    starts = row_starts[:, None] + np.cumsum(words, 1) - words
-    for domain, (_name, unsigned, signed, semantic, numeric) in enumerate(DOMAIN_SPECS):
-        width = unsigned + signed + semantic + numeric + 1
-        counts = counts_by_domain[:, domain]
-        sizes = words[:, domain]
-        positions = np.arange(sizes.sum()) - np.repeat(np.cumsum(sizes) - sizes, sizes)
-        values = exact[np.repeat(starts[:, domain], sizes) + positions].reshape(-1, width)
-        row_index = np.repeat(np.arange(batch, dtype=np.int32), counts)
-        scope = values[:, -1].view(np.int32).copy()
-        candidate = scope >= 0
-        scope[candidate] += np.repeat(offsets, counts)[candidate]
-        domains.append((
-            values[:, :unsigned], values[:, unsigned:unsigned + signed].view(np.int32),
-            values[:, unsigned + signed:unsigned + signed + semantic],
-            values[:, unsigned + signed + semantic:-1].view(np.float32), row_index, scope,
-        ))
-    action_row = np.repeat(np.arange(batch, dtype=np.int32), lengths)
-    action_position = np.arange(lengths.sum(), dtype=np.int32) - np.repeat(offsets, lengths)
-    action = np.concatenate([row[4] for row in rows])
-    legal = np.zeros((batch, actions), bool)
-    legal[action_row, action_position] = action[:, -1].astype(bool)
+    character, globals_, domains, action, action_row, action_position, legal = \
+        sts2_sim.unpack_packed_observations(rows)
     return model_inputs(
-        np.asarray([row[0] for row in rows], np.uint8),
-        np.asarray([row[1] for row in rows], np.float32), domains,
-        (action[:, :ACTION_FIELDS[0]],
-         action[:, ACTION_FIELDS[0]:sum(ACTION_FIELDS[:2])].view(np.int32),
-         action[:, sum(ACTION_FIELDS[:2]):sum(ACTION_FIELDS[:3])],
-         action[:, sum(ACTION_FIELDS[:3]):sum(ACTION_FIELDS)].view(np.float32)),
-        action_row, action_position, legal, target, model,
+        np.asarray(character), np.asarray(globals_),
+        [tuple(map(np.asarray, domain)) for domain in domains],
+        tuple(map(np.asarray, action)), np.asarray(action_row), np.asarray(action_position),
+        np.asarray(legal), target, model,
     )
 
 
@@ -2100,13 +2196,13 @@ class WinningReservoir:
         for index, (row, choice, log_probability, policy, value) in enumerate(
             zip(rows, choices, log_probabilities, policies, values)
         ):
-            if np.count_nonzero(row[4][:, -1]) <= 1:
+            if packed_legal_count(row) <= 1:
                 self.forced += 1
                 continue
             episode = self.pending[index]
             self.pending_seen[index] += 1
             item = (row, int(choice), float(log_probability), 1.0 - float(value),
-                    np.asarray(policy[:len(row[4])], np.float16))
+                    np.asarray(policy[:packed_action_count(row)], np.float16))
             if len(episode) < self.pending_capacity:
                 episode.append(item)
             else:
@@ -2138,7 +2234,7 @@ class WinningReservoir:
         groups = self.by_character(None)
         added = 0
         for item in rows:
-            character = int(item[0][0])
+            character = packed_character(item[0])
             quota = self.capacity // 5 + (character < self.capacity % 5)
             self.seen += 1
             self.character_seen[character] += 1
@@ -2183,7 +2279,7 @@ class WinningReservoir:
         rows = [row if len(row) == 5 else (*row, None) for row in state.get("rows", ())]
         groups = [[] for _ in range(5)]
         for row in rows:
-            character = int(row[0][0])
+            character = packed_character(row[0])
             if len(groups[character]) < self.capacity // 5 + (character < self.capacity % 5):
                 groups[character].append(row)
         self.rows = [row for group in groups for row in group]
@@ -2198,7 +2294,7 @@ class WinningReservoir:
     def by_character(self, character_start):
         groups = [[] for _ in range(5)]
         for index, (row, *_rest) in enumerate(self.rows):
-            character = int(row[0])
+            character = packed_character(row)
             groups[character].append(index)
         return groups
 
@@ -2219,18 +2315,32 @@ class WinningReservoir:
 
 def act(model, observation, target, sample, precision, generator=None, temperature=1):
     with torch.inference_mode():
-        inputs = tensors(observation, target, model)
-        logits, value_logit, progress_value = predict(model, inputs, precision, temperature)
-        legal = inputs[6].clone()
-        legal[~legal.any(1), 0] = True
-        masked = logits.masked_fill(~legal, -torch.inf)
-        choice = (
-            torch.multinomial(masked.exp().cpu(), 1, generator=generator).squeeze(1).to(target)
-            if sample else masked.argmax(1)
+        inputs = tensors(observation, torch.device("cpu") if target.type == "mps" else target, model)
+        if target.type == "mps":
+            inputs = upload(inputs, target)
+        logits, value_logit, progress_value = predict(
+            model, inputs, precision, temperature, flat_policy=True,
         )
-        assert legal.gather(1, choice[:, None]).all()
-    return (choice.cpu().numpy(), masked.gather(1, choice[:, None]).squeeze(1).cpu().numpy(),
-            masked.cpu().numpy(), value_logit.sigmoid().cpu().numpy(),
+        action_row = inputs[5][0][:len(logits)]
+        action_flat = inputs[5][1][:len(logits)]
+        legal = inputs[5][2][:len(logits)]
+        masked = logits.masked_fill(~legal, -torch.inf)
+        if sample:
+            race = torch.empty_like(masked).exponential_(generator=generator).log() - masked
+            minimum = race.new_full((len(observation[0]),), torch.inf).scatter_reduce_(
+                0, action_row, race, reduce="amin",
+            )
+            selected = (race == minimum[action_row]).nonzero().squeeze(1)
+        else:
+            maximum = masked.new_full((len(observation[0]),), -torch.inf).scatter_reduce_(
+                0, action_row, masked, reduce="amax",
+            )
+            selected = (masked == maximum[action_row]).nonzero().squeeze(1)
+        choice = action_flat[selected] % inputs[5][4]
+        assert len(choice) == len(observation[0]) and legal[selected].all()
+    policy = None
+    return (choice.cpu().numpy(), masked[selected].cpu().numpy(),
+            policy, value_logit.sigmoid().cpu().numpy(),
             progress_value.cpu().numpy())
 
 
@@ -2383,6 +2493,9 @@ class RolloutCollector:
         self.worker, self.generation = worker, generation
         self.trajectories = [None] * args.envs
         self.action_history = [[] for _ in range(args.envs)]
+        self.native_steps = []
+        self.native_starts = np.zeros(args.envs, np.int64)
+        self.native_started = np.full(args.envs, time.monotonic())
 
     def trace_empty(self, kind, indices, characters, stats):
         seeds = self.env.seeds()
@@ -2398,9 +2511,19 @@ class RolloutCollector:
     def collect(self, model, target, precision, deadline, steps, version, stop=None,
                 heartbeat=None, progress=None):
         args = self.args
-        cache_start = model.cache_stats.copy()
+        native = model is None
+        cache_start = dict.fromkeys(("card_hit", "card_miss", "graph_hit", "graph_miss"), 0) \
+            if native else model.cache_stats.copy()
         finished = []
         episodes = [[] for _ in range(5)]
+        sample_keys = (
+            "rows", "choices", "old_log", "values", "progress_values", "progress_floors",
+            "win_rewards", "progress_rewards", "terminals", "characters", "versions",
+        )
+        def materialize(trajectory):
+            samples = trajectory.pop("samples")
+            trajectory.update(zip(sample_keys, map(list, zip(*samples))))
+            return trajectory
         discarded_steps = orphan_empty_actions = sampled_steps = 0
         collect_seconds = 0.0
         for _ in range(steps):
@@ -2409,7 +2532,7 @@ class RolloutCollector:
             if heartbeat is not None:
                 heartbeat[self.worker] = time.monotonic()
             self.iteration += 1
-            empty = ~observation_legal(self.observation).any(1)
+            empty = np.zeros(args.envs, bool) if native else ~observation_legal(self.observation).any(1)
             if empty.any():
                 reset = np.flatnonzero(empty).tolist()
                 stale_characters = np.asarray(self.observation[0], np.uint8)
@@ -2418,7 +2541,7 @@ class RolloutCollector:
                 self.reservoir.discard(reset)
                 for index in reset:
                     if self.trajectories[index] is not None:
-                        discarded_steps += len(self.trajectories[index]["rows"])
+                        discarded_steps += len(self.trajectories[index]["samples"])
                     self.trajectories[index] = None
                     self.action_history[index].clear()
                 self.env.reset(reset, 0.0)
@@ -2427,15 +2550,22 @@ class RolloutCollector:
                 self.max_floor[reset] = 1
                 self.observation = self.env.observe_tokens(flat=True)
             step_started = time.monotonic()
-            characters = np.asarray(self.observation[0], np.uint8)
-            choice, log_probability, policy, value, progress_value = act(
-                model, self.observation, target, True, precision, self.torch_rng,
-                args.policy_temperature,
-            )
+            if native:
+                characters, choice, log_probability, value, progress_value, step_rows = \
+                    self.env.policy(args.policy_temperature)
+                characters = np.asarray(characters, np.uint8)
+                policy = None
+            else:
+                characters = np.asarray(self.observation[0], np.uint8)
+                choice, log_probability, policy, value, progress_value = act(
+                    model, self.observation, target, True, precision, self.torch_rng,
+                    args.policy_temperature,
+                )
+                step_rows = _pack_batch(self.observation)
             progress_floor = self.max_floor / 52
-            for index, action in enumerate(choice):
-                self.action_history[index].append(int(action))
-            step_rows = _pack_batch(self.observation)
+            if not native:
+                for index, action in enumerate(choice):
+                    self.action_history[index].append(int(action))
             self.reservoir.record(step_rows, choice, log_probability, policy, value, self.rng)
             in_combat = np.asarray([row[4] == 1 for row in self.env.stats()])
             self.combat_steps = np.where(in_combat, self.combat_steps + 1, 0)
@@ -2446,14 +2576,16 @@ class RolloutCollector:
             if progress is not None:
                 progress[self.worker] += args.envs
             self.episode_steps += 1
-            next_observation = self.env.observe_tokens((~done).tolist(), True)
+            next_observation = None if native else self.env.observe_tokens((~done).tolist(), True)
             stats = self.env.stats()
             floors = np.asarray([(row[0] - 1) * 17 + row[1] for row in stats], np.float32)
             next_max_floor = np.maximum(np.maximum(self.max_floor, floors), 52 * raw_reward)
             still_combat = np.asarray([row[4] == 1 for row in stats])
             truncated, step_truncated, combat_truncated, empty_actions = cuts(
                 done, self.episode_steps, self.combat_steps, still_combat,
-                observation_legal(next_observation), args.max_steps, args.max_combat_steps,
+                np.asarray(self.env.has_legal_actions((~done).tolist()))[:, None]
+                if native else observation_legal(next_observation),
+                args.max_steps, args.max_combat_steps,
             )
             boundary = done | truncated
             if empty_actions.any():
@@ -2461,27 +2593,22 @@ class RolloutCollector:
                 self.trace_empty("post_step", reset, characters, stats)
             progress_reward = (next_max_floor - self.max_floor) / 52
             self.max_floor = next_max_floor
-            for index, row in enumerate(step_rows):
-                trajectory = self.trajectories[index]
-                if trajectory is None:
-                    trajectory = {key: [] for key in (
-                        "rows", "choices", "old_log", "values", "progress_values",
-                        "progress_floors", "win_rewards",
-                        "progress_rewards", "terminals", "characters", "versions",
-                    )}
-                    trajectory["started"] = step_started
-                    self.trajectories[index] = trajectory
-                for key, item in (
-                    ("rows", row), ("choices", choice[index]),
-                    ("old_log", log_probability[index]), ("values", value[index]),
-                    ("progress_values", progress_value[index]),
-                    ("progress_floors", progress_floor[index]),
-                    ("win_rewards", raw_reward[index]),
-                    ("progress_rewards", progress_reward[index]),
-                    ("terminals", done[index]), ("characters", characters[index]),
-                    ("versions", version),
-                ):
-                    trajectory[key].append(item)
+            if native:
+                self.native_steps.append((
+                    step_rows, choice, log_probability, value, progress_value, progress_floor,
+                    raw_reward, progress_reward, done, characters, version,
+                ))
+            else:
+                for index, row in enumerate(step_rows):
+                    trajectory = self.trajectories[index]
+                    if trajectory is None:
+                        trajectory = {"samples": [], "started": step_started}
+                        self.trajectories[index] = trajectory
+                    trajectory["samples"].append((
+                        row, choice[index], log_probability[index], value[index],
+                        progress_value[index], progress_floor[index], raw_reward[index],
+                        progress_reward[index], done[index], characters[index], version,
+                    ))
             if boundary.any():
                 reset = np.flatnonzero(boundary).tolist()
                 wins = [bool(done[index] and stats[index][4] == 12) for index in reset]
@@ -2495,26 +2622,45 @@ class RolloutCollector:
                         int(empty_actions[index]),
                         self.iteration,
                     ))
-                    if done[index]:
-                        self.trajectories[index]["completion_seconds"] = (
-                            time.monotonic() - self.trajectories[index].pop("started")
-                        )
-                        finished.append(self.trajectories[index])
+                    if native and done[index]:
+                        history = self.native_steps[self.native_starts[index]:]
+                        trajectory = {
+                            key: [step[column] if column == 10 else step[column][index]
+                                  for step in history]
+                            for column, key in enumerate(sample_keys)
+                        }
+                        trajectory["completion_seconds"] = time.monotonic() - self.native_started[index]
+                        finished.append(trajectory)
+                    elif native:
+                        discarded_steps += len(self.native_steps) - int(self.native_starts[index])
+                    elif done[index]:
+                        trajectory = self.trajectories[index]
+                        trajectory["completion_seconds"] = time.monotonic() - trajectory.pop("started")
+                        finished.append(materialize(trajectory))
                     else:
-                        discarded_steps += len(self.trajectories[index]["rows"])
+                        discarded_steps += len(self.trajectories[index]["samples"])
                     self.trajectories[index] = None
                     self.action_history[index].clear()
+                    self.native_starts[index] = len(self.native_steps)
+                    self.native_started[index] = time.monotonic()
                 self.env.reset(reset, 0.0)
                 self.episode_steps[reset] = 0
                 self.combat_steps[reset] = 0
                 self.max_floor[reset] = 1
-                next_observation = self.env.observe_tokens(flat=True)
+                next_observation = None if native else self.env.observe_tokens(flat=True)
+                if native:
+                    drop = int(self.native_starts.min())
+                    if drop:
+                        del self.native_steps[:drop]
+                        self.native_starts -= drop
             segment = [
                 index for index, trajectory in enumerate(self.trajectories)
                 if trajectory is not None and args.segment_steps
-                and len(trajectory["rows"]) >= args.segment_steps
+                and len(trajectory["samples"]) >= args.segment_steps
             ]
             if segment:
+                if native:
+                    raise ValueError("native actors require complete terminal trajectories")
                 with torch.inference_mode():
                     next_inputs = tensors(next_observation, target, model)
                     _, bootstrap_value, bootstrap_progress = predict(model, next_inputs, precision)
@@ -2528,10 +2674,10 @@ class RolloutCollector:
                     )
                     trajectory["bootstrap_version"] = version
                     trajectory["completion_seconds"] = time.monotonic() - trajectory.pop("started")
-                    finished.append(trajectory); self.trajectories[index] = None
+                    finished.append(materialize(trajectory)); self.trajectories[index] = None
             self.observation = next_observation
             collect_seconds += time.monotonic() - step_started
-            if finished:
+            if finished and not native:
                 break
         return {
             "trajectories": finished,
@@ -2540,11 +2686,14 @@ class RolloutCollector:
             "orphan_empty_actions": orphan_empty_actions,
             "collect_seconds": collect_seconds, "discarded_steps": discarded_steps,
             "sampled_steps": sampled_steps,
-            **{key: model.cache_stats[key] - cache_start[key] for key in model.cache_stats},
+            **({key: 0 for key in cache_start} if native else {
+                key: model.cache_stats[key] - cache_start[key] for key in model.cache_stats
+            }),
         }
 
     def run(self, model, models, samples, stop, deadline, budget, worker=0,
-            heartbeat=None, progress=None, version=0):
+            heartbeat=None, progress=None, version=0, target=None, precision="fp32"):
+        target = target or torch.device("cpu")
         produced = 0
         def empty():
             return {
@@ -2556,6 +2705,7 @@ class RolloutCollector:
                 **dict.fromkeys(("card_hit", "card_miss", "graph_hit", "graph_miss"), 0),
             }
         pending = empty()
+        pending_rows = 0
         while produced < budget and time.monotonic() < deadline and not stop.is_set():
             latest = None
             while True:
@@ -2565,17 +2715,20 @@ class RolloutCollector:
                     break
             if latest:
                 version, state = latest
-                model.load_state_dict(state)
+                if model is None:
+                    self.env.load_policy(state)
+                else:
+                    model.load_state_dict(state)
             steps = sampling_steps(produced, budget, self.args.envs, self.args.sampler_steps)
             if not steps:
                 break
             result = self.collect(
-                model, torch.device("cpu"), "fp32", deadline, steps, version, stop,
+                model, target, precision, deadline, steps, version, stop,
                 heartbeat, progress,
             )
             pending["trajectories"].extend(result["trajectories"])
-            for target, rows in zip(pending["episodes"], result["episodes"]):
-                target.extend(rows)
+            for target_episodes, rows in zip(pending["episodes"], result["episodes"]):
+                target_episodes.extend(rows)
             for key in (
                 "orphan_empty_actions", "collect_seconds",
                 "discarded_steps", "sampled_steps", "card_hit", "card_miss",
@@ -2585,7 +2738,12 @@ class RolloutCollector:
             pending["iteration"] = result["iteration"]
             if not pending["trajectories"]:
                 continue
-            produced += sum(len(trajectory["rows"]) for trajectory in pending["trajectories"])
+            added = sum(len(trajectory["rows"]) for trajectory in result["trajectories"])
+            pending_rows += added
+            produced += added
+            if pending_rows < self.args.envs * 4 and produced < budget \
+                    and time.monotonic() < deadline and not stop.is_set():
+                continue
             pending["reservoir"] = self.reservoir.drain_candidates()
             pending["queued_at"] = time.monotonic()
             put_started = pending["queued_at"]
@@ -2594,15 +2752,18 @@ class RolloutCollector:
                     pending["queue_put_seconds"] = time.monotonic() - put_started
                     samples.put_nowait((worker, version, pending))
                     pending = empty()
+                    pending_rows = 0
                     break
                 except Full:
                     pending["queue_full_waits"] += 1
                     if heartbeat is not None:
                         heartbeat[worker] = time.monotonic()
                     time.sleep(.01)
-        pending["discarded_steps"] += sum(
-            len(trajectory["rows"]) for trajectory in self.trajectories
-            if trajectory is not None
+        pending["discarded_steps"] += (
+            sum(len(self.native_steps) - int(start) for start in self.native_starts)
+            if model is None else
+            sum(len(trajectory["samples"]) for trajectory in self.trajectories
+                if trajectory is not None)
         ) + sum(len(trajectory["rows"]) for trajectory in pending["trajectories"])
         pending["trajectories"].clear()
         active = [index for index, trajectory in enumerate(self.trajectories) if trajectory is not None]
@@ -2621,16 +2782,33 @@ class RolloutCollector:
 def collect_worker(model, args, sampler_session, stage, capacity, pending_capacity, iteration,
                    worker, generation, version, models, samples, stop, deadline, budget, results,
                    heartbeat, progress):
-    os.environ["RAYON_NUM_THREADS"] = str(args.sampler_threads)
-    torch.set_num_threads(args.torch_threads)
-    torch.set_num_interop_threads(1)
+    qos = getattr(ctypes.CDLL(None), "pthread_set_qos_class_self_np", None)
+    if qos is not None:
+        qos(int(os.environ.get("ACTOR_QOS", "0x11"), 0), 0)
+    if args.sampler_backend == "process":
+        os.environ["RAYON_NUM_THREADS"] = str(args.sampler_threads)
+        torch.set_num_threads(args.torch_threads)
+        torch.set_num_interop_threads(1)
+        torch._C._set_default_mobile_cpu_allocator()
     reservoir = WinningReservoir(capacity, args.envs, pending_capacity)
     collector = RolloutCollector(
         args, sampler_session, stage, reservoir, iteration, worker, generation,
     )
+    target = torch.device("mps") if os.environ.get("ACTOR_MPS") else torch.device("cpu")
+    precision = "bf16" if target.type == "mps" else "fp32"
+    if target.type == "mps":
+        model = model.to(target)
+        collector.torch_rng = torch.Generator(device=target).manual_seed(
+            args.seed + sampler_session * 10_000_000 + worker + generation * args.samplers
+        )
+    if isinstance(model, bytes):
+        collector.env.load_policy(model)
+        collector.observation = None
+        model = None
     heartbeat[worker] = time.monotonic()
     results.put(collector.run(
         model, models, samples, stop, deadline, budget, worker, heartbeat, progress, version,
+        target, precision,
     ))
 
 
@@ -2713,7 +2891,7 @@ class ExperienceDataset:
         progress_returns = progress_value_advantage + remaining_progress + progress_floor
         priority = 1 + np.abs(advantage) + progress_active * np.abs(progress_advantage) \
             + 4 * terminal + 4 * (returns > .5)
-        actionable = np.asarray([np.count_nonzero(row[4][:, -1]) > 1 for row in rows])
+        actionable = np.asarray([packed_legal_count(row) > 1 for row in rows])
         values = {
             "action": np.asarray([
                 item for trajectory in trajectories for item in trajectory["choices"]
@@ -2777,7 +2955,7 @@ class ExperienceDataset:
 
 def train_stream(model, optimizer, args, sampler_session, stage, target, deadline, budget,
                  base_decisions, auxiliary_decisions, stage_decisions, run_started, reservoir, progress_active,
-                 save_report, save_step):
+                 save_report, save_step, fingerprint):
     ascension, bonus = STAGES[stage]
     collector_args = copy.copy(args)
     pending_capacity = max(1, reservoir.capacity // args.envs)
@@ -2839,24 +3017,26 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
     reported_seconds = 0.0
     started = time.monotonic()
     rng = np.random.default_rng(args.seed + sampler_session + 1_000_000_000)
-    context = multiprocessing.get_context("spawn")
-    models = [context.Queue(maxsize=1) for _ in range(args.samplers)]
+    threaded = args.sampler_backend == "thread"
+    context = multiprocessing.get_context(os.environ.get("SAMPLER_START", "spawn"))
+    worker_type = threading.Thread if threaded else context.Process
+    queue_type = Queue if threaded else context.Queue
+    if threaded:
+        os.environ["RAYON_NUM_THREADS"] = str(args.samplers * args.sampler_threads)
+    models = [queue_type(maxsize=1) for _ in range(args.samplers)]
     sample_capacity = max(8, args.samplers * 16)
-    samples = context.Queue(maxsize=sample_capacity)
-    results = context.Queue(); stop = context.Event()
-    heartbeat = context.Array("d", [started] * args.samplers)
-    progress = context.Array("q", [0] * args.samplers)
-    packer = ThreadPoolExecutor(max_workers=4)
+    samples = queue_type(maxsize=sample_capacity)
+    results = queue_type(); stop = threading.Event() if threaded else context.Event()
+    heartbeat = [started] * args.samplers if threaded else context.Array("d", [started] * args.samplers)
+    progress = [0] * args.samplers if threaded else context.Array("q", [0] * args.samplers)
+    packer = ThreadPoolExecutor(max_workers=1)
     workers = [None] * args.samplers
+    actor = export_value_model(None, model, fingerprint, 1, 0, True)
 
     def start_worker(worker):
         heartbeat[worker] = time.monotonic()
         progress[worker] = 0
-        actor = Agent(
-            model.layout, model.width, model.layers, model.heads, model.feedforward, model.head_width,
-        ).cpu().eval()
-        actor.load_state_dict({key: value.detach().cpu() for key, value in model.state_dict().items()})
-        process = context.Process(target=collect_worker, args=(
+        process = worker_type(target=collect_worker, args=(
             actor, collector_args, sampler_session, stage,
             reservoir.capacity, pending_capacity, sampler_iterations[worker], worker,
             sampler_generations[worker], updates, models[worker], samples, stop, deadline, budget,
@@ -2875,7 +3055,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         for queue in models:
             try:
                 if state is None:
-                    state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+                    state = export_value_model(None, model, fingerprint, 1, 0, True)
                 queue.put_nowait((updates, state))
             except Full:
                 pass
@@ -2931,51 +3111,23 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         except NotImplementedError:
             pass
 
-    def upload(value):
-        marker = object()
-        tensors = []
-
-        def flatten(item):
-            if torch.is_tensor(item):
-                tensors.append(item)
-                return marker, len(tensors) - 1
-            if isinstance(item, tuple):
-                return tuple(flatten(child) for child in item)
-            return item
-
-        structure = flatten(value)
-        uploaded = [None] * len(tensors)
-        for dtype in {tensor.dtype for tensor in tensors}:
-            selected = [index for index, tensor in enumerate(tensors) if tensor.dtype == dtype]
-            sizes = [tensors[index].numel() for index in selected]
-            buffer = torch.cat([tensors[index].reshape(-1) for index in selected]).to(
-                target, non_blocking=True,
-            )
-            offset = 0
-            for index, size in zip(selected, sizes):
-                uploaded[index] = buffer[offset:offset + size].view(tensors[index].shape)
-                offset += size
-
-        def rebuild(item):
-            if isinstance(item, tuple) and len(item) == 2 and item[0] is marker:
-                return uploaded[item[1]]
-            if isinstance(item, tuple):
-                return tuple(rebuild(child) for child in item)
-            return item
-
-        return rebuild(structure)
+    def drain_samples():
+        for _ in range(sample_capacity):
+            try:
+                ingest(samples.get_nowait())
+            except (Empty, EOFError, OSError):
+                break
 
     def prepare(rows):
         prepared = time.monotonic()
         return unpack(rows, torch.device("cpu"), model, False), time.monotonic() - prepared
 
     def reserve_batch(size):
-        selected = dataset.sample(size, rng)
+        order = dataset.sample(len(dataset), rng)
+        selected = order[:size]
         rows = [dataset.rows[index] for index in selected]
         values = {key: dataset.data[key][selected].copy() for key in dataset.data}
-        expired = dataset.use(selected)
-        dataset.discard(expired)
-        return rows, values, [], packer.submit(prepare, rows), len(expired)
+        return selected, order, size, rows, values, [], packer.submit(prepare, rows)
 
     def optimizer_metrics():
         return {
@@ -3021,6 +3173,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         reported_trajectories = len(trajectory_lengths)
         for key, values in losses.items():
             reported_metrics[key] = len(values)
+        if target.type == "mps":
+            torch.mps.empty_cache()
         replay_fraction = winning_replayed / max(1, trained + winning_replayed)
         assert replay_fraction <= .1 + 1e-9
         _, _, curriculum = curriculum_weights(
@@ -3149,8 +3303,13 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             if sampler_exhausted[worker]:
                 continue
             wedged = process.is_alive() and now - heartbeat[worker] > args.sampler_timeout
-            failed = not process.is_alive() and process.exitcode not in (None, 0)
+            failed = not process.is_alive() and (
+                threaded or process.exitcode not in (None, 0)
+            )
             if not wedged and not failed:
+                continue
+            if threaded:
+                stop.set(); sampler_exhausted[worker] = True
                 continue
             if wedged:
                 sampler_wedges[worker] += 1
@@ -3185,12 +3344,14 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
     try:
         while True:
             drain_results()
+            drain_samples()
             restart_stalled()
             sampler_done = (stop.is_set() or all(not worker.is_alive() for worker in workers)) and samples.empty()
             if not pending:
                 if len(dataset) < args.batch and not sampler_done:
                     try:
                         ingest(samples.get(timeout=.1))
+                        drain_samples()
                     except (Empty, EOFError, OSError):
                         restart_stalled()
                         continue
@@ -3217,59 +3378,140 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     continue
                 if len(dataset) < args.batch and not sampler_done:
                     continue
-            while len(pending) < 4:
+            while len(pending) < 1:
+                ingested = False
                 if not sampler_done:
-                    try:
-                        ingest(samples.get_nowait())
-                    except (Empty, EOFError, OSError):
-                        pass
+                    before = decisions
+                    drain_samples()
+                    ingested = decisions != before
                     sampler_done = (stop.is_set() or all(not worker.is_alive() for worker in workers)) and samples.empty()
-                queued = sum(batch[4] for batch in pending)
-                boundary = min(next_report, next_save) - (base_decisions + handled) - queued
+                boundary = min(next_report, next_save) - (base_decisions + handled)
                 enough = len(dataset) >= args.batch or sampler_done and len(dataset)
-                if boundary <= 0 or not enough:
+                if boundary <= 0:
                     break
+                if not enough:
+                    if sampler_done or not ingested:
+                        break
+                    continue
                 pending.append(reserve_batch(min(args.batch, boundary)))
             if not pending:
                 if sampler_done and not len(dataset):
                     break
                 continue
             update_started = time.monotonic()
-            rows, values, replay, packed, retired = pending.pop(0)
-            handled += retired
-            policy_lags.extend((updates - values["version"]).tolist())
+            selected, order, cursor, rows, values, replay, packed = pending.pop(0)
             if not rows:
                 continue
             screen_started = time.monotonic()
             unpack_started = time.monotonic()
             cpu_inputs, unpack_elapsed = packed.result()
             screen_unpack_seconds += unpack_elapsed
-            inputs = upload(cpu_inputs)
+            inputs = upload(cpu_inputs, target)
             unpack_seconds = time.monotonic() - unpack_started
             unpack_durations.append(unpack_seconds)
             action = torch.as_tensor(values["action"], device=target)
             old = torch.as_tensor(values["old"], device=target)
+            lengths = np.asarray([packed_action_count(row) for row in rows], np.int64)
+            choice_index = torch.as_tensor(
+                np.cumsum(lengths) - lengths + values["action"], device=target,
+            )
+            flat_policy = not replay
             forward_started = time.monotonic()
             all_logits, all_prediction, all_progress_prediction = predict(
-                model, inputs, args.precision, args.policy_temperature,
+                model, inputs, args.precision, args.policy_temperature, flat_policy=flat_policy,
             )
             forward_seconds = time.monotonic() - forward_started
             screen_forward_seconds += forward_seconds
             screen_seconds += time.monotonic() - screen_started
             forward_durations.append(forward_seconds)
             backward_seconds = 0.0
-            logits = all_logits[:len(rows)]
             prediction = all_prediction[:len(rows)]
             progress_prediction = all_progress_prediction[:len(rows)]
             legal = inputs[6][:len(rows)]
-            log_ratio = logits.gather(1, action[:, None]).squeeze(1) - old
+            logits = all_logits[:sum(lengths)] if flat_policy else all_logits[:len(rows)]
+            log_ratio = (logits[choice_index] if flat_policy else
+                         logits.gather(1, action[:, None]).squeeze(1)) - old
             if not (legal.sum(1) > 1).all():
                 raise RuntimeError("forced action entered the dataset")
             fresh = log_ratio.abs() <= args.max_log_ratio
             invalid = ~fresh.detach().cpu().numpy()
-            dataset.ratio_dropped += int(invalid.sum())
-            handled += dataset.discard_ids(values["id"][invalid])
-            critic_mask = mask = fresh.to(log_ratio.dtype)
+            rejected = selected[invalid].tolist()
+            if rejected:
+                selected = selected[~invalid].tolist()
+                target_size = len(rows)
+                while len(selected) < target_size and cursor < len(order):
+                    candidate = order[cursor:cursor + target_size - len(selected)]
+                    cursor += len(candidate)
+                    candidate_rows = [dataset.rows[index] for index in candidate]
+                    candidate_values = {
+                        key: dataset.data[key][candidate].copy() for key in dataset.data
+                    }
+                    started_screen = time.monotonic()
+                    candidate_inputs = upload(prepare(candidate_rows)[0], target)
+                    candidate_lengths = np.asarray([
+                        packed_action_count(row) for row in candidate_rows
+                    ], np.int64)
+                    candidate_choice = torch.as_tensor(
+                        np.cumsum(candidate_lengths) - candidate_lengths + candidate_values["action"],
+                        device=target,
+                    )
+                    with torch.inference_mode():
+                        candidate_logits = predict(
+                            model, candidate_inputs, args.precision, args.policy_temperature,
+                            policy_only=True, flat_policy=True,
+                        )
+                    candidate_valid = (
+                        candidate_logits[candidate_choice]
+                        - torch.as_tensor(candidate_values["old"], device=target)
+                    ).abs() <= args.max_log_ratio
+                    screen_seconds += time.monotonic() - started_screen
+                    candidate_valid = candidate_valid.cpu().numpy()
+                    selected.extend(candidate[candidate_valid].tolist())
+                    rejected.extend(candidate[~candidate_valid].tolist())
+                if not selected:
+                    dataset.ratio_dropped += len(rejected)
+                    dataset.discard(np.asarray(rejected, np.int64))
+                    handled += len(rejected)
+                    continue
+                selected = np.asarray(selected, np.int64)
+                rows = [dataset.rows[index] for index in selected]
+                values = {key: dataset.data[key][selected].copy() for key in dataset.data}
+                unpack_started = time.monotonic()
+                inputs = upload(prepare(rows)[0], target)
+                unpack_seconds += time.monotonic() - unpack_started
+                action = torch.as_tensor(values["action"], device=target)
+                old = torch.as_tensor(values["old"], device=target)
+                lengths = np.asarray([packed_action_count(row) for row in rows], np.int64)
+                choice_index = torch.as_tensor(
+                    np.cumsum(lengths) - lengths + values["action"], device=target,
+                )
+                forward_started = time.monotonic()
+                all_logits, all_prediction, all_progress_prediction = predict(
+                    model, inputs, args.precision, args.policy_temperature, flat_policy=flat_policy,
+                )
+                forward_seconds += time.monotonic() - forward_started
+                prediction = all_prediction[:len(rows)]
+                progress_prediction = all_progress_prediction[:len(rows)]
+                legal = inputs[6][:len(rows)]
+                logits = all_logits[:sum(lengths)]
+                log_ratio = logits[choice_index] - old
+                if not (log_ratio.abs() <= args.max_log_ratio).all():
+                    raise RuntimeError("batch eligibility changed after screening")
+            selected = np.asarray(selected, np.int64)
+            expired = dataset.use(selected)
+            removed = np.asarray(rejected + expired.tolist(), np.int64)
+            dataset.ratio_dropped += len(rejected)
+            if len(removed):
+                dataset.discard(np.unique(removed))
+            handled += len(removed)
+            if not pending and not sampler_done:
+                drain_samples()
+                boundary = min(next_report, next_save) - (base_decisions + handled)
+                if boundary > 0 and len(dataset) >= args.batch:
+                    pending.append(reserve_batch(min(args.batch, boundary)))
+            policy_lags.extend((updates - values["version"]).tolist())
+            fresh = torch.ones_like(log_ratio, dtype=torch.bool)
+            critic_mask = mask = torch.ones_like(log_ratio)
             critic_count = critic_mask.sum()
             fresh_count = mask.sum()
             critic_denominator = critic_count.clamp_min(1)
@@ -3346,7 +3588,15 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 ratio * batch_advantage,
                 ratio.clamp(1 - args.clip, 1 + args.clip) * batch_advantage,
             ) * mask).sum() / denominator
-            entropy = (-(logits.exp() * logits * legal).sum(1) * mask).sum() / denominator
+            if flat_policy:
+                action_row = inputs[5][0][:len(logits)]
+                action_legal = inputs[5][2][:len(logits)]
+                entropy_by_row = logits.new_zeros(len(rows)).index_add(
+                    0, action_row, -(logits.exp() * logits * action_legal),
+                )
+            else:
+                entropy_by_row = -(logits.exp() * logits * legal).sum(1)
+            entropy = (entropy_by_row * mask).sum() / denominator
             loss = policy_loss + critic_loss - entropy_weight * entropy
             replay_valid = replay_eligible = eligible_cpu = valid_cpu = None
             if replay:
@@ -3373,7 +3623,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 reservoir.evict(rejected)
                 winning_rejected += len(rejected)
                 for sample in rejected:
-                    winning_evicted_characters[int(sample[0][0])] += 1
+                    winning_evicted_characters[packed_character(sample[0])] += 1
                 replay_weight = replay_valid.to(replay_value.dtype)
                 replay_denominator = replay_weight.sum().clamp_min(1)
                 replay_log_probability = replay_distribution.log_prob(replay_action)
@@ -3395,6 +3645,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             accepted, proposals, post_log_ratio = trust_region_step(
                 model, optimizer, inputs, action, old, fresh, denominator,
                 args.precision, args.target_kl, args.policy_temperature,
+                choice_index=choice_index if flat_policy else None,
             )
             rejected_proposals = sum(
                 not math.isfinite(value) or value > args.target_kl for value in proposals
@@ -3450,7 +3701,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             losses["kl"].append(kl); losses["clip_fraction"].append(clip_fraction)
             trained += fresh_rows; updates += 1
             if replay_valid is not None:
-                replay_characters = [int(sample[0][0]) for sample in replay]
+                replay_characters = [packed_character(sample[0]) for sample in replay]
                 for character, eligible, keep in zip(
                     replay_characters, eligible_cpu, valid_cpu
                 ):
@@ -3474,14 +3725,14 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             update_durations.append(update_elapsed)
             if update_elapsed > 5:
                 packed = rows + [sample[0] for sample in replay]
-                represented_actions = max(len(row[4]) for row in packed)
+                represented_actions = max(packed_action_count(row) for row in packed)
                 print(json.dumps({"slow_update": {
                     "seconds": update_elapsed,
                     "fresh": len(rows), "replay": len(replay),
-                    "state_tokens_max": max(int(row[2].sum()) for row in packed),
+                    "state_tokens_max": max(packed_state_count(row) for row in packed),
                     "represented_actions_max": represented_actions,
-                    "state_attention_pairs": sum((int(row[2].sum()) + 1) ** 2 for row in packed),
-                    "legal_actions_max": int(max(np.count_nonzero(row[4][:, -1]) for row in packed)),
+                    "state_attention_pairs": sum((packed_state_count(row) + 1) ** 2 for row in packed),
+                    "legal_actions_max": max(packed_legal_count(row) for row in packed),
                     "unpack_seconds": unpack_seconds,
                     "forward_seconds": forward_seconds, "backward_seconds": backward_seconds,
                 }}), flush=True)
@@ -3499,13 +3750,13 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
     finally:
         stop.set()
         packer.shutdown(wait=True, cancel_futures=True)
-        started_workers = [worker for worker in workers if worker is not None and worker.pid is not None]
+        started_workers = [worker for worker in workers if worker is not None and (threaded or worker.pid is not None)]
         shutdown_deadline = time.monotonic() + 5
         while any(worker.is_alive() for worker in started_workers) and time.monotonic() < shutdown_deadline:
             drain_results()
             for worker in started_workers:
                 worker.join(.05)
-        terminated = {worker for worker in started_workers if worker.is_alive()}
+        terminated = set() if threaded else {worker for worker in started_workers if worker.is_alive()}
         for worker in terminated:
             worker.terminate()
         for worker in terminated:
@@ -3517,8 +3768,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             discarded_steps += dropped
             watchdog_dropped += dropped * (worker in terminated)
             worker_accounted[index] += dropped
-    failed = [worker.exitcode for worker in started_workers
-              if worker not in terminated and worker.exitcode]
+    failed = [] if threaded else [worker.exitcode for worker in started_workers
+                                  if worker not in terminated and worker.exitcode]
     if failed:
         raise RuntimeError(f"sampler processes failed: {failed}")
     assert handled == decisions and not len(dataset)
@@ -3987,6 +4238,9 @@ function showVersion(){const run=versions[versionSelect.value],reports=run.repor
 
 
 def train(args):
+    qos = getattr(ctypes.CDLL(None), "pthread_set_qos_class_self_np", None)
+    if qos is not None:
+        qos(0x21, 0)
     torch.set_num_threads(args.torch_threads)
     torch.manual_seed(args.seed); np.random.seed(args.seed)
     target = device()
@@ -4113,7 +4367,9 @@ def train(args):
                 policies = logits.log_softmax(-1).cpu().numpy()
             for index, policy in zip(indices, policies):
                 row = reservoir.rows[index]
-                reservoir.rows[index] = (*row[:4], np.asarray(policy[:len(row[0][4])], np.float16))
+                reservoir.rows[index] = (*row[:4], np.asarray(
+                    policy[:packed_action_count(row[0])], np.float16,
+                ))
     decisions = source["decisions"] if source else 0
     auxiliary_decisions = source.get("auxiliary_decisions", source["decisions"]) if source else 0
     stage_decisions = resume_stage_decisions(source, stage)
@@ -4228,12 +4484,6 @@ def train(args):
         base = decisions
         budget = args.decisions - decisions if args.decisions else (1 << 62) // args.envs * args.envs
         last_checkpoint = last_development = None
-        def save_latest(step):
-            digest = save(latest, step, True)
-            atomic_json(output / "latest.json", {
-                "step": step, "stage": stage, "sampler_session": sampler_session,
-                "checkpoint": latest.name, "sha256": digest,
-            })
         def save_step(step):
             nonlocal last_checkpoint, last_development, best_score
             checkpoint = checkpoints_dir / f"{step:012}.pt"
@@ -4287,8 +4537,6 @@ def train(args):
             }
             immutable_json(reports_dir / f"{point['steps']:012}.json", row)
             atomic_json(output / "live.json", row)
-            if not last_checkpoint or last_checkpoint[0] != point["steps"]:
-                save_latest(point["steps"])
             keep = {last_checkpoint[1]} if last_checkpoint else set()
             keep.update(output / row["checkpoint"] for row in stage_bests.values())
             if best.get("checkpoint"):
@@ -4296,13 +4544,12 @@ def train(args):
             for checkpoint in checkpoints_dir.glob("*.pt"):
                 if checkpoint not in keep:
                     checkpoint.unlink()
-            dashboard(output.parent)
             print(json.dumps(row), flush=True)
         model.train()
         training = train_stream(
             model, optimizer, args, sampler_session, stage, target, deadline, budget,
             base, auxiliary_decisions, stage_decisions, run_started, reservoir, progress_active,
-            save_report, save_step,
+            save_report, save_step, manifest["fingerprint"],
         )
         if not training["decisions"]:
             break
@@ -4496,8 +4743,10 @@ def value_metrics(logits, labels, characters, temperature, bias, base_rates):
     return result
 
 
-def export_value_model(path, model, fingerprint, temperature, bias):
-    path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
+def export_value_model(path, model, fingerprint, temperature, bias, actor=False):
+    path = Path(path) if path is not None else None
+    if path is not None:
+        path.parent.mkdir(parents=True, exist_ok=True)
     parts = [
         b"STSVALUE", struct.pack("<IIQ", MODEL_VERSION, FEATURE_VERSION, fingerprint),
         struct.pack("<18I", model.width, model.layers, model.heads, model.feedforward,
@@ -4562,8 +4811,15 @@ def export_value_model(path, model, fingerprint, temperature, bias):
         add_linear(module)
     add_norm(model.menu_norm); add(model.menu_empty)
     add_linear(model.value[0]); add_linear(model.value[2])
+    if actor:
+        parts.append(b"STSACTOR")
+        for head in (model.policy, model.progress_value):
+            add_linear(head[0]); add_linear(head[2])
+    data = b"".join(parts)
+    if path is None:
+        return data
     temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_bytes(b"".join(parts)); temporary.replace(path)
+    temporary.write_bytes(data); temporary.replace(path)
     return sha256_file(path)
 
 
@@ -4673,15 +4929,19 @@ def probe_candidate_policy(model, target):
     row = torch.zeros(3, dtype=torch.long, device=target)
     legal = torch.ones(3, dtype=torch.bool, device=target)
     sequence = candidate_index(np.zeros(3, np.int32), 1, target)
-    base = model.decide(state, action, row, torch.arange(3, device=target), 3, legal, sequence)
+    base = model.decide(state, action, row, torch.arange(3, device=target), 3, legal, sequence, 3)
     value = model.value(state)
     permutation = torch.tensor((2, 0, 1), device=target)
-    permuted = model.decide(state, action[permutation], row, permutation, 3, legal, sequence)
+    permuted = model.decide(
+        state, action[permutation], row, permutation, 3, legal, sequence, 3,
+    )
     permuted_value = model.value(state)
     assert torch.allclose(base, permuted, atol=1e-6, rtol=1e-6)
     assert torch.allclose(value, permuted_value, atol=1e-6, rtol=1e-6)
     single_sequence = candidate_index(np.zeros(1, np.int32), 1, target)
-    single = model.decide(state, action[:1], row[:1], row[:1], 1, legal[:1], single_sequence)
+    single = model.decide(
+        state, action[:1], row[:1], row[:1], 1, legal[:1], single_sequence, 1,
+    )
     assert single.item() == 0
 
 
@@ -4789,9 +5049,17 @@ def probe():
     flat_observation = env.observe_tokens(flat=True)
     assert np.asarray(observation[1]).shape == (8, 0)
     python_rows, rust_rows = pack_batch(observation), pack_batch(flat_observation)
-    assert all(int(left[0]) == int(right[0]) and all(
-        np.array_equal(np.asarray(a), np.asarray(b)) for a, b in zip(left[1:], right[1:])
-    ) for left, right in zip(python_rows, rust_rows))
+    for rows in (python_rows, rust_rows):
+        for packed in rows:
+            validate_packed(packed)
+    def arrays(value):
+        if isinstance(value, (tuple, list)):
+            return [array for item in value for array in arrays(item)]
+        return [np.asarray(value)]
+    assert all(np.array_equal(left, right) for left, right in zip(
+        arrays(sts2_sim.unpack_packed_observations(python_rows)),
+        arrays(sts2_sim.unpack_packed_observations(list(rust_rows))),
+    ))
 
     active = np.arange(8) % 2 == 0
     mixed = env.observe_tokens(active.tolist())
@@ -4912,6 +5180,8 @@ def probe():
         blocks = state[:, :model.base_state_width].reshape(8, -1, model.width)
         assert torch.allclose(blocks.mean(2), torch.zeros_like(blocks[:, :, 0]), atol=1e-5)
         assert torch.equal(output[0], predict(model, inputs, "fp32", policy_only=True))
+        flat_policy = predict(model, inputs, "fp32", policy_only=True, flat_policy=True)
+        assert torch.equal(flat_policy, output[0].reshape(-1)[inputs[5][1]])
         flat_output = predict(model, tensors(flat_observation, target, model), "fp32")
         replay_output = predict(model, unpack([row, row], target, model), "fp32")
     flat_error = [float((left - right).abs().max()) for left, right in zip(output, flat_output)]
@@ -5014,7 +5284,7 @@ def probe():
         encoded, continuations, actors, target_inputs[4], target_inputs[5], nodes,
     )[0]
     detached_index = (*target_inputs[5][:7], torch.full_like(target_inputs[5][7], -1),
-                      target_inputs[5][8])
+                      *target_inputs[5][8:])
     detached = model.encode_actions(
         encoded, continuations, actors, target_inputs[4], detached_index, nodes,
     )[0]
@@ -5088,7 +5358,7 @@ def probe():
     with torch.no_grad():
         cached_output = predict(cached, cached_inputs, "fp32")
         repeated_output = predict(cached, cached_inputs, "fp32")
-    assert cached.cache_stats["card_hit"] and cached.cache_stats["graph_hit"]
+    assert cached.cache_stats["graph_hit"]
     assert all(torch.equal(left, right) for left, right in zip(cached_output, repeated_output))
 
     parity_env = sts2_sim.Batch(8, 72, 0)
@@ -5131,6 +5401,7 @@ def parser():
     run.add_argument("--samplers", type=int, default=4)
     run.add_argument("--torch-threads", type=int, default=2)
     run.add_argument("--sampler-threads", type=int, default=1)
+    run.add_argument("--sampler-backend", choices=("process", "thread"), default="process")
     run.add_argument("--sampler-steps", type=int, default=4)
     run.add_argument("--sampler-timeout", type=float, default=120)
     run.add_argument("--sampler-restarts", type=int, default=3)

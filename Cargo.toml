@@ -9,10 +9,15 @@ path = "src/lib.rs"
 crate-type = ["rlib", "cdylib"]
 
 [features]
-python = ["dep:numpy", "dep:pyo3", "dep:rayon"]
+python = ["dep:mimalloc", "dep:numpy", "dep:pyo3", "dep:rayon"]
 
 [dependencies]
 numpy = { version = "0.25", optional = true }
+mimalloc = { version = "0.1", optional = true }
 pyo3 = { version = "0.25", features = ["extension-module"], optional = true }
 rayon = { version = "1", optional = true }
 serde_json = "1"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
