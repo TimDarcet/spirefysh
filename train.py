@@ -9,9 +9,11 @@ import multiprocessing
 import os
 import pickle
 import struct
+import sys
 import tempfile
 import threading
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from queue import Empty, Full, Queue
@@ -31,6 +33,17 @@ CHANGE = "V68: native actors and compact transport with full-model updates."
 STAGES = [(0, bonus) for bonus in (24, 20, 16, 12, 8, 4, 0)] + [
     (ascension, 0) for ascension in range(1, 11)
 ]
+
+
+def redirect_output(path):
+    sys.stdout.flush()
+    sys.stderr.flush()
+    stream = path.open("a", buffering=1)
+    os.dup2(stream.fileno(), 1)
+    os.dup2(stream.fileno(), 2)
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+    return stream
 
 _TRAINING_METAL = r"""
 #include <metal_stdlib>
@@ -2496,6 +2509,12 @@ class RolloutCollector:
         self.native_steps = []
         self.native_starts = np.zeros(args.envs, np.int64)
         self.native_started = np.full(args.envs, time.monotonic())
+        self.log = None
+
+    def event(self, event, **values):
+        if self.log:
+            print(json.dumps({"time": time.time(), "event": event, **values}),
+                  file=self.log, flush=True)
 
     def trace_empty(self, kind, indices, characters, stats):
         seeds = self.env.seeds()
@@ -2719,6 +2738,7 @@ class RolloutCollector:
                     self.env.load_policy(state)
                 else:
                     model.load_state_dict(state)
+                self.event("model", version=version)
             steps = sampling_steps(produced, budget, self.args.envs, self.args.sampler_steps)
             if not steps:
                 break
@@ -2751,6 +2771,11 @@ class RolloutCollector:
                 try:
                     pending["queue_put_seconds"] = time.monotonic() - put_started
                     samples.put_nowait((worker, self.generation, version, pending))
+                    self.event(
+                        "packet", version=version, iteration=pending["iteration"],
+                        trajectories=len(pending["trajectories"]), rows=pending_rows,
+                        sampled=pending["sampled_steps"], discarded=pending["discarded_steps"],
+                    )
                     pending = empty()
                     pending_rows = 0
                     break
@@ -2782,6 +2807,9 @@ class RolloutCollector:
 def collect_worker(model, args, sampler_session, stage, capacity, pending_capacity, iteration,
                    worker, generation, version, models, samples, stop, deadline, budget, results,
                    heartbeat, progress):
+    log = (Path(args.output) / f"sampler-{worker}.log").open("a", buffering=1)
+    if args.sampler_backend == "process":
+        os.dup2(log.fileno(), 1); os.dup2(log.fileno(), 2)
     qos = getattr(ctypes.CDLL(None), "pthread_set_qos_class_self_np", None)
     if qos is not None:
         qos(int(os.environ.get("ACTOR_QOS", "0x11"), 0), 0)
@@ -2793,6 +2821,11 @@ def collect_worker(model, args, sampler_session, stage, capacity, pending_capaci
     reservoir = WinningReservoir(capacity, args.envs, pending_capacity)
     collector = RolloutCollector(
         args, sampler_session, stage, reservoir, iteration, worker, generation,
+    )
+    collector.log = log
+    collector.event(
+        "start", pid=os.getpid(), worker=worker, generation=generation,
+        session=sampler_session, stage=stage, envs=args.envs, threads=args.sampler_threads,
     )
     target = torch.device("mps") if os.environ.get("ACTOR_MPS") else torch.device("cpu")
     precision = "bf16" if target.type == "mps" else "fp32"
@@ -2806,10 +2839,20 @@ def collect_worker(model, args, sampler_session, stage, capacity, pending_capaci
         collector.observation = None
         model = None
     heartbeat[worker] = time.monotonic()
-    results.put(collector.run(
-        model, models, samples, stop, deadline, budget, worker, heartbeat, progress, version,
-        target, precision,
-    ))
+    try:
+        result = collector.run(
+            model, models, samples, stop, deadline, budget, worker, heartbeat, progress, version,
+            target, precision,
+        )
+        collector.event(
+            "stop", version=result[2], iteration=result[3]["iteration"],
+            sampled=result[3]["sampled_steps"], discarded=result[3]["discarded_steps"],
+        )
+        results.put(result)
+    except BaseException:
+        collector.event("error", version=version)
+        traceback.print_exc(file=log)
+        raise
 
 
 class ExperienceDataset:
@@ -3337,6 +3380,11 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             discarded_steps += dropped
             watchdog_dropped += dropped
             worker_accounted[worker] = worker_resolved[worker] = 0
+            print(json.dumps({
+                "time": time.time(), "event": "sampler_failure", "worker": worker,
+                "generation": sampler_generations[worker], "wedged": wedged,
+                "exitcode": process.exitcode, "dropped": dropped,
+            }), flush=True)
             if (sampler_restarts[worker] >= args.sampler_restarts or stop.is_set()
                     or time.monotonic() >= deadline or decisions >= budget):
                 sampler_exhausted[worker] = True
@@ -3349,6 +3397,11 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 except (Empty, EOFError, OSError):
                     break
             start_worker(worker)
+            print(json.dumps({
+                "time": time.time(), "event": "sampler_restart", "worker": worker,
+                "generation": sampler_generations[worker],
+                "restarts": sampler_restarts[worker],
+            }), flush=True)
 
     try:
         while True:
@@ -3735,7 +3788,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             if update_elapsed > 5:
                 packed = rows + [sample[0] for sample in replay]
                 represented_actions = max(packed_action_count(row) for row in packed)
-                print(json.dumps({"slow_update": {
+                print(json.dumps({"time": time.time(), "event": "slow_update", "metrics": {
                     "seconds": update_elapsed,
                     "fresh": len(rows), "replay": len(replay),
                     "state_tokens_max": max(packed_state_count(row) for row in packed),
@@ -4319,7 +4372,12 @@ def train(args):
     except BlockingIOError as error:
         raise RuntimeError(f"trainer already running for {output}") from error
     training_lock.seek(0); training_lock.truncate(); training_lock.write(str(os.getpid())); training_lock.flush()
+    redirect_output(output / "train.log")
     training = {key: value for key, value in vars(args).items() if key != "command"}
+    print(json.dumps({
+        "time": time.time(), "event": "start", "pid": os.getpid(),
+        "model_version": MODEL_VERSION, "checkpoint": args.checkpoint, "training": training,
+    }), flush=True)
     manifest = json.loads((output / "run.json").read_text()) if continuing else {
         "schema": 1, "model_version": MODEL_VERSION, "feature_version": FEATURE_VERSION,
         "fingerprint": probe_env.fingerprint(), "layout": layout, "precision": args.precision,
@@ -4486,7 +4544,7 @@ def train(args):
             "checkpoint": latest.name, "sha256": digest,
         })
         dashboard(output.parent)
-        print(json.dumps(promotion), flush=True)
+        print(json.dumps({"time": time.time(), "event": "promotion", **promotion}), flush=True)
 
     if args.promote_now:
         promote()
@@ -4508,6 +4566,10 @@ def train(args):
                 "immutable": str(checkpoint.relative_to(output)),
                 "immutable_sha256": immutable_digest, "sha256": digest,
             })
+            print(json.dumps({
+                "time": time.time(), "event": "checkpoint", "step": step,
+                "stage": stage, "path": str(checkpoint), "sha256": immutable_digest,
+            }), flush=True)
         def save_report(point, pipeline, window):
             row = {
                 "schema": 1, "step": point["steps"], "window": window,
@@ -4525,7 +4587,7 @@ def train(args):
             for checkpoint in checkpoints_dir.glob("*.pt"):
                 if checkpoint not in keep:
                     checkpoint.unlink()
-            print(json.dumps(row), flush=True)
+            print(json.dumps({"time": time.time(), "event": "report", **row}), flush=True)
         model.train()
         training = train_stream(
             model, optimizer, args, sampler_session, stage, target, deadline, budget,
@@ -4552,6 +4614,11 @@ def train(args):
         "training_fraction": training_seconds / max(1e-9, training_seconds + promotion_seconds),
         "decisions": decisions, "stage": stage,
     })
+    print(json.dumps({
+        "time": time.time(), "event": "complete", "decisions": decisions,
+        "stage": stage, "training_seconds": training_seconds,
+        "promotion_seconds": promotion_seconds,
+    }), flush=True)
     dashboard(output.parent)
 
 
