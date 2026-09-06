@@ -2692,7 +2692,7 @@ class RolloutCollector:
             trajectory.update(zip(sample_keys, map(list, zip(*samples))))
             return trajectory
         discarded_steps = orphan_empty_actions = sampled_steps = 0
-        search_stats = np.zeros(16, np.int64)
+        search_stats = np.zeros(17, np.int64)
         expert_rows = []
         collect_seconds = 0.0
         for _ in range(steps):
@@ -2738,6 +2738,7 @@ class RolloutCollector:
                     mcts_exploration=args.mcts_exploration,
                     mcts_value_consistency=getattr(args, "search_consistency_weight", 0) > 0,
                     mcts_heuristic=args.mcts_heuristic,
+                    mcts_timeout=args.mcts_timeout,
                 )
                 characters = np.asarray(characters, np.uint8)
                 critic_probability = np.asarray(critic_probability, np.float16)
@@ -2877,6 +2878,7 @@ class RolloutCollector:
             "mcts_rollout_completed": int(search_stats[13]),
             "mcts_rollout_invalid": int(search_stats[14]),
             "mcts_rollout_seconds": float(search_stats[15]) / 1e6,
+            "mcts_timeouts": int(search_stats[16]),
             **({key: 0 for key in cache_start} if native else {
                 key: model.cache_stats[key] - cache_start[key] for key in model.cache_stats
             }),
@@ -2902,6 +2904,7 @@ class RolloutCollector:
                 "mcts_inference_seconds": 0.0, "mcts_backup_seconds": 0.0,
                 "mcts_rollout_steps": 0, "mcts_rollout_completed": 0,
                 "mcts_rollout_invalid": 0, "mcts_rollout_seconds": 0.0,
+                "mcts_timeouts": 0,
                 **dict.fromkeys(("card_hit", "card_miss", "graph_hit", "graph_miss"), 0),
             }
         pending = empty()
@@ -2948,7 +2951,7 @@ class RolloutCollector:
                 "mcts_simulate_seconds", "mcts_encode_seconds",
                 "mcts_inference_seconds", "mcts_backup_seconds",
                 "mcts_rollout_steps", "mcts_rollout_completed", "mcts_rollout_invalid",
-                "mcts_rollout_seconds",
+                "mcts_rollout_seconds", "mcts_timeouts",
             ):
                 pending[key] += result[key]
             pending["iteration"] = result["iteration"]
@@ -3361,7 +3364,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
     mcts_turn_starts = 0
     mcts_seconds = mcts_simulate_seconds = mcts_encode_seconds = 0.0
     mcts_inference_seconds = mcts_backup_seconds = mcts_rollout_seconds = 0.0
-    mcts_rollout_steps = mcts_rollout_completed = mcts_rollout_invalid = 0
+    mcts_rollout_steps = mcts_rollout_completed = mcts_rollout_invalid = mcts_timeouts = 0
     expert_visits = expert_depth = 0
     segmented_trajectories = 0
     winning_added = winning_replayed = winning_rejected = orphan_empty_actions = post_kl_checks = 0
@@ -3451,7 +3454,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 pass
 
     def ingest(item):
-        nonlocal decisions, handled, forced, discarded_steps, sampled, collect_seconds, winning_added, orphan_empty_actions, latest_sampler_version, latest_sampler_iteration, dataset_peak, segmented_trajectories, queue_full_waits, queue_put_seconds, queue_delay_sum, queue_packets, queue_peak, mcts_roots, mcts_simulations, mcts_leaves, mcts_nodes, mcts_batches, mcts_targets, mcts_turn_starts, mcts_seconds, mcts_simulate_seconds, mcts_encode_seconds, mcts_inference_seconds, mcts_backup_seconds, mcts_rollout_steps, mcts_rollout_completed, mcts_rollout_invalid, mcts_rollout_seconds
+        nonlocal decisions, handled, forced, discarded_steps, sampled, collect_seconds, winning_added, orphan_empty_actions, latest_sampler_version, latest_sampler_iteration, dataset_peak, segmented_trajectories, queue_full_waits, queue_put_seconds, queue_delay_sum, queue_packets, queue_peak, mcts_roots, mcts_simulations, mcts_leaves, mcts_nodes, mcts_batches, mcts_targets, mcts_turn_starts, mcts_seconds, mcts_simulate_seconds, mcts_encode_seconds, mcts_inference_seconds, mcts_backup_seconds, mcts_rollout_steps, mcts_rollout_completed, mcts_rollout_invalid, mcts_rollout_seconds, mcts_timeouts
         worker, generation, version, result = item
         if generation != sampler_generations[worker]:
             return
@@ -3489,6 +3492,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         mcts_rollout_completed += result.get("mcts_rollout_completed", 0)
         mcts_rollout_invalid += result.get("mcts_rollout_invalid", 0)
         mcts_rollout_seconds += result.get("mcts_rollout_seconds", 0.0)
+        mcts_timeouts += result.get("mcts_timeouts", 0)
         for trajectory in result["trajectories"]:
             segmented_trajectories += int(not trajectory["terminals"][-1])
             trajectory_lengths.append(len(trajectory["rows"]))
@@ -3678,6 +3682,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             "mcts_rollout_steps": mcts_rollout_steps,
             "mcts_rollout_completed": mcts_rollout_completed,
             "mcts_rollout_invalid": mcts_rollout_invalid,
+            "mcts_timeouts": mcts_timeouts,
             "mcts_rollout_fraction": mcts_rollout_seconds / max(1e-9, mcts_seconds),
             "expert_buffer_rows": len(expert_dataset),
             "expert_rows_seen": expert_dataset.seen,
@@ -4414,6 +4419,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         "mcts_rollout_steps": mcts_rollout_steps,
         "mcts_rollout_completed": mcts_rollout_completed,
         "mcts_rollout_invalid": mcts_rollout_invalid,
+        "mcts_timeouts": mcts_timeouts,
         "mcts_rollout_fraction": mcts_rollout_seconds / max(1e-9, mcts_seconds),
         "expert_buffer_rows": len(expert_dataset),
         "expert_rows_seen": expert_dataset.seen,
@@ -5106,15 +5112,25 @@ def dashboard(target):
              "step": reports[key]["step"], "stage": reports[key].get("stage", {}),
              "description": reports[key].get("description", ""),
              "pipeline": reports[key].get("pipeline", []),
-             "metrics": reports[key]["metrics"], "_written": reports[key].get("_written")}
+             "metrics": dict(reports[key]["metrics"]), "_written": reports[key].get("_written")}
             for index, key in enumerate(sorted(reports), 1)
         ]
+        for row in report_rows:
+            floors = row["metrics"].get("trajectory_floors", [])
+            row["metrics"]["trajectory_floors"] = floors[::max(1, math.ceil(len(floors) / 16))]
+            for key in tuple(row["metrics"]):
+                if key.startswith("critic_preweight_") or key in (
+                    "characters", "critic_postweight_loss_mass",
+                ):
+                    row["metrics"].pop(key)
         version_groups = {}
         for row in report_rows:
             marker = row["description"].partition("Continuous V")[2].partition(" ")[0]
             version = int(marker) if marker.isdigit() else manifest.get("model_version", manifest.get("version", 0))
             version_groups.setdefault(version, []).append(row)
         for version, version_reports in version_groups.items():
+            for row in version_reports[1:]:
+                row.pop("description", None); row.pop("pipeline", None)
             version_manifest = manifest | manifest.get("version_history", {}).get(str(version), {})
             version_manifest["model_version"] = version
             if version == MODEL_VERSION:
@@ -5250,7 +5266,8 @@ def train(args):
             or min(args.mcts_max_depth, args.mcts_batch_size, args.mcts_min_visits,
                    args.mcts_max_targets, args.expert_batch, args.expert_capacity) < 1
             or min(args.mcts_prior_temperature, args.mcts_q_temperature) <= 0
-            or args.mcts_exploration < 0 or args.expert_weight < 0):
+            or args.mcts_exploration < 0 or args.expert_weight < 0
+            or not math.isfinite(args.mcts_timeout) or args.mcts_timeout < 0):
         raise ValueError("invalid MCTS settings")
     if args.envs % args.samplers:
         raise ValueError("environments must be divisible by samplers")
@@ -6686,6 +6703,7 @@ def parser():
     run.add_argument("--mcts-q-temperature", type=float, default=.002)
     run.add_argument("--mcts-exploration", type=float, default=1.5)
     run.add_argument("--mcts-heuristic", action="store_true")
+    run.add_argument("--mcts-timeout", type=float, default=60)
     run.add_argument("--expert-weight", type=float, default=.002)
     run.add_argument("--expert-max-lag", type=int, default=4)
     run.add_argument("--expert-batch", type=int)

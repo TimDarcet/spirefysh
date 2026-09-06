@@ -13219,34 +13219,41 @@ mod python {
 
     impl SearchNode {
         fn new(
-            observation: &ObservationV53,
+            candidates: Vec<CandidateRow>,
             log_policy: &[f32],
             value: f32,
             depth: usize,
             behavior_exponent: f32,
             packed: Option<Vec<u8>>,
         ) -> Self {
+            let action_count = candidates.len();
             let behavior_normalizer = log_policy
                 .iter()
                 .filter(|probability| probability.is_finite())
                 .map(|probability| (probability * behavior_exponent).exp())
                 .sum::<f32>();
-            let mut occurrences = FastMap::<u64, usize>::default();
+            let mut occurrences = FastMap::<u64, usize>::with_capacity_and_hasher(
+                candidates.len(),
+                BuildHasherDefault::default(),
+            );
             let mut kind_counts = [0; ACTION_KINDS];
-            let mut edges = observation
-                .candidates
-                .iter()
-                .zip(log_policy)
+            let mut edges = Vec::with_capacity(action_count);
+            for (candidate, (row, probability)) in candidates
+                .into_iter()
+                .zip(log_policy.iter().copied())
                 .enumerate()
-                .filter_map(|(candidate, (row, probability))| {
-                    let occurrence = occurrences.entry(public_candidate_digest(row)).or_default();
-                    let current_occurrence = *occurrence;
-                    *occurrence += 1;
-                    let kind = action_kind(&row.action);
-                    let kind_occurrence = kind_counts[kind];
-                    kind_counts[kind] += usize::from(row.legal);
-                    (row.legal && probability.is_finite()).then(|| SearchEdge {
-                        row: row.clone(),
+            {
+                let occurrence = occurrences
+                    .entry(public_candidate_digest(&row))
+                    .or_default();
+                let current_occurrence = *occurrence;
+                *occurrence += 1;
+                let kind = action_kind(&row.action);
+                let kind_occurrence = kind_counts[kind];
+                kind_counts[kind] += usize::from(row.legal);
+                if row.legal && probability.is_finite() {
+                    edges.push(SearchEdge {
+                        row,
                         candidate,
                         occurrence: current_occurrence,
                         kind_occurrence,
@@ -13259,9 +13266,9 @@ mod python {
                         terminal_visits: 0,
                         terminal_value_sum: 0.0,
                         invalid: false,
-                    })
-                })
-                .collect::<Vec<_>>();
+                    });
+                }
+            }
             let mut order = (0..edges.len()).collect::<Vec<_>>();
             order.sort_by(|&left, &right| edges[right].prior.total_cmp(&edges[left].prior));
             for (rank, &edge) in order.iter().enumerate() {
@@ -13271,7 +13278,7 @@ mod python {
                 value,
                 value_samples: 1,
                 packed,
-                action_count: observation.candidates.len(),
+                action_count,
                 depth,
                 visits: 0,
                 ranked: order,
@@ -13463,13 +13470,24 @@ mod python {
             heuristic: bool,
         ) -> Self {
             let digest = observation_digest(observation);
-            let mut lookup = FastMap::default();
+            let capacity = budget.saturating_mul(16).saturating_add(1);
+            let mut lookup =
+                FastMap::with_capacity_and_hasher(capacity, BuildHasherDefault::default());
             lookup.insert((digest, 0), 0);
             let games = capture_games.then(|| vec![root.clone()]);
             let mut root = root.clone();
             canonicalize_combat_hidden(&mut root);
             let root_turn = root.combat().map_or(0, |combat| combat.turn);
             let map = canonical_map(&root, content, layout);
+            let mut nodes = Vec::with_capacity(capacity);
+            nodes.push(SearchNode::new(
+                observation.candidates.clone(),
+                log_policy,
+                value,
+                0,
+                behavior_exponent,
+                Some(compact_packed_observation_known(observation, Some(digest))),
+            ));
             Self {
                 root,
                 root_observation: observation.clone(),
@@ -13480,14 +13498,7 @@ mod python {
                 budget,
                 turns,
                 max_depth,
-                nodes: vec![SearchNode::new(
-                    observation,
-                    log_policy,
-                    value,
-                    0,
-                    behavior_exponent,
-                    Some(compact_packed_observation_known(observation, Some(digest))),
-                )],
+                nodes,
                 lookup,
                 games,
                 progress,
@@ -13692,7 +13703,7 @@ mod python {
 
         fn expand(
             &mut self,
-            observation: &ObservationV53,
+            observation: ObservationV53,
             digest: u64,
             depth: usize,
             mut path: SearchPath,
@@ -13726,7 +13737,7 @@ mod python {
 
         fn insert(
             &mut self,
-            observation: &ObservationV53,
+            observation: ObservationV53,
             digest: u64,
             depth: usize,
             log_policy: &[f32],
@@ -13748,7 +13759,7 @@ mod python {
             let index = self.nodes.len();
             self.lookup.insert(key, index);
             self.nodes.push(SearchNode::new(
-                observation,
+                observation.candidates,
                 log_policy,
                 value,
                 depth,
@@ -13763,15 +13774,29 @@ mod python {
 
         fn expand_rollout(&mut self, mut leaf: PendingLeaf, rollout: Vec<RolloutStep>, value: f32) {
             for step in rollout {
-                let child = self.insert(
-                    &step.observation,
-                    step.digest,
-                    step.depth,
-                    &step.policy,
-                    value,
-                    step.game,
-                    Some(step.packed),
-                );
+                let RolloutStep {
+                    game,
+                    observation,
+                    policy,
+                    digest,
+                    choice,
+                    depth,
+                } = step;
+                let packed = (self.capture_children
+                    || self.lookup.get(&(digest, depth)).is_some_and(|&index| {
+                        let node = &self.nodes[index];
+                        node.packed.is_none()
+                            && node.visits + 1 >= self.pack_visits
+                            && node
+                                .edges
+                                .iter()
+                                .filter(|edge| edge.visits > 0 || edge.candidate == choice)
+                                .take(2)
+                                .count()
+                                >= 2
+                    }))
+                .then(|| compact_packed_observation_known(&observation, Some(digest)));
+                let child = self.insert(observation, digest, depth, &policy, value, game, packed);
                 let previous = leaf.path.steps.last_mut().expect("empty rollout path");
                 previous.child = Some(child);
                 leaf.path
@@ -13782,7 +13807,7 @@ mod python {
                 let edge = self.nodes[child]
                     .edges
                     .iter()
-                    .position(|edge| edge.candidate == step.choice)
+                    .position(|edge| edge.candidate == choice)
                     .expect("rollout action is absent from its node");
                 leaf.path.steps.push(SearchStep {
                     node: child,
@@ -13943,6 +13968,7 @@ mod python {
         rollout_completed: usize,
         rollout_invalid: usize,
         rollout_micros: u64,
+        timed_out: bool,
     }
 
     struct ExpertTarget {
@@ -13974,7 +14000,6 @@ mod python {
     struct RolloutStep {
         game: Option<Game>,
         observation: ObservationV53,
-        packed: Vec<u8>,
         policy: Vec<f32>,
         digest: u64,
         choice: usize,
@@ -14011,8 +14036,9 @@ mod python {
         random: &mut u64,
         temperature: f32,
         prior_temperature: f32,
+        deadline: Option<std::time::Instant>,
         stats: &mut SearchStats,
-    ) -> Result<Vec<CombatRollout>, String> {
+    ) -> Result<Option<Vec<CombatRollout>>, String> {
         let started = std::time::Instant::now();
         let mut games = leaves
             .iter_mut()
@@ -14027,13 +14053,20 @@ mod python {
             .collect::<Vec<_>>();
         let mut depths = leaves.iter().map(|leaf| leaf.depth).collect::<Vec<_>>();
         let mut values = vec![None; leaves.len()];
-        let mut paths = (0..leaves.len()).map(|_| Vec::new()).collect::<Vec<_>>();
+        let mut paths = leaves
+            .iter()
+            .map(|leaf| Vec::with_capacity((trees[leaf.tree].max_depth - leaf.depth).min(16)))
+            .collect::<Vec<_>>();
         let mut pending = (0..leaves.len()).collect::<Vec<_>>();
         let mut indices = Vec::with_capacity(leaves.len());
         let mut terminal = Vec::with_capacity(leaves.len());
         let mut actions = vec![None; leaves.len()];
         let mut first = true;
         loop {
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                stats.rollout_micros += started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+                return Ok(None);
+            }
             indices.clear();
             terminal.clear();
             for index in pending.drain(..) {
@@ -14069,19 +14102,7 @@ mod python {
                 break;
             }
             if first {
-                let packed = indices
-                    .par_iter()
-                    .zip(&terminal)
-                    .map(|(&index, &terminal)| {
-                        (!terminal).then(|| {
-                            compact_packed_observation_known(
-                                &leaves[index].observation,
-                                Some(leaves[index].digest),
-                            )
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                for ((&index, &terminal), packed) in indices.iter().zip(&terminal).zip(packed) {
+                for (&index, &terminal) in indices.iter().zip(&terminal) {
                     let output = &initial[index];
                     if terminal {
                         values[index] = Some(if trees[leaves[index].tree].progress {
@@ -14104,7 +14125,6 @@ mod python {
                                 .is_some()
                                 .then(|| games[index].clone()),
                             observation: leaves[index].observation.clone(),
-                            packed: packed.expect("combat rollout packed observation missing"),
                             policy: output.0.clone(),
                             digest: leaves[index].digest,
                             choice,
@@ -14139,21 +14159,20 @@ mod python {
                         terminal.iter().any(|&terminal| terminal),
                     )
                     .map_err(|error| error.to_string())?;
-                let packed = observations
+                let digests = observations
                     .par_iter()
                     .zip(&terminal)
                     .map(|(observation, &terminal)| {
-                        (!terminal)
-                            .then(|| compact_packed_observation_and_digest(observation, None))
+                        (!terminal).then(|| observation_digest(observation))
                     })
                     .collect::<Vec<_>>();
-                for ((((index, terminal), output), observation), packed) in indices
+                for ((((index, terminal), output), observation), digest) in indices
                     .iter()
                     .copied()
                     .zip(terminal.iter().copied())
                     .zip(outputs)
                     .zip(observations)
-                    .zip(packed)
+                    .zip(digests)
                 {
                     if terminal {
                         values[index] = Some(if trees[leaves[index].tree].progress {
@@ -14182,8 +14201,7 @@ mod python {
                             .iter_mut()
                             .filter(|value| value.is_finite())
                             .for_each(|value| *value -= normalizer);
-                        let (packed, digest) =
-                            packed.expect("combat rollout packed observation missing");
+                        let digest = digest.expect("combat rollout digest missing");
                         actions[index] = Some(observation.candidates[choice].action.clone());
                         paths[index].push(RolloutStep {
                             game: trees[leaves[index].tree]
@@ -14192,7 +14210,6 @@ mod python {
                                 .then(|| games[index].clone()),
                             digest,
                             observation,
-                            packed,
                             policy,
                             choice,
                             depth: depths[index],
@@ -14221,11 +14238,13 @@ mod python {
                 })?;
         }
         stats.rollout_micros += started.elapsed().as_micros().min(u64::MAX as u128) as u64;
-        Ok(values
-            .into_iter()
-            .zip(paths)
-            .map(|(value, steps)| CombatRollout { value, steps })
-            .collect())
+        Ok(Some(
+            values
+                .into_iter()
+                .zip(paths)
+                .map(|(value, steps)| CombatRollout { value, steps })
+                .collect(),
+        ))
     }
 
     fn run_mcts(
@@ -14239,6 +14258,7 @@ mod python {
         prior_temperature: f32,
         policy_temperature: f32,
         exploration: f32,
+        deadline: Option<std::time::Instant>,
         stats: &mut SearchStats,
     ) -> Result<(), String> {
         let mut cursor = 0;
@@ -14252,6 +14272,10 @@ mod python {
         let mut rollout_expansions: Vec<Vec<(PendingLeaf, Vec<RolloutStep>, f32)>> =
             (0..trees.len()).map(|_| Vec::new()).collect();
         while trees.iter().any(|tree| tree.simulations < tree.budget) {
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                stats.timed_out = true;
+                break;
+            }
             tasks.clear();
             for lane in 0..16 {
                 for offset in 0..trees.len() {
@@ -14346,23 +14370,29 @@ mod python {
                 )
                 .map_err(|error| error.to_string())?;
             stats.inference_micros += started.elapsed().as_micros().min(u64::MAX as u128) as u64;
-            let mut rollout_values = rollout
-                .then(|| {
-                    rollout_combat(
-                        model,
-                        trees,
-                        &mut leaves,
-                        &evaluated,
-                        content,
-                        layout,
-                        bonuses,
-                        random,
-                        policy_temperature,
-                        prior_temperature,
-                        stats,
-                    )
-                })
-                .transpose()?;
+            let mut rollout_values = if rollout {
+                let Some(values) = rollout_combat(
+                    model,
+                    trees,
+                    &mut leaves,
+                    &evaluated,
+                    content,
+                    layout,
+                    bonuses,
+                    random,
+                    policy_temperature,
+                    prior_temperature,
+                    deadline,
+                    stats,
+                )?
+                else {
+                    stats.timed_out = true;
+                    break;
+                };
+                Some(values)
+            } else {
+                None
+            };
             tracing::debug!(
                 tasks = tasks.len(),
                 leaves = leaves.len(),
@@ -14412,7 +14442,7 @@ mod python {
                     }
                     for (leaf, policy, value) in expansions.drain(..) {
                         tree.expand(
-                            &leaf.observation,
+                            leaf.observation,
                             leaf.digest,
                             leaf.depth,
                             leaf.path,
@@ -14452,6 +14482,7 @@ mod python {
         policy_temperature: f32,
         value_consistency: bool,
         heuristic: bool,
+        timeout: f64,
     ) -> Result<(Vec<ExpertTarget>, SearchStats), String> {
         let turn_start_count = observations
             .iter()
@@ -14532,6 +14563,18 @@ mod python {
             roots: trees.len(),
             ..SearchStats::default()
         };
+        let deadline = if timeout > 0.0 {
+            Some(
+                std::time::Instant::now()
+                    .checked_add(
+                        std::time::Duration::try_from_secs_f64(timeout)
+                            .map_err(|_| "invalid MCTS timeout")?,
+                    )
+                    .ok_or("invalid MCTS timeout")?,
+            )
+        } else {
+            None
+        };
         run_mcts(
             model,
             &mut trees,
@@ -14543,12 +14586,16 @@ mod python {
             prior_temperature,
             policy_temperature,
             exploration,
+            deadline,
             &mut stats,
         )?;
         let mut targets = Vec::new();
         for tree in trees {
             stats.simulations += tree.simulations;
             stats.nodes += tree.nodes.len();
+            if stats.timed_out {
+                continue;
+            }
             let (_, action_values) = tree.expectimax();
             let mut nodes = tree
                 .nodes
@@ -14845,7 +14892,7 @@ mod python {
                     }
                 })
                 .collect::<Vec<_>>();
-            let node = SearchNode::new(&row, &policy, 0.0, depth, 1.0, None);
+            let node = SearchNode::new(row.candidates.clone(), &policy, 0.0, depth, 1.0, None);
             if node.edges.is_empty() {
                 return self.leaf(&particles, Some(&row), depth, rng);
             }
@@ -15094,6 +15141,7 @@ mod python {
             prior_temperature,
             policy_temperature,
             exploration,
+            None,
             &mut stats,
         )?;
         let root_turn = tree.root_turn;
@@ -18715,7 +18763,14 @@ mod python {
                                     }
                                 })
                                 .collect::<Vec<_>>();
-                            let node = SearchNode::new(&observation, &policy, 0.0, 0, 1.0, None);
+                            let node = SearchNode::new(
+                                observation.candidates.clone(),
+                                &policy,
+                                0.0,
+                                0,
+                                1.0,
+                                None,
+                            );
                             if search.action_values.len() != node.edges.len() {
                                 return Err(
                                     "exact search returned incomplete root actions".to_owned()
@@ -18790,6 +18845,7 @@ mod python {
             mcts_exploration=1.5,
             mcts_value_consistency=false,
             mcts_heuristic=false,
+            mcts_timeout=0.0,
         ))]
         fn policy<'py>(
             &mut self,
@@ -18810,6 +18866,7 @@ mod python {
             mcts_exploration: f32,
             mcts_value_consistency: bool,
             mcts_heuristic: bool,
+            mcts_timeout: f64,
         ) -> PyResult<Bound<'py, PyTuple>> {
             if !(0.0..=1.0).contains(&mcts_fraction)
                 || mcts_max_depth == 0
@@ -18822,6 +18879,8 @@ mod python {
                 || mcts_q_temperature <= 0.0
                 || !mcts_exploration.is_finite()
                 || mcts_exploration < 0.0
+                || !mcts_timeout.is_finite()
+                || mcts_timeout < 0.0
             {
                 return Err(PyValueError::new_err("invalid MCTS settings"));
             }
@@ -18915,12 +18974,13 @@ mod python {
                             temperature,
                             mcts_value_consistency,
                             mcts_heuristic,
+                            mcts_timeout,
                         )
                     })
                     .map_err(PyValueError::new_err)?;
                 stats.micros = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
                 if stats.roots > 0 {
-                    tracing::info!(
+                    tracing::debug!(
                         turn_starts = stats.turn_starts,
                         roots = stats.roots,
                         simulations = stats.simulations,
@@ -18937,9 +18997,17 @@ mod python {
                         rollout_completed = stats.rollout_completed,
                         rollout_invalid = stats.rollout_invalid,
                         rollout_us = stats.rollout_micros,
+                        timed_out = stats.timed_out,
                         "mcts"
                     );
-                    if stats.micros > 5_000_000 {
+                    if stats.timed_out {
+                        tracing::warn!(
+                            roots = stats.roots,
+                            simulations = stats.simulations,
+                            elapsed_us = stats.micros,
+                            "mcts_timeout"
+                        );
+                    } else if stats.micros > 5_000_000 {
                         tracing::warn!(
                             roots = stats.roots,
                             simulations = stats.simulations,
@@ -19076,6 +19144,7 @@ mod python {
                     search_stats.rollout_completed as u64,
                     search_stats.rollout_invalid as u64,
                     search_stats.rollout_micros,
+                    search_stats.timed_out as u64,
                 ]
                 .into_pyobject(py)?
                 .into_any(),
