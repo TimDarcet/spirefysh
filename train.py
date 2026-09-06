@@ -1065,11 +1065,7 @@ class ConceptEmbeddings(nn.Module):
         self.num_embeddings = layout["concept_vocab"]
 
     def forward(self, codes):
-        output = self.tables[0].weight.new_zeros((*codes.shape, self.tables[0].embedding_dim))
-        for start, size, table in zip(self.starts, self.sizes, self.tables):
-            present = (codes >= start) & (codes < start + size)
-            output += table(torch.where(present, codes - start + 1, 0))
-        return output
+        return nn.functional.embedding(codes, self.flattened())
 
     def flattened(self):
         return torch.cat((self.tables[0].weight[:1] * 0,
