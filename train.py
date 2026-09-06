@@ -60,6 +60,7 @@ STAGES = [(0, bonus) for bonus in (24, 20, 16, 12, 8, 4, 0)] + [
 
 
 _EVENT_STREAM = None
+_ACCELERATOR_LOCK = None
 _GLOG = logging.getLogger()
 _GLOG_THREADS = []
 _GLOG_INFO_FD = None
@@ -1046,7 +1047,20 @@ class _FusedSemantic(torch.autograd.Function):
 
 
 def device():
+    global _ACCELERATOR_LOCK
     if torch.backends.mps.is_available():
+        if _ACCELERATOR_LOCK is None:
+            path = Path(tempfile.gettempdir()) / f"spirefysh-{os.getuid()}-mps.lock"
+            lock = path.open("a+")
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                lock.seek(0)
+                owner = lock.read().strip() or "unknown"
+                lock.close()
+                raise RuntimeError(f"MPS is already in use by process {owner}") from error
+            lock.seek(0); lock.truncate(); lock.write(str(os.getpid())); lock.flush()
+            _ACCELERATOR_LOCK = lock
         return torch.device("mps")
     if torch.cuda.is_available():
         return torch.device("cuda")
@@ -2886,6 +2900,10 @@ class RolloutCollector:
 def collect_worker(model, args, sampler_session, stage, capacity, pending_capacity, iteration,
                    worker, generation, version, models, samples, stop, deadline, budget, results,
                    heartbeat, progress):
+    global _ACCELERATOR_LOCK
+    if args.sampler_backend == "process" and _ACCELERATOR_LOCK is not None:
+        _ACCELERATOR_LOCK.close()
+        _ACCELERATOR_LOCK = None
     if args.sampler_backend == "process":
         configure_logging(args.output, f"sampler-{worker}", getattr(args, "log_level", "INFO"))
     qos = getattr(ctypes.CDLL(None), "pthread_set_qos_class_self_np", None)
@@ -3272,6 +3290,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
     sampler_restarts = [0] * args.samplers
     sampler_wedges = [0] * args.samplers
     sampler_restart_streaks = [0] * args.samplers
+    sampler_recovery_packets = [0] * args.samplers
     sampler_stale_since = [None] * args.samplers
     sampler_exhausted = [False] * args.samplers
     watchdog_dropped = queue_full_waits = 0
@@ -3306,16 +3325,20 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
     packer = ThreadPoolExecutor(max_workers=1)
     workers = [None] * args.samplers
     watchdog_terminated = set()
+    watchdog_pending = [False] * args.samplers
+    watchdog_failures = Queue()
     actor = export_value_model(None, model, fingerprint, 1, 0, True)
+    actor_version = updates
 
     def start_worker(worker):
         heartbeat[worker] = time.monotonic()
         progress[worker] = 0
+        sampler_recovery_packets[worker] = 0
         sampler_stale_since[worker] = None
         process = worker_type(target=collect_worker, args=(
             actor, collector_args, sampler_session, stage,
             reservoir.capacity, pending_capacity, sampler_iterations[worker], worker,
-            sampler_generations[worker], updates, models[worker], samples, stop, deadline, budget,
+            sampler_generations[worker], actor_version, models[worker], samples, stop, deadline, budget,
             results, heartbeat, progress,
         ), name=f"sampler-{worker}")
         workers[worker] = process
@@ -3325,23 +3348,30 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         start_worker(worker)
 
     def publish():
+        nonlocal actor, actor_version
         if stop.is_set():
             return
-        state = None
+        actor = export_value_model(None, model, fingerprint, 1, 0, True)
+        actor_version = updates
         for queue in models:
             try:
-                if state is None:
-                    state = export_value_model(None, model, fingerprint, 1, 0, True)
-                queue.put_nowait((updates, state))
+                queue.put_nowait((actor_version, actor))
             except Full:
-                pass
+                try:
+                    queue.get(timeout=.1)
+                    queue.put((actor_version, actor), timeout=.1)
+                except (Empty, Full, EOFError, OSError):
+                    pass
 
-    def ingest(item):
+    def ingest(item, packet=True):
         nonlocal decisions, handled, forced, discarded_steps, sampled, collect_seconds, winning_added, orphan_empty_actions, latest_sampler_version, latest_sampler_iteration, dataset_peak, segmented_trajectories, queue_full_waits, queue_put_seconds, queue_delay_sum, queue_packets, queue_peak, mcts_roots, mcts_simulations, mcts_leaves, mcts_nodes, mcts_batches, mcts_targets, mcts_turn_starts, mcts_seconds, mcts_simulate_seconds, mcts_encode_seconds, mcts_inference_seconds, mcts_backup_seconds, mcts_rollout_steps, mcts_rollout_completed, mcts_rollout_invalid, mcts_rollout_seconds, mcts_timeouts
         worker, generation, version, result = item
         if generation != sampler_generations[worker]:
             return
-        sampler_restart_streaks[worker] = 0
+        if packet:
+            sampler_recovery_packets[worker] += 1
+            if sampler_recovery_packets[worker] >= 2:
+                sampler_restart_streaks[worker] = 0
         sampler_versions[worker] = version
         sampler_iterations[worker] = result["iteration"]
         latest_sampler_version = min(sampler_versions)
@@ -3661,47 +3691,61 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
     def drain_results():
         while True:
             try:
-                ingest(results.get_nowait())
+                ingest(results.get_nowait(), False)
             except (Empty, EOFError, OSError):
                 return
 
-    def restart_stalled():
+    def watch_samplers():
+        while not stop.wait(min(1., args.sampler_timeout / 10)):
+            now = time.monotonic()
+            if now >= deadline:
+                return
+            for worker, process in enumerate(workers):
+                if sampler_exhausted[worker] or watchdog_pending[worker]:
+                    continue
+                alive = process.is_alive()
+                stale = alive and now - heartbeat[worker] > args.sampler_timeout
+                if not stale:
+                    sampler_stale_since[worker] = None
+                elif sampler_stale_since[worker] is None:
+                    sampler_stale_since[worker] = now
+                wedged = alive and sampler_wedged(
+                    heartbeat[worker], sampler_stale_since[worker], now, args.sampler_timeout,
+                )
+                failed = not alive and (threaded or process.exitcode not in (None, 0))
+                if not wedged and not failed:
+                    continue
+                watchdog_pending[worker] = True
+                if threaded:
+                    stop.set()
+                elif wedged:
+                    watchdog_terminated.add(process)
+                    process.terminate(); process.join(5)
+                    if process.is_alive():
+                        process.kill(); process.join()
+                watchdog_failures.put((
+                    worker, process, wedged, None if threaded else process.exitcode,
+                ))
+
+    def recover_workers():
         nonlocal sampled, discarded_steps, watchdog_dropped
-        if stop.is_set() or time.monotonic() >= deadline or decisions >= budget:
-            stop.set()
-            return
-        now = time.monotonic()
-        for worker, process in enumerate(workers):
-            if sampler_exhausted[worker]:
-                continue
-            stale = process.is_alive() and now - heartbeat[worker] > args.sampler_timeout
-            if not stale:
-                sampler_stale_since[worker] = None
-            elif sampler_stale_since[worker] is None:
-                sampler_stale_since[worker] = now
-            wedged = process.is_alive() and sampler_wedged(
-                heartbeat[worker], sampler_stale_since[worker], now, args.sampler_timeout,
-            )
-            failed = not process.is_alive() and (
-                threaded or process.exitcode not in (None, 0)
-            )
-            if not wedged and not failed:
+        while True:
+            try:
+                worker, process, wedged, exitcode = watchdog_failures.get_nowait()
+            except Empty:
+                return
+            if process is not workers[worker]:
+                watchdog_pending[worker] = False
                 continue
             if threaded:
-                stop.set(); sampler_exhausted[worker] = True
+                stop.set(); sampler_exhausted[worker] = True; watchdog_pending[worker] = False
                 continue
             if wedged:
                 sampler_wedges[worker] += 1
-                watchdog_terminated.add(process)
-                process.terminate()
             process.join(5)
             if process.is_alive():
                 process.kill(); process.join()
-            while True:
-                try:
-                    ingest(samples.get_nowait())
-                except (Empty, EOFError, OSError):
-                    break
+            drain_samples()
             drain_results()
             observed = int(progress[worker])
             sampled += max(0, observed - worker_accounted[worker])
@@ -3712,11 +3756,12 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             emit_event({
                 "time": time.time(), "event": "sampler_failure", "worker": worker,
                 "generation": sampler_generations[worker], "wedged": wedged,
-                "exitcode": process.exitcode, "dropped": dropped,
+                "exitcode": exitcode, "dropped": dropped,
             }, logging.WARNING)
             if (sampler_restart_streaks[worker] >= args.sampler_restarts or stop.is_set()
                     or time.monotonic() >= deadline or decisions >= budget):
                 sampler_exhausted[worker] = True
+                watchdog_pending[worker] = False
                 continue
             sampler_restarts[worker] += 1
             sampler_restart_streaks[worker] += 1
@@ -3727,17 +3772,20 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 except (Empty, EOFError, OSError):
                     break
             start_worker(worker)
+            watchdog_pending[worker] = False
             emit_event({
                 "time": time.time(), "event": "sampler_restart", "worker": worker,
                 "generation": sampler_generations[worker],
                 "restarts": sampler_restarts[worker], "streak": sampler_restart_streaks[worker],
             })
 
+    watchdog = threading.Thread(target=watch_samplers, name="sampler-watchdog", daemon=True)
+    watchdog.start()
     try:
         while True:
             drain_results()
             drain_samples()
-            restart_stalled()
+            recover_workers()
             now = time.monotonic()
             if now >= next_heartbeat_log:
                 try:
@@ -3758,7 +3806,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                         ingest(samples.get(timeout=.1))
                         drain_samples()
                     except (Empty, EOFError, OSError):
-                        restart_stalled()
+                        recover_workers()
                         continue
                     sampler_done = (stop.is_set() or all(not worker.is_alive() for worker in workers)) and samples.empty()
                 absolute = base_decisions + handled
@@ -4243,6 +4291,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     stop.set()
     finally:
         stop.set()
+        watchdog.join()
+        recover_workers()
         packer.shutdown(wait=True, cancel_futures=True)
         started_workers = [worker for worker in workers if worker is not None and (threaded or worker.pid is not None)]
         shutdown_deadline = time.monotonic() + 5
