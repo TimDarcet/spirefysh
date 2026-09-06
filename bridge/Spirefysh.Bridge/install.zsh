@@ -279,15 +279,15 @@ fi
 
 /bin/zsh "$script_dir/validate-mod-settings.zsh" "$settings_path"
 if [[ "$test_mode" == true ]]; then
-  profile_guard_dll="$repo_root/tools/Spirefysh.ProfileGuard/bin/Debug/net10.0/Spirefysh.ProfileGuard.dll"
-  if [[ ! -f "$profile_guard_dll" ]]; then
-    print -u2 "self-test ProfileGuard artifact is missing: $profile_guard_dll"
+  tools_dll="$repo_root/tools/Spirefysh.Tools/bin/Debug/net10.0/Spirefysh.Tools.dll"
+  if [[ ! -f "$tools_dll" ]]; then
+    print -u2 "self-test tools artifact is missing: $tools_dll"
     exit 2
   fi
-  dotnet "$profile_guard_dll" verify "$profile_dir" "$profile_snapshot"
+  dotnet "$tools_dll" profile verify "$profile_dir" "$profile_snapshot"
 else
-  dotnet run --project "$repo_root/tools/Spirefysh.ProfileGuard" -- \
-    verify "$profile_dir" "$profile_snapshot"
+  dotnet run --project "$repo_root/tools/Spirefysh.Tools" -- \
+    profile verify "$profile_dir" "$profile_snapshot"
 fi
 
 local_mods_dir="$game_contents/MacOS/mods"
@@ -316,8 +316,8 @@ else
 fi
 verify_exact_artifact_directory "$artifact_dir"
 if [[ "$test_mode" != true ]]; then
-  dotnet run --project "$repo_root/tools/Spirefysh.OracleProbe" -- \
-    "$game_data_dir/sts2.dll" validate-bridge "$artifact_dir/Spirefysh.Bridge.dll"
+  dotnet run --project "$repo_root/tools/Spirefysh.Tools" -- \
+    bridge "$game_data_dir/sts2.dll" "$artifact_dir/Spirefysh.Bridge.dll"
 fi
 
 if [[ ! -d "$local_mods_dir" ]]; then

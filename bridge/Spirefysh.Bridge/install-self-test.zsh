@@ -13,7 +13,7 @@ install_script="$script_dir/install.zsh"
 disable_script="$script_dir/disable.zsh"
 self_test_root=$(mktemp -d /tmp/spirefysh-bridge-install-self-test.XXXXXX)
 cases=0
-profile_guard_dll="$repo_root/tools/Spirefysh.ProfileGuard/bin/Debug/net10.0/Spirefysh.ProfileGuard.dll"
+tools_dll="$repo_root/tools/Spirefysh.Tools/bin/Debug/net10.0/Spirefysh.Tools.dll"
 
 cleanup_self_test() {
   case "$self_test_root" in
@@ -25,7 +25,7 @@ cleanup_self_test() {
 }
 trap cleanup_self_test EXIT INT TERM
 
-dotnet build "$repo_root/tools/Spirefysh.ProfileGuard/Spirefysh.ProfileGuard.csproj" \
+dotnet build "$repo_root/tools/Spirefysh.Tools/Spirefysh.Tools.csproj" \
   --no-restore >/dev/null
 
 require() {
@@ -65,7 +65,7 @@ make_fixture() {
   fixture_hash=$(shasum -a 256 "$fixture_game_data/sts2.dll" | cut -d ' ' -f 1)
   fixture_content_hash=$(shasum -a 256 "${fixture_game_data:h}/Slay the Spire 2.pck" | cut -d ' ' -f 1)
   fixture_release_hash=$(shasum -a 256 "${fixture_game_data:h}/release_info.json" | cut -d ' ' -f 1)
-  dotnet "$profile_guard_dll" snapshot "$fixture_profile" "$fixture_baseline" >/dev/null
+  dotnet "$tools_dll" profile snapshot "$fixture_profile" "$fixture_baseline" >/dev/null
 }
 
 run_fixture_install() {
