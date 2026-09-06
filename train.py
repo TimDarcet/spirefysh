@@ -2493,18 +2493,19 @@ def curriculum_weights(stage, stage_decisions, auxiliary_decisions, args, active
     }
 
 
-def resume_stage_decisions(source, stage):
+def resume_curriculum(source, stage):
     if not source:
-        return 0
+        return 0, stage <= 6
     auxiliary = source.get("auxiliary_decisions", source["decisions"])
     if not stage:
-        return auxiliary
-    if "stage_decisions" not in source:
-        raise ValueError("checkpoint lacks the current-stage decision clock")
-    stage_decisions = source["stage_decisions"]
-    if not 0 <= stage_decisions <= auxiliary:
-        raise ValueError("invalid current-stage decision clock")
-    return stage_decisions
+        stage_decisions = auxiliary
+    else:
+        if "stage_decisions" not in source:
+            raise ValueError("checkpoint lacks the current-stage decision clock")
+        stage_decisions = source["stage_decisions"]
+        if not 0 <= stage_decisions <= auxiliary:
+            raise ValueError("invalid current-stage decision clock")
+    return stage_decisions, source.get("progress_active", stage <= 6)
 
 
 def cuts(done, episode_steps, combat_steps, still_combat, legal, max_steps, max_combat_steps):
@@ -4941,7 +4942,7 @@ def optimizer_groups(model, policy_multiplier, critic_multiplier):
     ], indices
 
 
-def repartition_optimizer(state, index_groups):
+def repartition_optimizer(state, index_groups, selected=None):
     groups = state["param_groups"]
     parameter_count = sum(map(len, index_groups))
     saved = [parameter for group in groups for parameter in group["params"]]
@@ -4960,13 +4961,19 @@ def repartition_optimizer(state, index_groups):
         templates = groups
     else:
         return False
-    state["param_groups"] = [
+    groups = [
         copy.deepcopy(template) | {
             "params": [by_index[index] for index in indices], "lr_scale": scale,
         }
         for template, indices in zip(templates, index_groups)
         for scale in [template.get("lr_scale", 1.)]
     ]
+    if selected is not None:
+        groups = [groups[selected]]
+        parameters = set(groups[0]["params"])
+        state["state"] = {key: value for key, value in state["state"].items()
+                          if key in parameters}
+    state["param_groups"] = groups
     return True
 def logged_history(run, manifest):
     reports, promotions = {}, {}
@@ -5313,10 +5320,13 @@ def train(args):
     optimizer = torch.optim.Adam(
         parameter_groups, lr=args.learning_rate, eps=1e-5, fused=fused_optimizer
     )
-    optimizer_restored = bool(
-        not args.critic_only and source and source["_optimizer_compatible"]
+    optimizer_restored = bool(source and (
+        optimizer_compatible(source["optimizer"], len(tuple(model.critic.parameters())))
+        if args.critic_only else source["_optimizer_compatible"]
         and repartition_optimizer(source["optimizer"], group_indices)
-    )
+    ))
+    if args.critic_only and source and not optimizer_restored:
+        optimizer_restored = repartition_optimizer(source["optimizer"], group_indices, 2)
     if optimizer_restored:
         optimizer.load_state_dict(source["optimizer"])
         torch.set_rng_state(source["torch_rng"].cpu())
@@ -5349,7 +5359,10 @@ def train(args):
         "stages": [{"ascension": ascension, "bonus": bonus} for ascension, bonus in STAGES],
         "training": training,
         "source": args.checkpoint, "optimizer_restored": optimizer_restored,
-        "resume": "warm continuation; learner, optimizer and reservoir restored; sampler restarted" if source else None,
+        "resume": ("warm continuation; learner, optimizer and reservoir restored; sampler restarted"
+                   if optimizer_restored else
+                   "warm continuation; learner and reservoir restored; optimizer reset")
+                  if source else None,
     }
     if continuing and manifest.get("model_version") != MODEL_VERSION:
         raise ValueError("new model versions require a new output directory")
@@ -5382,13 +5395,14 @@ def train(args):
     args.trainer_session = len(sessions) + 1
     sessions.append({
         "id": args.trainer_session, "step": source["decisions"] if source else 0,
-        "training": training,
+        "training": training, "optimizer_restored": optimizer_restored,
     })
     atomic_json(output / "run.json", manifest)
     configure_logging(output, "learner", args.log_level, args.trainer_session)
     emit_event({
         "event": "start", "pid": os.getpid(), "model_version": MODEL_VERSION,
         "checkpoint": args.checkpoint,
+        "optimizer_restored": optimizer_restored,
         "parent_checkpoint_step": source["decisions"] if source else None,
         "parent_checkpoint_sha256": parent_checkpoint_sha256, "training": training,
     })
@@ -5416,13 +5430,12 @@ def train(args):
                 ))
     decisions = source["decisions"] if source else 0
     auxiliary_decisions = source.get("auxiliary_decisions", source["decisions"]) if source else 0
-    stage_decisions = resume_stage_decisions(source, stage)
+    stage_decisions, progress_active = resume_curriculum(source, stage)
     critic_balance = CriticBalance(
         args.critic_balance_decay,
         source.get("critic_balance")
         if source and source.get("_source_model_version") == MODEL_VERSION else None,
     )
-    progress_active = stage <= 6
     sampler_session = source.get("sampler_session", source.get("sampler_index", 0)) if source else 0
     promotion_index = source.get("promotion_index", 0) if source else 0
     if not 0 <= stage < len(STAGES):
@@ -6132,6 +6145,11 @@ def finalize(args):
 
 def probe():
     target = torch.device("cpu")
+    assert resume_curriculum(None, 7) == (0, False)
+    assert resume_curriculum({
+        "decisions": 20, "auxiliary_decisions": 12, "stage_decisions": 4,
+        "progress_active": False,
+    }, 6) == (4, False)
     assert bounded_mcts_timeout(0, 120) == 60
     assert bounded_mcts_timeout(20, 120) == 20
     assert bounded_mcts_timeout(200, 120) == 60
@@ -6297,14 +6315,25 @@ def probe():
             pass
         env.load_policy(export_value_model(None, model, env.fingerprint(), 1, 0, actor=True))
         assert len(env.policy(sample=False, advance=False)[0]) == 2
+        groups, group_indices = optimizer_groups(model, 1, 1)
+        optimizer = torch.optim.Adam(groups)
+        sum(parameter.sum() for parameter in model.critic.parameters()).backward()
+        optimizer.step()
+        optimizer_state = optimizer.state_dict()
         checkpoint = Path(directory) / "checkpoint.pt"
         torch.save({
             "schema": 1, "model_version": MODEL_VERSION, "feature_version": FEATURE_VERSION,
             "fingerprint": env.fingerprint(), "layout": layout, "architecture": architecture(model),
-            "model": model.state_dict(), "optimizer": {"state": {}, "param_groups": []},
+            "model": model.state_dict(), "optimizer": optimizer_state,
         }, checkpoint)
-        restored, _ = load(checkpoint, target)
+        restored, loaded = load(checkpoint, target)
         assert restored.pooling == model.pooling
+        assert loaded["_optimizer_compatible"]
+        critic_state = copy.deepcopy(optimizer_state)
+        assert repartition_optimizer(critic_state, group_indices, 2)
+        critic_optimizer = torch.optim.Adam(restored.critic.parameters())
+        critic_optimizer.load_state_dict(critic_state)
+        assert len(critic_optimizer.state) == len(tuple(restored.critic.parameters()))
         incompatible = torch.load(checkpoint, weights_only=False)
         incompatible["architecture"]["position_caps"]["enemy"] = 31
         torch.save(incompatible, checkpoint)
