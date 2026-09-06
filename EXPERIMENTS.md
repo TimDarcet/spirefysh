@@ -2465,6 +2465,12 @@ Third interruption and resume: The resumed process recovered three more sampler 
 
 Fourth interruption and resume: The next process exhausted its restart allowance at 04:05 on 2026-09-06 and cleanly flushed 18,123,054 accepted decisions. Its final report, checkpoint, and completion event agree exactly; `latest.pt` has SHA-256 `10ee2f984a9953c134665d8d2dcb5fcf0edec08826cfab86b5bf4ced49cf81e3`. Across this session all 241 optimizer proposals were accepted without a retry, 1,205,988 of 1,207,313 expert targets were trained, 1,325 startup-backlog rows expired, and none were capacity-evicted. The identical configuration resumes to 20,000,046, the largest compatible 512-environment target; a final 14-environment step will reach exactly 20,000,060.
 
+## 2026-09-06 — Bound native search by the sampler watchdog
+
+Diagnosis: Full-combat native MCTS had no deadline when `--mcts-timeout` retained its zero default. Rare depth-256 calls could therefore outlive the 120-second sampler watchdog, which terminated a healthy worker still inside search and eventually exhausted the three-restart allowance.
+
+Fix: Native search now receives the shorter of its explicit timeout and half the sampler watchdog interval; zero selects that watchdog-derived bound. The worker refreshes its heartbeat immediately after search returns. The Python probe covers the timeout boundary, and all 182 Rust tests, strict Clippy, Python compilation, and the full Python/MPS parity probe pass.
+
 ## 2026-09-06 — Three-million-decision full-combat search ablation
 
 The 20M run was stopped on request after checkpoint 18,388,366. Three fresh MODEL70 A0/+4 trials now use its original step-zero initialization, sampling/model seeds, LR `6e-4`, batch 8,192, policy temperature `.8`, entropy schedule, expert settings, and full-combat depth-256 heuristic teacher. They run sequentially for exactly 3,000,000 accepted decisions: no search; 5% of turn-start roots with 256 simulations, minimum eight visits, and Q temperature `.02`; then the same search with 256 simulations forced at every elite and boss turn. The existing `mcts_boss_simulations` override now covers both elite and boss rooms. Each trial uses a 512-environment main phase followed by the minimal sub-512 tail needed for the exact budget. Outputs are `target/full-combat-v70-a0-b4-3m-control`, `target/full-combat-v70-a0-b4-3m-f05-s256-v8-q02`, and `target/full-combat-v70-a0-b4-3m-f05-s256-v8-q02-forced`.
