@@ -1337,14 +1337,24 @@ class Agent(nn.Module):
         inverse = torch.empty_like(order)
         inverse[order] = torch.arange(len(order), device=order.device)
         values, group = values[order], group[order]
-        selected = selected[order] if selected is not None else None
+        selected_count = selected
+        selected = (torch.arange(len(values), device=values.device) >= len(values) - selected)[order] \
+            if selected is not None else None
         counts = torch.bincount(group, minlength=groups)
         if values.device.type == "mps" and self.width // self.heads in (16, 32):
             lengths = counts + 1
             padded_groups = (groups // 256 + 1) * 256
             lengths = nn.functional.pad(lengths, (0, padded_groups - groups), value=1)
             total = len(values) + padded_groups
-            extra = (-total) % (65_536 if groups >= 4096 else 4096)
+            query_size = 0 if not selected_count else min(
+                size for power in range(max(1, (selected_count - 1).bit_length()), 64)
+                for size in (3 * (1 << power) // 4, 1 << power) if size >= selected_count
+            )
+            query_extra = query_size - (selected_count or 0)
+            quantum = 65_536 if groups >= 4096 else 4096
+            extra = (-total) % quantum
+            if extra < query_extra:
+                extra += quantum
             lengths[groups:] += extra // (padded_groups - groups)
             lengths[groups:groups + extra % (padded_groups - groups)] += 1
             total += extra
@@ -1361,11 +1371,19 @@ class Agent(nn.Module):
             )
             for layer_index, layer in enumerate(transformer.layers):
                 if selected is not None and layer_index == len(transformer.layers) - 1:
-                    positions = torch.cat((offsets[:-1], destination[selected])).sort().values
+                    parts = [offsets[:-1], destination[selected]]
+                    if query_extra:
+                        dummy_counts = lengths[groups:] - 1
+                        starts = torch.repeat_interleave(offsets[groups:-1] + 1, dummy_counts)
+                        position = torch.arange(extra, device=values.device) \
+                            - torch.repeat_interleave(dummy_counts.cumsum(0) - dummy_counts,
+                                                     dummy_counts)
+                        parts.append((starts + position)[:query_extra])
+                    positions, query_order = torch.cat(parts).sort()
+                    real = (query_order >= len(lengths)) & \
+                        (query_order < len(lengths) + selected_count)
                     query_counts = torch.bincount(sequence[positions], minlength=len(lengths))
                     query_offsets = torch.cat((query_counts.new_zeros(1), query_counts.cumsum(0)))
-                    query_position = torch.arange(len(positions), device=values.device) \
-                        - torch.repeat_interleave(query_offsets[:-1], query_counts)
                     qkv = nn.functional.linear(
                         layer.norm1(current), layer.self_attn.in_proj_weight,
                         layer.self_attn.in_proj_bias,
@@ -1378,7 +1396,7 @@ class Agent(nn.Module):
                     current = current[positions] + layer.self_attn.out_proj(attended)
                     current = current + layer.linear2(layer.activation(layer.linear1(layer.norm2(current))))
                     state = current[query_offsets[:groups]]
-                    items = current[query_position > 0][torch.argsort(order[selected])]
+                    items = current[real][torch.argsort(order[selected])]
                     return state, items
                 qkv = nn.functional.linear(
                     layer.norm1(current), layer.self_attn.in_proj_weight,
@@ -1633,10 +1651,9 @@ class Agent(nn.Module):
         values = torch.cat(values)
         rows = torch.cat(rows)
         self._sequence_lengths = torch.bincount(rows, minlength=batch) + 1
-        selected = torch.arange(len(values), device=values.device) >= len(values) - len(action)
         state, transformed = self._sequence(
             values, rows, batch, self.concepts.local("token_role", 0), self.global_transformer,
-            selected,
+            len(action),
         )
         transformed = self.global_norm(transformed)
         action = transformed if len(action) else action
