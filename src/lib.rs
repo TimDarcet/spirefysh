@@ -6,7 +6,7 @@
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use std::{collections::HashSet, ops::RangeInclusive};
+use std::{collections::HashSet, ops::RangeInclusive, sync::Arc};
 
 mod foundation;
 mod game;
@@ -1767,7 +1767,7 @@ pub struct MapNode {
 
 #[derive(Clone, Debug, Default)]
 pub struct Map {
-    pub nodes: Vec<MapNode>,
+    pub nodes: Arc<[MapNode]>,
     pub current: Option<usize>,
 }
 
@@ -1959,6 +1959,26 @@ impl Rngs {
             shops: named("shops"),
             transformations: named("transformations"),
         }
+    }
+
+    fn positions(&self) -> [u64; 15] {
+        [
+            self.combat_card_generation.1,
+            self.combat_card_selection.1,
+            self.combat_energy_costs.1,
+            self.combat_orb_generation.1,
+            self.combat_potion_generation.1,
+            self.combat_targets.1,
+            self.monster_ai.1,
+            self.niche.1,
+            self.shuffle.1,
+            self.treasure_room_relics.1,
+            self.unknown_map_point.1,
+            self.up_front.1,
+            self.rewards.1,
+            self.shops.1,
+            self.transformations.1,
+        ]
     }
 }
 

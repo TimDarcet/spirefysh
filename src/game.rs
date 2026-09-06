@@ -1202,6 +1202,12 @@ impl Game {
         Ok(())
     }
 
+    pub fn step_with_rng(&mut self, content: &Content, action: Action) -> Result<bool, Error> {
+        let before = (self.rngs.positions(), self.event_rng.map(|rng| rng.1));
+        self.step(content, action)?;
+        Ok(before != (self.rngs.positions(), self.event_rng.map(|rng| rng.1)))
+    }
+
     fn make_map(&mut self, content: &Content) -> Map {
         #[derive(Clone)]
         struct Node {
@@ -1822,7 +1828,8 @@ impl Game {
                         })
                         .collect(),
                 })
-                .collect(),
+                .collect::<Vec<_>>()
+                .into(),
             current: None,
         }
     }
@@ -1872,7 +1879,7 @@ impl Game {
             });
         }
         Map {
-            nodes,
+            nodes: nodes.into(),
             current: None,
         }
     }
