@@ -1077,9 +1077,8 @@ impl Game {
             }
             let target_type = if card.id == card_id::SOVEREIGN_BLADE
                 && combat.player.power(power_id::SEEKING_EDGE) > 0
+                || def.id == "CARD.SHIV" && combat.player.power(power_id::FAN_OF_KNIVES) > 0
             {
-                Target::AllEnemies
-            } else if def.id == "CARD.SHIV" && combat.player.power(power_id::FAN_OF_KNIVES) > 0 {
                 Target::AllEnemies
             } else {
                 card.target(*def)
@@ -1130,10 +1129,9 @@ impl Game {
     }
 
     pub fn step(&mut self, content: &Content, action: Action) -> Result<(), Error> {
-        if !self.actions(content).contains(&action)
-            && !(matches!(self.phase, Phase::Event(..))
-                && matches!(action, Action::EventRelic(..) | Action::EventCard(..)))
-        {
+        let hidden_event_choice = matches!(self.phase, Phase::Event(..))
+            && matches!(action, Action::EventRelic(..) | Action::EventCard(..));
+        if !self.actions(content).contains(&action) && !hidden_event_choice {
             return Err(Error::InvalidAction);
         }
         match action {
@@ -1566,8 +1564,8 @@ impl Game {
             let treasure = point(&mut nodes, &mut grid, 3, row);
             nodes[treasure].room = Some(Room::Treasure);
             nodes[treasure].fixed = true;
-            for col in 0..7 {
-                let Some(stray) = grid[row][col].filter(|&id| id != treasure) else {
+            for slot in &mut grid[row] {
+                let Some(stray) = slot.filter(|&id| id != treasure) else {
                     continue;
                 };
                 for parent in nodes[stray].parents.clone() {
@@ -1578,7 +1576,7 @@ impl Game {
                     remove_edge(&mut nodes, stray, child);
                     add(&mut nodes, treasure, child);
                 }
-                grid[row][col] = None;
+                *slot = None;
             }
         }
         let boss = nodes.len();
@@ -1623,13 +1621,12 @@ impl Game {
                 break;
             }
             let mut unassigned = Vec::new();
-            for col in 0..7 {
-                for row in 0..length {
-                    if let Some(id) = grid[row][col].filter(|&id| nodes[id].room.is_none()) {
-                        unassigned.push(id);
-                    }
-                }
-            }
+            unassigned.extend(
+                grid.iter()
+                    .take(length)
+                    .flatten()
+                    .filter_map(|&slot| slot.filter(|&id| nodes[id].room.is_none())),
+            );
             unassigned.sort_by_key(|&id| (nodes[id].col, nodes[id].row));
             rng.shuffle(&mut unassigned);
             for id in unassigned {
@@ -1649,7 +1646,7 @@ impl Game {
             }
         }
         for row in &grid {
-            for id in row.into_iter().flatten() {
+            for id in row.iter().flatten() {
                 nodes[*id].room.get_or_insert(Room::Combat);
             }
         }
@@ -1723,18 +1720,18 @@ impl Game {
                 _ => 0,
             };
             if shift != 0 {
-                for row in 0..length {
-                    let old = grid[row];
-                    grid[row] = [None; 7];
+                for row in grid.iter_mut().take(length) {
+                    let old = *row;
+                    *row = [None; 7];
                     for id in old.into_iter().flatten() {
                         let col = (nodes[id].col as i8 + shift) as usize;
                         nodes[id].col = col;
-                        grid[row][col] = Some(id);
+                        row[col] = Some(id);
                     }
                 }
             }
-            for row in 0..length {
-                let row_nodes: Vec<_> = grid[row].into_iter().flatten().collect();
+            for row in grid.iter_mut().take(length) {
+                let row_nodes: Vec<_> = row.iter().flatten().copied().collect();
                 loop {
                     let mut moved = false;
                     for &id in &row_nodes {
@@ -1755,12 +1752,12 @@ impl Game {
                                 .all(|&other| nodes[other].col.abs_diff(col) <= 1)
                         });
                         let next = allowed
-                            .filter(|&col| col == old || grid[row][col].is_none())
+                            .filter(|&col| col == old || row[col].is_none())
                             .max_by_key(|&col| (gap(col), std::cmp::Reverse(col)))
                             .unwrap_or(old);
                         if gap(next) > gap(old) {
-                            grid[row][old] = None;
-                            grid[row][next] = Some(id);
+                            row[old] = None;
+                            row[next] = Some(id);
                             nodes[id].col = next;
                             moved = true;
                         }
@@ -1770,9 +1767,9 @@ impl Game {
                     }
                 }
             }
-            for row in 0..length {
+            for row in grid.iter_mut().take(length) {
                 for col in 0..7 {
-                    let Some(id) = grid[row][col] else { continue };
+                    let Some(id) = row[col] else { continue };
                     if nodes[id].parents.len() != 1 || nodes[id].children.len() != 1 {
                         continue;
                     }
@@ -1781,16 +1778,16 @@ impl Game {
                     let next = if nodes[id].col < nodes[parent].col
                         && nodes[id].col < nodes[child].col
                     {
-                        (col < 6 && grid[row][col + 1].is_none()).then_some(col + 1)
+                        (col < 6 && row[col + 1].is_none()).then_some(col + 1)
                     } else if nodes[id].col > nodes[parent].col && nodes[id].col > nodes[child].col
                     {
-                        (col > 0 && grid[row][col - 1].is_none()).then_some(col - 1)
+                        (col > 0 && row[col - 1].is_none()).then_some(col - 1)
                     } else {
                         None
                     };
                     if let Some(next) = next {
-                        grid[row][col] = None;
-                        grid[row][next] = Some(id);
+                        row[col] = None;
+                        row[next] = Some(id);
                         nodes[id].col = next;
                     }
                 }
@@ -1804,8 +1801,8 @@ impl Game {
         ) {
             ids.push(ancient);
         }
-        for row in 1..length {
-            ids.extend(grid[row].into_iter().flatten());
+        for row in grid.iter().take(length).skip(1) {
+            ids.extend(row.iter().flatten().copied());
         }
         ids.push(boss);
         ids.extend(second);
@@ -2446,7 +2443,7 @@ impl Game {
             Action::SacrificeCards => {
                 self.next_card_reward(content);
                 self.paels_wing = self.paels_wing.saturating_add(1);
-                if self.paels_wing % 2 == 0 {
+                if self.paels_wing.is_multiple_of(2) {
                     let rarity = self.roll_relic_rarity();
                     if let Some(relic) = self.pull_relic(false, rarity, false, false) {
                         self.obtain_relic(content, relic);
@@ -2901,10 +2898,10 @@ impl Game {
                 + self.has_relic(content, "RELIC.FAKE_VENERABLE_TEA_SET") as u8;
         }
         if unknown {
+            let next = &self.map.nodes[node].next;
             let shop_allowed = previous != Room::Shop
-                && !(!self.map.nodes[node].next.is_empty()
-                    && self.map.nodes[node]
-                        .next
+                && (next.is_empty()
+                    || !next
                         .iter()
                         .all(|&next| self.map.nodes[next].room == Room::Shop));
             let roll = self.rngs.unknown_map_point.single();
@@ -3891,7 +3888,7 @@ impl Game {
             }
         });
         let mut cards = self.card_rewards(content, &pool, count, room);
-        if self.lasting_candy > 0 && self.lasting_candy % 2 == 0 {
+        if self.lasting_candy > 0 && self.lasting_candy.is_multiple_of(2) {
             let mut powers: Vec<_> = pool
                 .iter()
                 .copied()
@@ -3915,7 +3912,7 @@ impl Game {
         cards
     }
 
-    fn modify_reward_cards(&mut self, content: &Content, cards: &mut Vec<Card>) {
+    fn modify_reward_cards(&mut self, content: &Content, cards: &mut [Card]) {
         for (index, relic) in self.run.relics.clone().into_iter().enumerate() {
             if self.melted_relics.contains(&index) {
                 continue;
@@ -4207,10 +4204,11 @@ impl Game {
             .iter()
             .enumerate()
             .filter(|(index, id)| {
+                let relic = content.relics[**id as usize].id;
                 !self.melted_relics.contains(index)
                     && relic_group(**id).is_some()
                     && !matches!(
-                        content.relics[**id as usize].id,
+                        relic,
                         "RELIC.ALCHEMICAL_COFFER"
                             | "RELIC.ASTROLABE"
                             | "RELIC.BIG_MUSHROOM"
@@ -4234,7 +4232,7 @@ impl Game {
                             | "RELIC.WAR_PAINT"
                             | "RELIC.WHETSTONE"
                     )
-                    && !(content.relics[**id as usize].id == "RELIC.MAW_BANK" && self.maw_bank)
+                    && (relic != "RELIC.MAW_BANK" || !self.maw_bank)
             })
             .map(|(index, _)| index)
             .collect()
@@ -4710,17 +4708,16 @@ impl Game {
                 for _ in 0..2 {
                     if content.characters[self.run.character as usize].id == "CHARACTER.DEFECT"
                         && self.rngs.rewards.below(100) == 0
+                        && let Some(id) = content.card_id("CARD.CLAW")
                     {
-                        if let Some(id) = content.card_id("CARD.CLAW") {
-                            bundles.push(vec![
-                                Card {
-                                    id,
-                                    ..Card::default()
-                                };
-                                3
-                            ]);
-                            continue;
-                        }
+                        bundles.push(vec![
+                            Card {
+                                id,
+                                ..Card::default()
+                            };
+                            3
+                        ]);
+                        continue;
                     }
                     let mut bundle = Vec::new();
                     for rarity in [CardRarity::Common, CardRarity::Common, CardRarity::Uncommon] {
@@ -7993,36 +7990,38 @@ impl Game {
         self.creature_mut(Actor::Player)
             .powers
             .retain(|power| power.id != power_id::DRAW_CARDS_NEXT_TURN);
-        if turn == 1 && self.has_relic(content, "RELIC.BLESSED_ANTLER") {
-            if let Some(id) = content.card_id("CARD.DAZED") {
-                for _ in 0..3 {
-                    let index = self
-                        .rngs
-                        .shuffle
-                        .below((self.combat().unwrap().draw.len() + 1) as u32)
-                        as usize;
-                    let card = Card {
-                        id,
-                        instance: self.next_card,
-                        ..Card::default()
-                    };
-                    self.next_card += 1;
-                    self.combat_mut().unwrap().insert_unknown_draw(index, card);
-                }
+        if turn == 1
+            && self.has_relic(content, "RELIC.BLESSED_ANTLER")
+            && let Some(id) = content.card_id("CARD.DAZED")
+        {
+            for _ in 0..3 {
+                let index = self
+                    .rngs
+                    .shuffle
+                    .below((self.combat().unwrap().draw.len() + 1) as u32)
+                    as usize;
+                let card = Card {
+                    id,
+                    instance: self.next_card,
+                    ..Card::default()
+                };
+                self.next_card += 1;
+                self.combat_mut().unwrap().insert_unknown_draw(index, card);
             }
         }
-        if turn == 1 && ninja_scroll {
-            if let Some(id) = content.card_id("CARD.SHIV") {
-                for _ in 0..3 {
-                    self.add_generated(
-                        content,
-                        Pile::Hand,
-                        Card {
-                            id,
-                            ..Card::default()
-                        },
-                    );
-                }
+        if turn == 1
+            && ninja_scroll
+            && let Some(id) = content.card_id("CARD.SHIV")
+        {
+            for _ in 0..3 {
+                self.add_generated(
+                    content,
+                    Pile::Hand,
+                    Card {
+                        id,
+                        ..Card::default()
+                    },
+                );
             }
         }
         if self.has_relic(content, "RELIC.TOASTY_MITTENS") {
@@ -11279,15 +11278,14 @@ impl Game {
                             (card.instance != 0).then_some((card.instance, card.value))
                         })
                 };
-                if let Some((instance, value)) = persisted {
-                    if let Some(master) = self
+                if let Some((instance, value)) = persisted
+                    && let Some(master) = self
                         .run
                         .deck
                         .iter_mut()
                         .find(|master| master.instance == instance)
-                    {
-                        master.value = value;
-                    }
+                {
+                    master.value = value;
                 }
             }
             Effect::SetCardCost(cost) => {
@@ -12357,18 +12355,17 @@ impl Game {
                         .player
                         .powers
                         .retain(|power| power.id != power_id::DAMPEN);
-                } else if enemy_id == "MONSTER.TORCH_HEAD_AMALGAM" {
-                    if let Some(queen) =
+                } else if enemy_id == "MONSTER.TORCH_HEAD_AMALGAM"
+                    && let Some(queen) =
                         self.combat_mut().unwrap().enemies.iter_mut().find(|enemy| {
                             enemy.creature.hp > 0
                                 && content.enemies[enemy.creature.id as usize].id == "MONSTER.QUEEN"
                         })
-                        && queen.move_index == 2
-                    {
-                        queen.move_index = 5;
-                        queen.last_move = 5;
-                        queen.repeats = 1;
-                    }
+                    && queen.move_index == 2
+                {
+                    queen.move_index = 5;
+                    queen.last_move = 5;
+                    queen.repeats = 1;
                 }
                 let strength = self.combat().unwrap().enemies[index]
                     .creature
@@ -14707,7 +14704,7 @@ impl Game {
             }
             if self.has_relic(content, "RELIC.TOY_BOX") && self.toy_box_combats < 12 {
                 self.toy_box_combats += 1;
-                if self.toy_box_combats % 3 == 0
+                if self.toy_box_combats.is_multiple_of(3)
                     && let Some(index) = self
                         .wax_relics
                         .iter()
@@ -15241,7 +15238,7 @@ mod tests {
         combat.enemies[0].creature.block = 0;
         combat.enemies[0].creature.powers.clear();
         combat.energy = 10;
-        let mut expected_rng = game.rngs.combat_card_selection.clone();
+        let mut expected_rng = game.rngs.combat_card_selection;
         let expected = cards[expected_rng.below(cards.len() as u32) as usize].instance;
         let draws = game.rngs.combat_card_selection.1;
 
