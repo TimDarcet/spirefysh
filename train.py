@@ -3966,7 +3966,11 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 expert_logits = all_logits[policy_actions:policy_actions + expert_actions]
                 log_ratio = logits[choice_index] - old
                 if not (log_ratio.abs() <= args.max_log_ratio).all():
-                    raise RuntimeError("batch eligibility changed after screening")
+                    rejected.extend(selected.tolist())
+                    dataset.ratio_dropped += len(rejected)
+                    dataset.discard(np.asarray(rejected, np.int64))
+                    handled += len(rejected)
+                    continue
             selected = np.asarray(selected, np.int64)
             expired = dataset.use(selected, args.priority_decay)
             removed = np.asarray(rejected + expired.tolist(), np.int64)
