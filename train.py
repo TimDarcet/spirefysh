@@ -5117,7 +5117,17 @@ def dashboard(target):
         ]
         for row in report_rows:
             floors = row["metrics"].get("trajectory_floors", [])
-            row["metrics"]["trajectory_floors"] = floors[::max(1, math.ceil(len(floors) / 16))]
+            floor_groups = [[] for _ in range(5)]
+            character = 0; previous = -math.inf
+            for floor in floors:
+                character = min(4, max(0, int(floor[2]))) if len(floor) > 2 \
+                    else min(4, character + int(floor[0] < previous))
+                floor_groups[character].append(floor)
+                previous = floor[0]
+            row["metrics"]["trajectory_floors"] = [
+                floor for group in floor_groups
+                for floor in group[::max(1, math.ceil(len(group) / 8))]
+            ]
             for key in tuple(row["metrics"]):
                 if key.startswith("critic_preweight_") or key in (
                     "characters", "critic_postweight_loss_mass",
@@ -6601,7 +6611,8 @@ def probe():
     assert parity_error <= 1e-5, parity_error
     actor = export_value_model(None, model, parity_env.fingerprint(), 1, 0, True)
     plain = sts2_sim.Batch(8, 73, 0); searched = sts2_sim.Batch(8, 73, 0)
-    plain.load_policy(actor); searched.load_policy(actor)
+    timed = sts2_sim.Batch(8, 73, 0)
+    plain.load_policy(actor); searched.load_policy(actor); timed.load_policy(actor)
     actor_inputs = tensors(plain.observe_tokens(), target, model)
     with torch.no_grad():
         python_critic = critic_probabilities(predict(model, actor_inputs, "fp32")[1]).numpy()
@@ -6610,24 +6621,35 @@ def probe():
     assert np.max(np.abs(native_critic - python_critic)) <= 1e-5
     assert all(len(row) == 10 and 0 <= row[9] <= 52 for row in plain.stats())
     mcts_roots = mcts_targets = consistency_targets = plain_targets = 0
+    rollout_steps = timeout_roots = 0
     for step in range(16):
         base = plain.policy(1, True, True)
         consistency = bool(step % 2)
         preview = searched.policy(
             1, False, False, mcts_fraction=1, mcts_simulations=4,
-            mcts_boss_simulations=8, mcts_turns=1, mcts_max_depth=32,
+            mcts_boss_simulations=8, mcts_turns=0, mcts_max_depth=32,
             mcts_batch_size=32, mcts_min_visits=1, mcts_max_targets=8,
             mcts_prior_temperature=1, mcts_q_temperature=.002, mcts_exploration=1.5,
             mcts_value_consistency=consistency,
         )
         shadow = searched.policy(
             1, True, True, mcts_fraction=1, mcts_simulations=4,
-            mcts_boss_simulations=8, mcts_turns=1, mcts_max_depth=32,
+            mcts_boss_simulations=8, mcts_turns=0, mcts_max_depth=32,
             mcts_batch_size=32, mcts_min_visits=1, mcts_max_targets=8,
             mcts_prior_temperature=1, mcts_q_temperature=.002, mcts_exploration=1.5,
         )
         assert np.array_equal(base[1], shadow[1]) \
             and repr(plain.stats()) == repr(searched.stats()) and plain.seeds() == searched.seeds()
+        timed_preview = timed.policy(
+            1, False, False, mcts_fraction=1, mcts_simulations=4,
+            mcts_boss_simulations=8, mcts_turns=0, mcts_max_depth=32,
+            mcts_batch_size=32, mcts_min_visits=1, mcts_max_targets=8,
+            mcts_timeout=1e-9,
+        )
+        timed_step = timed.policy(1, True, True)
+        assert np.array_equal(base[1], timed_step[1]) \
+            and repr(plain.stats()) == repr(timed.stats()) and plain.seeds() == timed.seeds()
+        assert timed_preview[6][16] == int(bool(timed_preview[6][0])) and not timed_preview[5]
         assert shadow[6][0] == 0
         assert preview[6][0] == preview[6][6]
         for target_row in preview[5]:
@@ -6644,10 +6666,12 @@ def probe():
                 assert not extra
                 plain_targets += 1
         mcts_roots += preview[6][0]; mcts_targets += preview[6][5]
+        rollout_steps += preview[6][12]; timeout_roots += timed_preview[6][0]
         done = np.flatnonzero(base[8]).tolist()
         if done:
-            plain.reset(done, 0); searched.reset(done, 0)
+            plain.reset(done, 0); searched.reset(done, 0); timed.reset(done, 0)
     assert mcts_roots and mcts_targets and consistency_targets and plain_targets
+    assert rollout_steps and timeout_roots
     parameters = sum(parameter.numel() for parameter in model.parameters())
     assert 700_000 <= parameters <= 1_500_000
     print(json.dumps({
@@ -6703,7 +6727,7 @@ def parser():
     run.add_argument("--mcts-q-temperature", type=float, default=.002)
     run.add_argument("--mcts-exploration", type=float, default=1.5)
     run.add_argument("--mcts-heuristic", action="store_true")
-    run.add_argument("--mcts-timeout", type=float, default=60)
+    run.add_argument("--mcts-timeout", type=float, default=0)
     run.add_argument("--expert-weight", type=float, default=.002)
     run.add_argument("--expert-max-lag", type=int, default=4)
     run.add_argument("--expert-batch", type=int)

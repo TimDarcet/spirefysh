@@ -13470,7 +13470,9 @@ mod python {
             heuristic: bool,
         ) -> Self {
             let digest = observation_digest(observation);
-            let capacity = budget.saturating_mul(16).saturating_add(1);
+            let capacity = budget
+                .saturating_mul(if turns == 0 { max_depth.min(16) } else { 1 })
+                .saturating_add(1);
             let mut lookup =
                 FastMap::with_capacity_and_hasher(capacity, BuildHasherDefault::default());
             lookup.insert((digest, 0), 0);
@@ -14593,7 +14595,7 @@ mod python {
         for tree in trees {
             stats.simulations += tree.simulations;
             stats.nodes += tree.nodes.len();
-            if stats.timed_out {
+            if tree.simulations < tree.budget {
                 continue;
             }
             let (_, action_values) = tree.expectimax();
