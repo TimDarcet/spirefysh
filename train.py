@@ -293,10 +293,12 @@ kernel void backward_key_value(
         grad_qkv[k + width + column] = grad_output[begin * width + head * dimension + column];
         return;
     }
+    bool selected_query = false;
     float value = qkv[k + width + column];
     float dk = 0.0f, dv = 0.0f;
     for (int query_index = begin; query_index < end; ++query_index) {
         uint token = sparse ? selected[query_index] : query_index;
+        if (sparse) selected_query |= token == key;
         uint query = token * 3 * width + head * dimension + column;
         uint out = query_index * width + head * dimension + column;
         float q = qkv[query], key_value = qkv[k + column], grad = grad_output[out];
@@ -305,6 +307,7 @@ kernel void backward_key_value(
         dk += ds * q * rsqrt(float(dimension));
         dv += probability * grad;
     }
+    if (sparse && !selected_query) grad_qkv[key * 3 * width + head * dimension + column] = 0.0f;
     grad_qkv[k + column] = dk;
     grad_qkv[k + width + column] = dv;
 }
@@ -390,10 +393,12 @@ kernel void attention_backward_key_value_bfloat(
         grad_qkv[k + width + column] = grad_output[begin * width + head * dimension + column];
         return;
     }
+    bool selected_query = false;
     float value = float(qkv[k + width + column]);
     float dk = 0.0f, dv = 0.0f;
     for (int query_index = begin; query_index < end; ++query_index) {
         uint token = sparse ? selected[query_index] : query_index;
+        if (sparse) selected_query |= token == key;
         uint query = token * 3 * width + head * dimension + column;
         uint out = query_index * width + head * dimension + column;
         float q = float(qkv[query]), key_value = float(qkv[k + column]), grad = float(grad_output[out]);
@@ -402,6 +407,8 @@ kernel void attention_backward_key_value_bfloat(
         dk += ds * q * rsqrt(float(dimension));
         dv += probability * grad;
     }
+    if (sparse && !selected_query)
+        grad_qkv[key * 3 * width + head * dimension + column] = bfloat(0.0f);
     grad_qkv[k + column] = bfloat(dk);
     grad_qkv[k + width + column] = bfloat(dv);
 }
@@ -854,7 +861,7 @@ class _RaggedAttention(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         qkv, offsets, sequence, selected, query_offsets, output, lse = ctx.saved_tensors
-        grad_qkv = torch.zeros_like(qkv) if ctx.sparse else torch.empty_like(qkv)
+        grad_qkv = torch.empty_like(qkv)
         delta = torch.empty_like(lse)
         query_threads = len(output) * ctx.heads * ctx.dimension
         key_threads = len(qkv) * ctx.heads * ctx.dimension
@@ -4286,6 +4293,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     winning_replayed += replay_count
             if updates % args.publish_updates == 0:
                 publish()
+            if target.type == "mps":
+                torch.mps.empty_cache()
             backward_seconds = time.monotonic() - backward_started
             backward_durations.append(backward_seconds)
             update_elapsed = time.monotonic() - update_started
