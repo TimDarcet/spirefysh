@@ -1,4 +1,5 @@
 #![cfg_attr(not(feature = "python"), allow(dead_code))]
+#![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
 use crate::*;
 #[cfg(feature = "python")]
@@ -937,17 +938,13 @@ fn populate_domain_features(
                 }
             }
             match &game.phase {
-                Phase::Combat(combat) => {
-                    if combat.choice.is_some() {
-                        push_semantic(row, layout, Semantic::Pile, row.u[5]);
-                        push_filter_semantics(row, layout, 6, 7);
-                        push_op_semantics(row, layout, 8, 9);
-                    }
+                Phase::Combat(combat) if combat.choice.is_some() => {
+                    push_semantic(row, layout, Semantic::Pile, row.u[5]);
+                    push_filter_semantics(row, layout, 6, 7);
+                    push_op_semantics(row, layout, 8, 9);
                 }
-                Phase::TransformCards(target, ..) => {
-                    if target.is_some() {
-                        push_semantic(row, layout, Semantic::Card, row.u[4] - 1);
-                    }
+                Phase::TransformCards(target, ..) if target.is_some() => {
+                    push_semantic(row, layout, Semantic::Card, row.u[4] - 1);
                 }
                 Phase::EnchantCards(..) => {
                     push_semantic(row, layout, Semantic::Enchantment, row.u[4] - 1);
@@ -2574,16 +2571,16 @@ fn preview_effects(
                 }
             }
             Effect::DrawUntilNot(kind) => {
-                if let Some(count) = exact_draw_until_not(game, content, kind) {
-                    if let Some(drawn) = preview_draw_count(
+                if let Some(count) = exact_draw_until_not(game, content, kind)
+                    && let Some(drawn) = preview_draw_count(
                         game,
                         content,
                         count.saturating_mul(repeats),
                         false,
                         preview,
-                    ) {
-                        preview.draw = preview.draw.saturating_add(drawn);
-                    }
+                    )
+                {
+                    preview.draw = preview.draw.saturating_add(drawn);
                 }
             }
             Effect::DrawFiltered(count, filter) => {
@@ -2692,30 +2689,25 @@ fn preview_effects(
                 preview_exhaust(game, content, hand.saturating_mul(repeats), preview);
                 preview.hand = 0;
             }
-            Effect::RecycleHand(draw) => {
-                if !draw_forbidden(game, content, false) {
-                    preview.draw_available = preview.draw_available.saturating_add(preview.hand);
-                    preview.hand = 0;
-                    if let Some(drawn) = preview_draw_count(
-                        game,
-                        content,
-                        draw[context.upgraded as usize] as i16,
-                        false,
-                        preview,
-                    ) {
-                        preview.draw = preview.draw.saturating_add(drawn.saturating_mul(repeats));
-                    }
+            Effect::RecycleHand(draw) if !draw_forbidden(game, content, false) => {
+                preview.draw_available = preview.draw_available.saturating_add(preview.hand);
+                preview.hand = 0;
+                if let Some(drawn) = preview_draw_count(
+                    game,
+                    content,
+                    draw[context.upgraded as usize] as i16,
+                    false,
+                    preview,
+                ) {
+                    preview.draw = preview.draw.saturating_add(drawn.saturating_mul(repeats));
                 }
             }
-            Effect::ShuffleHandDraw(draw) => {
-                if !draw_forbidden(game, content, false) {
-                    preview.draw_available = preview.draw_available.saturating_add(preview.hand);
-                    preview.hand = 0;
-                    if let Some(drawn) =
-                        preview_draw_count(game, content, draw as i16, false, preview)
-                    {
-                        preview.draw = preview.draw.saturating_add(drawn.saturating_mul(repeats));
-                    }
+            Effect::ShuffleHandDraw(draw) if !draw_forbidden(game, content, false) => {
+                preview.draw_available = preview.draw_available.saturating_add(preview.hand);
+                preview.hand = 0;
+                if let Some(drawn) = preview_draw_count(game, content, draw as i16, false, preview)
+                {
+                    preview.draw = preview.draw.saturating_add(drawn.saturating_mul(repeats));
                 }
             }
             Effect::AutoPlayDraw(amount, _) => {
@@ -2841,19 +2833,19 @@ fn preview_effects(
                     );
                 }
             }
-            Effect::Heal(target, amount) | Effect::HealPercent(target, amount) => {
-                if targets_player(target, context) {
-                    let mut amount = preview_amount(game, content, context, amount).max(0);
-                    if matches!(effect, Effect::HealPercent(..)) {
-                        amount = preview_player_health(game)
-                            .1
-                            .saturating_add(preview.player_max_hp_delta)
-                            .saturating_mul(amount)
-                            / 100;
-                    }
-                    for _ in 0..repeats.max(0) {
-                        preview_player_hp(game, preview, amount);
-                    }
+            Effect::Heal(target, amount) | Effect::HealPercent(target, amount)
+                if targets_player(target, context) =>
+            {
+                let mut amount = preview_amount(game, content, context, amount).max(0);
+                if matches!(effect, Effect::HealPercent(..)) {
+                    amount = preview_player_health(game)
+                        .1
+                        .saturating_add(preview.player_max_hp_delta)
+                        .saturating_mul(amount)
+                        / 100;
+                }
+                for _ in 0..repeats.max(0) {
+                    preview_player_hp(game, preview, amount);
                 }
             }
             Effect::MaxHp(amount) => {
@@ -3474,12 +3466,16 @@ fn played_card_preview(
         .collect::<Vec<_>>();
     let child = combat.player.power(power_id::CHILD_OF_THE_STARS);
     let black_hole = combat.player.power(power_id::BLACK_HOLE);
-    let danse = (cost >= 2)
-        .then(|| combat.player.power(power_id::DANSE_MACABRE))
-        .unwrap_or(0);
-    let ash = (card.flags(def) & ETHEREAL != 0)
-        .then(|| combat.player.power(power_id::SPIRIT_OF_ASH))
-        .unwrap_or(0);
+    let danse = if cost >= 2 {
+        combat.player.power(power_id::DANSE_MACABRE)
+    } else {
+        0
+    };
+    let ash = if card.flags(def) & ETHEREAL != 0 {
+        combat.player.power(power_id::SPIRIT_OF_ASH)
+    } else {
+        0
+    };
     let hit = PreviewHit {
         target: PreviewTarget::All,
         damage: PreviewDamage::Unpowered,
@@ -3554,18 +3550,24 @@ fn played_card_preview(
     }
     let old_attacks = original.history.attacks;
     let old_skills = original.history.skills;
-    let attack_triggers = (card_type == CardType::Attack)
-        .then_some((old_attacks + plays as i16) / 3 - old_attacks / 3)
-        .unwrap_or(0);
-    let skill_triggers = (card_type == CardType::Skill)
-        .then_some((old_skills + plays as i16) / 3 - old_skills / 3)
-        .unwrap_or(0);
+    let attack_triggers = if card_type == CardType::Attack {
+        (old_attacks + plays as i16) / 3 - old_attacks / 3
+    } else {
+        0
+    };
+    let skill_triggers = if card_type == CardType::Skill {
+        (old_skills + plays as i16) / 3 - old_skills / 3
+    } else {
+        0
+    };
     if relic("RELIC.ORNAMENTAL_FAN") {
         preview_gain_block(&projected, content, &mut preview, 4, attack_triggers);
     }
-    let kusarigama = (card_type == CardType::Attack && relic("RELIC.KUSARIGAMA"))
-        .then_some((original.kusarigama as i16 + plays as i16) / 3)
-        .unwrap_or(0);
+    let kusarigama = if card_type == CardType::Attack && relic("RELIC.KUSARIGAMA") {
+        (original.kusarigama as i16 + plays as i16) / 3
+    } else {
+        0
+    };
     if kusarigama > 0 {
         push_preview_hit(
             &projected,
@@ -5000,7 +5002,7 @@ fn state_summary_tokens(game: &Game, content: &Content, bonuses: (i16, i16), out
                 combat.drawn as f32 / 20.0,
                 combat.lightning_channeled as f32 / 20.0,
                 combat.orbs_channeled as f32 / 20.0,
-                combat.poisoned as u8 as f32,
+                combat.poisoned as f32,
             ]);
             out.push(row);
             for slot in 0..combat.orb_slots as usize {
@@ -5624,7 +5626,7 @@ fn public_relic_bags(game: &Game, content: &Content, layout: Layout) -> [Vec<Vec
     bags
 }
 
-fn public_encounters<'a>(game: &Game, content: &'a Content, elite: bool) -> Vec<Id> {
+fn public_encounters(game: &Game, content: &Content, elite: bool) -> Vec<Id> {
     let full = public_encounter_pool(game, content, elite);
     let active = if elite {
         game.elite_encounters_left > 0
@@ -6683,7 +6685,7 @@ fn candidate_actions(game: &Game, content: &Content) -> (Vec<Action>, Vec<bool>)
         }
     }
     for action in &legal {
-        if !represented.contains(&action) {
+        if !represented.contains(action) {
             represented.push(action.clone());
         }
     }
@@ -6974,54 +6976,51 @@ fn state_card_domains(
         0,
         game.run.deck.iter().copied().map(|card| (0, 0, card, 0)),
     );
-    match &game.phase {
-        Phase::Combat(combat) => {
-            for (zone, cards) in [
-                (HAND_ZONE, combat.hand.as_slice()),
-                (DISCARD_ZONE, combat.discard.as_slice()),
-                (EXHAUST_ZONE, combat.exhaust.as_slice()),
-            ] {
-                push_cards(
-                    domains,
-                    game,
-                    content,
-                    encoding,
-                    STATE_SCOPE,
-                    zone as u32,
-                    0,
-                    cards
-                        .iter()
-                        .copied()
-                        .enumerate()
-                        .map(|(order, card)| (3, order as u32 + 1, card, 0)),
-                );
-            }
-            let draw_len = combat.draw.len();
+    if let Phase::Combat(combat) = &game.phase {
+        for (zone, cards) in [
+            (HAND_ZONE, combat.hand.as_slice()),
+            (DISCARD_ZONE, combat.discard.as_slice()),
+            (EXHAUST_ZONE, combat.exhaust.as_slice()),
+        ] {
             push_cards(
                 domains,
                 game,
                 content,
                 encoding,
                 STATE_SCOPE,
-                DRAW_ZONE as u32,
+                zone as u32,
                 0,
-                combat
-                    .draw
+                cards
                     .iter()
                     .copied()
                     .enumerate()
-                    .map(|(index, card)| {
-                        if index < combat.known_draw_bottom {
-                            (2, (index + 1) as u32, card, 0)
-                        } else if index >= draw_len - combat.known_draw_top {
-                            (1, (draw_len - index) as u32, card, 0)
-                        } else {
-                            (0, 0, card, 0)
-                        }
-                    }),
+                    .map(|(order, card)| (3, order as u32 + 1, card, 0)),
             );
         }
-        _ => {}
+        let draw_len = combat.draw.len();
+        push_cards(
+            domains,
+            game,
+            content,
+            encoding,
+            STATE_SCOPE,
+            DRAW_ZONE as u32,
+            0,
+            combat
+                .draw
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(index, card)| {
+                    if index < combat.known_draw_bottom {
+                        (2, (index + 1) as u32, card, 0)
+                    } else if index >= draw_len - combat.known_draw_top {
+                        (1, (draw_len - index) as u32, card, 0)
+                    } else {
+                        (0, 0, card, 0)
+                    }
+                }),
+        );
     }
 }
 
@@ -7312,9 +7311,11 @@ fn push_actor_domains(
                         .get(owner.saturating_sub(3) as usize)
                         .copied()
                         .unwrap_or_default(),
-                    (content.enemies[enemy.creature.id as usize].id == "MONSTER.WRIGGLER")
-                        .then(|| (owner - 3) % 2 + 1)
-                        .unwrap_or(0),
+                    if content.enemies[enemy.creature.id as usize].id == "MONSTER.WRIGGLER" {
+                        (owner - 3) % 2 + 1
+                    } else {
+                        0
+                    },
                 )
             });
         row.u[..10].copy_from_slice(&[
@@ -7595,7 +7596,7 @@ fn push_status_domain(out: &mut Vec<DomainRow>, kind: u32, order: usize, values:
     out.push(row);
 }
 
-fn public_encounter_pool<'a>(game: &Game, content: &'a Content, elite: bool) -> Vec<Id> {
+fn public_encounter_pool(game: &Game, content: &Content, elite: bool) -> Vec<Id> {
     let act = &content.acts[game.act as usize];
     if elite {
         return act.elites.to_vec();
@@ -8676,9 +8677,11 @@ fn continuation_domains(game: &Game, content: &Content) -> Vec<DomainRow> {
     if let Phase::Rewards(rewards) = &game.phase {
         let full = game.replacing_potion;
         let arity = rewards.card_rewards.len()
-            + full
-                .then_some(rewards.cards.len() + rewards.relics.len() + rewards.potions.len())
-                .unwrap_or(0);
+            + if full {
+                rewards.cards.len() + rewards.relics.len() + rewards.potions.len()
+            } else {
+                0
+            };
         if arity > 0 {
             let list = out.row(9, 11 + full as u32, NO_NODE, 0, 0, 11, 0, arity as u32);
             let parent = out.rows[list].u[2];
@@ -8787,14 +8790,16 @@ fn continuation_domains(game: &Game, content: &Content) -> Vec<DomainRow> {
         (6, game.reward_gold_parts.clone()),
         (
             7,
-            game.conveyor
-                .then(|| {
+            if game.conveyor {
+                {
                     game.event_data[..3]
                         .iter()
                         .map(|&value| i32::try_from(value).expect("conveyor value exceeds i32"))
                         .collect()
-                })
-                .unwrap_or_default(),
+                }
+            } else {
+                Default::default()
+            },
         ),
     ] {
         let list = out.row(9, variant, NO_NODE, 0, 0, variant, 0, values.len() as u32);
@@ -8842,7 +8847,7 @@ fn candidate_card(
     scope: i32,
     action: &Action,
 ) -> Option<DomainRow> {
-    let Some((zone, role, order_kind, order, card, context)) = (match action {
+    let (zone, role, order_kind, order, card, context) = (match action {
         Action::Play { hand, .. } => game.combat().and_then(|combat| {
             combat
                 .hand
@@ -8930,9 +8935,7 @@ fn candidate_card(
                 .map(|card| (ATTACHED_CARD_ZONE as u32, 8, 0, 0, card, 0))
         }
         _ => None,
-    }) else {
-        return None;
-    };
+    })?;
     Some(card_domain_row(
         game, content, encoding, scope, zone, role, order_kind, order, card, context,
     ))
@@ -9351,7 +9354,7 @@ fn action_row(
             let normal = game
                 .map
                 .current
-                .map_or(true, |current| game.map.nodes[current].next.contains(index));
+                .is_none_or(|current| game.map.nodes[current].next.contains(index));
             row.u[5] = if normal { 1 } else { 2 };
             if !normal {
                 row.u[6] = 1;
@@ -9912,7 +9915,7 @@ impl<'a> LegacyValueModel<'a> {
             || layer_count == 0
             || layer_count > 64
             || heads == 0
-            || width % heads != 0
+            || !width.is_multiple_of(heads)
             || feedforward == 0
             || globals != globals_len(layout)
             || card_zones != CARD_ZONES
@@ -10045,15 +10048,15 @@ impl<'a> LegacyValueModel<'a> {
 
     fn encode_token(&self, token: &Token) -> Vec<f32> {
         let mut out = vec![0.0; self.width];
-        for row in 0..self.width {
-            out[row] = self.numeric[row * TOKEN_NUMERIC..][..TOKEN_NUMERIC]
+        for (row, output) in out.iter_mut().enumerate() {
+            *output = self.numeric[row * TOKEN_NUMERIC..][..TOKEN_NUMERIC]
                 .iter()
                 .zip(&token[TOKEN_CATEGORICAL..])
                 .map(|(weight, value)| weight * value)
                 .sum();
         }
-        for field in 0..TOKEN_CATEGORICAL {
-            let categorical = token[field].round() as usize;
+        for (field, value) in token.iter().take(TOKEN_CATEGORICAL).enumerate() {
+            let categorical = value.round() as usize;
             if categorical == 0 {
                 continue;
             }
@@ -12037,7 +12040,7 @@ fn linear(input: &[f32], weights: &[f32], bias: &[f32]) -> Vec<f32> {
                 1,
             );
         }
-        return output;
+        output
     }
     #[cfg(not(target_os = "macos"))]
     bias.iter()
@@ -12101,7 +12104,7 @@ fn linear_batch(input: &[f32], input_width: usize, weights: &[f32], bias: &[f32]
                 .zip(bias)
                 .for_each(|(value, bias)| *value += bias);
         }
-        return output;
+        output
     }
     #[cfg(not(target_os = "macos"))]
     input
@@ -13439,6 +13442,7 @@ mod python {
         child: Option<usize>,
     }
 
+    #[allow(clippy::large_enum_variant)]
     enum SearchResult {
         Value(SearchPath, f32),
         Leaf(SearchLeaf),
@@ -13683,14 +13687,13 @@ mod python {
 
         fn invalidate(&mut self, path: &mut SearchPath) {
             if let Some(step) = path.steps.last() {
-                if self.nodes[step.node].packed.is_none() {
-                    if let Some(index) = path
+                if self.nodes[step.node].packed.is_none()
+                    && let Some(index) = path
                         .packed
                         .iter()
                         .position(|(node, _)| *node == Some(step.node))
-                    {
-                        self.nodes[step.node].packed = Some(path.packed.swap_remove(index).1);
-                    }
+                {
+                    self.nodes[step.node].packed = Some(path.packed.swap_remove(index).1);
                 }
                 self.nodes[step.node].edges[step.edge].invalid = true;
             }
@@ -15832,11 +15835,9 @@ mod python {
                 .sum::<f32>()
                 * 5.0;
         }
-        if game.run.act == 3 {
-            if game.room == Room::Elite {
-                let reserve = game.run.max_hp * 2 / 3;
-                score -= (reserve - hp).max(0) as f32 * 750.0;
-            }
+        if game.run.act == 3 && game.room == Room::Elite {
+            let reserve = game.run.max_hp * 2 / 3;
+            score -= (reserve - hp).max(0) as f32 * 750.0;
         }
         if game.run.character == 0 {
             for (index, card) in game.run.deck.iter().enumerate() {
@@ -17479,7 +17480,7 @@ mod python {
         }
 
         fn repeat_groups(&mut self, size: usize) -> PyResult<()> {
-            if size == 0 || self.games.len() % size != 0 {
+            if size == 0 || !self.games.len().is_multiple_of(size) {
                 return Err(PyValueError::new_err("invalid group size"));
             }
             self.games.par_chunks_mut(size).for_each(|group| {
@@ -18266,8 +18267,9 @@ mod python {
                         Some(start)
                     })
                     .collect::<Vec<_>>();
-                for domain in 0..DOMAIN_NAMES.len() {
-                    let (u_width, s_width, c_width, f_width) = DOMAIN_WIDTHS[domain];
+                for (domain, &(u_width, s_width, c_width, f_width)) in
+                    DOMAIN_WIDTHS.iter().enumerate()
+                {
                     let total = rows
                         .iter()
                         .filter_map(Option::as_ref)
@@ -18378,8 +18380,8 @@ mod python {
                 )?;
                 let mut packed_rows = Vec::with_capacity(batches);
                 for (batch, row) in packed_data.into_iter().enumerate() {
-                    let (character, globals, counts, exact, actions, digest) = row.map_or_else(
-                        || {
+                    let (character, globals, counts, exact, actions, digest) =
+                        row.unwrap_or_else(|| {
                             (
                                 u8::MAX,
                                 vec![0.0; globals_len(layout)],
@@ -18388,9 +18390,7 @@ mod python {
                                 Vec::new(),
                                 0,
                             )
-                        },
-                        |row| row,
-                    );
+                        });
                     digests[batch] = digest;
                     packed_rows.push(PyTuple::new(
                         py,
@@ -18451,8 +18451,8 @@ mod python {
                 );
             }
             let mut packed_domains = Vec::with_capacity(DOMAIN_NAMES.len());
-            for domain in 0..DOMAIN_NAMES.len() {
-                let (u_width, s_width, c_width, f_width) = DOMAIN_WIDTHS[domain];
+            for (domain, &(u_width, s_width, c_width, f_width)) in DOMAIN_WIDTHS.iter().enumerate()
+            {
                 let max_rows = rows
                     .iter()
                     .filter_map(Option::as_ref)
