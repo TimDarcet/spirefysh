@@ -1,20 +1,23 @@
 import argparse
+import atexit
 import copy
 import ctypes
 import fcntl
 import hashlib
 import json
+import logging
 import math
 import multiprocessing
 import os
 import pickle
+import re
 import struct
 import sys
 import tempfile
 import threading
 import time
-import traceback
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from pathlib import Path
 from queue import Empty, Full, Queue
 
@@ -26,24 +29,155 @@ import sts2_sim
 
 
 FEATURE_VERSION = 55
-MODEL_VERSION = 68
+MODEL_VERSION = 70
+CATEGORIES = 83
+MAX_PROGRESS = 72
 PRECISIONS = ("fp32", "bf16")
 WINNING_CAPACITY = 0
-CHANGE = "V68: native actors and compact transport with full-model updates."
+CHANGE = "V70: spaced act transitions and frozen-policy critic training."
 STAGES = [(0, bonus) for bonus in (24, 20, 16, 12, 8, 4, 0)] + [
     (ascension, 0) for ascension in range(1, 11)
 ]
 
 
-def redirect_output(path):
-    sys.stdout.flush()
-    sys.stderr.flush()
-    stream = path.open("a", buffering=1)
-    os.dup2(stream.fileno(), 1)
-    os.dup2(stream.fileno(), 2)
+_EVENT_STREAM = None
+_GLOG = logging.getLogger()
+_GLOG_THREADS = []
+_GLOG_INFO_FD = None
+_GLOG_ACTIVE = False
+_GLOG_PATTERN = re.compile(
+    rb"^[DIWEF]\d{4} \d{2}:\d{2}:\d{2}\.\d{6} "
+)
+
+
+class GlogFormatter(logging.Formatter):
+    def __init__(self, role):
+        super().__init__()
+        self.role = role
+
+    def format(self, record):
+        severity = {logging.DEBUG: "D", logging.INFO: "I", logging.WARNING: "W",
+                    logging.ERROR: "E", logging.CRITICAL: "F"}.get(record.levelno, "I")
+        when = datetime.fromtimestamp(record.created)
+        source = Path(record.pathname).name
+        prefix = (
+            f"{severity}{when:%m%d %H:%M:%S}.{when.microsecond:06d} "
+            f"{record.process:06d} {getattr(record, 'native_tid', record.thread):08d} "
+            f"{self.role:<12} {record.threadName:<16} {source:>20}:{record.lineno:05d}] "
+        )
+        message = record.getMessage()
+        if record.exc_info:
+            message += "\n" + self.formatException(record.exc_info)
+        return "\n".join(prefix + line for line in message.splitlines() or [""])
+
+
+class BelowWarning(logging.Filter):
+    def filter(self, record):
+        return record.levelno < logging.WARNING
+
+
+def configure_logging(output, role, level="INFO"):
+    global _GLOG_ACTIVE, _GLOG_INFO_FD
+    if _GLOG_ACTIVE:
+        return
+    logs = Path(output) / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    info_fd = os.open(logs / f"{role}.INFO", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    _GLOG_INFO_FD = info_fd
+    lock = threading.Lock()
+    formatter = GlogFormatter(role)
+
+    def capture(fd, name, severity):
+        saved = os.dup(fd)
+        read_fd, write_fd = os.pipe()
+        os.dup2(write_fd, fd); os.close(write_fd)
+        capture_fd = os.open(
+            logs / f"{role}.{name}", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644,
+        )
+
+        def forward():
+            with os.fdopen(read_fd, "rb", buffering=0) as source:
+                for raw in iter(source.readline, b""):
+                    raw = raw.rstrip(b"\r\n")
+                    if _GLOG_PATTERN.match(raw):
+                        line = raw + b"\n"
+                    else:
+                        record = logging.LogRecord(
+                            "external", severity, f"<{name}>", 0,
+                            raw.decode(errors="replace"), (), None,
+                        )
+                        record.native_tid = threading.get_native_id()
+                        line = (formatter.format(record) + "\n").encode()
+                    os.write(saved, line)
+                    with lock:
+                        os.write(capture_fd, line)
+                        os.write(info_fd, line)
+            os.close(capture_fd); os.close(saved)
+
+        thread = threading.Thread(target=forward, name=f"{name}-capture", daemon=True)
+        thread.start(); _GLOG_THREADS.append(thread)
+
+    sys.stdout.flush(); sys.stderr.flush()
+    capture(1, "stdout", logging.INFO)
+    capture(2, "stderr", logging.WARNING)
     sys.stdout.reconfigure(line_buffering=True)
     sys.stderr.reconfigure(line_buffering=True)
-    return stream
+    factory = logging.getLogRecordFactory()
+
+    def record_factory(*args, **kwargs):
+        record = factory(*args, **kwargs)
+        record.native_tid = threading.get_native_id()
+        return record
+
+    logging.setLogRecordFactory(record_factory)
+    _GLOG.handlers.clear()
+    _GLOG.setLevel(getattr(logging, level.upper()))
+    stdout = logging.StreamHandler(sys.stdout); stdout.addFilter(BelowWarning())
+    stderr = logging.StreamHandler(sys.stderr); stderr.setLevel(logging.WARNING)
+    for handler in (stdout, stderr):
+        handler.setFormatter(formatter); _GLOG.addHandler(handler)
+    _GLOG.propagate = False
+    logging.captureWarnings(True)
+    sts2_sim.configure_logging(role, level)
+    _GLOG_ACTIVE = True
+    _GLOG.info("logging_started info=%s stdout=%s stderr=%s",
+               logs / f"{role}.INFO", logs / f"{role}.stdout", logs / f"{role}.stderr")
+
+
+def shutdown_logging():
+    global _GLOG_ACTIVE
+    if not _GLOG_ACTIVE:
+        return
+    sys.stdout.flush(); sys.stderr.flush(); logging.shutdown()
+    for fd in (1, 2):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    for thread in _GLOG_THREADS:
+        thread.join(2)
+    if _GLOG_INFO_FD is not None:
+        os.close(_GLOG_INFO_FD)
+    _GLOG_ACTIVE = False
+
+
+atexit.register(shutdown_logging)
+
+
+def emit_event(value, level=logging.INFO):
+    line = json.dumps(value, separators=(",", ":"))
+    if _EVENT_STREAM is None:
+        print(line, flush=True)
+    else:
+        print(line, file=_EVENT_STREAM, flush=True)
+    fields = {key: item for key, item in value.items()
+              if key not in ("event", "metrics", "pipeline", "result")}
+    if "metrics" in value:
+        fields.update({key: item for key, item in value["metrics"].items()
+                       if isinstance(item, (bool, int, float, str))})
+    _GLOG.log(level, "%s %s", value.get("event", "event"),
+              " ".join(f"{key}={json.dumps(item, separators=(',', ':'))}"
+                       for key, item in fields.items()), stacklevel=2)
 
 _TRAINING_METAL = r"""
 #include <metal_stdlib>
@@ -1010,19 +1144,16 @@ class Agent(nn.Module):
         self.policy = nn.Sequential(
             nn.Linear(self.state_width + width, self.head_width), nn.ReLU(), nn.Linear(self.head_width, 1),
         )
-        self.value = nn.Sequential(
-            nn.Linear(self.state_width, self.head_width), nn.ReLU(), nn.Linear(self.head_width, 1),
-        )
-        self.progress_value = nn.Sequential(
-            nn.Linear(self.state_width, self.head_width), nn.ReLU(), nn.Linear(self.head_width, 1),
+        self.critic = nn.Sequential(
+            nn.Linear(self.state_width, self.head_width), nn.ReLU(),
+            nn.Linear(self.head_width, CATEGORIES),
         )
         self._graph_cache = {}
         self.cache_stats = {"card_hit": 0, "card_miss": 0, "graph_hit": 0, "graph_miss": 0}
         nn.init.normal_(self.policy[-1].weight, std=0.01)
         nn.init.zeros_(self.policy[-1].bias)
-        for head in (self.value, self.progress_value):
-            nn.init.zeros_(head[-1].weight)
-            nn.init.zeros_(head[-1].bias)
+        nn.init.zeros_(self.critic[-1].weight)
+        nn.init.zeros_(self.critic[-1].bias)
 
     def load_state_dict(self, state_dict, strict=True, assign=False):
         self._graph_cache.clear()
@@ -1382,9 +1513,7 @@ class Agent(nn.Module):
         )
         if policy_only:
             return policy
-        output = (
-            policy, self.value(state).squeeze(-1), self.progress_value(state).squeeze(-1),
-        )
+        output = policy, self.critic(state)
         return (*output, state) if return_state else output
 
 
@@ -1415,7 +1544,7 @@ def architecture(model):
                             "events", "encounters", "crystal", "continuations", "current_map_node",
                             "available_actions"],
         "semantic_vocab": model.semantic.num_embeddings, "candidate_numeric": ACTION_FIELDS[3],
-        "value_heads": ["win_logit", "progress"],
+        "value_heads": [f"terminal_progress_categorical_{CATEGORIES}"],
         "winning_reservoir": WINNING_CAPACITY,
     }
 
@@ -1433,6 +1562,19 @@ def predict(model, inputs, precision, temperature=1, policy_only=False, flat_pol
             flat_policy=flat_policy,
         )
     return output.float() if policy_only else tuple(value.float() for value in output)
+
+
+def critic_probabilities(logits):
+    return logits.softmax(-1)
+
+
+def critic_expected(probabilities):
+    categories = torch.arange(CATEGORIES, device=probabilities.device, dtype=probabilities.dtype)
+    return probabilities @ categories / (CATEGORIES - 1)
+
+
+def critic_win_logit(logits):
+    return logits[..., -1] - logits[..., :-1].logsumexp(-1)
 
 
 def upload(value, target):
@@ -1534,7 +1676,7 @@ def trust_region_step(model, optimizer, inputs, action, old, fresh, denominator,
 
 
 def critic_only_step(model, optimizer, parameters=None):
-    parameters = parameters or (tuple(model.value.parameters()) + tuple(model.progress_value.parameters()))
+    parameters = parameters or tuple(model.critic.parameters())
     selected = {id(parameter) for parameter in parameters}
     for parameter in model.parameters():
         if id(parameter) not in selected:
@@ -1921,7 +2063,10 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
     action_count = len(action_u)
     policy_sequence = candidate_index(action_row, batch, target)
     action_size = bucket(action_count) if pad_sequences else action_count
-    action_width = bucket(actions) if pad_sequences else actions
+    action_width = (
+        bucket(max(actions, (action_size + batch - 1) // batch))
+        if pad_sequences else actions
+    )
     candidate_sources = []
     for domain, (u, s, _c, _f, _row, scope) in enumerate(domains):
         if domain == DOMAIN["continuation"]:
@@ -2011,6 +2156,8 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
     if action_size > action_count:
         occupied = np.zeros(batch * action_width, bool); occupied[action_flat] = True
         dummy_flat = np.flatnonzero(~occupied)[:action_size - action_count]
+        if len(dummy_flat) != action_size - action_count:
+            raise ValueError("insufficient padded action capacity")
         action_row = np.pad(action_row, (0, action_size - action_count))
         action_row[action_count:] = dummy_flat // action_width
         action_flat = np.r_[action_flat, dummy_flat]
@@ -2206,6 +2353,7 @@ class WinningReservoir:
     def record(self, rows, choices, log_probabilities, policies, values, rng):
         if not self.capacity:
             return
+        policies = policies if policies is not None else [None] * len(rows)
         for index, (row, choice, log_probability, policy, value) in enumerate(
             zip(rows, choices, log_probabilities, policies, values)
         ):
@@ -2215,6 +2363,7 @@ class WinningReservoir:
             episode = self.pending[index]
             self.pending_seen[index] += 1
             item = (row, int(choice), float(log_probability), 1.0 - float(value),
+                    None if policy is None else
                     np.asarray(policy[:packed_action_count(row)], np.float16))
             if len(episode) < self.pending_capacity:
                 episode.append(item)
@@ -2331,7 +2480,7 @@ def act(model, observation, target, sample, precision, generator=None, temperatu
         inputs = tensors(observation, torch.device("cpu") if target.type == "mps" else target, model)
         if target.type == "mps":
             inputs = upload(inputs, target)
-        logits, value_logit, progress_value = predict(
+        logits, critic_logits = predict(
             model, inputs, precision, temperature, flat_policy=True,
         )
         action_row = inputs[5][0][:len(logits)]
@@ -2353,8 +2502,7 @@ def act(model, observation, target, sample, precision, generator=None, temperatu
         assert len(choice) == len(observation[0]) and legal[selected].all()
     policy = None
     return (choice.cpu().numpy(), masked[selected].cpu().numpy(),
-            policy, value_logit.sigmoid().cpu().numpy(),
-            progress_value.cpu().numpy())
+            policy, critic_probabilities(critic_logits).cpu().numpy())
 
 
 def bands(values):
@@ -2440,11 +2588,15 @@ def curriculum_weights(stage, stage_decisions, auxiliary_decisions, args, active
     stage_fraction = min(1, stage_decisions / args.progress_decisions)
     progress_fraction = min(1, auxiliary_decisions / args.progress_decisions)
     scale = max(.35, .8 ** stage)
+    fixed_entropy = getattr(args, "entropy_weight", None)
     beta = 0 if not active else (
         args.progress_beta if args.progress_beta is not None
         else 1 - .9 * progress_fraction
     )
-    entropy_start, entropy_end = args.entropy_start * scale, args.entropy_end * scale
+    entropy_start, entropy_end = (
+        (fixed_entropy, fixed_entropy) if fixed_entropy is not None
+        else (args.entropy_start * scale, args.entropy_end * scale)
+    )
     return beta, entropy_start + (entropy_end - entropy_start) * stage_fraction, {
         "stage_decisions": stage_decisions, "auxiliary_decisions": auxiliary_decisions,
         "fraction": stage_fraction, "progress_fraction": progress_fraction,
@@ -2495,9 +2647,6 @@ class RolloutCollector:
         self.observation = self.env.observe_tokens(flat=True)
         self.episode_steps = np.zeros(args.envs, np.int32)
         self.combat_steps = np.zeros(args.envs, np.int32)
-        self.max_floor = np.asarray(
-            [(row[0] - 1) * 17 + row[1] for row in self.env.stats()], np.float32
-        )
         self.reservoir = reservoir
         seed = args.seed + sampler_session * 10_000_000 + seed_worker
         self.rng = np.random.default_rng(seed)
@@ -2509,12 +2658,11 @@ class RolloutCollector:
         self.native_steps = []
         self.native_starts = np.zeros(args.envs, np.int64)
         self.native_started = np.full(args.envs, time.monotonic())
-        self.log = None
 
     def event(self, event, **values):
-        if self.log:
-            print(json.dumps({"time": time.time(), "event": event, **values}),
-                  file=self.log, flush=True)
+        _GLOG.info("%s %s", event, " ".join(
+            f"{key}={json.dumps(value, separators=(',', ':'))}" for key, value in values.items()
+        ), stacklevel=2)
 
     def trace_empty(self, kind, indices, characters, stats):
         seeds = self.env.seeds()
@@ -2536,14 +2684,16 @@ class RolloutCollector:
         finished = []
         episodes = [[] for _ in range(5)]
         sample_keys = (
-            "rows", "choices", "old_log", "values", "progress_values", "progress_floors",
-            "win_rewards", "progress_rewards", "terminals", "characters", "versions",
+            "rows", "choices", "old_log", "critic_probabilities", "canonical_progress",
+            "phases", "win_rewards", "terminals", "characters", "versions",
         )
         def materialize(trajectory):
             samples = trajectory.pop("samples")
             trajectory.update(zip(sample_keys, map(list, zip(*samples))))
             return trajectory
         discarded_steps = orphan_empty_actions = sampled_steps = 0
+        search_stats = np.zeros(17, np.int64)
+        expert_rows = []
         collect_seconds = 0.0
         for _ in range(steps):
             if time.monotonic() >= deadline or stop and stop.is_set():
@@ -2566,26 +2716,55 @@ class RolloutCollector:
                 self.env.reset(reset, 0.0)
                 self.episode_steps[reset] = 0
                 self.combat_steps[reset] = 0
-                self.max_floor[reset] = 1
                 self.observation = self.env.observe_tokens(flat=True)
             step_started = time.monotonic()
+            state_stats = self.env.stats()
+            canonical = np.asarray([row[9] for row in state_stats], np.uint8)
+            phases = np.asarray([row[4] for row in state_stats], np.uint8)
             if native:
-                characters, choice, log_probability, value, progress_value, step_rows = \
-                    self.env.policy(args.policy_temperature)
+                (characters, choice, log_probability, critic_probability, step_rows,
+                 step_experts, step_search_stats) = self.env.policy(
+                    args.policy_temperature,
+                    mcts_fraction=args.mcts_fraction,
+                    mcts_simulations=args.mcts_simulations,
+                    mcts_boss_simulations=args.mcts_boss_simulations,
+                    mcts_turns=args.mcts_turns,
+                    mcts_max_depth=args.mcts_max_depth,
+                    mcts_batch_size=args.mcts_batch_size,
+                    mcts_min_visits=args.mcts_min_visits,
+                    mcts_max_targets=args.mcts_max_targets,
+                    mcts_prior_temperature=args.mcts_prior_temperature,
+                    mcts_q_temperature=args.mcts_q_temperature,
+                    mcts_exploration=args.mcts_exploration,
+                    mcts_value_consistency=getattr(args, "search_consistency_weight", 0) > 0,
+                    mcts_heuristic=args.mcts_heuristic,
+                    mcts_timeout=args.mcts_timeout,
+                )
                 characters = np.asarray(characters, np.uint8)
+                critic_probability = np.asarray(critic_probability, np.float16)
+                search_stats += np.asarray(step_search_stats, np.int64)
+                for expert in step_experts:
+                    row, target, visits, depth, *consistency = expert
+                    consistency = (((), np.empty(0, np.float32), 1., 0.)
+                                   if not consistency else
+                                   (tuple(consistency[0]), np.asarray(consistency[1], np.float32),
+                                    consistency[2], consistency[3]))
+                    expert_rows.append((row, np.asarray(target, np.float16), version,
+                                        visits, depth, consistency))
                 policy = None
             else:
                 characters = np.asarray(self.observation[0], np.uint8)
-                choice, log_probability, policy, value, progress_value = act(
+                choice, log_probability, policy, critic_probability = act(
                     model, self.observation, target, True, precision, self.torch_rng,
                     args.policy_temperature,
                 )
                 step_rows = _pack_batch(self.observation)
-            progress_floor = self.max_floor / 52
             if not native:
                 for index, action in enumerate(choice):
                     self.action_history[index].append(int(action))
-            self.reservoir.record(step_rows, choice, log_probability, policy, value, self.rng)
+            self.reservoir.record(
+                step_rows, choice, log_probability, policy, critic_probability[:, -1], self.rng,
+            )
             in_combat = np.asarray([row[4] == 1 for row in self.env.stats()])
             self.combat_steps = np.where(in_combat, self.combat_steps + 1, 0)
             raw_reward, done, _ = self.env.step(choice.tolist())
@@ -2597,8 +2776,6 @@ class RolloutCollector:
             self.episode_steps += 1
             next_observation = None if native else self.env.observe_tokens((~done).tolist(), True)
             stats = self.env.stats()
-            floors = np.asarray([(row[0] - 1) * 17 + row[1] for row in stats], np.float32)
-            next_max_floor = np.maximum(np.maximum(self.max_floor, floors), 52 * raw_reward)
             still_combat = np.asarray([row[4] == 1 for row in stats])
             truncated, step_truncated, combat_truncated, empty_actions = cuts(
                 done, self.episode_steps, self.combat_steps, still_combat,
@@ -2610,12 +2787,10 @@ class RolloutCollector:
             if empty_actions.any():
                 reset = np.flatnonzero(empty_actions).tolist()
                 self.trace_empty("post_step", reset, characters, stats)
-            progress_reward = (next_max_floor - self.max_floor) / 52
-            self.max_floor = next_max_floor
             if native:
                 self.native_steps.append((
-                    step_rows, choice, log_probability, value, progress_value, progress_floor,
-                    raw_reward, progress_reward, done, characters, version,
+                    step_rows, choice, log_probability, critic_probability, canonical, phases,
+                    raw_reward, done, characters, version,
                 ))
             else:
                 for index, row in enumerate(step_rows):
@@ -2624,9 +2799,9 @@ class RolloutCollector:
                         trajectory = {"samples": [], "started": step_started}
                         self.trajectories[index] = trajectory
                     trajectory["samples"].append((
-                        row, choice[index], log_probability[index], value[index],
-                        progress_value[index], progress_floor[index], raw_reward[index],
-                        progress_reward[index], done[index], characters[index], version,
+                        row, choice[index], log_probability[index], critic_probability[index],
+                        canonical[index], phases[index], raw_reward[index], done[index],
+                        characters[index], version,
                     ))
             if boundary.any():
                 reset = np.flatnonzero(boundary).tolist()
@@ -2644,7 +2819,7 @@ class RolloutCollector:
                     if native and done[index]:
                         history = self.native_steps[self.native_starts[index]:]
                         trajectory = {
-                            key: [step[column] if column == 10 else step[column][index]
+                            key: [step[column] if column == 9 else step[column][index]
                                   for step in history]
                             for column, key in enumerate(sample_keys)
                         }
@@ -2665,7 +2840,6 @@ class RolloutCollector:
                 self.env.reset(reset, 0.0)
                 self.episode_steps[reset] = 0
                 self.combat_steps[reset] = 0
-                self.max_floor[reset] = 1
                 next_observation = None if native else self.env.observe_tokens(flat=True)
                 if native:
                     drop = int(self.native_starts.min())
@@ -2678,22 +2852,7 @@ class RolloutCollector:
                 and len(trajectory["samples"]) >= args.segment_steps
             ]
             if segment:
-                if native:
-                    raise ValueError("native actors require complete terminal trajectories")
-                with torch.inference_mode():
-                    next_inputs = tensors(next_observation, target, model)
-                    _, bootstrap_value, bootstrap_progress = predict(model, next_inputs, precision)
-                    bootstrap_value = bootstrap_value.sigmoid().cpu().numpy()
-                    bootstrap_progress = bootstrap_progress.cpu().numpy()
-                for index in segment:
-                    trajectory = self.trajectories[index]
-                    trajectory["bootstrap_value"] = bootstrap_value[index]
-                    trajectory["bootstrap_progress"] = (
-                        bootstrap_progress[index] - self.max_floor[index] / 52
-                    )
-                    trajectory["bootstrap_version"] = version
-                    trajectory["completion_seconds"] = time.monotonic() - trajectory.pop("started")
-                    finished.append(materialize(trajectory)); self.trajectories[index] = None
+                raise ValueError("categorical critic requires complete terminal trajectories")
             self.observation = next_observation
             collect_seconds += time.monotonic() - step_started
             if finished and not native:
@@ -2705,6 +2864,21 @@ class RolloutCollector:
             "orphan_empty_actions": orphan_empty_actions,
             "collect_seconds": collect_seconds, "discarded_steps": discarded_steps,
             "sampled_steps": sampled_steps,
+            "expert_rows": expert_rows,
+            "mcts_roots": int(search_stats[0]), "mcts_simulations": int(search_stats[1]),
+            "mcts_leaves": int(search_stats[2]), "mcts_nodes": int(search_stats[3]),
+            "mcts_batches": int(search_stats[4]), "mcts_targets": int(search_stats[5]),
+            "mcts_turn_starts": int(search_stats[6]),
+            "mcts_seconds": float(search_stats[7]) / 1e6,
+            "mcts_simulate_seconds": float(search_stats[8]) / 1e6,
+            "mcts_encode_seconds": float(search_stats[9]) / 1e6,
+            "mcts_inference_seconds": float(search_stats[10]) / 1e6,
+            "mcts_backup_seconds": float(search_stats[11]) / 1e6,
+            "mcts_rollout_steps": int(search_stats[12]),
+            "mcts_rollout_completed": int(search_stats[13]),
+            "mcts_rollout_invalid": int(search_stats[14]),
+            "mcts_rollout_seconds": float(search_stats[15]) / 1e6,
+            "mcts_timeouts": int(search_stats[16]),
             **({key: 0 for key in cache_start} if native else {
                 key: model.cache_stats[key] - cache_start[key] for key in model.cache_stats
             }),
@@ -2721,6 +2895,16 @@ class RolloutCollector:
                 "collect_seconds": 0.0, "queue_full_waits": 0,
                 "queue_put_seconds": 0.0,
                 "discarded_steps": 0, "sampled_steps": 0,
+                "expert_rows": [],
+                "mcts_roots": 0, "mcts_simulations": 0, "mcts_leaves": 0,
+                "mcts_nodes": 0, "mcts_batches": 0, "mcts_targets": 0,
+                "mcts_turn_starts": 0,
+                "mcts_seconds": 0.0,
+                "mcts_simulate_seconds": 0.0, "mcts_encode_seconds": 0.0,
+                "mcts_inference_seconds": 0.0, "mcts_backup_seconds": 0.0,
+                "mcts_rollout_steps": 0, "mcts_rollout_completed": 0,
+                "mcts_rollout_invalid": 0, "mcts_rollout_seconds": 0.0,
+                "mcts_timeouts": 0,
                 **dict.fromkeys(("card_hit", "card_miss", "graph_hit", "graph_miss"), 0),
             }
         pending = empty()
@@ -2746,13 +2930,28 @@ class RolloutCollector:
                 model, target, precision, deadline, steps, version, stop,
                 heartbeat, progress,
             )
+            self.event(
+                "collect", version=version, iteration=result["iteration"],
+                sampled=result["sampled_steps"], trajectories=len(result["trajectories"]),
+                rows=sum(len(row["rows"]) for row in result["trajectories"]),
+                seconds=round(result["collect_seconds"], 3),
+                mcts_roots=result["mcts_roots"], mcts_simulations=result["mcts_simulations"],
+                mcts_targets=result["mcts_targets"], mcts_seconds=round(result["mcts_seconds"], 3),
+            )
             pending["trajectories"].extend(result["trajectories"])
+            pending["expert_rows"].extend(result["expert_rows"])
             for target_episodes, rows in zip(pending["episodes"], result["episodes"]):
                 target_episodes.extend(rows)
             for key in (
                 "orphan_empty_actions", "collect_seconds",
                 "discarded_steps", "sampled_steps", "card_hit", "card_miss",
-                "graph_hit", "graph_miss",
+                "graph_hit", "graph_miss", "mcts_roots", "mcts_simulations",
+                "mcts_leaves", "mcts_nodes", "mcts_batches", "mcts_targets",
+                "mcts_turn_starts", "mcts_seconds",
+                "mcts_simulate_seconds", "mcts_encode_seconds",
+                "mcts_inference_seconds", "mcts_backup_seconds",
+                "mcts_rollout_steps", "mcts_rollout_completed", "mcts_rollout_invalid",
+                "mcts_rollout_seconds", "mcts_timeouts",
             ):
                 pending[key] += result[key]
             pending["iteration"] = result["iteration"]
@@ -2807,9 +3006,8 @@ class RolloutCollector:
 def collect_worker(model, args, sampler_session, stage, capacity, pending_capacity, iteration,
                    worker, generation, version, models, samples, stop, deadline, budget, results,
                    heartbeat, progress):
-    log = (Path(args.output) / f"sampler-{worker}.log").open("a", buffering=1)
     if args.sampler_backend == "process":
-        os.dup2(log.fileno(), 1); os.dup2(log.fileno(), 2)
+        configure_logging(args.output, f"sampler-{worker}", getattr(args, "log_level", "INFO"))
     qos = getattr(ctypes.CDLL(None), "pthread_set_qos_class_self_np", None)
     if qos is not None:
         qos(int(os.environ.get("ACTOR_QOS", "0x11"), 0), 0)
@@ -2822,7 +3020,6 @@ def collect_worker(model, args, sampler_session, stage, capacity, pending_capaci
     collector = RolloutCollector(
         args, sampler_session, stage, reservoir, iteration, worker, generation,
     )
-    collector.log = log
     collector.event(
         "start", pid=os.getpid(), worker=worker, generation=generation,
         session=sampler_session, stage=stage, envs=args.envs, threads=args.sampler_threads,
@@ -2851,8 +3048,11 @@ def collect_worker(model, args, sampler_session, stage, capacity, pending_capaci
         results.put(result)
     except BaseException:
         collector.event("error", version=version)
-        traceback.print_exc(file=log)
+        _GLOG.exception("sampler_failed version=%d", version)
         raise
+    finally:
+        if args.sampler_backend == "process":
+            shutdown_logging()
 
 
 class ExperienceDataset:
@@ -2860,9 +3060,11 @@ class ExperienceDataset:
         self.rows = []
         self.data = {
             "action": np.empty(0, np.int64), "old": np.empty(0, np.float32),
-            "advantage": np.empty(0, np.float32), "progress_advantage": np.empty(0, np.float32),
-            "returns": np.empty(0, np.float32), "progress_returns": np.empty(0, np.float32),
-            "character": np.empty(0, np.int8), "priority": np.empty(0, np.float32),
+            "advantage": np.empty(0, np.float32),
+            "critic_target": np.empty((0, CATEGORIES), np.float16),
+            "value": np.empty(0, np.float32), "canonical": np.empty(0, np.int8),
+            "phase": np.empty(0, np.int8), "character": np.empty(0, np.int8),
+            "priority": np.empty(0, np.float32),
             "version": np.empty(0, np.int64), "id": np.empty(0, np.int64),
         }
         self.next_id = 0
@@ -2872,78 +3074,64 @@ class ExperienceDataset:
     def __len__(self):
         return len(self.rows)
 
-    def add(self, result, args, progress_active=True):
+    def add(self, result, args, limit=None):
         trajectories = result["trajectories"]
         if not trajectories:
-            return 0, 0
+            return 0, 0, 0
         fields = (
-            "rows", "choices", "old_log", "values", "progress_values",
-            "progress_floors", "win_rewards", "progress_rewards",
-            "terminals", "characters", "versions",
+            "rows", "choices", "old_log", "critic_probabilities", "canonical_progress",
+            "phases", "win_rewards", "terminals", "characters", "versions",
         )
         rows = [item for trajectory in trajectories for item in trajectory["rows"]]
-        reward = np.asarray([
-            item for trajectory in trajectories for item in trajectory["win_rewards"]
-        ], np.float32)
-        progress_reward = np.asarray([
-            item for trajectory in trajectories for item in trajectory["progress_rewards"]
-        ], np.float32)
-        value = np.asarray([
-            item for trajectory in trajectories for item in trajectory["values"]
-        ], np.float32)
-        progress_value = np.asarray([
-            item for trajectory in trajectories for item in trajectory["progress_values"]
-        ], np.float32)
-        progress_floor = np.asarray([
-            item for trajectory in trajectories for item in trajectory["progress_floors"]
-        ], np.float32)
-        remaining_progress = progress_value - progress_floor
-        terminal = np.asarray([
-            item for trajectory in trajectories for item in trajectory["terminals"]
-        ], bool)
-        advantage = np.zeros_like(reward)
-        progress_value_advantage = np.zeros_like(reward); progress_advantage = np.zeros_like(reward)
+        advantage = np.empty(len(rows), np.float32)
+        targets = np.empty((len(rows), CATEGORIES), np.float16)
+        values = np.empty(len(rows), np.float32)
         end = 0
         for trajectory in trajectories:
             length = len(trajectory["rows"])
             if not length or any(len(trajectory[key]) != length for key in fields):
                 raise ValueError("invalid trajectory fields")
             start, end = end, end + length
-            bootstrap = trajectory.get("bootstrap_value")
-            if (terminal[start:end - 1].any() or (not terminal[end - 1] and bootstrap is None)
-                    or (terminal[end - 1] and bootstrap is not None)
-                    or (bootstrap is not None
-                        and trajectory.get("bootstrap_version") != trajectory["versions"][-1])):
+            terminal = np.asarray(trajectory["terminals"], bool)
+            probabilities = np.asarray(trajectory["critic_probabilities"], np.float32)
+            canonical = np.asarray(trajectory["canonical_progress"], np.int64)
+            if (terminal[:-1].any() or not terminal[-1] or probabilities.shape != (length, CATEGORIES)
+                    or not np.isfinite(probabilities).all()
+                    or not np.allclose(probabilities.sum(1), 1, atol=2e-3)
+                    or canonical.min() < 0 or canonical.max() > MAX_PROGRESS):
                 raise ValueError("invalid trajectory terminal")
-            gae = progress_gae = 0.0
-            next_value = float(bootstrap or 0)
-            next_progress = float(trajectory.get("bootstrap_progress") or 0)
-            for step in reversed(range(start, end)):
-                live = not terminal[step]
-                gae = reward[step] + live * next_value - value[step] + args.gae_lambda * live * gae
-                progress_gae = (
-                    progress_reward[step] + args.progress_gamma * live * next_progress
-                    - remaining_progress[step]
-                    + args.progress_gamma * args.gae_lambda * live * progress_gae
-                )
-                advantage[step] = gae
-                progress_value_advantage[step] = progress_gae
-                progress_advantage[step] = progress_gae
-                next_value = value[step]; next_progress = remaining_progress[step]
-        returns = np.clip(advantage + value, 0, 1)
-        progress_returns = progress_value_advantage + remaining_progress + progress_floor
-        priority = 1 + np.abs(advantage) + progress_active * np.abs(progress_advantage) \
-            + 4 * terminal + 4 * (returns > .5)
-        actionable = np.asarray([packed_legal_count(row) > 1 for row in rows])
-        values = {
+            category = CATEGORIES - 1 if trajectory["win_rewards"][-1] > .5 else int(canonical.max())
+            target = np.zeros(CATEGORIES, np.float32); target[category] = 1
+            targets[end - 1] = target
+            for index in range(length - 2, -1, -1):
+                target = (1 - args.critic_lambda) * probabilities[index + 1] \
+                    + args.critic_lambda * target
+                targets[start + index] = target
+            expected = probabilities @ (np.arange(CATEGORIES, dtype=np.float32) / (CATEGORIES - 1))
+            values[start:end] = expected
+            advantage[start:end] = category / (CATEGORIES - 1) - expected
+        terminal = np.asarray([
+            item for trajectory in trajectories for item in trajectory["terminals"]
+        ], bool)
+        wins = targets[:, -1] > .5
+        priority = 1 + np.abs(advantage) + 4 * terminal + 4 * wins
+        actionable = np.ones(len(rows), bool) if getattr(args, "critic_only", False) else np.asarray([
+            packed_legal_count(row) > 1 for row in rows
+        ])
+        data = {
             "action": np.asarray([
                 item for trajectory in trajectories for item in trajectory["choices"]
             ], np.int64),
             "old": np.asarray([
                 item for trajectory in trajectories for item in trajectory["old_log"]
             ], np.float32),
-            "advantage": advantage, "progress_advantage": progress_advantage,
-            "returns": returns, "progress_returns": progress_returns,
+            "advantage": advantage, "critic_target": targets, "value": values,
+            "canonical": np.asarray([
+                item for trajectory in trajectories for item in trajectory["canonical_progress"]
+            ], np.int8),
+            "phase": np.asarray([
+                item for trajectory in trajectories for item in trajectory["phases"]
+            ], np.int8),
             "character": np.asarray([
                 item for trajectory in trajectories for item in trajectory["characters"]
             ], np.int8),
@@ -2953,15 +3141,17 @@ class ExperienceDataset:
             ], np.int64),
             "id": np.arange(self.next_id, self.next_id + len(rows), dtype=np.int64),
         }
-        self.next_id += len(rows)
+        accepted = len(rows) if limit is None else max(0, min(len(rows), limit))
+        rows, actionable = rows[:accepted], actionable[:accepted]
+        self.next_id += accepted
         self.rows.extend(row for row, keep in zip(rows, actionable) if keep)
-        for key, value in values.items():
-            self.data[key] = np.concatenate((self.data[key], value[actionable]))
-        self.seen += len(rows)
+        for key, value in data.items():
+            self.data[key] = np.concatenate((self.data[key], value[:accepted][actionable]))
+        self.seen += accepted
         self.admitted += int(actionable.sum())
-        forced = len(rows) - int(actionable.sum())
+        forced = accepted - int(actionable.sum())
         self.forced_dropped += forced
-        return len(rows), forced
+        return accepted, forced, len(data["action"]) - accepted
 
     def prune(self, version, lag, limit=None):
         stale = np.flatnonzero(self.data["version"] < version - lag)
@@ -2984,41 +3174,198 @@ class ExperienceDataset:
         self.discard(indices)
         return len(indices)
 
-    def sample(self, size, rng):
+    def sample(self, size, rng, balanced=False):
         size = min(size, len(self))
+        if balanced:
+            pools = [list(rng.permutation(np.flatnonzero(self.data["character"] == character)))
+                     for character in range(5)]
+            selected = []
+            while len(selected) < size and any(pools):
+                for pool in pools:
+                    if pool and len(selected) < size:
+                        selected.append(pool.pop())
+            return np.asarray(selected, np.int64)
         return rng.choice(len(self), size, replace=False)
 
-    def use(self, indices):
+    def use(self, indices, decay=3):
         self.uses += len(indices)
-        self.data["priority"][indices] -= 3
+        self.data["priority"][indices] -= decay
         expired = indices[self.data["priority"][indices] < 0]
         self.retired += len(expired)
         return expired
 
 
+class CriticBalance:
+    def __init__(self, decay=.99, state=None):
+        self.decay = decay
+        self.frequencies = [np.zeros(size, np.float64) for size in (5, 14, MAX_PROGRESS + 1)]
+        self.initialized = False
+        if state:
+            self.initialized = bool(state.get("initialized"))
+            self.frequencies = [np.asarray(row, np.float64) for row in state["frequencies"]]
+        self.reset_report()
+
+    def state_dict(self):
+        return {"initialized": self.initialized,
+                "frequencies": [row.tolist() for row in self.frequencies]}
+
+    def weights(self, character, phase, floor):
+        columns = tuple(np.asarray(column, np.int64) for column in (character, phase, floor))
+        batch = [np.bincount(column, minlength=len(frequency)) / len(column)
+                 for column, frequency in zip(columns, self.frequencies)]
+        if self.initialized:
+            for frequency, current in zip(self.frequencies, batch):
+                frequency *= self.decay; frequency += (1 - self.decay) * current
+        else:
+            for frequency, current in zip(self.frequencies, batch):
+                frequency[:] = current
+            self.initialized = True
+        weight = np.prod([
+            np.maximum(frequency[column], 1e-8) ** -.5
+            for frequency, column in zip(self.frequencies, columns)
+        ], axis=0) ** (1 / 3)
+        weight = np.clip(weight, .25, 4); weight /= weight.mean()
+        for count, column in zip(self.counts, columns):
+            count += np.bincount(column, minlength=len(count))
+        self.ess += weight.sum() ** 2 / np.square(weight).sum()
+        self.rows += len(weight); self.batches += 1
+        return weight.astype(np.float32)
+
+    def record_loss(self, target, weighted_category_loss):
+        self.target_counts += target.sum(0)
+        self.loss_mass += weighted_category_loss.sum(0)
+
+    def reset_report(self):
+        self.counts = [np.zeros(size, np.int64) for size in (5, 14, MAX_PROGRESS + 1)]
+        self.target_counts = np.zeros(CATEGORIES, np.float64)
+        self.loss_mass = np.zeros(CATEGORIES, np.float64)
+        self.ess = 0.; self.rows = self.batches = 0
+
+    def report(self):
+        result = {
+            "critic_preweight_character_counts": self.counts[0].tolist(),
+            "critic_preweight_phase_counts": self.counts[1].tolist(),
+            "critic_preweight_floor_counts": self.counts[2].tolist(),
+            "critic_preweight_target_counts": self.target_counts.tolist(),
+            "critic_postweight_loss_mass": self.loss_mass.tolist(),
+            "critic_weight_ess": self.ess / max(1, self.batches),
+            "critic_weight_ess_fraction": self.ess / max(1, self.rows),
+        }
+        self.reset_report()
+        return result
+
+class ExpertDataset:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.rows = []
+        self.targets = []
+        self.consistencies = []
+        self.versions = np.empty(0, np.int64)
+        self.visits = np.empty(0, np.int32)
+        self.depths = np.empty(0, np.int32)
+        self.ids = np.empty(0, np.int64)
+        self.next_id = 0
+        self.seen = self.used = self.stale = self.evicted = 0
+
+    def __len__(self):
+        return len(self.rows)
+
+    def add(self, rows):
+        if not rows:
+            return
+        for row, target, _version, _visits, _depth, consistency in rows:
+            target = np.asarray(target, np.float16)
+            if (target.shape != (packed_action_count(row),) or not np.isfinite(target).all()
+                    or abs(float(target.sum()) - 1) > 2e-3 or (target < 0).any()):
+                raise ValueError("invalid expert target")
+            children, weights, self_weight, terminal_value = consistency
+            if (len(children) != len(weights) or not np.isfinite(weights).all()
+                    or (weights < 0).any() or not 0 <= self_weight <= 1
+                    or not np.isfinite(terminal_value)
+                    or float(weights.sum()) + self_weight > 1.002
+                    or not 0 <= terminal_value <= 1 - self_weight - float(weights.sum()) + .002):
+                raise ValueError("invalid search consistency target")
+        self.rows.extend(row for row, *_ in rows)
+        self.targets.extend(np.asarray(target, np.float16) for _, target, *_ in rows)
+        self.consistencies.extend(row[5] for row in rows)
+        self.versions = np.r_[self.versions, np.asarray([row[2] for row in rows], np.int64)]
+        self.visits = np.r_[self.visits, np.asarray([row[3] for row in rows], np.int32)]
+        self.depths = np.r_[self.depths, np.asarray([row[4] for row in rows], np.int32)]
+        self.ids = np.r_[self.ids, np.arange(self.next_id, self.next_id + len(rows))]
+        self.next_id += len(rows)
+        self.seen += len(rows)
+        if len(self) > self.capacity:
+            count = len(self) - self.capacity
+            self.evicted += count
+            self.discard(np.arange(count))
+
+    def sample(self, size, rng):
+        return rng.choice(len(self), min(size, len(self)), replace=False)
+
+    def prune(self, version, lag):
+        stale = np.flatnonzero(self.versions < version - lag)
+        self.stale += len(stale)
+        self.discard(stale)
+
+    def discard(self, indices):
+        if not len(indices):
+            return
+        keep = np.ones(len(self), bool); keep[indices] = False
+        self.rows = [row for row, selected in zip(self.rows, keep) if selected]
+        self.targets = [row for row, selected in zip(self.targets, keep) if selected]
+        self.consistencies = [row for row, selected in zip(self.consistencies, keep) if selected]
+        self.versions = self.versions[keep]
+        self.visits = self.visits[keep]
+        self.depths = self.depths[keep]
+        self.ids = self.ids[keep]
+
+    def discard_ids(self, ids):
+        self.discard(np.flatnonzero(np.isin(self.ids, ids)))
+
+
 def train_stream(model, optimizer, args, sampler_session, stage, target, deadline, budget,
                  base_decisions, auxiliary_decisions, stage_decisions, run_started, reservoir, progress_active,
-                 save_report, save_step, fingerprint):
+                 save_report, save_step, fingerprint, critic_balance):
     ascension, bonus = STAGES[stage]
     collector_args = copy.copy(args)
     pending_capacity = max(1, reservoir.capacity // args.envs)
     collector_args.envs //= args.samplers
     dataset = ExperienceDataset()
+    expert_dataset = ExpertDataset(args.expert_capacity)
     episodes = [[] for _ in range(5)]
     promotion_episodes = []
-    losses = {key: [] for key in ("mean_advantage", "policy_loss", "value_loss", "progress_value_loss", "progress_beta", "entropy", "entropy_weight", "kl", "post_kl", "clip_fraction", "winning_loss", "winning_kl")}
+    losses = {key: [] for key in (
+        "mean_advantage", "policy_loss", "expert_loss", "expert_entropy", "expert_kl",
+        "expert_rows", "ppo_policy_head_grad_norm", "expert_policy_head_grad_norm",
+        "expert_ppo_grad_ratio", "expert_ppo_grad_cosine", "critic_loss",
+        "search_consistency_loss", "critic_expected", "critic_win_probability", "entropy", "entropy_weight", "kl",
+        "post_kl", "clip_fraction", "winning_loss", "winning_kl",
+    )}
     pipeline = [
         f"{args.samplers} continuous CPU actor{'s' if args.samplers > 1 else ''} → "
         + (f"{args.segment_steps}-decision bootstrapped segments" if args.segment_steps
            else "complete terminal trajectories"),
         "Bounded queue → policy-lag and action-ratio freshness filters",
-        "Uniform reusable rows; prefilter forced/stale/ratio-invalid; priority −3 per use",
+        f"{'Character-balanced' if args.character_balanced else 'Uniform'} reusable rows; "
+        f"prefilter forced/stale/ratio-invalid; priority −{args.priority_decay:g} per use",
         f"{model.layers}-layer card encoder + party/enemy/map summaries + action-object menu → heads",
-        f"Asynchronous clipped PPO; full model updated every iteration; "
+        f"{CATEGORIES}-class terminal-progress critic; detached backward λ={args.critic_lambda:g} targets",
+        "Critic loss balanced by EMA character/phase/canonical-floor frequency",
+        "Turn-start native MCTS → expectimax-Q targets and policy-expectation critic transitions",
+        ("Frozen encoder and policy; critic head only" if args.critic_only else
+         "Asynchronous clipped PPO; full model updated every iteration") + "; "
+        f"policy-head LR ×{args.head_learning_rate_multiplier:g}; "
+        f"critic LR ×{args.critic_learning_rate_multiplier:g}; "
         f"weights published every {args.publish_updates} updates",
     ]
     winning_behavior_drift = 0
     decisions = discarded_steps = handled = sampled = attempted = forced = trained = updates = windows = 0
+    mcts_roots = mcts_simulations = mcts_leaves = mcts_nodes = mcts_batches = mcts_targets = 0
+    mcts_turn_starts = 0
+    mcts_seconds = mcts_simulate_seconds = mcts_encode_seconds = 0.0
+    mcts_inference_seconds = mcts_backup_seconds = mcts_rollout_seconds = 0.0
+    mcts_rollout_steps = mcts_rollout_completed = mcts_rollout_invalid = mcts_timeouts = 0
+    expert_visits = expert_depth = 0
     segmented_trajectories = 0
     winning_added = winning_replayed = winning_rejected = orphan_empty_actions = post_kl_checks = 0
     policy_update_attempts = pre_kl_rejected_updates = post_kl_discarded_updates = 0
@@ -3060,6 +3407,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
     reported_steps = reported_trajectories = 0
     reported_seconds = 0.0
     started = time.monotonic()
+    next_heartbeat_log = started
     rng = np.random.default_rng(args.seed + sampler_session + 1_000_000_000)
     threaded = args.sampler_backend == "thread"
     context = multiprocessing.get_context(os.environ.get("SAMPLER_START", "spawn"))
@@ -3086,7 +3434,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             reservoir.capacity, pending_capacity, sampler_iterations[worker], worker,
             sampler_generations[worker], updates, models[worker], samples, stop, deadline, budget,
             results, heartbeat, progress,
-        ))
+        ), name=f"sampler-{worker}")
         workers[worker] = process
         process.start()
 
@@ -3106,7 +3454,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 pass
 
     def ingest(item):
-        nonlocal decisions, handled, forced, discarded_steps, sampled, collect_seconds, winning_added, orphan_empty_actions, latest_sampler_version, latest_sampler_iteration, dataset_peak, segmented_trajectories, queue_full_waits, queue_put_seconds, queue_delay_sum, queue_packets, queue_peak
+        nonlocal decisions, handled, forced, discarded_steps, sampled, collect_seconds, winning_added, orphan_empty_actions, latest_sampler_version, latest_sampler_iteration, dataset_peak, segmented_trajectories, queue_full_waits, queue_put_seconds, queue_delay_sum, queue_packets, queue_peak, mcts_roots, mcts_simulations, mcts_leaves, mcts_nodes, mcts_batches, mcts_targets, mcts_turn_starts, mcts_seconds, mcts_simulate_seconds, mcts_encode_seconds, mcts_inference_seconds, mcts_backup_seconds, mcts_rollout_steps, mcts_rollout_completed, mcts_rollout_invalid, mcts_rollout_seconds, mcts_timeouts
         worker, generation, version, result = item
         if generation != sampler_generations[worker]:
             return
@@ -3114,7 +3462,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         sampler_iterations[worker] = result["iteration"]
         latest_sampler_version = min(sampler_versions)
         latest_sampler_iteration = max(sampler_iterations)
-        added, excluded = dataset.add(result, args, progress_active)
+        added, excluded, excess = dataset.add(result, args, budget - decisions)
+        expert_dataset.add(result.get("expert_rows", []))
         decisions += added
         handled += excluded
         forced += excluded
@@ -3126,6 +3475,24 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             len(trajectory["rows"]) for trajectory in result["trajectories"]
         )
         discarded_steps += result["discarded_steps"]
+        discarded_steps += excess
+        mcts_roots += result.get("mcts_roots", 0)
+        mcts_simulations += result.get("mcts_simulations", 0)
+        mcts_leaves += result.get("mcts_leaves", 0)
+        mcts_nodes += result.get("mcts_nodes", 0)
+        mcts_batches += result.get("mcts_batches", 0)
+        mcts_targets += result.get("mcts_targets", 0)
+        mcts_turn_starts += result.get("mcts_turn_starts", 0)
+        mcts_seconds += result.get("mcts_seconds", 0.0)
+        mcts_simulate_seconds += result.get("mcts_simulate_seconds", 0.0)
+        mcts_encode_seconds += result.get("mcts_encode_seconds", 0.0)
+        mcts_inference_seconds += result.get("mcts_inference_seconds", 0.0)
+        mcts_backup_seconds += result.get("mcts_backup_seconds", 0.0)
+        mcts_rollout_steps += result.get("mcts_rollout_steps", 0)
+        mcts_rollout_completed += result.get("mcts_rollout_completed", 0)
+        mcts_rollout_invalid += result.get("mcts_rollout_invalid", 0)
+        mcts_rollout_seconds += result.get("mcts_rollout_seconds", 0.0)
+        mcts_timeouts += result.get("mcts_timeouts", 0)
         for trajectory in result["trajectories"]:
             segmented_trajectories += int(not trajectory["terminals"][-1])
             trajectory_lengths.append(len(trajectory["rows"]))
@@ -3139,6 +3506,20 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             trajectory_seconds.append(trajectory["completion_seconds"])
         dataset_peak = max(dataset_peak, len(dataset))
         update = result["reservoir"]
+        missing = [index for index, row in enumerate(update["rows"]) if row[4] is None]
+        for start in range(0, len(missing), 128):
+            indices = missing[start:start + 128]
+            with torch.no_grad():
+                inputs = unpack([update["rows"][index][0] for index in indices], target, model)
+                logits = predict(
+                    model, inputs, args.precision, args.policy_temperature,
+                )[0].masked_fill(~inputs[6], -torch.inf)
+                policies = logits.log_softmax(-1).cpu().numpy()
+            for index, policy in zip(indices, policies):
+                row = update["rows"][index]
+                update["rows"][index] = (*row[:4], np.asarray(
+                    policy[:packed_action_count(row[0])], np.float16,
+                ))
         winning_added += reservoir.admit(
             update["rows"], update["wins"], update["skipped"], update["forced"], rng,
         )
@@ -3173,11 +3554,39 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         return unpack(rows, torch.device("cpu"), model, False), time.monotonic() - prepared
 
     def reserve_batch(size):
-        order = dataset.sample(len(dataset), rng)
+        order = dataset.sample(len(dataset), rng, args.character_balanced)
         selected = order[:size]
         rows = [dataset.rows[index] for index in selected]
+        expert_selected = expert_dataset.sample(args.expert_batch, rng) \
+            if args.expert_weight or args.search_consistency_weight else np.empty(0, np.int64)
+        expert_rows = [expert_dataset.rows[index] for index in expert_selected]
+        expert_targets = [expert_dataset.targets[index] for index in expert_selected]
+        expert_ids = expert_dataset.ids[expert_selected].copy()
+        expert_visits_batch = expert_dataset.visits[expert_selected].copy()
+        expert_depths_batch = expert_dataset.depths[expert_selected].copy()
+        consistency_positions = np.asarray([
+            index for index, selected in enumerate(expert_selected)
+            if expert_dataset.consistencies[selected][2] < 1
+        ], np.int64)
+        if len(consistency_positions) > args.search_consistency_batch:
+            consistency_positions = rng.choice(
+                consistency_positions, args.search_consistency_batch, replace=False
+            )
+        search_children = []
+        search_groups = []
+        for group, position in enumerate(consistency_positions):
+            children, weights, self_weight, terminal_value = \
+                expert_dataset.consistencies[expert_selected[position]]
+            search_groups.append((position, group, len(children), weights,
+                                  self_weight, terminal_value))
+            search_children.extend(children)
         values = {key: dataset.data[key][selected].copy() for key in dataset.data}
-        return selected, order, size, rows, values, [], packer.submit(prepare, rows)
+        replay = reservoir.sample(len(selected) // 9, rng)
+        return selected, order, size, rows, expert_ids, expert_rows, expert_targets, \
+            expert_visits_batch, expert_depths_batch, values, replay, search_groups, \
+            search_children, packer.submit(
+            prepare, rows + expert_rows + [sample[0] for sample in replay] + search_children
+        )
 
     def optimizer_metrics():
         return {
@@ -3255,6 +3664,33 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             "update_seconds": update_seconds,
             "actor_decisions_per_second": sampled / max(1e-9, collect_seconds),
             "learner_decisions_per_second": trained / max(1e-9, update_seconds),
+            "mcts_roots": mcts_roots, "mcts_simulations": mcts_simulations,
+            "mcts_leaves": mcts_leaves, "mcts_nodes": mcts_nodes,
+            "mcts_batches": mcts_batches, "mcts_targets": mcts_targets,
+            "mcts_turn_starts": mcts_turn_starts,
+            "mcts_seconds": mcts_seconds,
+            "mcts_root_fraction": mcts_roots / max(1, mcts_turn_starts),
+            "mcts_roots_per_decision": mcts_roots / max(1, sampled),
+            "mcts_simulations_per_root": mcts_simulations / max(1, mcts_roots),
+            "mcts_simulations_per_second": mcts_simulations / max(1e-9, mcts_seconds),
+            "mcts_leaf_batch_mean": mcts_leaves / max(1, mcts_batches),
+            "mcts_targets_per_root": mcts_targets / max(1, mcts_roots),
+            "mcts_simulate_fraction": mcts_simulate_seconds / max(1e-9, mcts_seconds),
+            "mcts_encode_fraction": mcts_encode_seconds / max(1e-9, mcts_seconds),
+            "mcts_inference_fraction": mcts_inference_seconds / max(1e-9, mcts_seconds),
+            "mcts_backup_fraction": mcts_backup_seconds / max(1e-9, mcts_seconds),
+            "mcts_rollout_steps": mcts_rollout_steps,
+            "mcts_rollout_completed": mcts_rollout_completed,
+            "mcts_rollout_invalid": mcts_rollout_invalid,
+            "mcts_timeouts": mcts_timeouts,
+            "mcts_rollout_fraction": mcts_rollout_seconds / max(1e-9, mcts_seconds),
+            "expert_buffer_rows": len(expert_dataset),
+            "expert_rows_seen": expert_dataset.seen,
+            "expert_rows_used": expert_dataset.used,
+            "expert_rows_stale": expert_dataset.stale,
+            "expert_rows_evicted": expert_dataset.evicted,
+            "expert_visit_mean": expert_visits / max(1, expert_dataset.used),
+            "expert_depth_mean": expert_depth / max(1, expert_dataset.used),
             "row_utilization": trained / max(1, attempted),
             "update_seconds_p95": float(np.quantile(update_durations, .95)) if update_durations else 0,
             "unpack_seconds_p95": float(np.quantile(unpack_durations, .95)) if unpack_durations else 0,
@@ -3318,6 +3754,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             "winning_collection_drift": float(winning_behavior_drift),
             "observed_kl": observed_kl, "observed_clip_fraction": observed_clip,
             "progress_active": progress_active, "curriculum": curriculum,
+            **critic_balance.report(),
             **recent_metrics,
         }
         reported_steps = handled
@@ -3330,7 +3767,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
     promotion_result = None
     def update_promotion():
         nonlocal promotion_ready, promotion_result
-        if promotion_ready or stage + 1 >= len(STAGES):
+        if args.critic_only or promotion_ready or stage + 1 >= len(STAGES):
             return
         promotion_ready, promotion_result = promotion_sample(
             promotion_episodes, args.promotion_window, args.promote_win_rate,
@@ -3380,11 +3817,11 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             discarded_steps += dropped
             watchdog_dropped += dropped
             worker_accounted[worker] = worker_resolved[worker] = 0
-            print(json.dumps({
+            emit_event({
                 "time": time.time(), "event": "sampler_failure", "worker": worker,
                 "generation": sampler_generations[worker], "wedged": wedged,
                 "exitcode": process.exitcode, "dropped": dropped,
-            }), flush=True)
+            }, logging.WARNING)
             if (sampler_restarts[worker] >= args.sampler_restarts or stop.is_set()
                     or time.monotonic() >= deadline or decisions >= budget):
                 sampler_exhausted[worker] = True
@@ -3397,17 +3834,30 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 except (Empty, EOFError, OSError):
                     break
             start_worker(worker)
-            print(json.dumps({
+            emit_event({
                 "time": time.time(), "event": "sampler_restart", "worker": worker,
                 "generation": sampler_generations[worker],
                 "restarts": sampler_restarts[worker],
-            }), flush=True)
+            })
 
     try:
         while True:
             drain_results()
             drain_samples()
             restart_stalled()
+            now = time.monotonic()
+            if now >= next_heartbeat_log:
+                try:
+                    queue_size = samples.qsize()
+                except NotImplementedError:
+                    queue_size = -1
+                _GLOG.info(
+                    "heartbeat decisions=%d sampled=%d updates=%d dataset=%d expert=%d "
+                    "queue=%d sampler_version=%d sampler_age_s=%.1f",
+                    decisions, sampled, updates, len(dataset), len(expert_dataset), queue_size,
+                    latest_sampler_version, max(now - value for value in heartbeat[:]),
+                )
+                next_heartbeat_log = now + 10
             sampler_done = (stop.is_set() or all(not worker.is_alive() for worker in workers)) and samples.empty()
             if not pending:
                 if len(dataset) < args.batch and not sampler_done:
@@ -3421,6 +3871,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 absolute = base_decisions + handled
                 boundary = min(next_report, next_save) - absolute
                 stale = dataset.prune(updates, args.max_policy_lag, boundary)
+                expert_dataset.prune(updates, args.expert_max_lag)
                 handled += stale
                 absolute = base_decisions + handled
                 if absolute >= next_save:
@@ -3461,7 +3912,9 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     break
                 continue
             update_started = time.monotonic()
-            selected, order, cursor, rows, values, replay, packed = pending.pop(0)
+            (selected, order, cursor, rows, expert_ids, expert_rows, expert_targets,
+             expert_visits_batch, expert_depths_batch, values, replay, search_groups, search_children,
+             packed) = pending.pop(0)
             if not rows:
                 continue
             screen_started = time.monotonic()
@@ -3474,12 +3927,15 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             action = torch.as_tensor(values["action"], device=target)
             old = torch.as_tensor(values["old"], device=target)
             lengths = np.asarray([packed_action_count(row) for row in rows], np.int64)
+            expert_lengths = np.asarray([
+                packed_action_count(row) for row in expert_rows
+            ], np.int64)
             choice_index = torch.as_tensor(
                 np.cumsum(lengths) - lengths + values["action"], device=target,
             )
             flat_policy = not replay
             forward_started = time.monotonic()
-            all_logits, all_prediction, all_progress_prediction = predict(
+            all_logits, all_critic_logits = predict(
                 model, inputs, args.precision, args.policy_temperature, flat_policy=flat_policy,
             )
             forward_seconds = time.monotonic() - forward_started
@@ -3487,15 +3943,20 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             screen_seconds += time.monotonic() - screen_started
             forward_durations.append(forward_seconds)
             backward_seconds = 0.0
-            prediction = all_prediction[:len(rows)]
-            progress_prediction = all_progress_prediction[:len(rows)]
+            critic_logits = all_critic_logits[:len(rows)]
             legal = inputs[6][:len(rows)]
-            logits = all_logits[:sum(lengths)] if flat_policy else all_logits[:len(rows)]
+            policy_actions = int(lengths.sum())
+            expert_actions = int(expert_lengths.sum())
+            logits = all_logits[:policy_actions] if flat_policy else all_logits[:len(rows)]
+            expert_logits = (all_logits[policy_actions:policy_actions + expert_actions]
+                             if flat_policy else
+                             all_logits[len(rows):len(rows) + len(expert_rows)])
             log_ratio = (logits[choice_index] if flat_policy else
                          logits.gather(1, action[:, None]).squeeze(1)) - old
-            if not (legal.sum(1) > 1).all():
+            if not args.critic_only and not (legal.sum(1) > 1).all():
                 raise RuntimeError("forced action entered the dataset")
-            fresh = log_ratio.abs() <= args.max_log_ratio
+            fresh = torch.ones_like(log_ratio, dtype=torch.bool) if args.critic_only \
+                else log_ratio.abs() <= args.max_log_ratio
             invalid = ~fresh.detach().cpu().numpy()
             rejected = selected[invalid].tolist()
             if rejected:
@@ -3538,8 +3999,10 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 selected = np.asarray(selected, np.int64)
                 rows = [dataset.rows[index] for index in selected]
                 values = {key: dataset.data[key][selected].copy() for key in dataset.data}
+                replay = []
+                flat_policy = True
                 unpack_started = time.monotonic()
-                inputs = upload(prepare(rows)[0], target)
+                inputs = upload(prepare(rows + expert_rows + search_children)[0], target)
                 unpack_seconds += time.monotonic() - unpack_started
                 action = torch.as_tensor(values["action"], device=target)
                 old = torch.as_tensor(values["old"], device=target)
@@ -3548,35 +4011,30 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     np.cumsum(lengths) - lengths + values["action"], device=target,
                 )
                 forward_started = time.monotonic()
-                all_logits, all_prediction, all_progress_prediction = predict(
+                all_logits, all_critic_logits = predict(
                     model, inputs, args.precision, args.policy_temperature, flat_policy=flat_policy,
                 )
                 forward_seconds += time.monotonic() - forward_started
-                prediction = all_prediction[:len(rows)]
-                progress_prediction = all_progress_prediction[:len(rows)]
+                critic_logits = all_critic_logits[:len(rows)]
                 legal = inputs[6][:len(rows)]
-                logits = all_logits[:sum(lengths)]
+                policy_actions = int(lengths.sum())
+                expert_actions = int(expert_lengths.sum())
+                logits = all_logits[:policy_actions]
+                expert_logits = all_logits[policy_actions:policy_actions + expert_actions]
                 log_ratio = logits[choice_index] - old
                 if not (log_ratio.abs() <= args.max_log_ratio).all():
                     raise RuntimeError("batch eligibility changed after screening")
             selected = np.asarray(selected, np.int64)
-            expired = dataset.use(selected)
+            expired = dataset.use(selected, args.priority_decay)
             removed = np.asarray(rejected + expired.tolist(), np.int64)
             dataset.ratio_dropped += len(rejected)
             if len(removed):
                 dataset.discard(np.unique(removed))
             handled += len(removed)
-            if not pending and not sampler_done:
-                drain_samples()
-                boundary = min(next_report, next_save) - (base_decisions + handled)
-                if boundary > 0 and len(dataset) >= args.batch:
-                    pending.append(reserve_batch(args.batch))
             policy_lags.extend((updates - values["version"]).tolist())
             fresh = torch.ones_like(log_ratio, dtype=torch.bool)
-            critic_mask = mask = torch.ones_like(log_ratio)
-            critic_count = critic_mask.sum()
+            mask = torch.ones_like(log_ratio)
             fresh_count = mask.sum()
-            critic_denominator = critic_count.clamp_min(1)
             denominator = fresh_count.clamp_min(1)
             safe_log_ratio = torch.where(fresh, log_ratio, torch.zeros_like(log_ratio))
             ratio = safe_log_ratio.exp()
@@ -3585,27 +4043,22 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             fresh_rows = int(fresh_count)
             attempted += len(rows)
             kl_value = float(kl)
-            progress_beta, entropy_weight, _ = curriculum_weights(
+            _, entropy_weight, _ = curriculum_weights(
                 stage, stage_decisions + handled, auxiliary_decisions + handled, args, progress_active
             )
-            batch_returns = torch.as_tensor(values["returns"], device=target)
-            batch_progress_returns = torch.as_tensor(values["progress_returns"], device=target)
-            value_loss = (nn.functional.binary_cross_entropy_with_logits(
-                prediction, batch_returns, reduction="none"
-            ) * critic_mask).sum() / critic_denominator
-            progress_value_loss = (
-                (progress_prediction - batch_progress_returns).square() * critic_mask
-            ).sum() / critic_denominator
-            critic_loss = args.value_weight * (
-                value_loss + (progress_beta > 0) * progress_value_loss
+            batch_target = torch.as_tensor(values["critic_target"], device=target)
+            critic_weights = critic_balance.weights(
+                values["character"], values["phase"], values["canonical"],
             )
-            critic_parameters = tuple(model.value.parameters()) + tuple(model.progress_value.parameters())
-            if not critic_count:
-                update_elapsed = time.monotonic() - update_started
-                update_seconds += update_elapsed
-                update_durations.append(update_elapsed)
-                backward_durations.append(0.0)
-                continue
+            critic_weights = torch.as_tensor(critic_weights, device=target)
+            category_loss = -batch_target * critic_logits.log_softmax(-1)
+            value_loss = (category_loss.sum(1) * critic_weights).mean()
+            critic_loss = args.value_weight * value_loss
+            critic_parameters = tuple(model.critic.parameters())
+            critic_balance.record_loss(
+                values["critic_target"].astype(np.float64),
+                (category_loss.detach() * critic_weights[:, None]).cpu().numpy(),
+            )
             if not fresh_rows:
                 backward_started = time.monotonic()
                 optimizer.zero_grad(set_to_none=True); critic_loss.backward(inputs=critic_parameters)
@@ -3617,8 +4070,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 update_seconds += update_elapsed
                 update_durations.append(update_elapsed)
                 continue
-            policy_update_attempts += 1
-            if kl_value > args.target_kl:
+            policy_update_attempts += int(not args.critic_only)
+            if not args.critic_only and kl_value > args.target_kl:
                 dataset.kl_dropped += fresh_rows
                 pre_kl_rejected_updates += 1
                 backward_started = time.monotonic()
@@ -3632,20 +4085,17 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 update_durations.append(update_elapsed)
                 continue
             advantages = torch.as_tensor(values["advantage"], device=target)
-            progress_advantages = torch.as_tensor(values["progress_advantage"], device=target)
             characters = torch.as_tensor(values["character"], device=target)
-            normalized = []
-            for advantage_values in (advantages, progress_advantages):
-                result = advantage_values
-                for character in range(5):
-                    selected = fresh & (characters == character)
-                    selected_float = selected.to(advantage_values.dtype)
-                    count = selected_float.sum().clamp_min(1)
-                    mean = (advantage_values * selected_float).sum() / count
-                    std = (((advantage_values - mean).square() * selected_float).sum() / count).sqrt()
-                    result = torch.where(selected, (advantage_values - mean) / (std + 1e-8), result)
-                normalized.append(result)
-            batch_advantage = normalized[0] + progress_beta * normalized[1]
+            batch_advantage = advantages
+            for character in range(5):
+                member = fresh & (characters == character)
+                member_float = member.to(advantages.dtype)
+                count = member_float.sum().clamp_min(1)
+                mean = (advantages * member_float).sum() / count
+                std = (((advantages - mean).square() * member_float).sum() / count).sqrt()
+                batch_advantage = torch.where(
+                    member, (advantages - mean) / (std + 1e-8), batch_advantage,
+                )
             policy_loss = -(torch.minimum(
                 ratio * batch_advantage,
                 ratio.clamp(1 - args.clip, 1 + args.clip) * batch_advantage,
@@ -3659,12 +4109,67 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             else:
                 entropy_by_row = -(logits.exp() * logits * legal).sum(1)
             entropy = (entropy_by_row * mask).sum() / denominator
-            loss = policy_loss + critic_loss - entropy_weight * entropy
+            expert_loss = logits.sum() * 0
+            expert_entropy = expert_loss
+            expert_count = len(expert_rows)
+            if expert_count and args.expert_weight:
+                if flat_policy:
+                    expert_target = np.concatenate(expert_targets).astype(np.float32)
+                else:
+                    expert_target = np.zeros(expert_logits.shape, np.float32)
+                    for row, target_distribution in enumerate(expert_targets):
+                        expert_target[row, :len(target_distribution)] = target_distribution
+                expert_target = torch.as_tensor(expert_target, device=target)
+                positive = expert_target > 0
+                expert_loss = -(expert_target[positive] * expert_logits[positive]).sum() \
+                    / expert_count
+                expert_entropy = -(expert_target[positive] * expert_target[positive].log()).sum() \
+                    / expert_count
+            search_consistency_loss = critic_logits.sum() * 0
+            if search_groups:
+                critic_values = critic_expected(critic_probabilities(all_critic_logits))
+                child_offset = len(rows) + len(expert_rows) + len(replay)
+                consistency_losses = []
+                for position, _group, count, weights, self_weight, terminal_value in search_groups:
+                    parent = critic_values[len(rows) + position]
+                    children = critic_values[child_offset:child_offset + count]
+                    child_offset += count
+                    expected = self_weight * parent + terminal_value
+                    if count:
+                        expected = expected + (children * torch.as_tensor(
+                            weights, device=target
+                        )).sum()
+                    consistency_losses.append((parent - expected).square())
+                search_consistency_loss = torch.stack(consistency_losses).mean()
+            loss = policy_loss + critic_loss - entropy_weight * entropy \
+                + args.expert_weight * expert_loss \
+                + args.search_consistency_weight * search_consistency_loss
+            ppo_head_grad = expert_head_grad = expert_ppo_grad_cosine = None
+            if expert_count and args.expert_weight:
+                policy_parameters = tuple(model.policy.parameters())
+                ppo_gradients = torch.autograd.grad(
+                    policy_loss, policy_parameters, retain_graph=True, allow_unused=True
+                )
+                expert_gradients = torch.autograd.grad(
+                    args.expert_weight * expert_loss, policy_parameters,
+                    retain_graph=True, allow_unused=True,
+                )
+                pairs = [(left.float(), right.float()) for left, right in zip(
+                    ppo_gradients, expert_gradients
+                ) if left is not None and right is not None]
+                ppo_head_grad = torch.stack([left.square().sum() for left, _ in pairs]).sum().sqrt()
+                expert_head_grad = torch.stack([
+                    right.square().sum() for _, right in pairs
+                ]).sum().sqrt()
+                expert_ppo_grad_cosine = torch.stack([
+                    (left * right).sum() for left, right in pairs
+                ]).sum() / (ppo_head_grad * expert_head_grad).clamp_min(1e-12)
             replay_valid = replay_eligible = eligible_cpu = valid_cpu = None
             if replay:
-                replay_logits = all_logits[len(rows):]
-                replay_value = all_prediction[len(rows):]
-                replay_legal = inputs[6][len(rows):]
+                replay_start = len(rows) + len(expert_rows)
+                replay_logits = all_logits[replay_start:]
+                replay_value = critic_probabilities(all_critic_logits[replay_start:])[:, -1]
+                replay_legal = inputs[6][replay_start:]
                 replay_masked = replay_logits.masked_fill(~replay_legal, -torch.inf)
                 replay_action = torch.as_tensor([sample[1] for sample in replay], device=target)
                 reference = np.full(replay_masked.shape, -np.inf, np.float32)
@@ -3695,7 +4200,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     torch.zeros_like(replay_log_probability),
                 )
                 replay_ratio = replay_log_ratio.exp()
-                replay_advantage = (1 - replay_value.sigmoid()).detach()
+                replay_advantage = (1 - replay_value).detach()
                 winning_loss = -args.winning_loss_weight * (torch.minimum(
                     replay_ratio * replay_advantage,
                     replay_ratio.clamp(1 - args.clip, 1 + args.clip) * replay_advantage,
@@ -3704,11 +4209,15 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 replay_kl_mean = (replay_kl * replay_weight).sum() / replay_denominator
             backward_started = time.monotonic()
             optimizer.zero_grad(set_to_none=True); loss.backward()
-            accepted, proposals, post_log_ratio = trust_region_step(
-                model, optimizer, inputs, action, old, fresh, denominator,
-                args.precision, args.target_kl, args.policy_temperature,
-                choice_index=choice_index if flat_policy else None,
-            )
+            if args.critic_only:
+                critic_only_step(model, optimizer); critic_only_updates += 1
+                accepted, proposals, post_log_ratio = True, [0.], log_ratio.detach()
+            else:
+                accepted, proposals, post_log_ratio = trust_region_step(
+                    model, optimizer, inputs, action, old, fresh, denominator,
+                    args.precision, args.target_kl, args.policy_temperature,
+                    choice_index=choice_index if flat_policy else None,
+                )
             rejected_proposals = sum(
                 not math.isfinite(value) or value > args.target_kl for value in proposals
             )
@@ -3721,18 +4230,12 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 dataset.post_kl_dropped += fresh_rows
                 post_kl_discarded_updates += 1
                 optimizer.zero_grad(set_to_none=True)
-                retry_prediction, retry_progress = predict(
+                retry_logits = predict(
                     model, inputs, args.precision, args.policy_temperature,
-                )[1:]
-                retry_value_loss = (nn.functional.binary_cross_entropy_with_logits(
-                    retry_prediction[:len(rows)], batch_returns, reduction="none"
-                ) * critic_mask).sum() / critic_denominator
-                retry_progress_loss = (
-                    (retry_progress[:len(rows)] - batch_progress_returns).square() * critic_mask
-                ).sum() / critic_denominator
+                )[1][:len(rows)]
                 retry_critic_loss = args.value_weight * (
-                    retry_value_loss + (progress_beta > 0) * retry_progress_loss
-                )
+                    -batch_target * retry_logits.log_softmax(-1)
+                ).sum(1).mul(critic_weights).mean()
                 retry_critic_loss.backward(inputs=critic_parameters)
                 critic_only_step(model, optimizer, critic_parameters); publish()
                 critic_only_updates += 1
@@ -3751,17 +4254,34 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             accepted_pre_kl_sum += kl_value
             accepted_post_kl_sum += post_kl
             clip_fraction = (((ratio - 1).abs() > args.clip).to(mask.dtype) * mask).sum().div(denominator).detach()
-            losses["mean_advantage"].append(float(np.mean(
-                values["advantage"][fresh_cpu] + progress_beta * values["progress_advantage"][fresh_cpu]
-            )))
+            losses["mean_advantage"].append(float(np.mean(values["advantage"][fresh_cpu])))
             losses["policy_loss"].append(policy_loss.detach())
-            losses["value_loss"].append(value_loss.detach())
-            losses["progress_value_loss"].append(progress_value_loss.detach())
-            losses["progress_beta"].append(progress_beta)
+            if expert_count and args.expert_weight:
+                losses["expert_loss"].append(expert_loss.detach())
+                losses["expert_entropy"].append(expert_entropy.detach())
+                losses["expert_kl"].append((expert_loss - expert_entropy).detach())
+                losses["expert_rows"].append(expert_count)
+                losses["ppo_policy_head_grad_norm"].append(ppo_head_grad.detach())
+                losses["expert_policy_head_grad_norm"].append(expert_head_grad.detach())
+                losses["expert_ppo_grad_ratio"].append(
+                    (expert_head_grad / ppo_head_grad.clamp_min(1e-12)).detach()
+                )
+                losses["expert_ppo_grad_cosine"].append(expert_ppo_grad_cosine.detach())
+            probabilities = critic_probabilities(critic_logits.detach())
+            losses["critic_loss"].append(value_loss.detach())
+            if search_groups:
+                losses["search_consistency_loss"].append(search_consistency_loss.detach())
+            losses["critic_expected"].append(critic_expected(probabilities).mean())
+            losses["critic_win_probability"].append(probabilities[:, -1].mean())
             losses["entropy"].append(entropy.detach())
             losses["entropy_weight"].append(entropy_weight)
             losses["kl"].append(kl); losses["clip_fraction"].append(clip_fraction)
             trained += fresh_rows; updates += 1
+            if expert_count:
+                expert_visits += int(expert_visits_batch.sum())
+                expert_depth += int(expert_depths_batch.sum())
+                expert_dataset.used += expert_count
+                expert_dataset.discard_ids(expert_ids)
             if replay_valid is not None:
                 replay_characters = [packed_character(sample[0]) for sample in replay]
                 for character, eligible, keep in zip(
@@ -3785,10 +4305,29 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             update_elapsed = time.monotonic() - update_started
             update_seconds += update_elapsed
             update_durations.append(update_elapsed)
+            _GLOG.info(
+                "optimizer_update update=%d rows=%d expert_rows=%d replay=%d "
+                "policy_loss=%.6g expert_loss=%.6g ppo_head_grad=%.6g expert_head_grad=%.6g "
+                "expert_grad_cosine=%.6g critic_loss=%.6g search_consistency_loss=%.6g "
+                "critic_expected=%.6g "
+                "critic_win_probability=%.6g entropy=%.6g "
+                "pre_kl=%.6g post_kl=%.6g seconds=%.3f",
+                updates, fresh_rows, expert_count, len(replay), float(policy_loss.detach()),
+                float(expert_loss.detach()),
+                float(ppo_head_grad.detach()) if ppo_head_grad is not None else 0,
+                float(expert_head_grad.detach()) if expert_head_grad is not None else 0,
+                float(expert_ppo_grad_cosine.detach())
+                if expert_ppo_grad_cosine is not None else 0,
+                float(value_loss.detach()), float(search_consistency_loss.detach()),
+                float(critic_expected(probabilities).mean()),
+                float(probabilities[:, -1].mean()),
+                float(entropy.detach()),
+                kl_value, post_kl, update_elapsed,
+            )
             if update_elapsed > 5:
-                packed = rows + [sample[0] for sample in replay]
+                packed = rows + expert_rows + [sample[0] for sample in replay]
                 represented_actions = max(packed_action_count(row) for row in packed)
-                print(json.dumps({"time": time.time(), "event": "slow_update", "metrics": {
+                emit_event({"time": time.time(), "event": "slow_update", "metrics": {
                     "seconds": update_elapsed,
                     "fresh": len(rows), "replay": len(replay),
                     "state_tokens_max": max(packed_state_count(row) for row in packed),
@@ -3797,7 +4336,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     "legal_actions_max": max(packed_legal_count(row) for row in packed),
                     "unpack_seconds": unpack_seconds,
                     "forward_seconds": forward_seconds, "backward_seconds": backward_seconds,
-                }}), flush=True)
+                }}, logging.WARNING)
             absolute = base_decisions + handled
             if absolute >= next_save:
                 save_step(absolute)
@@ -3830,6 +4369,10 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             dropped = max(0, observed - worker_resolved[index])
             discarded_steps += dropped
             watchdog_dropped += dropped * (worker in terminated)
+        if not threaded:
+            for queue in (*models, samples, results):
+                queue.cancel_join_thread()
+                queue.close()
     failed = [] if threaded else [worker.exitcode for worker in started_workers
                                   if worker not in terminated
                                   and worker not in watchdog_terminated and worker.exitcode]
@@ -3858,6 +4401,33 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         "update_seconds": update_seconds,
         "actor_decisions_per_second": sampled / max(1e-9, collect_seconds),
         "learner_decisions_per_second": trained / max(1e-9, update_seconds),
+        "mcts_roots": mcts_roots, "mcts_simulations": mcts_simulations,
+        "mcts_leaves": mcts_leaves, "mcts_nodes": mcts_nodes,
+        "mcts_batches": mcts_batches, "mcts_targets": mcts_targets,
+        "mcts_turn_starts": mcts_turn_starts,
+        "mcts_seconds": mcts_seconds,
+        "mcts_root_fraction": mcts_roots / max(1, mcts_turn_starts),
+        "mcts_roots_per_decision": mcts_roots / max(1, sampled),
+        "mcts_simulations_per_root": mcts_simulations / max(1, mcts_roots),
+        "mcts_simulations_per_second": mcts_simulations / max(1e-9, mcts_seconds),
+        "mcts_leaf_batch_mean": mcts_leaves / max(1, mcts_batches),
+        "mcts_targets_per_root": mcts_targets / max(1, mcts_roots),
+        "mcts_simulate_fraction": mcts_simulate_seconds / max(1e-9, mcts_seconds),
+        "mcts_encode_fraction": mcts_encode_seconds / max(1e-9, mcts_seconds),
+        "mcts_inference_fraction": mcts_inference_seconds / max(1e-9, mcts_seconds),
+        "mcts_backup_fraction": mcts_backup_seconds / max(1e-9, mcts_seconds),
+        "mcts_rollout_steps": mcts_rollout_steps,
+        "mcts_rollout_completed": mcts_rollout_completed,
+        "mcts_rollout_invalid": mcts_rollout_invalid,
+        "mcts_timeouts": mcts_timeouts,
+        "mcts_rollout_fraction": mcts_rollout_seconds / max(1e-9, mcts_seconds),
+        "expert_buffer_rows": len(expert_dataset),
+        "expert_rows_seen": expert_dataset.seen,
+        "expert_rows_used": expert_dataset.used,
+        "expert_rows_stale": expert_dataset.stale,
+        "expert_rows_evicted": expert_dataset.evicted,
+        "expert_visit_mean": expert_visits / max(1, expert_dataset.used),
+        "expert_depth_mean": expert_depth / max(1, expert_dataset.used),
         "row_utilization": trained / max(1, attempted),
         "update_seconds_p95": float(np.quantile(update_durations, .95)) if update_durations else 0,
         "unpack_seconds_p95": float(np.quantile(unpack_durations, .95)) if unpack_durations else 0,
@@ -3924,6 +4494,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         "winning_collection_drift": float(winning_behavior_drift),
         "observed_kl": observed_kl, "observed_clip_fraction": observed_clip,
         "progress_active": progress_active, "curriculum": curriculum,
+        **critic_balance.report(),
         **metric_means(losses),
     }
 
@@ -4024,6 +4595,284 @@ def evaluate(model, args, target, seed=None, runs=None, stage=None, max_steps=No
     }
 
 
+def evaluate_search_policies(args):
+    model, checkpoint = load(args.checkpoint, torch.device("cpu")); model.eval()
+    ascension, bonus = STAGES[checkpoint["stage"]]
+    policy = export_value_model(None, model, checkpoint["fingerprint"], 1, 0, True)
+    modes = []
+    for mode in args.modes:
+        started = time.monotonic(); characters = []
+        totals = dict.fromkeys((
+            "mcts_roots", "mcts_simulations", "mcts_targets", "mcts_rollout_steps",
+            "mcts_rollout_completed", "mcts_rollout_invalid", "mcts_rollout_micros",
+            "search_hits", "search_misses",
+            "exact_calls", "exact_states", "exact_transitions", "exact_rng_transitions",
+            "exact_rng_calls", "exact_failures",
+        ), 0)
+        for character in args.characters:
+            outcomes = []; floors = []; caps = 0
+            for start in range(0, args.runs, args.batch):
+                count = min(args.batch, args.runs - start)
+                env = sts2_sim.Batch(
+                    count, args.seed + character * 1_000_000 + start,
+                    character, ascension=ascension,
+                )
+                env.set_training_bonus(bonus); env.load_policy(policy)
+                active = np.ones(count, bool); steps = np.zeros(count, np.int32)
+                combat_steps = np.zeros(count, np.int32); turn_depth = np.zeros(count, np.int32)
+                previous_turn = np.full(count, -1, np.int32); targets = {}
+                for _ in range(args.max_steps):
+                    if not active.any():
+                        break
+                    stats = env.stats()
+                    in_combat = np.asarray([row[4] == 1 for row in stats])
+                    turns = np.asarray([row[5] if row[4] == 1 else -1 for row in stats])
+                    fresh_turn = active & in_combat & (turns != previous_turn)
+                    turn_depth[fresh_turn] = 0
+                    result = env.policy(
+                        args.policy_temperature, False, False,
+                        mcts_fraction=1 if mode not in ("policy", "exact") else 0,
+                        mcts_simulations=args.simulations if mode not in ("policy", "exact") else 0,
+                        mcts_boss_simulations=args.simulations
+                        if mode not in ("policy", "exact") else 0,
+                        mcts_turns=0 if mode.startswith("combat") else 1,
+                        mcts_max_depth=args.max_depth,
+                        mcts_batch_size=args.search_batch, mcts_min_visits=args.min_visits,
+                        mcts_max_targets=args.max_targets,
+                        mcts_prior_temperature=args.prior_temperature,
+                        mcts_q_temperature=args.q_temperature,
+                        mcts_exploration=args.exploration,
+                        mcts_heuristic=mode.endswith("heuristic"),
+                    )
+                    choices = np.asarray(result[1], np.int64); rows = result[4]
+                    if mode != "policy" and mode != "exact":
+                        search = np.asarray(result[6], np.int64)
+                        totals["mcts_roots"] += int(search[0])
+                        totals["mcts_simulations"] += int(search[1])
+                        totals["mcts_targets"] += int(search[5])
+                        totals["mcts_rollout_steps"] += int(search[12])
+                        totals["mcts_rollout_completed"] += int(search[13])
+                        totals["mcts_rollout_invalid"] += int(search[14])
+                        totals["mcts_rollout_micros"] += int(search[15])
+                        for row, target, _visits, depth, *_ in result[5]:
+                            targets[bytes(row), int(depth)] = int(np.argmax(target))
+                    elif mode == "exact":
+                        indices = [int(index) for index in np.flatnonzero(fresh_turn)
+                                   if packed_legal_count(rows[index]) > 1]
+                        exact = env.exact_choices(
+                            indices, 1, args.max_depth, args.exact_samples,
+                            args.max_exact_states,
+                            args.seed + character * 1_000_000 + start, True,
+                        )
+                        for index, row in zip(indices, exact):
+                            (_choice, _value, states, transitions, rng_transitions,
+                             rng, plan, error) = row
+                            totals["exact_calls"] += 1
+                            totals["exact_states"] += states
+                            totals["exact_transitions"] += transitions
+                            totals["exact_rng_transitions"] += rng_transitions
+                            totals["exact_rng_calls"] += rng
+                            if error:
+                                totals["exact_failures"] += 1
+                            else:
+                                for packed, choice, depth in plan:
+                                    targets[bytes(packed), int(depth)] = choice
+                    if mode != "policy":
+                        for index in np.flatnonzero(active & in_combat):
+                            choice = targets.get((bytes(rows[index]), int(turn_depth[index])))
+                            if choice is None:
+                                totals["search_misses"] += packed_legal_count(rows[index]) > 1
+                            else:
+                                choices[index] = choice; totals["search_hits"] += 1
+                    combat_steps = np.where(active & in_combat, combat_steps + 1, 0)
+                    turn_depth[active & in_combat] += 1
+                    previous_turn = np.where(active & in_combat, turns, -1)
+                    _, done, _ = env.step(choices.tolist(), active.tolist())
+                    done = np.asarray(done, bool); steps += active
+                    final = env.stats()
+                    still_combat = np.asarray([row[4] == 1 for row in final])
+                    capped = active & ~done & (
+                        (steps >= args.max_steps)
+                        | ((combat_steps >= args.max_combat_steps) & still_combat)
+                    )
+                    for index in np.flatnonzero(done | capped):
+                        outcomes.append(int(done[index] and final[index][4] == 12))
+                        floors.append(int((final[index][0] - 1) * 17 + final[index][1]))
+                    caps += int(capped.sum())
+                    finished = np.flatnonzero(done | capped).tolist()
+                    active &= ~(done | capped)
+                    if finished:
+                        env.reset(finished, 0)
+            wins = sum(outcomes); boss_entries = sum(
+                won or floor >= 51 for won, floor in zip(outcomes, floors)
+            )
+            characters.append({
+                "character": character, "runs": args.runs, "wins": wins,
+                "win_rate": wins / args.runs, "floor_mean": float(np.mean(floors)),
+                "boss_entries": boss_entries, "boss_entry_rate": boss_entries / args.runs,
+                "boss_conversion": wins / max(1, boss_entries), "caps": caps,
+                "outcomes": outcomes, "floors": floors,
+            })
+            print(json.dumps({"mode": mode, "character": character, "wins": wins,
+                              "floor_mean": characters[-1]["floor_mean"],
+                              "seconds": time.monotonic() - started}), flush=True)
+        wins = sum(row["wins"] for row in characters); runs = len(args.characters) * args.runs
+        boss_entries = sum(row["boss_entries"] for row in characters)
+        modes.append({
+            "mode": mode, "runs": runs, "wins": wins, "win_rate": wins / runs,
+            "floor_mean": float(np.mean([floor for row in characters for floor in row["floors"]])),
+            "boss_entries": boss_entries, "boss_entry_rate": boss_entries / runs,
+            "boss_conversion": wins / max(1, boss_entries), "caps": sum(row["caps"] for row in characters),
+            "seconds": time.monotonic() - started, "characters": characters, **totals,
+        })
+        print(json.dumps({key: modes[-1][key] for key in (
+            "mode", "runs", "wins", "win_rate", "floor_mean", "boss_entries",
+            "boss_conversion", "caps", "seconds", "search_hits", "search_misses",
+            "mcts_simulations", "mcts_rollout_steps", "mcts_rollout_completed",
+            "mcts_rollout_invalid", "mcts_rollout_micros", "exact_calls", "exact_states",
+            "exact_failures",
+        )}), flush=True)
+    report = {
+        "checkpoint": args.checkpoint, "step": checkpoint["decisions"],
+        "stage": {"index": checkpoint["stage"], "ascension": ascension, "bonus": bonus},
+        "settings": {key: value for key, value in vars(args).items() if key != "command"},
+        "modes": modes,
+    }
+    immutable_json(Path(args.output), report)
+
+
+def critic_metrics(rows):
+    probability = np.asarray([row["critic_probability"] for row in rows], np.float32)
+    category = np.asarray([row["terminal_category"] for row in rows], np.int64)
+    selected = probability[np.arange(len(rows)), category]
+    result = {
+        "states": len(rows),
+        "categorical_nll": float(-np.log(selected.clip(1e-12)).mean()),
+        "categorical_brier": float(np.mean(np.square(probability).sum(1) + 1 - 2 * selected)),
+    }
+    for name, target_key, prediction_key, scale in (
+        ("win", "win", "win_prediction", 1),
+        ("floor", "terminal_floor", "floor_prediction", CATEGORIES - 1),
+    ):
+        target = np.asarray([row[target_key] for row in rows], np.float32)
+        prediction = np.asarray([row[prediction_key] for row in rows], np.float32)
+        error = (prediction - target) * scale
+        correlation = float(np.corrcoef(target, prediction)[0, 1]) \
+            if len(rows) > 1 and target.std() > 1e-7 and prediction.std() > 1e-7 else None
+        correlation = correlation if correlation is None or math.isfinite(correlation) else None
+        result[name] = {
+            "target_mean": float(target.mean()), "prediction_mean": float(prediction.mean()),
+            "target_std": float(target.std()), "prediction_std": float(prediction.std()),
+            "bias": float(error.mean()), "mae": float(np.abs(error).mean()),
+            "rmse": float(np.sqrt(np.mean(error ** 2))), "correlation": correlation,
+        }
+    return result
+
+
+def critic_diagnostics(args):
+    model, checkpoint = load(args.checkpoint, torch.device("cpu")); model.eval()
+    ascension, bonus = STAGES[checkpoint["stage"]]
+    policy = export_value_model(None, model, checkpoint["fingerprint"], 1, 0, True)
+    states = []
+    transitions = []
+    capped_episodes = 0
+    for character in range(5):
+        for start in range(0, args.runs, args.batch):
+            count = min(args.batch, args.runs - start)
+            env = sts2_sim.Batch(
+                count, args.seed + character * 1_000_000 + start,
+                character, ascension=ascension,
+            )
+            env.set_training_bonus(bonus); env.load_policy(policy)
+            active = np.ones(count, bool)
+            histories = [[] for _ in range(count)]
+            steps = np.zeros(count, np.int32)
+            combat_steps = np.zeros(count, np.int32)
+            for _ in range(args.max_steps):
+                if not active.any():
+                    break
+                stats = env.stats()
+                result = env.policy(args.policy_temperature, True, True)
+                critic_probability = np.asarray(result[3], np.float32)
+                win = critic_probability[:, -1]
+                floor = critic_probability @ np.arange(CATEGORIES) / (CATEGORIES - 1)
+                for index in np.flatnonzero(active):
+                    row = stats[index]
+                    histories[index].append({
+                        "character": character, "phase": int(row[4]),
+                        "floor": int(row[9]),
+                        "reward_screen": row[4] == 2,
+                        "win_prediction": float(win[index]),
+                        "floor_prediction": float(floor[index]),
+                        "critic_probability": critic_probability[index].tolist(),
+                    })
+                done = np.asarray(result[8], bool)
+                final = result[9]
+                legal = np.asarray(result[10], bool)
+                in_combat = np.asarray(result[11], bool)
+                combat_steps = np.where(active & in_combat, combat_steps + 1, 0)
+                steps += active
+                still_combat = np.asarray([row[4] == 1 for row in final])
+                capped = active & ~done & (
+                    (steps >= args.max_steps)
+                    | ((combat_steps >= args.max_combat_steps) & still_combat)
+                    | ~legal
+                )
+                for index in np.flatnonzero(active & done):
+                    terminal_category = CATEGORIES - 1 if final[index][4] == 12 else int(final[index][9])
+                    path = histories[index]
+                    successor = [state["floor_prediction"] for state in path[1:]] \
+                        + [terminal_category / (CATEGORIES - 1)]
+                    transitions.extend({
+                        "floor": state["floor"],
+                        "residual": (state["floor_prediction"] - next_value) * (CATEGORIES - 1),
+                    } for state, next_value in zip(path, successor))
+                    states.extend(state | {
+                        "win": int(final[index][4] == 12),
+                        "terminal_floor": terminal_category / (CATEGORIES - 1),
+                        "terminal_category": terminal_category,
+                    } for state in histories[index])
+                capped_episodes += int(capped.sum())
+                finished = np.flatnonzero(done | capped | ~legal).tolist()
+                active &= ~(done | capped)
+                if finished:
+                    env.reset(finished, 0)
+    phase_names = ("map", "combat", "rewards", "shop", "rest", "event", "remove",
+                   "upgrade", "transform", "enchant", "choose_cards", "choose_bundles")
+    grouped = {}
+    for name, key in (
+        ("character", lambda row: row["character"]),
+        ("phase", lambda row: phase_names[row["phase"]]),
+        ("floor", lambda row: row["floor"]),
+        ("reward_screen", lambda row: row["reward_screen"]),
+    ):
+        values = {}
+        for row in states:
+            values.setdefault(str(key(row)), []).append(row)
+        grouped[name] = {value: critic_metrics(rows) for value, rows in values.items()}
+    residual = np.asarray([row["residual"] for row in transitions], np.float32)
+    transition_consistency = {"transitions": len(residual)}
+    if len(residual):
+        transition_consistency |= {
+            "bias": float(residual.mean()), "mae": float(np.abs(residual).mean()),
+            "rmse": float(np.sqrt(np.mean(residual ** 2))),
+            "p95_absolute": float(np.quantile(np.abs(residual), .95)),
+        }
+    report = {
+        "checkpoint": args.checkpoint, "step": checkpoint["decisions"],
+        "stage": {"index": checkpoint["stage"], "ascension": ascension, "bonus": bonus},
+        "runs_per_character": args.runs, "states": len(states),
+        "capped_episodes": capped_episodes, "overall": critic_metrics(states),
+        "groups": grouped,
+        "transition_consistency": transition_consistency,
+    }
+    immutable_json(Path(args.output), report)
+    print(json.dumps({key: report[key] for key in (
+        "checkpoint", "step", "stage", "runs_per_character", "states",
+        "capped_episodes", "overall", "transition_consistency",
+    )}, indent=2))
+
+
 def immutable_json(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("x") as output:
@@ -4033,6 +4882,13 @@ def immutable_json(path, value):
 def atomic_json(path, value):
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(value, indent=2, sort_keys=True))
+    temporary.replace(path)
+
+
+def atomic_live(path, value):
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    data = json.dumps(value, separators=(",", ":")).replace("</", "<\\/")
+    temporary.write_text(f"window.spirefyshLive={data};")
     temporary.replace(path)
 
 
@@ -4090,7 +4946,7 @@ def load_stage_bests(output, development, checkpoints, best):
 
 def save_checkpoint(path, model, optimizer, manifest, stage, decisions, sampler_session,
                     promotion_index, progress_active, reservoir, auxiliary_decisions,
-                    stage_decisions, replace=False):
+                    stage_decisions, critic_balance=None, replace=False):
     if path.exists() and not replace:
         raise FileExistsError(path)
     target = path.with_suffix(path.suffix + ".tmp") if replace else path
@@ -4104,6 +4960,7 @@ def save_checkpoint(path, model, optimizer, manifest, stage, decisions, sampler_
             "progress_active": progress_active,
             "auxiliary_decisions": auxiliary_decisions,
             "stage_decisions": stage_decisions,
+            "critic_balance": critic_balance.state_dict() if critic_balance else None,
             "winning_reservoir": reservoir.state_dict() if reservoir else None,
             "model": model.state_dict(), "optimizer": optimizer.state_dict(),
             "torch_rng": torch.get_rng_state(),
@@ -4133,6 +4990,51 @@ def migrate_optimizer(state, parameter_count):
     for parameter in embeddings[1:]:
         state["state"].pop(parameter, None)
     groups[0]["params"] = parameters[:3] + parameters[18:]
+    return True
+
+
+def optimizer_groups(model, policy_multiplier, critic_multiplier):
+    parameters = list(model.parameters())
+    policy = {id(parameter) for parameter in model.policy.parameters()}
+    critic = {id(parameter) for parameter in model.critic.parameters()}
+    indices = [
+        [index for index, parameter in enumerate(parameters)
+         if id(parameter) not in policy | critic],
+        [index for index, parameter in enumerate(parameters) if id(parameter) in policy],
+        [index for index, parameter in enumerate(parameters) if id(parameter) in critic],
+    ]
+    return [
+        {"params": [parameters[index] for index in group], "lr_scale": scale}
+        for group, scale in zip(indices, (1., policy_multiplier, critic_multiplier))
+    ], indices
+
+
+def repartition_optimizer(state, index_groups):
+    groups = state["param_groups"]
+    parameter_count = sum(map(len, index_groups))
+    saved = [parameter for group in groups for parameter in group["params"]]
+    if len(saved) != parameter_count:
+        return False
+    if len(groups) == 1:
+        by_index = saved
+        templates = groups * len(index_groups)
+    elif len(groups) == len(index_groups) and all(
+        len(group["params"]) == len(indices) for group, indices in zip(groups, index_groups)
+    ):
+        by_index = [None] * parameter_count
+        for group, indices in zip(groups, index_groups):
+            for index, parameter in zip(indices, group["params"]):
+                by_index[index] = parameter
+        templates = groups
+    else:
+        return False
+    state["param_groups"] = [
+        copy.deepcopy(template) | {
+            "params": [by_index[index] for index in indices], "lr_scale": scale,
+        }
+        for template, indices in zip(templates, index_groups)
+        for scale in [template.get("lr_scale", 1.)]
+    ]
     return True
 
 
@@ -4210,15 +5112,35 @@ def dashboard(target):
              "step": reports[key]["step"], "stage": reports[key].get("stage", {}),
              "description": reports[key].get("description", ""),
              "pipeline": reports[key].get("pipeline", []),
-             "metrics": reports[key]["metrics"], "_written": reports[key].get("_written")}
+             "metrics": dict(reports[key]["metrics"]), "_written": reports[key].get("_written")}
             for index, key in enumerate(sorted(reports), 1)
         ]
+        for row in report_rows:
+            floors = row["metrics"].get("trajectory_floors", [])
+            floor_groups = [[] for _ in range(5)]
+            character = 0; previous = -math.inf
+            for floor in floors:
+                character = min(4, max(0, int(floor[2]))) if len(floor) > 2 \
+                    else min(4, character + int(floor[0] < previous))
+                floor_groups[character].append(floor)
+                previous = floor[0]
+            row["metrics"]["trajectory_floors"] = [
+                floor for group in floor_groups
+                for floor in group[::max(1, math.ceil(len(group) / 8))]
+            ]
+            for key in tuple(row["metrics"]):
+                if key.startswith("critic_preweight_") or key in (
+                    "characters", "critic_postweight_loss_mass",
+                ):
+                    row["metrics"].pop(key)
         version_groups = {}
         for row in report_rows:
             marker = row["description"].partition("Continuous V")[2].partition(" ")[0]
             version = int(marker) if marker.isdigit() else manifest.get("model_version", manifest.get("version", 0))
             version_groups.setdefault(version, []).append(row)
         for version, version_reports in version_groups.items():
+            for row in version_reports[1:]:
+                row.pop("description", None); row.pop("pipeline", None)
             version_manifest = manifest | manifest.get("version_history", {}).get(str(version), {})
             version_manifest["model_version"] = version
             if version == MODEL_VERSION:
@@ -4232,13 +5154,18 @@ def dashboard(target):
                 sessions = [row for row in manifest.get("sessions", []) if row["step"] <= version_reports[-1]["step"]]
                 version_manifest["sessions"] = sessions[-1:] or manifest.get("sessions", [])[:1]
             low, high = version_reports[0]["step"], version_reports[-1]["step"]
-            runs[name if len(version_groups) == 1 else f"{name}/V{version}"] = {
+            key = name if len(version_groups) == 1 else f"{name}/V{version}"
+            live = str((run / "live.js").relative_to(target)) \
+                if version == manifest.get("model_version") else None
+            runs[key] = {
                 "version": version, "manifest": version_manifest,
                 "source": manifest.get("source") if len(version_groups) == 1 else None,
                 "reports": version_reports,
                 "promotions": [promotions[key] for key in sorted(promotions) if low <= key <= high],
-                "best": best if version == manifest.get("model_version") else None,
+                "best": best if version == manifest.get("model_version") else None, "live": live,
             }
+            if live:
+                atomic_live(run / "live.js", {"version": version, "report": version_reports[-1]})
     def history(name, seen=()):
         row = runs[name]
         source = Path(row["source"]).resolve() if row["source"] else None
@@ -4267,14 +5194,16 @@ function updateSteps(history,run){const starts=(run.manifest.sessions||[]).map(s
 function emaLine(points){const alpha=Math.max(.01,Math.min(1,Number(ema.value)||.2));let value;return points.map((point,index)=>({x:point.x,y:value=index?alpha*point.y+(1-alpha)*value:point.y}))}
 function stageTransitions(history,run){const promotions=(run?.promotions||[]).filter(row=>row.promoted);if(promotions.length)return promotions.map(promotion=>{const report=history.find(row=>row.step===promotion.step)||history.filter(row=>row.step<=promotion.step).at(-1),after=history.find(row=>row.step>promotion.step),next=run.manifest.stages?.[(promotion.stage?.index??-1)+1]||after?.stage,position=xaxis.value==='decisions'?promotion.step:report&&xaxis.value==='updates'?report._updates:Number.isFinite(Number(promotion._written))?(promotion._written-timeOrigin)/60:Number.isFinite(Number(promotion.seconds))?promotion.seconds/60:report?x(report):NaN;return{x:position,stage:next}}).filter(point=>Number.isFinite(Number(point.x)));return history.slice(1).flatMap((row,index)=>Number.isFinite(Number(row.stage?.ascension))&&Number.isFinite(Number(history[index].stage?.ascension))&&(row.stage.ascension!==history[index].stage.ascension||row.stage.bonus!==history[index].stage.bonus)?[{x:x(row),stage:row.stage}]:[])}
 function stageLines(history,run){return stageTransitions(history,run).map(point=>({type:'line',xref:'x',yref:'paper',x0:point.x,x1:point.x,y0:0,y1:1,layer:'below',line:{color:'rgba(232,236,242,.38)',width:1,dash:'dash'}}))}
-function layout(percent=false,range,history=[],run){const title=xaxis.value==='time'?'Wall-clock time (minutes)':xaxis.value==='decisions'?'# decisions':'Optimizer steps';return{template:'plotly_dark',paper_bgcolor:'rgba(0,0,0,0)',plot_bgcolor:'rgba(0,0,0,0)',margin:{l:62,r:18,t:12,b:52},hovermode:'closest',showlegend:true,shapes:stageLines(history,run),xaxis:{title,gridcolor:'#303a49'},yaxis:{gridcolor:'#303a49',tickformat:percent?'.0%':undefined,range,zerolinecolor:'#8794a8'}}}
+function layout(percent=false,range,history=[],run){const title=xaxis.value==='time'?'Wall-clock time (minutes)':xaxis.value==='decisions'?'# decisions':'Optimizer steps';return{template:'plotly_dark',paper_bgcolor:'rgba(0,0,0,0)',plot_bgcolor:'rgba(0,0,0,0)',margin:{l:62,r:18,t:12,b:52},hovermode:'closest',showlegend:true,uirevision:`${versionSelect.value}:${xaxis.value}`,shapes:stageLines(history,run),xaxis:{title,gridcolor:'#303a49'},yaxis:{gridcolor:'#303a49',tickformat:percent?'.0%':undefined,range,zerolinecolor:'#8794a8'}}}
 function plot(id,points,{range,percent=false,tozero=false,history=[],run}={}){const traces=[{x:points.map(point=>point.x),y:points.map(point=>point.y),mode:'lines+markers',name:'raw',line:{color:'#6fb1ff',width:2},marker:{color:'#6fb1ff',size:6,opacity:.8},hovertemplate:'x %{x}<br>y %{y:.5g}<extra></extra>'}];if(smooth.checked&&points.length>1){const line=emaLine(points);traces.push({x:line.map(point=>point.x),y:line.map(point=>point.y),mode:'lines',name:`EMA α=${Number(ema.value)||.2}`,line:{color:'#ffb454',width:4},hovertemplate:'EMA %{y:.5g}<extra></extra>'})}const options=layout(percent,range,history,run);if(tozero)options.yaxis.rangemode='tozero';Plotly.react(id,traces,options,config)}
 function floorPlot(history,run){const training=run.manifest.sessions?.at(-1)?.training||run.manifest.training||{},envs=training.envs||1,points=[];for(const report of history){let inferred=0,last=-Infinity;for(const row of report.metrics.trajectory_floors||[]){const [iteration,floor,stored]=row;if(stored===undefined&&iteration<last)inferred++;const character=stored??Math.min(inferred,4);points.push({x:xaxis.value==='updates'?report._updates:xaxis.value==='decisions'?iteration*envs:(report.metrics.seconds||0)/60,y:floor,character,updates:report._updates,step:report.step});last=iteration}}for(let i=points.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[points[i],points[j]]=[points[j],points[i]]}const trajectory={x:points.map(point=>point.x),y:points.map(point=>point.y),customdata:points.map(point=>[characterNames[point.character],point.updates,point.step]),mode:'markers',showlegend:false,marker:{color:points.map(point=>characterColors[point.character]),size:6,opacity:.5},hovertemplate:'%{customdata[0]}<br>floor %{y}<br>optimizer steps %{customdata[1]:,}<br>report decisions %{customdata[2]:,}<extra></extra>'},legend=characterNames.map((name,character)=>({x:[null],y:[null],mode:'markers',name,hoverinfo:'skip',marker:{color:characterColors[character],size:7,opacity:.5}})),options=layout(false,[0,52],history,run);options.yaxis.title='Terminal floor';Plotly.react('floor',[trajectory,...legend],options,config)}
 function stagePlot(id,history,key,color,run){const rows=history.filter(row=>Number.isFinite(Number(row.stage?.[key]))).map(row=>({x:x(row),y:row.stage[key]}));for(const transition of stageTransitions(history,run))if(Number.isFinite(Number(transition.stage?.[key])))rows.push({x:transition.x,y:transition.stage[key]});rows.sort((left,right)=>left.x-right.x);const options=layout(false,undefined,history,run);options.yaxis={...options.yaxis,title:key==='ascension'?'Ascension':'Bonus strength',rangemode:'tozero',dtick:key==='ascension'?1:4};Plotly.react(id,[{x:rows.map(row=>row.x),y:rows.map(row=>row.y),mode:'lines+markers',name:key==='ascension'?'Ascension':'Bonus strength',line:{color,width:3,shape:'hv'},marker:{color,size:6},hovertemplate:`${key==='ascension'?'ascension':'bonus'} %{y}<extra></extra>`}],options,config)}
 function promotionSummary(row){if(!row)return '<p>No promotion check yet.</p>';const characters=row.result?.characters||[],rows=characters.map(item=>`<tr><td>${characterNames[item.character]??`Character ${item.character}`}</td><td>${item.wins}/${item.runs}</td><td>${(100*item.wins/item.runs).toFixed(1)}%</td><td>${Number(item.floor_mean).toFixed(2)}</td><td>${item.caps}</td></tr>`).join('');return `<p class="${row.promoted?'yes':'no'}">${row.promoted?'Promoted':'Stayed at current stage'} · threshold ${(100*row.threshold).toFixed(0)}% per character · seed ${row.seed}</p><table><thead><tr><th>Character</th><th>Wins</th><th>Rate</th><th>Mean floor</th><th>Caps</th></tr></thead><tbody>${rows}</tbody></table>`}
 function saveDashboardState(){const views={};document.querySelectorAll('.plot').forEach(node=>{const view={};if(node._fullLayout?.xaxis?.autorange===false)view.x=[...node._fullLayout.xaxis.range];if(node._fullLayout?.yaxis?.autorange===false)view.y=[...node._fullLayout.yaxis.range];if(view.x||view.y)views[node.id]=view});try{sessionStorage.setItem(refreshKey,JSON.stringify({version:versionSelect.value,followLatest:versionSelect.value===names.at(-1),xaxis:xaxis.value,smooth:smooth.checked,ema:ema.value,scroll:[scrollX,scrollY],views}))}catch{}}
 function restoreDashboardState(){if(saved?.version===versionSelect.value&&saved.xaxis===xaxis.value)for(const [id,view] of Object.entries(saved.views||{})){const update={};if(view.x)update['xaxis.range']=view.x;if(view.y)update['yaxis.range']=view.y;if(Object.keys(update).length)Plotly.relayout(id,update)}if(saved?.scroll)scrollTo(...saved.scroll)}
-function showVersion(){const run=versions[versionSelect.value],reports=run.reports;updateSteps(reports,run);const timed=reports.find(row=>Number.isFinite(Number(row._written))&&Number.isFinite(Number(row.metrics.seconds)));timeOrigin=timed?timed._written-timed.metrics.seconds:0;document.querySelector('#title').textContent=`Spirefysh V${run.version} · ${run.run}`;plot('advantage',series(reports,'mean_advantage'),{history:reports,run});plot('throughput',series(reports,'decisions_per_second'),{tozero:true,history:reports,run});floorPlot(reports,run);stagePlot('ascension',reports,'ascension','#fb7185',run);stagePlot('bonus',reports,'bonus','#f59e0b',run);plot('wins',reports.map(row=>({x:x(row),y:row.metrics.wins/Math.max(1,row.metrics.episodes)})),{range:[0,1],percent:true,history:reports,run});plot('clip',series(reports,'clip_fraction'),{range:[0,1],percent:true,history:reports,run});plot('kl',series(reports,'kl'),{tozero:true,history:reports,run});plot('entropy',series(reports,'entropy'),{tozero:true,history:reports,run});document.querySelector('#promotion').innerHTML=promotionSummary(run.promotions.at(-1))}versionSelect.onchange=showVersion;xaxis.onchange=showVersion;smooth.onchange=showVersion;ema.oninput=showVersion;showVersion();setTimeout(restoreDashboardState,100);window.addEventListener('beforeunload',saveDashboardState);setInterval(()=>{saveDashboardState();location.reload()},15000)</script>"""
+function showVersion(){const run=versions[versionSelect.value],reports=run.reports;updateSteps(reports,run);const timed=reports.find(row=>Number.isFinite(Number(row._written))&&Number.isFinite(Number(row.metrics.seconds)));timeOrigin=timed?timed._written-timed.metrics.seconds:0;document.querySelector('#title').textContent=`Spirefysh V${run.version} · ${run.run}`;plot('advantage',series(reports,'mean_advantage'),{history:reports,run});plot('throughput',series(reports,'decisions_per_second'),{tozero:true,history:reports,run});floorPlot(reports,run);stagePlot('ascension',reports,'ascension','#fb7185',run);stagePlot('bonus',reports,'bonus','#f59e0b',run);plot('wins',reports.map(row=>({x:x(row),y:row.metrics.wins/Math.max(1,row.metrics.episodes)})),{range:[0,1],percent:true,history:reports,run});plot('clip',series(reports,'clip_fraction'),{range:[0,1],percent:true,history:reports,run});plot('kl',series(reports,'kl'),{tozero:true,history:reports,run});plot('entropy',series(reports,'entropy'),{tozero:true,history:reports,run});document.querySelector('#promotion').innerHTML=promotionSummary(run.promotions.at(-1))}
+function refreshLive(){const selected=versionSelect.value,run=versions[selected];if(!run?.live)return;const script=document.createElement('script');script.src=encodeURI(run.live)+`?${Date.now()}`;script.onload=()=>{script.remove();const live=window.spirefyshLive;if(versionSelect.value!==selected||live?.version!==run.version)return;const report=live.report,last=run.reports.at(-1);if(!last||report.step>last.step||report._written>last._written){run.reports=[...run.reports.filter(row=>row.step!==report.step),report].sort((a,b)=>a.step-b.step);showVersion()}};script.onerror=()=>script.remove();document.head.append(script)}
+versionSelect.onchange=showVersion;xaxis.onchange=showVersion;smooth.onchange=showVersion;ema.oninput=showVersion;showVersion();setTimeout(restoreDashboardState,100);window.addEventListener('beforeunload',saveDashboardState);setInterval(refreshLive,15000)</script>"""
     content = content.replace(
         "<section class=panel><h2>Entropy</h2><div id=entropy class=plot></div></section></div><section class=panel><h2>Promotion</h2>",
         "<section class=panel><h2>Entropy</h2><div id=entropy class=plot></div></section><section class=panel><h2>Dataset size</h2><div id=dataset class=plot></div></section></div><section class=panel><h2>Promotion</h2>",
@@ -4303,12 +5232,17 @@ function showVersion(){const run=versions[versionSelect.value],reports=run.repor
 
 
 def train(args):
+    global _EVENT_STREAM
+    if args.expert_batch is None:
+        args.expert_batch = args.batch
     qos = getattr(ctypes.CDLL(None), "pthread_set_qos_class_self_np", None)
     if qos is not None:
         qos(0x21, 0)
     torch.set_num_threads(args.torch_threads)
     torch.manual_seed(args.seed); np.random.seed(args.seed)
     target = device()
+    if not 0 <= args.start_stage < len(STAGES):
+        raise ValueError("invalid start stage")
     if args.precision not in PRECISIONS:
         raise ValueError("precision must be fp32 or bf16")
     if args.precision != "fp32" and target.type not in ("mps", "cuda"):
@@ -4321,14 +5255,36 @@ def train(args):
            args.development_runs, args.progress_decisions,
            args.max_policy_lag + 1) < 1 or min(args.max_log_ratio, args.policy_temperature) <= 0:
         raise ValueError("invalid asynchronous replay settings")
-    if args.sampler_timeout <= 0 or args.sampler_restarts < 0 or not 0 < args.progress_gamma <= 1:
-        raise ValueError("invalid sampler watchdog or progress discount")
-    if args.segment_steps < 0:
-        raise ValueError("invalid segment length")
+    if args.sampler_timeout <= 0 or args.sampler_restarts < 0:
+        raise ValueError("invalid sampler watchdog")
+    if (args.segment_steps < 0 or args.winning_capacity < 0 or args.priority_decay <= 0
+            or min(args.critic_consistency_weight, args.search_consistency_weight) < 0
+            or min(args.critic_consistency_batch, args.search_consistency_batch) < 1):
+        raise ValueError("invalid replay setting")
+    if min(args.head_learning_rate_multiplier, args.critic_learning_rate_multiplier) <= 0:
+        raise ValueError("invalid head learning-rate multiplier")
+    if (args.gae_lambda != 1 or args.segment_steps or not 0 <= args.critic_lambda <= 1
+            or not 0 <= args.critic_balance_decay < 1
+            or args.blended_critic or args.critic_consistency_weight
+            or args.search_consistency_weight and not args.critic_only):
+        raise ValueError("invalid categorical critic settings")
+    if args.entropy_weight is not None and args.entropy_weight < 0:
+        raise ValueError("invalid entropy weight")
+    if (not 0 <= args.mcts_fraction <= 1
+            or min(args.mcts_simulations, args.mcts_boss_simulations, args.mcts_turns,
+                   args.expert_max_lag) < 0
+            or min(args.mcts_max_depth, args.mcts_batch_size, args.mcts_min_visits,
+                   args.mcts_max_targets, args.expert_batch, args.expert_capacity) < 1
+            or min(args.mcts_prior_temperature, args.mcts_q_temperature) <= 0
+            or args.mcts_exploration < 0 or args.expert_weight < 0
+            or not math.isfinite(args.mcts_timeout) or args.mcts_timeout < 0):
+        raise ValueError("invalid MCTS settings")
     if args.envs % args.samplers:
         raise ValueError("environments must be divisible by samplers")
     if args.hours <= 0 and args.decisions <= 0:
         raise ValueError("set --hours or --decisions")
+    if args.critic_only and not args.checkpoint:
+        raise ValueError("critic-only training requires --checkpoint")
     if not 0 <= args.promotion_trigger_rate <= args.promote_win_rate <= 1:
         raise ValueError("invalid promotion rates")
     if seed_panel(args.development_seed, args.development_runs)[1] > args.promotion_seed:
@@ -4350,17 +5306,30 @@ def train(args):
         args.width, args.layers, args.heads, args.feedforward = config
         model = Agent(layout, *config).to(target)
     fused_optimizer = target.type != "cpu"
-    optimizer = torch.optim.Adam(
-        model.parameters(), lr=args.learning_rate, eps=1e-5, fused=fused_optimizer
+    parameter_groups, group_indices = optimizer_groups(
+        model, args.head_learning_rate_multiplier, args.critic_learning_rate_multiplier,
     )
-    optimizer_restored = bool(source and source["_optimizer_compatible"])
+    if args.critic_only:
+        model.requires_grad_(False); model.critic.requires_grad_(True)
+        parameter_groups = [{"params": list(model.critic.parameters()), "lr_scale": 1.}]
+    optimizer = torch.optim.Adam(
+        parameter_groups, lr=args.learning_rate, eps=1e-5, fused=fused_optimizer
+    )
+    optimizer_restored = bool(
+        not args.critic_only and source and source["_optimizer_compatible"]
+        and repartition_optimizer(source["optimizer"], group_indices)
+    )
     if optimizer_restored:
         optimizer.load_state_dict(source["optimizer"])
-        for group in optimizer.param_groups:
-            group["lr"] = args.learning_rate
-            group["fused"] = fused_optimizer
-            group["foreach"] = None
         torch.set_rng_state(source["torch_rng"].cpu())
+    scales = (args.critic_learning_rate_multiplier,) if args.critic_only else (
+        1., args.head_learning_rate_multiplier, args.critic_learning_rate_multiplier,
+    )
+    for group, scale in zip(optimizer.param_groups, scales):
+        group["lr"] = args.learning_rate * scale
+        group["lr_scale"] = scale
+        group["fused"] = fused_optimizer
+        group["foreach"] = None
     output = Path(args.output)
     continuing = output.exists()
     if continuing and (not source or Path(args.checkpoint).resolve() != (output / "latest.pt").resolve()):
@@ -4372,12 +5341,13 @@ def train(args):
     except BlockingIOError as error:
         raise RuntimeError(f"trainer already running for {output}") from error
     training_lock.seek(0); training_lock.truncate(); training_lock.write(str(os.getpid())); training_lock.flush()
-    redirect_output(output / "train.log")
+    configure_logging(output, "learner", args.log_level)
+    _EVENT_STREAM = (output / "events.jsonl").open("a", buffering=1)
     training = {key: value for key, value in vars(args).items() if key != "command"}
-    print(json.dumps({
+    emit_event({
         "time": time.time(), "event": "start", "pid": os.getpid(),
         "model_version": MODEL_VERSION, "checkpoint": args.checkpoint, "training": training,
-    }), flush=True)
+    })
     manifest = json.loads((output / "run.json").read_text()) if continuing else {
         "schema": 1, "model_version": MODEL_VERSION, "feature_version": FEATURE_VERSION,
         "fingerprint": probe_env.fingerprint(), "layout": layout, "precision": args.precision,
@@ -4412,7 +5382,8 @@ def train(args):
             if args.progress_beta is not None
             else "run-global 1 -> 0.1; held through A0/+0; off on A1/+0 entry"
         ),
-        "entropy": "(start -> end) * max(0.35, 0.8^stage)",
+        "entropy": f"fixed {args.entropy_weight}" if args.entropy_weight is not None
+                   else "(start -> end) * max(0.35, 0.8^stage)",
     }
     manifest.setdefault("sessions", []).append({"step": source["decisions"] if source else 0, "training": training})
     atomic_json(output / "run.json", manifest)
@@ -4422,8 +5393,8 @@ def train(args):
     champions_dir = output / "stage-champions"; champions_dir.mkdir(exist_ok=continuing)
     entries_dir = output / "stage-entries"; entries_dir.mkdir(exist_ok=continuing)
     promotions_dir = output / "promotions"; promotions_dir.mkdir(exist_ok=continuing)
-    stage = source["stage"] if source else 0
-    reservoir = WinningReservoir(WINNING_CAPACITY, args.envs)
+    stage = source["stage"] if source else args.start_stage
+    reservoir = WinningReservoir(args.winning_capacity, args.envs)
     if source and source.get("_source_model_version") == MODEL_VERSION and source.get("winning_reservoir"):
         reservoir.load_state_dict(source["winning_reservoir"])
         missing = [index for index, row in enumerate(reservoir.rows) if row[4] is None]
@@ -4443,6 +5414,11 @@ def train(args):
     decisions = source["decisions"] if source else 0
     auxiliary_decisions = source.get("auxiliary_decisions", source["decisions"]) if source else 0
     stage_decisions = resume_stage_decisions(source, stage)
+    critic_balance = CriticBalance(
+        args.critic_balance_decay,
+        source.get("critic_balance")
+        if source and source.get("_source_model_version") == MODEL_VERSION else None,
+    )
     progress_active = stage <= 6
     sampler_session = source.get("sampler_session", source.get("sampler_index", 0)) if source else 0
     promotion_index = source.get("promotion_index", 0) if source else 0
@@ -4461,6 +5437,7 @@ def train(args):
         initial_digest = save_checkpoint(
             initial, model, optimizer, manifest, stage, 0, sampler_session,
             promotion_index, progress_active, reservoir, auxiliary_decisions, stage_decisions,
+            critic_balance,
         )
         atomic_json(output / "initial.json", {
             "step": 0, "checkpoint": initial.name, "sha256": initial_digest,
@@ -4470,7 +5447,7 @@ def train(args):
         return save_checkpoint(
             path, model, optimizer, manifest, stage, step, sampler_session,
             promotion_index, progress_active, reservoir, auxiliary_decisions + step - decisions,
-            stage_decisions + step - decisions, replace,
+            stage_decisions + step - decisions, critic_balance, replace,
         )
     if initial is not None and decisions == 0:
         link_checkpoint(initial, latest)
@@ -4544,7 +5521,7 @@ def train(args):
             "checkpoint": latest.name, "sha256": digest,
         })
         dashboard(output.parent)
-        print(json.dumps({"time": time.time(), "event": "promotion", **promotion}), flush=True)
+        emit_event({"time": time.time(), "event": "promotion", **promotion})
 
     if args.promote_now:
         promote()
@@ -4566,10 +5543,10 @@ def train(args):
                 "immutable": str(checkpoint.relative_to(output)),
                 "immutable_sha256": immutable_digest, "sha256": digest,
             })
-            print(json.dumps({
+            emit_event({
                 "time": time.time(), "event": "checkpoint", "step": step,
                 "stage": stage, "path": str(checkpoint), "sha256": immutable_digest,
-            }), flush=True)
+            })
         def save_report(point, pipeline, window):
             row = {
                 "schema": 1, "step": point["steps"], "window": window,
@@ -4580,6 +5557,8 @@ def train(args):
             }
             immutable_json(reports_dir / f"{point['steps']:012}.json", row)
             atomic_json(output / "live.json", row)
+            live = row | {"_written": (output / "live.json").stat().st_mtime}
+            atomic_live(output / "live.js", {"version": MODEL_VERSION, "report": live})
             keep = {last_checkpoint[1]} if last_checkpoint else set()
             keep.update(output / row["checkpoint"] for row in stage_bests.values())
             if best.get("checkpoint"):
@@ -4587,12 +5566,12 @@ def train(args):
             for checkpoint in checkpoints_dir.glob("*.pt"):
                 if checkpoint not in keep:
                     checkpoint.unlink()
-            print(json.dumps({"time": time.time(), "event": "report", **row}), flush=True)
+            emit_event({"time": time.time(), "event": "report", **row})
         model.train()
         training = train_stream(
             model, optimizer, args, sampler_session, stage, target, deadline, budget,
             base, auxiliary_decisions, stage_decisions, run_started, reservoir, progress_active,
-            save_report, save_step, manifest["fingerprint"],
+            save_report, save_step, manifest["fingerprint"], critic_balance,
         )
         if not training["decisions"]:
             break
@@ -4614,12 +5593,14 @@ def train(args):
         "training_fraction": training_seconds / max(1e-9, training_seconds + promotion_seconds),
         "decisions": decisions, "stage": stage,
     })
-    print(json.dumps({
+    emit_event({
         "time": time.time(), "event": "complete", "decisions": decisions,
         "stage": stage, "training_seconds": training_seconds,
         "promotion_seconds": promotion_seconds,
-    }), flush=True)
+    })
     dashboard(output.parent)
+    _EVENT_STREAM.close(); _EVENT_STREAM = None
+    shutdown_logging()
 
 
 def load(path, target):
@@ -4627,7 +5608,7 @@ def load(path, target):
     live = sts2_sim.Batch(1, 0, None, ascension=0)
     layout = dict(live.token_layout())
     version = checkpoint.get("model_version")
-    if checkpoint.get("schema") != 1 or version != MODEL_VERSION:
+    if checkpoint.get("schema") != 1 or version not in (68, 69, MODEL_VERSION):
         raise ValueError("incompatible checkpoint")
     if checkpoint.get("feature_version") != FEATURE_VERSION or layout["version"] != FEATURE_VERSION:
         raise ValueError("incompatible feature version")
@@ -4640,18 +5621,198 @@ def load(path, target):
         ))).to(target)
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError("invalid checkpoint architecture") from error
-    if config != architecture(model):
+    if version == MODEL_VERSION and config != architecture(model):
         raise ValueError("incompatible model architecture")
-    missing, unexpected = model.load_state_dict(checkpoint["model"], strict=True)
+    state = checkpoint["model"]
+    if version in (68, 69):
+        migrated = model.state_dict()
+        for key in migrated:
+            if key in state and state[key].shape == migrated[key].shape \
+                    and not key.startswith("critic.2."):
+                migrated[key] = state[key]
+        if version == 68:
+            for suffix in ("weight", "bias"):
+                migrated[f"critic.0.{suffix}"] = state[f"progress_value.0.{suffix}"]
+        else:
+            mapping = [(old, old) for old in range(16)] \
+                + [(old, old + 10) for old in range(16, 35)] \
+                + [(34, 54)] + [(old, old + 20) for old in range(35, 53)] + [(53, 82)]
+            for old, new in mapping:
+                migrated["critic.2.weight"][new] = state["critic.2.weight"][old]
+                migrated["critic.2.bias"][new] = state["critic.2.bias"][old]
+        state = migrated
+    missing, unexpected = model.load_state_dict(state, strict=True)
     if missing or unexpected:
         raise ValueError("incompatible model migration")
-    checkpoint["_optimizer_compatible"] = migrate_optimizer(
+    checkpoint["_optimizer_compatible"] = version == MODEL_VERSION and migrate_optimizer(
         checkpoint["optimizer"], len(tuple(model.parameters()))
     )
     checkpoint["_source_model_version"] = version
     checkpoint["model_version"] = MODEL_VERSION
     checkpoint["architecture"] = architecture(model)
     return model, checkpoint
+
+
+def diagnose_search(args):
+    model, checkpoint = load(args.checkpoint, torch.device("cpu")); model.eval()
+    ascension, bonus = STAGES[checkpoint["stage"]]
+    env = sts2_sim.Batch(args.envs, args.seed, None, ascension=ascension)
+    env.set_training_bonus(bonus)
+    env.load_policy(export_value_model(None, model, env.fingerprint(), 1, 0, True))
+    previous = [-1] * args.envs
+    roots = []
+    for step in range(args.max_steps):
+        stats = env.stats(); seeds = env.seeds()
+        for index, row in enumerate(stats):
+            turn = row[5] if row[4] == 1 else -1
+            fresh = turn >= 0 and turn != previous[index]
+            previous[index] = turn
+            ticket = (seeds[index] * 0x9E3779B1 + row[1] * 131 + turn * 17) & 0xffffffff
+            if not fresh or ticket % args.sample_stride or len(roots) >= args.roots:
+                continue
+            started = time.monotonic()
+            try:
+                result = json.loads(env.search_diagnostics(
+                    index, args.simulations, 1, args.max_depth, args.batch_size,
+                    args.prior_temperature, args.exploration, args.policy_temperature,
+                    args.exact_samples, args.max_exact_states, args.seed + len(roots),
+                    args.progress_value, args.q_temperature,
+                ))
+            except ValueError as error:
+                print(json.dumps({"skipped": {"seed": seeds[index], "floor": row[1], "turn": turn},
+                                  "error": str(error)}), flush=True)
+                continue
+            result["seconds"] = time.monotonic() - started
+            roots.append(result)
+            print(json.dumps({"root": result["root"], "mcts": result["mcts"],
+                              "exact": result["exact"], "seconds": result["seconds"]}), flush=True)
+        if len(roots) >= args.roots:
+            break
+        result = env.policy(args.policy_temperature, True, True)
+        done = np.flatnonzero(result[8]).tolist()
+        if done:
+            env.reset(done, 0)
+            for index in done:
+                previous[index] = -1
+    if not roots:
+        raise RuntimeError("no turn-start roots sampled")
+    output = Path(args.output); output.parent.mkdir(parents=True, exist_ok=True)
+    raw = output.with_suffix(".json")
+    raw.write_text(json.dumps({"checkpoint": args.checkpoint, "roots": roots}, indent=2))
+    nodes = [node | {"root": root_index, **root["root"]}
+             for root_index, root in enumerate(roots) for node in root["nodes"]]
+    pairs = []; total_pairs = 0; rng = np.random.default_rng(args.seed)
+    for root_index, root in enumerate(roots):
+        leaves = root["leaves"]
+        for left in range(len(leaves)):
+            for right in range(left + 1, len(leaves)):
+                total_pairs += 1
+                high, low = (leaves[left], leaves[right]) \
+                    if leaves[left]["value"] >= leaves[right]["value"] \
+                    else (leaves[right], leaves[left])
+                pair = {
+                    "root": root_index,
+                    "delta_value": high["value"] - low["value"],
+                    "delta_player_hp": high["player_hp"] - low["player_hp"],
+                    "delta_enemy_hp": high["enemy_hp"] - low["enemy_hp"],
+                    "weight": high["weight"] * low["weight"],
+                }
+                if len(pairs) < args.max_pairs:
+                    pairs.append(pair)
+                else:
+                    replace = int(rng.integers(total_pairs))
+                    if replace < args.max_pairs:
+                        pairs[replace] = pair
+    leaf_fits = []
+    for root_index, root in enumerate(roots):
+        value = np.asarray([leaf["value"] for leaf in root["leaves"]])
+        features = np.asarray([[1, leaf["player_hp"], leaf["enemy_hp"]] for leaf in root["leaves"]])
+        coefficient = np.linalg.lstsq(features, value, rcond=None)[0]
+        residual = np.square(value - features @ coefficient).sum()
+        total = np.square(value - value.mean()).sum()
+        leaf_fits.append({"root": root_index, "value_per_player_hp": float(coefficient[1]),
+                          "value_per_enemy_hp": float(coefficient[2]),
+                          "r2": float(1 - residual / total) if total else None})
+    exact = np.asarray([node["exact"] for node in nodes]); approximate = np.asarray([node["approximate"] for node in nodes])
+    errors = np.abs(exact - approximate); visits = np.asarray([node["visits"] for node in nodes])
+    actions = [action | {"root": root_index, "node": node["node"], "depth": node["depth"]}
+               for root_index, root in enumerate(roots) for node in root["nodes"]
+               for action in node["actions"] if action["approximate"] is not None]
+    action_exact = np.asarray([action["exact"] for action in actions])
+    action_approximate = np.asarray([action["approximate"] for action in actions])
+    action_errors = np.abs(action_exact - action_approximate)
+    gaps = [root["root_policy"] for root in roots]
+    summary = {
+        "objective": "progress" if args.progress_value else "win",
+        "roots": len(roots), "nodes": len(nodes), "leaf_pairs": total_pairs,
+        "plotted_leaf_pairs": len(pairs), "mae": float(errors.mean()),
+        "rmse": float(np.sqrt(np.mean((exact - approximate) ** 2))),
+        "correlation": float(np.corrcoef(exact, approximate)[0, 1]) if len(nodes) > 1 else None,
+        "visit_error_correlation": float(np.corrcoef(np.log1p(visits), errors)[0, 1]) if len(nodes) > 1 else None,
+        "policy_expected_gap_mean": float(np.mean([row["policy_expected_gap"] for row in gaps])),
+        "policy_greedy_gap_mean": float(np.mean([row["policy_greedy_gap"] for row in gaps])),
+        "search_gap_mean": float(np.mean([row["search_gap"] for row in gaps])),
+        "search_q_gap_mean": float(np.mean([row["search_q_gap"] for row in gaps])),
+        "q_actions": len(actions), "q_mae": float(action_errors.mean()),
+        "q_rmse": float(np.sqrt(np.mean((action_exact - action_approximate) ** 2))),
+        "q_correlation": float(np.corrcoef(action_exact, action_approximate)[0, 1]),
+        "q_target_gap_mean": float(np.mean([row["q_target_gap"] for row in gaps])),
+        "q_target_entropy_mean": float(np.mean([row["q_target_entropy"] for row in gaps])),
+        "leaf_value_linear_fits": leaf_fits,
+    }
+    if args.progress_value:
+        summary |= {"mae_floors": summary["mae"] * 52,
+                    "rmse_floors": summary["rmse"] * 52,
+                    "policy_expected_gap_floors": summary["policy_expected_gap_mean"] * 52,
+                    "search_gap_floors": summary["search_gap_mean"] * 52,
+                    "search_q_gap_floors": summary["search_q_gap_mean"] * 52,
+                    "q_mae_floors": summary["q_mae"] * 52,
+                    "q_rmse_floors": summary["q_rmse"] * 52,
+                    "q_target_gap_floors": summary["q_target_gap_mean"] * 52}
+    data = json.dumps({"nodes": nodes, "pairs": pairs, "roots": roots, "summary": summary}).replace("</", "<\\/")
+    html = output.with_suffix(".html")
+    html.write_text("""<!doctype html><meta charset=utf-8><title>Search diagnostics</title>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script><style>body{font:14px system-ui;margin:24px;background:#101319;color:#e8ecf2}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(520px,1fr));gap:18px}.plot{height:560px;background:#171d28;border:1px solid #303a49;border-radius:10px}pre{white-space:pre-wrap}</style>
+<h1>Exact vs approximate expectimax</h1><p>Crosses have zero outgoing visits: MCTS expanded and evaluated the node, backed its value up through the incoming edge, but never traversed an action from that node. Their approximate value is therefore the raw value-model estimate.</p><pre id=summary></pre><div id=values class=grid></div><h1>Exact versus sampled action Q</h1><div id=actions class=grid></div><h1>Value geometry across exhaustive leaves</h1><p>Signed HP differences are better-valued leaf minus worse-valued leaf. Negative enemy HP therefore means the value model prefers a leaf with less enemy life remaining.</p><div id=leaves class=grid></div><script>const data=""" + data + r""",config={responsive:true,displaylogo:false},base={template:'plotly_dark',paper_bgcolor:'#171d28',plot_bgcolor:'#171d28',margin:{l:70,r:30,t:55,b:60}};
+summary.textContent=JSON.stringify(data.summary,null,2);const progress=data.summary.objective==='progress',scale=progress?53:1,valueName=progress?'predicted terminal category':'win probability';function panel(parent,id){const div=document.createElement('div');div.id=id;div.className='plot';document.querySelector(parent).append(div);return div}data.roots.forEach((root,index)=>{const label=`Root ${index} · character ${root.root.character} · floor ${root.root.floor} turn ${root.root.turn}`,n=data.nodes.filter(row=>row.root===index),x=n.map(row=>row.exact*scale),y=n.map(row=>row.approximate*scale),lo=Math.min(...x,...y),hi=Math.max(...x,...y),valuePanel=panel('#values',`values-${index}`);Plotly.newPlot(valuePanel,[{x,y,mode:'markers',marker:{size:n.map(row=>row.visits?5+3*Math.log1p(row.visits):8),symbol:n.map(row=>row.visits?'circle':'x'),color:n.map(row=>Math.log1p(row.visits)),colorscale:'Viridis',showscale:true,colorbar:{title:'log(1+visits)'}},customdata:n.map(row=>[row.depth,row.visits,row.absolute_error*scale,row.rng]),hovertemplate:'depth %{customdata[0]} · visits %{customdata[1]}<br>exact %{x:.6f}<br>approximate %{y:.6f}<br>|error| %{customdata[2]:.6f}<br>RNG %{customdata[3]}<extra></extra>'},{x:[lo,hi],y:[lo,hi],mode:'lines',line:{dash:'dash',color:'#ddd'},name:'identity'}],{...base,title:label,xaxis:{title:`Repeated-exhaustive ${valueName}`,gridcolor:'#303a49'},yaxis:{title:`MCTS ${valueName}`,gridcolor:'#303a49'},showlegend:false},config);const q=root.nodes.flatMap(node=>node.actions.map(action=>({...action,depth:node.depth}))).filter(row=>row.approximate!==null),qx=q.map(row=>row.exact*scale),qy=q.map(row=>row.approximate*scale),qlo=Math.min(...qx,...qy),qhi=Math.max(...qx,...qy),actionPanel=panel('#actions',`actions-${index}`);Plotly.newPlot(actionPanel,[{x:qx,y:qy,mode:'markers',marker:{size:q.map(row=>5+2.5*Math.log1p(row.visits)),color:q.map(row=>Math.log1p(row.visits)),colorscale:'Viridis',showscale:true,colorbar:{title:'log(1+visits)'},opacity:.65},customdata:q.map(row=>[row.action,row.depth,row.visits,row.target]),hovertemplate:'%{customdata[0]}<br>depth %{customdata[1]} · visits %{customdata[2]}<br>exact Q %{x:.6f}<br>sampled Q %{y:.6f}<br>target %{customdata[3]:.4f}<extra></extra>'},{x:[qlo,qhi],y:[qlo,qhi],mode:'lines',line:{dash:'dash',color:'#ddd'},name:'identity'}],{...base,title:label,xaxis:{title:`Repeated-exhaustive Q (${valueName})`,gridcolor:'#303a49'},yaxis:{title:`Sampled expectimax Q (${valueName})`,gridcolor:'#303a49'},showlegend:false},config);const p=data.pairs.filter(row=>row.root===index),z=p.map(row=>row.delta_value*scale),leafPanel=panel('#leaves',`leaves-${index}`);Plotly.newPlot(leafPanel,[{type:'scatter3d',mode:'markers',x:p.map(row=>row.delta_player_hp),y:p.map(row=>row.delta_enemy_hp),z,marker:{size:3,opacity:.35,color:z,colorscale:'Plasma',showscale:true,colorbar:{title:`Δ ${valueName}`}},customdata:p.map(row=>row.weight),hovertemplate:`Δ player HP %{x}<br>Δ enemy HP %{y}<br>Δ ${valueName} %{z:.6f}<br>particle-pair weight %{customdata}<extra></extra>`}],{...base,title:label,scene:{xaxis:{title:'Δ player HP'},yaxis:{title:'Δ enemy remaining HP'},zaxis:{title:`Δ ${valueName}`}}},config)})</script>""")
+    print(json.dumps(summary, indent=2)); print(html); print(raw)
+
+
+def compare_search(args):
+    runs = []
+    for item in args.input:
+        label, path = item.split("=", 1)
+        data = json.loads(Path(path).read_text())
+        nodes = [node for root in data["roots"] for node in root["nodes"]]
+        exact = np.asarray([node["exact"] for node in nodes])
+        approximate = np.asarray([node["approximate"] for node in nodes])
+        actions = [action for root in data["roots"] for node in root["nodes"]
+                   for action in node["actions"] if action["approximate"] is not None]
+        action_exact = np.asarray([action["exact"] for action in actions])
+        action_approximate = np.asarray([action["approximate"] for action in actions])
+        summary = {
+            "nodes": len(nodes),
+            "mae": float(np.abs(exact - approximate).mean()),
+            "correlation": float(np.corrcoef(exact, approximate)[0, 1]),
+            "q_actions": len(actions),
+            "q_mae": float(np.abs(action_exact - action_approximate).mean()),
+            "q_correlation": float(np.corrcoef(action_exact, action_approximate)[0, 1]),
+            "search_gap_mean": float(np.mean([root["root_policy"]["search_gap"] for root in data["roots"]])),
+            "search_q_gap_mean": float(np.mean([root["root_policy"]["search_q_gap"] for root in data["roots"]])),
+            "q_target_gap_mean": float(np.mean([root["root_policy"]["q_target_gap"] for root in data["roots"]])),
+        }
+        runs.append({"temperature": label, "objective": data["roots"][0]["settings"]["objective"], "summary": summary,
+                     "roots": [{"root": root["root"], "nodes": root["nodes"]}
+                               for root in data["roots"]]})
+    if not runs or any(len(run["roots"]) != len(runs[0]["roots"]) or
+                       run["objective"] != runs[0]["objective"] for run in runs):
+        raise ValueError("search diagnostics have incompatible roots")
+    data = json.dumps(runs).replace("</", "<\\/")
+    output = Path(args.output); output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text("""<!doctype html><meta charset=utf-8><title>MCTS prior-temperature comparison</title>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script><style>body{font:14px system-ui;margin:24px;background:#101319;color:#e8ecf2}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(560px,1fr));gap:18px}.plot{height:560px;background:#171d28;border:1px solid #303a49;border-radius:10px}table{border-collapse:collapse;margin-bottom:24px}th,td{padding:7px 12px;border-bottom:1px solid #303a49;text-align:right}th:first-child,td:first-child{text-align:left}</style>
+<h1>MCTS prior-temperature comparison</h1><table id=summary></table><h1>Node values</h1><div id=plots class=grid></div><h1>Action Q values</h1><div id=qplots class=grid></div><script>const runs=""" + data + r""",scale=runs[0].objective==='progress'?53:1,unit=runs[0].objective==='progress'?'terminal category':'win probability',colors=['#60a5fa','#f59e0b','#f472b6','#34d399'],config={responsive:true,displaylogo:false},base={template:'plotly_dark',paper_bgcolor:'#171d28',plot_bgcolor:'#171d28',margin:{l:70,r:25,t:55,b:60}};summary.innerHTML=`<tr><th>Prior temperature</th><th>Nodes</th><th>Node MAE (${unit})</th><th>Node corr.</th><th>Q MAE (${unit})</th><th>Q corr.</th><th>Visit gap</th><th>Q argmax gap</th><th>Q target gap</th></tr>`+runs.map(run=>`<tr><td>${run.temperature}</td><td>${run.summary.nodes}</td><td>${Number(run.summary.mae*scale).toPrecision(4)}</td><td>${Number(run.summary.correlation).toFixed(4)}</td><td>${Number(run.summary.q_mae*scale).toPrecision(4)}</td><td>${Number(run.summary.q_correlation).toFixed(4)}</td><td>${Number(run.summary.search_gap_mean*scale).toPrecision(4)}</td><td>${Number(run.summary.search_q_gap_mean*scale).toPrecision(4)}</td><td>${Number(run.summary.q_target_gap_mean*scale).toPrecision(4)}</td></tr>`).join('');for(let root=0;root<runs[0].roots.length;root++){const div=document.createElement('div');div.className='plot';plots.append(div);const all=runs.flatMap(run=>run.roots[root].nodes),lo=Math.min(...all.flatMap(row=>[row.exact,row.approximate]))*scale,hi=Math.max(...all.flatMap(row=>[row.exact,row.approximate]))*scale,info=runs[0].roots[root].root,traces=runs.map((run,index)=>{const rows=run.roots[root].nodes;return{x:rows.map(row=>row.exact*scale),y:rows.map(row=>row.approximate*scale),mode:'markers',name:`temperature ${run.temperature}`,marker:{color:colors[index%colors.length],size:rows.map(row=>row.visits?5+2.5*Math.log1p(row.visits):7),symbol:rows.map(row=>row.visits?'circle':'x'),opacity:.6},customdata:rows.map(row=>[row.depth,row.visits,row.absolute_error*scale]),hovertemplate:`temperature ${run.temperature}<br>depth %{customdata[0]} · visits %{customdata[1]}<br>exact %{x:.6f}<br>approximate %{y:.6f}<br>|error| %{customdata[2]:.6f}<extra></extra>`}});traces.push({x:[lo,hi],y:[lo,hi],mode:'lines',name:'identity',line:{color:'#ddd',dash:'dash'}});Plotly.newPlot(div,traces,{...base,title:`Root ${root} · character ${info.character} · floor ${info.floor} turn ${info.turn}`,xaxis:{title:`Repeated-exhaustive ${unit}`,gridcolor:'#303a49',range:[lo,hi]},yaxis:{title:`MCTS ${unit}`,gridcolor:'#303a49',range:[lo,hi]},legend:{orientation:'h'}},config);const qdiv=document.createElement('div');qdiv.className='plot';qplots.append(qdiv);const qall=runs.flatMap(run=>run.roots[root].nodes.flatMap(node=>node.actions.map(action=>({...action,depth:node.depth}))).filter(row=>row.approximate!==null)),qlo=Math.min(...qall.flatMap(row=>[row.exact,row.approximate]))*scale,qhi=Math.max(...qall.flatMap(row=>[row.exact,row.approximate]))*scale,qtraces=runs.map((run,index)=>{const rows=run.roots[root].nodes.flatMap(node=>node.actions.map(action=>({...action,depth:node.depth}))).filter(row=>row.approximate!==null);return{x:rows.map(row=>row.exact*scale),y:rows.map(row=>row.approximate*scale),mode:'markers',name:`temperature ${run.temperature}`,marker:{color:colors[index%colors.length],size:rows.map(row=>5+2.5*Math.log1p(row.visits)),opacity:.55},customdata:rows.map(row=>[row.action,row.depth,row.visits,row.target]),hovertemplate:`temperature ${run.temperature}<br>%{customdata[0]}<br>depth %{customdata[1]} · visits %{customdata[2]}<br>exact Q %{x:.6f}<br>sampled Q %{y:.6f}<br>target %{customdata[3]:.4f}<extra></extra>`}});qtraces.push({x:[qlo,qhi],y:[qlo,qhi],mode:'lines',name:'identity',line:{color:'#ddd',dash:'dash'}});Plotly.newPlot(qdiv,qtraces,{...base,title:`Root ${root} · character ${info.character} · floor ${info.floor} turn ${info.turn}`,xaxis:{title:`Repeated-exhaustive Q (${unit})`,gridcolor:'#303a49',range:[qlo,qhi]},yaxis:{title:`Sampled expectimax Q (${unit})`,gridcolor:'#303a49',range:[qlo,qhi]},legend:{orientation:'h'}},config)}</script>""")
+    print(output)
 
 
 def value_dataset(model, args, target, seed, runs, deadline):
@@ -4740,7 +5901,7 @@ def value_logits(model, states, batch, target):
     with torch.no_grad():
         for start in range(0, len(states), batch):
             inputs = unpack(states[start : start + batch], target, model)
-            values.extend(model(*inputs[:6])[1].cpu().tolist())
+            values.extend(critic_win_logit(model(*inputs[:6])[1]).cpu().tolist())
     return np.asarray(values, np.float32)
 
 
@@ -4864,12 +6025,11 @@ def export_value_model(path, model, fingerprint, temperature, bias, actor=False)
                    model.menu_count):
         add_linear(module)
     add_norm(model.menu_norm); add(model.menu_empty)
-    add_linear(model.value[0]); add_linear(model.value[2])
+    add_linear(model.critic[0]); add_linear(model.critic[2])
     if actor:
         flush()
         parts.append(b"STSACTOR")
-        for head in (model.policy, model.progress_value):
-            add_linear(head[0]); add_linear(head[2])
+        add_linear(model.policy[0]); add_linear(model.policy[2])
     flush()
     data = b"".join(parts)
     if path is None:
@@ -4907,9 +6067,9 @@ def finalize(args):
     fit_states, fit_report = len(fit[0]), fit[3]
     for parameter in model.parameters():
         parameter.requires_grad_(False)
-    for parameter in model.value.parameters():
+    for parameter in model.critic.parameters():
         parameter.requires_grad_(True)
-    optimizer = torch.optim.Adam(model.value.parameters(), lr=args.learning_rate)
+    optimizer = torch.optim.Adam(model.critic.parameters(), lr=args.learning_rate)
     rng = np.random.default_rng(args.seed)
     model.train()
     for _ in range(args.epochs):
@@ -4921,7 +6081,7 @@ def finalize(args):
             inputs = unpack([fit[0][row] for row in index], target, model)
             labels = torch.as_tensor(fit[1][index], device=target)
             loss = nn.functional.binary_cross_entropy_with_logits(
-                model(*inputs[:6])[1], labels
+                critic_win_logit(model(*inputs[:6])[1]), labels,
             )
             optimizer.zero_grad(set_to_none=True); loss.backward(); optimizer.step()
     del fit
@@ -4953,7 +6113,9 @@ def finalize(args):
     parity_env = sts2_sim.Batch(8, args.test_seed + 99_000_000, None, ascension=10)
     parity_inputs = tensors(parity_env.observe_tokens(), target, model)
     with torch.no_grad():
-        python_values = (predict(model, parity_inputs, "fp32")[1] / temperature + bias).sigmoid().cpu().numpy()
+        python_values = (
+            critic_win_logit(predict(model, parity_inputs, "fp32")[1]) / temperature + bias
+        ).sigmoid().cpu().numpy()
     rust_values = np.asarray(parity_env.rust_values(str(output)))
     parity_error = float(np.max(np.abs(python_values - rust_values)))
     if parity_error > 1e-5:
@@ -4986,12 +6148,12 @@ def probe_candidate_policy(model, target):
     legal = torch.ones(3, dtype=torch.bool, device=target)
     sequence = candidate_index(np.zeros(3, np.int32), 1, target)
     base = model.decide(state, action, row, torch.arange(3, device=target), 3, legal, sequence, 3)
-    value = model.value(state)
+    value = model.critic(state)
     permutation = torch.tensor((2, 0, 1), device=target)
     permuted = model.decide(
         state, action[permutation], row, permutation, 3, legal, sequence, 3,
     )
-    permuted_value = model.value(state)
+    permuted_value = model.critic(state)
     assert torch.allclose(base, permuted, atol=1e-6, rtol=1e-6)
     assert torch.allclose(value, permuted_value, atol=1e-6, rtol=1e-6)
     single_sequence = candidate_index(np.zeros(1, np.int32), 1, target)
@@ -5047,6 +6209,12 @@ def probe_action_menu(model, target):
 
 def probe():
     torch.manual_seed(7); np.random.seed(7)
+    record = logging.LogRecord(
+        "probe", logging.INFO, "/tmp/CommandPhaseTelemetryWave112.cs", 7, "message", (), None,
+    )
+    record.native_tid = 1
+    formatted = GlogFormatter("probe").format(record)
+    assert "CommandPhaseTelemetryWave112.cs:00007] message" in formatted
     assert bands([])["mean"] is None
     assert episode_summary([])["floor_mean"] is None
     promotion = [
@@ -5147,32 +6315,46 @@ def probe():
             except ValueError:
                 pass
 
-    segment = {
+    sampled_probabilities = np.zeros((2, CATEGORIES), np.float32)
+    sampled_probabilities[(0, 1), (10, 20)] = 1
+    trajectory = {
         "rows": [row, row], "choices": [0, 0], "old_log": [0., 0.],
-        "values": [.2, .2], "progress_values": [.3, .3], "progress_floors": [.1, .1],
-        "win_rewards": [0., 0], "progress_rewards": [0., 0],
-        "terminals": [False, False], "characters": [0, 0], "versions": [3, 3],
-        "bootstrap_value": .25, "bootstrap_progress": .2, "bootstrap_version": 3,
+        "critic_probabilities": sampled_probabilities, "canonical_progress": [4, 5],
+        "phases": [1, 2], "win_rewards": [0., 0], "terminals": [False, True],
+        "characters": [0, 0], "versions": [3, 3],
     }
     dataset = ExperienceDataset()
     assert dataset.add(
-        {"trajectories": [segment]}, argparse.Namespace(gae_lambda=1., progress_gamma=1.),
-    ) == (2, 0)
+        {"trajectories": [trajectory]}, argparse.Namespace(critic_lambda=.5),
+    ) == (2, 0, 0)
+    assert dataset.data["critic_target"][1, 5] == 1
+    assert dataset.data["critic_target"][0, 5] == .5
+    assert dataset.data["critic_target"][0, 20] == .5
+    limited = ExperienceDataset()
+    assert limited.add(
+        {"trajectories": [trajectory]}, argparse.Namespace(critic_lambda=1.), 1,
+    ) == (1, 0, 1)
     selected = dataset.sample(2, np.random.default_rng(19))
     before = dataset.data["priority"].copy()
     expired = dataset.use(selected)
     assert np.allclose(dataset.data["priority"][selected], before[selected] - 3)
     dataset.discard(expired)
     assert len(dataset) == 2 - len(expired)
-    mismatched = copy.deepcopy(segment); mismatched["bootstrap_version"] = 4
+    mismatched = copy.deepcopy(trajectory); mismatched["terminals"][-1] = False
     try:
         ExperienceDataset().add(
             {"trajectories": [mismatched]},
-            argparse.Namespace(gae_lambda=1., progress_gamma=1.),
+            argparse.Namespace(critic_lambda=1.),
         )
-        raise AssertionError("accepted mixed-version bootstrap")
+        raise AssertionError("accepted incomplete trajectory")
     except ValueError:
         pass
+    balance = CriticBalance(.9)
+    weights = balance.weights(np.array([0, 0, 1]), np.array([1, 1, 2]), np.array([4, 4, 5]))
+    assert np.isclose(weights.mean(), 1) and .25 / 4 <= weights.min() / weights.max() <= 1
+    balance.record_loss(np.ones((3, CATEGORIES)) / CATEGORIES,
+                        np.ones((3, CATEGORIES)) / CATEGORIES)
+    assert balance.report()["critic_weight_ess"] <= 3
 
     inputs = tensors(observation, target, model)
     object_group, object_count, menu_rows, _menu_sequence = inputs[5][8]
@@ -5228,10 +6410,9 @@ def probe():
     assert not torch.allclose(tree((2, 3)), tree((3, 2)))
 
     with torch.no_grad():
-        model.value[-1].weight.normal_(std=.1); model.value[-1].bias.fill_(.03)
-        model.progress_value[-1].weight.normal_(std=.1); model.progress_value[-1].bias.fill_(-.02)
+        model.critic[-1].weight.normal_(std=.1); model.critic[-1].bias.fill_(.03)
         full = model(*inputs[:6], return_state=True)
-        output, state = full[:3], full[3]
+        output, state = full[:2], full[2]
         assert state.shape == (8, 1152)
         blocks = state[:, :model.base_state_width].reshape(8, -1, model.width)
         assert torch.allclose(blocks.mean(2), torch.zeros_like(blocks[:, :, 0]), atol=1e-5)
@@ -5289,9 +6470,9 @@ def probe():
         absent_inputs = _tensors(absent, target, model)
         illegal_full = model(*illegal_inputs[:6], return_state=True)
         absent_full = model(*absent_inputs[:6], return_state=True)
-        illegal_output, absent_output = illegal_full[:3], absent_full[:3]
+        illegal_output, absent_output = illegal_full[:2], absent_full[:2]
         padded_output = predict(model, _tensors(padded, target, model), "fp32")
-    assert not torch.allclose(illegal_full[3], absent_full[3])
+    assert not torch.allclose(illegal_full[2], absent_full[2])
     assert all(torch.allclose(left, right, atol=1e-6, rtol=1e-6)
                for left, right in zip(absent_output, padded_output))
 
@@ -5376,8 +6557,7 @@ def probe():
         value.square().mean() for value in predict(selected_critic, selected_inputs, "fp32")[1:]
     )
     full_loss.backward()
-    selected_parameters = tuple(selected_critic.value.parameters()) \
-        + tuple(selected_critic.progress_value.parameters())
+    selected_parameters = tuple(selected_critic.critic.parameters())
     selected_loss.backward(inputs=selected_parameters)
     full_parameters = dict(full_critic.named_parameters())
     selected_ids = {id(parameter) for parameter in selected_parameters}
@@ -5389,16 +6569,16 @@ def probe():
 
     trusted = copy.deepcopy(model).train()
     trusted_inputs = tensors(observation, target, trusted)
-    logits, value, progress = predict(trusted, trusted_inputs, "fp32")
-    loss = logits.masked_fill(~trusted_inputs[6], 0).sum() + value.sum() + progress.sum()
+    logits, value = predict(trusted, trusted_inputs, "fp32")
+    loss = logits.masked_fill(~trusted_inputs[6], 0).sum() + value.sum()
     loss.backward()
     assert all(parameter.grad is None or parameter.grad.isfinite().all()
                for parameter in trusted.parameters())
     if accelerator.type in ("mps", "cuda"):
         mixed = copy.deepcopy(model).to(accelerator).train()
         mixed_inputs = tensors(observation, accelerator, mixed)
-        logits, value, progress = predict(mixed, mixed_inputs, "bf16")
-        loss = logits.masked_fill(~mixed_inputs[6], 0).sum() + value.sum() + progress.sum()
+        logits, value = predict(mixed, mixed_inputs, "bf16")
+        loss = logits.masked_fill(~mixed_inputs[6], 0).sum() + value.sum()
         loss.backward()
         assert loss.isfinite() and all(
             parameter.grad is None or parameter.grad.isfinite().all()
@@ -5420,15 +6600,80 @@ def probe():
     parity_env = sts2_sim.Batch(8, 72, 0)
     parity_inputs = tensors(parity_env.observe_tokens(), target, model)
     with torch.no_grad():
-        python_value = (predict(model, parity_inputs, "fp32")[1] / .83 - .17).sigmoid().numpy()
+        python_value = (
+            critic_win_logit(predict(model, parity_inputs, "fp32")[1]) / .83 - .17
+        ).sigmoid().numpy()
     with tempfile.TemporaryDirectory() as directory:
         exported = Path(directory) / "value.bin"
         export_value_model(exported, model, parity_env.fingerprint(), .83, -.17)
         rust_value = np.asarray(parity_env.rust_values(str(exported)))
     parity_error = float(np.max(np.abs(rust_value - python_value)))
     assert parity_error <= 1e-5, parity_error
+    actor = export_value_model(None, model, parity_env.fingerprint(), 1, 0, True)
+    plain = sts2_sim.Batch(8, 73, 0); searched = sts2_sim.Batch(8, 73, 0)
+    timed = sts2_sim.Batch(8, 73, 0)
+    plain.load_policy(actor); searched.load_policy(actor); timed.load_policy(actor)
+    actor_inputs = tensors(plain.observe_tokens(), target, model)
+    with torch.no_grad():
+        python_critic = critic_probabilities(predict(model, actor_inputs, "fp32")[1]).numpy()
+    native_critic = np.asarray(plain.policy(1, False, False)[3])
+    assert native_critic.shape == (8, CATEGORIES)
+    assert np.max(np.abs(native_critic - python_critic)) <= 1e-5
+    assert all(len(row) == 10 and 0 <= row[9] <= 52 for row in plain.stats())
+    mcts_roots = mcts_targets = consistency_targets = plain_targets = 0
+    rollout_steps = timeout_roots = 0
+    for step in range(16):
+        base = plain.policy(1, True, True)
+        consistency = bool(step % 2)
+        preview = searched.policy(
+            1, False, False, mcts_fraction=1, mcts_simulations=4,
+            mcts_boss_simulations=8, mcts_turns=0, mcts_max_depth=32,
+            mcts_batch_size=32, mcts_min_visits=1, mcts_max_targets=8,
+            mcts_prior_temperature=1, mcts_q_temperature=.002, mcts_exploration=1.5,
+            mcts_value_consistency=consistency,
+        )
+        shadow = searched.policy(
+            1, True, True, mcts_fraction=1, mcts_simulations=4,
+            mcts_boss_simulations=8, mcts_turns=0, mcts_max_depth=32,
+            mcts_batch_size=32, mcts_min_visits=1, mcts_max_targets=8,
+            mcts_prior_temperature=1, mcts_q_temperature=.002, mcts_exploration=1.5,
+        )
+        assert np.array_equal(base[1], shadow[1]) \
+            and repr(plain.stats()) == repr(searched.stats()) and plain.seeds() == searched.seeds()
+        timed_preview = timed.policy(
+            1, False, False, mcts_fraction=1, mcts_simulations=4,
+            mcts_boss_simulations=8, mcts_turns=0, mcts_max_depth=32,
+            mcts_batch_size=32, mcts_min_visits=1, mcts_max_targets=8,
+            mcts_timeout=1e-9,
+        )
+        timed_step = timed.policy(1, True, True)
+        assert np.array_equal(base[1], timed_step[1]) \
+            and repr(plain.stats()) == repr(timed.stats()) and plain.seeds() == timed.seeds()
+        assert timed_preview[6][16] == int(bool(timed_preview[6][0])) and not timed_preview[5]
+        assert shadow[6][0] == 0
+        assert preview[6][0] == preview[6][6]
+        for target_row in preview[5]:
+            row, expert, visits, depth, *extra = target_row
+            assert len(expert) == packed_action_count(row) and np.isclose(sum(expert), 1)
+            assert visits >= 1 and 0 <= depth <= 32
+            if consistency:
+                children, weights, self_weight, terminal_value = extra
+                assert len(extra) == 4 and len(children) == len(weights)
+                assert 0 <= self_weight <= 1 and 0 <= sum(weights) + self_weight <= 1.002
+                assert 0 <= terminal_value <= 1 - self_weight + .002
+                consistency_targets += 1
+            else:
+                assert not extra
+                plain_targets += 1
+        mcts_roots += preview[6][0]; mcts_targets += preview[6][5]
+        rollout_steps += preview[6][12]; timeout_roots += timed_preview[6][0]
+        done = np.flatnonzero(base[8]).tolist()
+        if done:
+            plain.reset(done, 0); searched.reset(done, 0); timed.reset(done, 0)
+    assert mcts_roots and mcts_targets and consistency_targets and plain_targets
+    assert rollout_steps and timeout_roots
     parameters = sum(parameter.numel() for parameter in model.parameters())
-    assert 800_000 <= parameters <= 1_500_000
+    assert 700_000 <= parameters <= 1_500_000
     print(json.dumps({
         "device": str(accelerator), "layout": layout, "parameters": parameters,
         "state_width": model.state_width,
@@ -5436,7 +6681,7 @@ def probe():
             float((output[0] - permuted[0][:, inverse]).abs().max()),
             float((output[1] - permuted[1]).abs().max()),
         ),
-        "rust_parity_error": parity_error,
+        "rust_parity_error": parity_error, "mcts_roots": mcts_roots,
     }))
 
 
@@ -5451,6 +6696,7 @@ def parser():
     run.add_argument("--heads", type=int)
     run.add_argument("--feedforward", type=int)
     run.add_argument("--precision", choices=PRECISIONS, default="bf16")
+    run.add_argument("--start-stage", type=int, default=0)
     run.add_argument("--hours", type=float, default=0)
     run.add_argument("--decisions", type=int, default=0)
     run.add_argument("--envs", type=int, default=512)
@@ -5458,6 +6704,7 @@ def parser():
     run.add_argument("--torch-threads", type=int, default=2)
     run.add_argument("--sampler-threads", type=int, default=1)
     run.add_argument("--sampler-backend", choices=("process", "thread"), default="process")
+    run.add_argument("--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"), default="INFO")
     run.add_argument("--sampler-steps", type=int, default=4)
     run.add_argument("--sampler-timeout", type=float, default=120)
     run.add_argument("--sampler-restarts", type=int, default=3)
@@ -5468,17 +6715,50 @@ def parser():
     run.add_argument("--max-policy-lag", type=int, default=128)
     run.add_argument("--max-log-ratio", type=float, default=.5)
     run.add_argument("--policy-temperature", type=float, default=.8)
+    run.add_argument("--mcts-fraction", type=float, default=0)
+    run.add_argument("--mcts-simulations", type=int, default=0)
+    run.add_argument("--mcts-boss-simulations", type=int, default=0)
+    run.add_argument("--mcts-turns", type=int, default=1)
+    run.add_argument("--mcts-max-depth", type=int, default=64)
+    run.add_argument("--mcts-batch-size", type=int, default=256)
+    run.add_argument("--mcts-min-visits", type=int, default=16)
+    run.add_argument("--mcts-max-targets", type=int, default=64)
+    run.add_argument("--mcts-prior-temperature", type=float, default=1)
+    run.add_argument("--mcts-q-temperature", type=float, default=.002)
+    run.add_argument("--mcts-exploration", type=float, default=1.5)
+    run.add_argument("--mcts-heuristic", action="store_true")
+    run.add_argument("--mcts-timeout", type=float, default=0)
+    run.add_argument("--expert-weight", type=float, default=.002)
+    run.add_argument("--expert-max-lag", type=int, default=4)
+    run.add_argument("--expert-batch", type=int)
+    run.add_argument("--expert-capacity", type=int, default=131_072)
     run.add_argument("--batch", type=int, default=1024)
     run.add_argument("--learning-rate", type=float, default=3e-4)
+    run.add_argument("--head-learning-rate-multiplier", type=float, default=1)
+    run.add_argument("--critic-learning-rate-multiplier", type=float, default=1)
+    run.add_argument("--critic-only", action="store_true")
     run.add_argument("--gae-lambda", type=float, default=1.0)
+    run.add_argument("--critic-lambda", type=float, default=1.0)
+    run.add_argument("--critic-balance-decay", type=float, default=.99)
     run.add_argument("--progress-gamma", type=float, default=1.0)
+    run.add_argument("--critic-consistency-weight", type=float, default=0)
+    run.add_argument("--critic-consistency-batch", type=int, default=1024)
+    run.add_argument("--search-consistency-weight", type=float, default=0)
+    run.add_argument("--search-consistency-batch", type=int, default=256)
+    run.add_argument("--blended-critic", action="store_true")
+    run.add_argument("--critic-win-ema-decay", type=float, default=.9)
+    run.add_argument("--critic-blend-power", type=float, default=.4)
     run.add_argument("--progress-decisions", type=int, default=5_000_000)
     run.add_argument("--progress-beta", type=float)
     run.add_argument("--clip", type=float, default=0.2)
     run.add_argument("--value-weight", type=float, default=0.5)
     run.add_argument("--winning-loss-weight", type=float, default=0.1)
+    run.add_argument("--winning-capacity", type=int, default=WINNING_CAPACITY)
+    run.add_argument("--priority-decay", type=float, default=3)
+    run.add_argument("--character-balanced", action="store_true")
     run.add_argument("--entropy-start", type=float, default=0.01)
     run.add_argument("--entropy-end", type=float, default=0.001)
+    run.add_argument("--entropy-weight", type=float)
     run.add_argument("--target-kl", type=float, default=0.004)
     run.add_argument("--training-seed", type=int, default=1_900_000_000)
     run.add_argument("--development-seed", type=int, default=3_500_000_000)
@@ -5497,6 +6777,7 @@ def parser():
     run.add_argument("--promote-now", action="store_true")
     evaluate_parser = commands.add_parser("evaluate")
     evaluate_parser.add_argument("checkpoint")
+    evaluate_parser.add_argument("--output")
     evaluate_parser.add_argument("--ascension", type=int, default=0)
     evaluate_parser.add_argument("--bonus", type=int, default=24)
     evaluate_parser.add_argument("--validation-seed", type=int, default=3_500_000_000)
@@ -5505,6 +6786,32 @@ def parser():
     evaluate_parser.add_argument("--max-steps", type=int, default=2048)
     evaluate_parser.add_argument("--max-combat-steps", type=int, default=512)
     evaluate_parser.add_argument("--precision", choices=PRECISIONS, default="fp32")
+    search_evaluation = commands.add_parser("evaluate-search-policies")
+    search_evaluation.add_argument("checkpoint")
+    search_evaluation.add_argument("--output", default="target/search-policy-evaluation.json")
+    search_evaluation.add_argument(
+        "--modes", nargs="+", choices=(
+            "policy", "sampled", "exact", "heuristic", "combat", "combat-heuristic",
+        ),
+        default=("policy", "sampled", "exact"),
+    )
+    search_evaluation.add_argument("--runs", type=int, default=16)
+    search_evaluation.add_argument("--batch", type=int, default=16)
+    search_evaluation.add_argument("--characters", type=int, nargs="+", default=(0, 1, 2, 3, 4))
+    search_evaluation.add_argument("--max-steps", type=int, default=2048)
+    search_evaluation.add_argument("--max-combat-steps", type=int, default=512)
+    search_evaluation.add_argument("--policy-temperature", type=float, default=.8)
+    search_evaluation.add_argument("--simulations", type=int, default=128)
+    search_evaluation.add_argument("--max-depth", type=int, default=64)
+    search_evaluation.add_argument("--search-batch", type=int, default=256)
+    search_evaluation.add_argument("--min-visits", type=int, default=16)
+    search_evaluation.add_argument("--max-targets", type=int, default=64)
+    search_evaluation.add_argument("--prior-temperature", type=float, default=3)
+    search_evaluation.add_argument("--q-temperature", type=float, default=.002)
+    search_evaluation.add_argument("--exploration", type=float, default=1.5)
+    search_evaluation.add_argument("--exact-samples", type=int, default=16)
+    search_evaluation.add_argument("--max-exact-states", type=int, default=100_000)
+    search_evaluation.add_argument("--seed", type=int, default=4_620_000_000)
     final = commands.add_parser("finalize")
     final.add_argument("checkpoint")
     final.add_argument("--output", default="target/value/value.bin")
@@ -5526,6 +6833,38 @@ def parser():
     final.add_argument("--seed", type=int, default=29)
     dashboard_parser = commands.add_parser("dashboard")
     dashboard_parser.add_argument("target", nargs="?", default="target")
+    search = commands.add_parser("search-diagnostics")
+    search.add_argument("checkpoint")
+    search.add_argument("--output", default="target/search-diagnostics-v68")
+    search.add_argument("--roots", type=int, default=6)
+    search.add_argument("--envs", type=int, default=64)
+    search.add_argument("--max-steps", type=int, default=2048)
+    search.add_argument("--sample-stride", type=int, default=64)
+    search.add_argument("--simulations", type=int, default=128)
+    search.add_argument("--max-depth", type=int, default=64)
+    search.add_argument("--batch-size", type=int, default=256)
+    search.add_argument("--prior-temperature", type=float, default=1)
+    search.add_argument("--exploration", type=float, default=1.5)
+    search.add_argument("--policy-temperature", type=float, default=.8)
+    search.add_argument("--exact-samples", type=int, default=16)
+    search.add_argument("--max-exact-states", type=int, default=100_000)
+    search.add_argument("--max-pairs", type=int, default=200_000)
+    search.add_argument("--progress-value", action="store_true")
+    search.add_argument("--q-temperature", type=float, default=.002)
+    search.add_argument("--seed", type=int, default=3_200_000_000)
+    compare = commands.add_parser("compare-search")
+    compare.add_argument("input", nargs="+")
+    compare.add_argument("--output", default="target/search-diagnostics-comparison.html")
+    critic = commands.add_parser("critic-diagnostics")
+    critic.add_argument("checkpoint")
+    critic.add_argument("--output", default="target/critic-diagnostics.json")
+    critic.add_argument("--runs", type=int, default=64)
+    critic.add_argument("--batch", type=int, default=32)
+    critic.add_argument("--max-steps", type=int, default=2048)
+    critic.add_argument("--max-combat-steps", type=int, default=512)
+    critic.add_argument("--policy-temperature", type=float, default=.8)
+    critic.add_argument("--precision", choices=PRECISIONS, default="fp32")
+    critic.add_argument("--seed", type=int, default=3_600_000_000)
     commands.add_parser("probe")
     return root
 
@@ -5538,8 +6877,19 @@ if __name__ == "__main__":
         finalize(args)
     elif args.command == "evaluate":
         target = device(); model, _ = load(args.checkpoint, target)
-        print(json.dumps(evaluate(model, args, target), indent=2))
+        report = evaluate(model, args, target)
+        if args.output:
+            immutable_json(Path(args.output), report)
+        print(json.dumps(report, indent=2))
+    elif args.command == "evaluate-search-policies":
+        evaluate_search_policies(args)
     elif args.command == "dashboard":
         dashboard(Path(args.target))
+    elif args.command == "search-diagnostics":
+        diagnose_search(args)
+    elif args.command == "compare-search":
+        compare_search(args)
+    elif args.command == "critic-diagnostics":
+        critic_diagnostics(args)
     else:
         probe()

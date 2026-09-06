@@ -1876,7 +1876,10 @@ fn trace_map(state: &Value, action: &Value, after: &Value) -> Map {
             .collect();
     }
     let current = current_coord.and_then(|coord| coords.get(&coord).copied());
-    Map { nodes, current }
+    Map {
+        nodes: nodes.into(),
+        current,
+    }
 }
 
 fn trace_rewards(

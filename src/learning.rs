@@ -8,14 +8,16 @@ use std::{
     fs,
     hash::{Hash, Hasher},
     io,
+    ops::Deref,
     path::Path,
-    sync::Mutex,
+    sync::{Arc, Mutex, RwLock},
 };
 
 const MAGIC: &[u8; 8] = b"STSVALUE";
 const ACTOR_MAGIC: &[u8; 8] = b"STSACTOR";
 const VERSION: u32 = 55;
-const VALUE_MODEL_VERSION: u32 = 68;
+const VALUE_MODEL_VERSION: u32 = 70;
+const VALUE_CATEGORIES: usize = 83;
 const TOKEN_CATEGORICAL: usize = 10;
 const TOKEN_NUMERIC: usize = 24;
 const TOKEN_VALUES: usize = TOKEN_CATEGORICAL + TOKEN_NUMERIC;
@@ -293,6 +295,32 @@ impl DomainRow {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+enum DomainRows {
+    Owned(Vec<DomainRow>),
+    Shared(Arc<[DomainRow]>),
+}
+
+impl Deref for DomainRows {
+    type Target = [DomainRow];
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Owned(rows) => rows,
+            Self::Shared(rows) => rows,
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a DomainRows {
+    type Item = &'a DomainRow;
+    type IntoIter = std::slice::Iter<'a, DomainRow>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 struct CandidateRow {
     action: Action,
     u: [u32; ACTION_U],
@@ -306,7 +334,7 @@ struct CandidateRow {
 struct ObservationV53 {
     character: u8,
     globals: Vec<f32>,
-    domains: [Vec<DomainRow>; 16],
+    domains: [DomainRows; 16],
     candidates: Vec<CandidateRow>,
     potential: f32,
 }
@@ -1566,6 +1594,19 @@ fn phase_index(phase: &Phase) -> usize {
         Phase::Won => 12,
         Phase::Dead => 13,
     }
+}
+
+fn canonical_progress(game: &Game) -> u8 {
+    let floor = game.run.floor;
+    let progress = match game.run.act {
+        0 | 1 => floor,
+        2 if game.golden_compass == Some(2) => 25 + floor,
+        2 => 25 + floor + u8::from(floor >= 7) + u8::from(floor >= 10),
+        3 => 54 + floor,
+        act => panic!("invalid canonical-progress act {act}"),
+    };
+    assert!(progress <= 72, "canonical progress {progress} exceeds 72");
+    progress
 }
 
 fn card_type_index(card_type: CardType) -> usize {
@@ -4324,6 +4365,15 @@ fn resolved_hits(
 }
 
 fn action_preview(game: &Game, content: &Content, action: &Action) -> Option<CardPreview> {
+    action_preview_resolved(game, content, action, true)
+}
+
+fn action_preview_resolved(
+    game: &Game,
+    content: &Content,
+    action: &Action,
+    resolve: bool,
+) -> Option<CardPreview> {
     let mut preview = match action {
         Action::Play { hand, target } => game
             .combat()?
@@ -4349,6 +4399,9 @@ fn action_preview(game: &Game, content: &Content, action: &Action) -> Option<Car
         }
         _ => None,
     }?;
+    if !resolve {
+        return Some(preview);
+    }
     if game.replaying {
         let mut live = game.clone();
         live.replaying = false;
@@ -6165,7 +6218,7 @@ fn state_entity_tokens(game: &Game, content: &Content, layout: Layout) -> Vec<To
         ));
     }
 
-    for node in &game.map.nodes {
+    for node in game.map.nodes.iter() {
         let mut row = token(
             MAP_COLLECTION,
             0,
@@ -6743,9 +6796,38 @@ fn target_index(target: Target) -> u32 {
     }
 }
 
+struct CardEncoding {
+    masters: HashMap<u32, usize>,
+    cost_relics: (bool, bool),
+    previews: HashMap<Card, [i32; 6]>,
+}
+
+impl CardEncoding {
+    fn new(game: &Game, content: &Content) -> Self {
+        let mut gauntlets = false;
+        let mut scarf = false;
+        for &id in &game.run.relics {
+            gauntlets |= content.relics[id as usize].id == "RELIC.SPIKED_GAUNTLETS";
+            scarf |= content.relics[id as usize].id == "RELIC.BRILLIANT_SCARF";
+        }
+        Self {
+            masters: master_cards(&game.run.deck),
+            cost_relics: (
+                gauntlets,
+                scarf
+                    && game
+                        .combat()
+                        .is_some_and(|combat| combat.history.manual_plays == 4),
+            ),
+            previews: HashMap::new(),
+        }
+    }
+}
+
 fn card_domain_row(
     game: &Game,
     content: &Content,
+    encoding: &mut CardEncoding,
     scope: i32,
     zone: u32,
     role: u32,
@@ -6755,41 +6837,21 @@ fn card_domain_row(
     context: i32,
 ) -> DomainRow {
     let def = content.cards[card.id as usize];
-    let masters = master_cards(&game.run.deck);
     let combat_dampened = game
         .combat()
         .map_or(&[][..], |combat| combat.dampened.as_slice());
-    let (master, _) = card_relation(card, &game.run.deck, &masters, combat_dampened);
-    let dampened = game
-        .combat()
-        .and_then(|combat| {
-            combat
-                .dampened
-                .iter()
-                .find(|(instance, _)| *instance == card.instance)
-        })
-        .map_or(0, |(_, upgrades)| *upgrades as u32 + 1);
+    let (master, dampened) =
+        card_relation(card, &game.run.deck, &encoding.masters, combat_dampened);
     let energy = game
         .combat()
         .map_or(game.run.energy as i16, |combat| combat.energy);
     let effective_cost = game.combat().map_or_else(
         || crate::game::card_cost(card, def, energy),
         |combat| {
-            let gauntlets = game
-                .run
-                .relics
-                .iter()
-                .any(|&id| content.relics[id as usize].id == "RELIC.SPIKED_GAUNTLETS");
-            if game
-                .run
-                .relics
-                .iter()
-                .any(|&id| content.relics[id as usize].id == "RELIC.BRILLIANT_SCARF")
-                && combat.history.manual_plays == 4
-            {
+            if encoding.cost_relics.1 {
                 0
             } else {
-                crate::game::energy_cost(combat, card, def, gauntlets)
+                crate::game::energy_cost(combat, card, def, encoding.cost_relics.0)
             }
         },
     );
@@ -6797,7 +6859,44 @@ fn card_domain_row(
         def.star_cost[card.upgrades.min(1) as usize] as i16,
         |combat| crate::game::star_cost(combat, card, def),
     );
-    let preview = card_preview(game, content, card, None);
+    let preview = *encoding.previews.entry(card).or_insert_with(|| {
+        let preview = card_preview(game, content, card, None);
+        [
+            preview
+                .outcome
+                .block
+                .unwrap_or(preview.block as f32)
+                .round() as i32,
+            preview
+                .hits
+                .iter()
+                .filter(|hit| {
+                    matches!(
+                        hit.target,
+                        PreviewTarget::Chosen | PreviewTarget::Random | PreviewTarget::Lowest
+                    )
+                })
+                .map(|&hit| preview_damage(game, content, hit) as i32)
+                .sum(),
+            preview
+                .hits
+                .iter()
+                .filter(|hit| matches!(hit.target, PreviewTarget::All | PreviewTarget::Other))
+                .map(|&hit| preview_damage(game, content, hit) as i32)
+                .sum(),
+            preview.outcome.draw.unwrap_or(preview.draw as f32).round() as i32,
+            preview
+                .outcome
+                .discard
+                .unwrap_or(preview.discard as f32)
+                .round() as i32,
+            preview
+                .outcome
+                .exhaust
+                .unwrap_or(preview.exhaust as f32)
+                .round() as i32,
+        ]
+    });
     let mut row = DomainRow::new(CARD_DOMAIN, scope);
     row.u.copy_from_slice(&[
         zone,
@@ -6813,7 +6912,7 @@ fn card_domain_row(
         card.cost_override.is_some() as u32,
         card.enchantment.map_or(0, |value| value as u32 + 1),
         card.variant as u32,
-        dampened,
+        dampened as u32,
         card.card_type(def) as u32,
         def.rarity as u32,
         target_index(card.target(def)),
@@ -6831,39 +6930,12 @@ fn card_domain_row(
         def.star_cost[card.upgrades.min(1) as usize] as i32,
         effective_cost as i32,
         effective_star as i32,
-        preview
-            .outcome
-            .block
-            .unwrap_or(preview.block as f32)
-            .round() as i32,
-        preview
-            .hits
-            .iter()
-            .filter(|hit| {
-                matches!(
-                    hit.target,
-                    PreviewTarget::Chosen | PreviewTarget::Random | PreviewTarget::Lowest
-                )
-            })
-            .map(|&hit| preview_damage(game, content, hit) as i32)
-            .sum(),
-        preview
-            .hits
-            .iter()
-            .filter(|hit| matches!(hit.target, PreviewTarget::All | PreviewTarget::Other))
-            .map(|&hit| preview_damage(game, content, hit) as i32)
-            .sum(),
-        preview.outcome.draw.unwrap_or(preview.draw as f32).round() as i32,
-        preview
-            .outcome
-            .discard
-            .unwrap_or(preview.discard as f32)
-            .round() as i32,
-        preview
-            .outcome
-            .exhaust
-            .unwrap_or(preview.exhaust as f32)
-            .round() as i32,
+        preview[0],
+        preview[1],
+        preview[2],
+        preview[3],
+        preview[4],
+        preview[5],
         context,
     ]);
     row
@@ -6873,6 +6945,7 @@ fn push_cards(
     domains: &mut [Vec<DomainRow>; 16],
     game: &Game,
     content: &Content,
+    encoding: &mut CardEncoding,
     scope: i32,
     zone: u32,
     role: u32,
@@ -6880,16 +6953,22 @@ fn push_cards(
 ) {
     domains[CARD_DOMAIN].extend(cards.into_iter().map(|(order_kind, order, card, context)| {
         card_domain_row(
-            game, content, scope, zone, role, order_kind, order, card, context,
+            game, content, encoding, scope, zone, role, order_kind, order, card, context,
         )
     }));
 }
 
-fn state_card_domains(game: &Game, content: &Content, domains: &mut [Vec<DomainRow>; 16]) {
+fn state_card_domains(
+    game: &Game,
+    content: &Content,
+    encoding: &mut CardEncoding,
+    domains: &mut [Vec<DomainRow>; 16],
+) {
     push_cards(
         domains,
         game,
         content,
+        encoding,
         STATE_SCOPE,
         DECK_ZONE as u32,
         0,
@@ -6906,6 +6985,7 @@ fn state_card_domains(game: &Game, content: &Content, domains: &mut [Vec<DomainR
                     domains,
                     game,
                     content,
+                    encoding,
                     STATE_SCOPE,
                     zone as u32,
                     0,
@@ -6921,6 +7001,7 @@ fn state_card_domains(game: &Game, content: &Content, domains: &mut [Vec<DomainR
                 domains,
                 game,
                 content,
+                encoding,
                 STATE_SCOPE,
                 DRAW_ZONE as u32,
                 0,
@@ -7058,7 +7139,9 @@ fn phase_domain_row(game: &Game, content: &Content) -> DomainRow {
     row
 }
 
-fn canonical_map(game: &Game) -> (Vec<DomainRow>, Vec<DomainRow>, Vec<u32>, u32) {
+type CanonicalMap = (Arc<[DomainRow]>, Arc<[DomainRow]>, Arc<[u32]>, u32);
+
+fn canonical_map(game: &Game, content: &Content, layout: Layout) -> CanonicalMap {
     let mut order = (0..game.map.nodes.len()).collect::<Vec<_>>();
     order.sort_by_key(|&index| {
         let node = &game.map.nodes[index];
@@ -7143,16 +7226,22 @@ fn canonical_map(game: &Game) -> (Vec<DomainRow>, Vec<DomainRow>, Vec<u32>, u32)
             *counts.entry((0, ids[index])).or_insert(0) += 1;
         }
     }
-    let edges = counts
+    let mut edges = counts
         .into_iter()
         .map(|((src, dst), multiplicity)| {
             let mut row = DomainRow::new(MAP_EDGE_DOMAIN, STATE_SCOPE);
             row.u[..3].copy_from_slice(&[src, dst, multiplicity]);
             row
         })
-        .collect();
+        .collect::<Vec<_>>();
+    for row in &mut nodes {
+        populate_domain_features(game, content, layout, MAP_NODE_DOMAIN, row);
+    }
+    for row in &mut edges {
+        populate_domain_features(game, content, layout, MAP_EDGE_DOMAIN, row);
+    }
     let current = game.map.current.map_or(0, |index| ids[index]);
-    (nodes, edges, ids, current)
+    (nodes.into(), edges.into(), ids.into(), current)
 }
 
 fn run_domain_row(game: &Game, bonuses: (i16, i16), current: u32) -> DomainRow {
@@ -7201,7 +7290,12 @@ fn run_domain_row(game: &Game, bonuses: (i16, i16), current: u32) -> DomainRow {
     row
 }
 
-fn push_actor_domains(game: &Game, content: &Content, domains: &mut [Vec<DomainRow>; 16]) {
+fn push_actor_domains(
+    game: &Game,
+    content: &Content,
+    encoding: &CardEncoding,
+    domains: &mut [Vec<DomainRow>; 16],
+) {
     let Some(combat) = game.combat() else { return };
     let mut actor = |owner: u32, kind: u32, creature: &Creature, enemy: Option<&Enemy>| {
         let mut row = DomainRow::new(ACTOR_DOMAIN, STATE_SCOPE);
@@ -7371,6 +7465,7 @@ fn push_actor_domains(game: &Game, content: &Content, domains: &mut [Vec<DomainR
         domains[STATUS_DOMAIN].push(card_status_domain_row(
             game,
             content,
+            encoding,
             1,
             order,
             card,
@@ -7381,6 +7476,7 @@ fn push_actor_domains(game: &Game, content: &Content, domains: &mut [Vec<DomainR
         domains[STATUS_DOMAIN].push(card_status_domain_row(
             game,
             content,
+            encoding,
             HISTORY_COURSE_STATUS,
             0,
             card,
@@ -7419,6 +7515,7 @@ fn push_actor_domains(game: &Game, content: &Content, domains: &mut [Vec<DomainR
 fn card_status_domain_row(
     game: &Game,
     content: &Content,
+    encoding: &CardEncoding,
     kind: u32,
     order: usize,
     card: Card,
@@ -7426,8 +7523,8 @@ fn card_status_domain_row(
 ) -> DomainRow {
     let def = content.cards[card.id as usize];
     let combat = game.combat().unwrap();
-    let masters = master_cards(&game.run.deck);
-    let (master, dampened) = card_relation(card, &game.run.deck, &masters, &combat.dampened);
+    let (master, dampened) =
+        card_relation(card, &game.run.deck, &encoding.masters, &combat.dampened);
     let mut row = DomainRow::new(STATUS_DOMAIN, STATE_SCOPE);
     row.u.copy_from_slice(&[
         1,
@@ -8737,7 +8834,14 @@ fn continuation_domains(game: &Game, content: &Content) -> Vec<DomainRow> {
     out.rows
 }
 
-fn candidate_card(game: &Game, content: &Content, scope: i32, action: &Action) -> Vec<DomainRow> {
+fn candidate_card(
+    game: &Game,
+    content: &Content,
+    encoding: &mut CardEncoding,
+    layout: Layout,
+    scope: i32,
+    action: &Action,
+) -> Option<DomainRow> {
     let Some((zone, role, order_kind, order, card, context)) = (match action {
         Action::Play { hand, .. } => game.combat().and_then(|combat| {
             combat
@@ -8817,7 +8921,7 @@ fn candidate_card(game: &Game, content: &Content, scope: i32, action: &Action) -
         Action::EventCard(index, card) => {
             Some((ATTACHED_CARD_ZONE as u32, 7, 0, *index as u32 + 1, *card, 0))
         }
-        Action::Event(_) if matches!(&game.phase, Phase::Event(id, _) if Some(*id) == Layout::new(content).slippery_bridge) => {
+        Action::Event(_) if matches!(&game.phase, Phase::Event(id, _) if Some(*id) == layout.slippery_bridge) => {
             game.run
                 .deck
                 .iter()
@@ -8827,30 +8931,34 @@ fn candidate_card(game: &Game, content: &Content, scope: i32, action: &Action) -
         }
         _ => None,
     }) else {
-        return Vec::new();
+        return None;
     };
-    vec![card_domain_row(
-        game, content, scope, zone, role, order_kind, order, card, context,
-    )]
+    Some(card_domain_row(
+        game, content, encoding, scope, zone, role, order_kind, order, card, context,
+    ))
 }
 
 fn candidate_domain_rows(
+    domains: &mut [Vec<DomainRow>; 16],
     game: &Game,
     content: &Content,
+    encoding: &mut CardEncoding,
     layout: Layout,
     scope: i32,
     action: &Action,
-) -> [Vec<DomainRow>; 16] {
-    let mut out = std::array::from_fn(|_| Vec::new());
-    out[CARD_DOMAIN].extend(candidate_card(game, content, scope, action));
+) {
+    if let Some(row) = candidate_card(game, content, encoding, layout, scope, action) {
+        domains[CARD_DOMAIN].push(row);
+    }
     if let Action::Choose(index) = action
         && let Phase::ChooseBundles(bundles) = &game.phase
         && let Some(cards) = bundles.get(*index)
     {
-        out[CARD_DOMAIN].extend(cards.iter().copied().enumerate().map(|(order, card)| {
+        domains[CARD_DOMAIN].extend(cards.iter().copied().enumerate().map(|(order, card)| {
             card_domain_row(
                 game,
                 content,
+                encoding,
                 scope,
                 ATTACHED_CARD_ZONE as u32,
                 9,
@@ -8866,7 +8974,7 @@ fn candidate_domain_rows(
             if let Some(Some(id)) = game.run.potions.get(*slot) {
                 let mut row = DomainRow::new(POTION_DOMAIN, scope);
                 row.u[..5].copy_from_slice(&[2, *slot as u32, *id as u32 + 1, 0, *slot as u32 + 1]);
-                out[POTION_DOMAIN].push(row);
+                domains[POTION_DOMAIN].push(row);
             }
         }
         Action::RewardRelic(index) => {
@@ -8884,7 +8992,7 @@ fn candidate_domain_rows(
                     *index as u32 + 1,
                     crate::game::relic_group(id).unwrap_or(4) as u32,
                 ]);
-                out[RELIC_DOMAIN].push(row);
+                domains[RELIC_DOMAIN].push(row);
             }
         }
         Action::RewardPotion(index) => {
@@ -8893,7 +9001,7 @@ fn candidate_domain_rows(
             {
                 let mut row = DomainRow::new(POTION_DOMAIN, scope);
                 row.u[..5].copy_from_slice(&[3, u32::MAX, id as u32 + 1, 0, *index as u32 + 1]);
-                out[POTION_DOMAIN].push(row);
+                domains[POTION_DOMAIN].push(row);
             }
         }
         Action::Buy(index) => {
@@ -8910,7 +9018,7 @@ fn candidate_domain_rows(
                             crate::game::relic_group(*id).unwrap_or(4) as u32,
                         ]);
                         row.s[0] = *price;
-                        out[RELIC_DOMAIN].push(row);
+                        domains[RELIC_DOMAIN].push(row);
                     }
                     ShopItem::Potion(id, price) => {
                         let mut row = DomainRow::new(POTION_DOMAIN, scope);
@@ -8922,13 +9030,13 @@ fn candidate_domain_rows(
                             *index as u32 + 1,
                         ]);
                         row.s[0] = *price;
-                        out[POTION_DOMAIN].push(row);
+                        domains[POTION_DOMAIN].push(row);
                     }
                     ShopItem::Remove(price) => {
                         let mut continuation = ContinuationBuilder::for_game(game, scope);
                         let item = continuation.row(8, 7, NO_NODE, 0, 0, 0, 0, 0);
                         continuation.rows[item].s[0] = *price;
-                        out[CONTINUATION_DOMAIN].extend(continuation.rows);
+                        domains[CONTINUATION_DOMAIN].extend(continuation.rows);
                     }
                     ShopItem::Card(..) => {}
                 }
@@ -8945,11 +9053,11 @@ fn candidate_domain_rows(
                     payload.is_some() as u32,
                 ]);
                 event.s[0] = payload.unwrap_or_default();
-                out[EVENT_DOMAIN].push(event);
+                domains[EVENT_DOMAIN].push(event);
                 if let Some(option) = options.get(*index) {
                     let mut continuation = ContinuationBuilder::for_game(game, scope);
                     continuation.option(*option, content, NO_NODE, 0, *index as u32);
-                    out[CONTINUATION_DOMAIN].extend(continuation.rows);
+                    domains[CONTINUATION_DOMAIN].extend(continuation.rows);
                 }
                 if let Some(id) = ancient_offer(game, content, *index) {
                     let mut row = DomainRow::new(RELIC_DOMAIN, scope);
@@ -8959,7 +9067,7 @@ fn candidate_domain_rows(
                         *index as u32 + 1,
                         crate::game::relic_group(id).unwrap_or(4) as u32,
                     ]);
-                    out[RELIC_DOMAIN].push(row);
+                    domains[RELIC_DOMAIN].push(row);
                 }
                 if content.events[*id as usize].id == "EVENT.RANWID_THE_ELDER"
                     && *index == 2
@@ -8973,7 +9081,7 @@ fn candidate_domain_rows(
                         owned + 1,
                         crate::game::relic_group(id).unwrap_or(4) as u32,
                     ]);
-                    out[RELIC_DOMAIN].push(row);
+                    domains[RELIC_DOMAIN].push(row);
                 }
                 if Some(*id) == layout.relic_trader {
                     for (kind, id) in [
@@ -8994,7 +9102,7 @@ fn candidate_domain_rows(
                             *index as u32 + 1,
                             crate::game::relic_group(id).unwrap_or(4) as u32,
                         ]);
-                        out[RELIC_DOMAIN].push(row);
+                        domains[RELIC_DOMAIN].push(row);
                     }
                 }
             }
@@ -9002,12 +9110,12 @@ fn candidate_domain_rows(
         Action::CrystalCell(x, y) => {
             let mut row = DomainRow::new(CRYSTAL_DOMAIN, scope);
             row.u[..3].copy_from_slice(&[2, *x as u32, *y as u32]);
-            out[CRYSTAL_DOMAIN].push(row);
+            domains[CRYSTAL_DOMAIN].push(row);
         }
         Action::CrystalTool(big) => {
             let mut row = DomainRow::new(CRYSTAL_DOMAIN, scope);
             row.u[..2].copy_from_slice(&[3, *big as u32]);
-            out[CRYSTAL_DOMAIN].push(row);
+            domains[CRYSTAL_DOMAIN].push(row);
         }
         Action::EventRelic(index, id) => {
             let mut row = DomainRow::new(RELIC_DOMAIN, scope);
@@ -9017,7 +9125,7 @@ fn candidate_domain_rows(
                 *index as u32 + 1,
                 crate::game::relic_group(*id).unwrap_or(4) as u32,
             ]);
-            out[RELIC_DOMAIN].push(row);
+            domains[RELIC_DOMAIN].push(row);
         }
         Action::RerollCards => {
             if let Phase::Rewards(rewards) = &game.phase {
@@ -9043,12 +9151,11 @@ fn candidate_domain_rows(
                         }
                     }
                 }
-                out[CONTINUATION_DOMAIN].extend(continuation.rows);
+                domains[CONTINUATION_DOMAIN].extend(continuation.rows);
             }
         }
         _ => {}
     }
-    out
 }
 
 fn action_features(u: &[u32; ACTION_U], s: &[i32; ACTION_S]) -> [f32; ACTION_F] {
@@ -9091,6 +9198,13 @@ fn action_features(u: &[u32; ACTION_U], s: &[i32; ACTION_S]) -> [f32; ACTION_F] 
 }
 
 fn packed_observation(row: &ObservationV53) -> (Vec<f32>, Vec<u32>, Vec<u32>, Vec<u32>, u64) {
+    packed_observation_known(row, None)
+}
+
+fn packed_observation_known(
+    row: &ObservationV53,
+    known_digest: Option<u64>,
+) -> (Vec<f32>, Vec<u32>, Vec<u32>, Vec<u32>, u64) {
     let mut counts = Vec::with_capacity(DOMAIN_NAMES.len());
     let mut exact = Vec::new();
     let mut actions = Vec::new();
@@ -9111,7 +9225,9 @@ fn packed_observation(row: &ObservationV53) -> (Vec<f32>, Vec<u32>, Vec<u32>, Ve
         actions.extend(candidate.f.map(f32::to_bits));
         actions.push(candidate.legal as u32);
     }
-    let digest = packed_observation_digest(row.character, &row.globals, &counts, &exact, &actions);
+    let digest = known_digest.unwrap_or_else(|| {
+        packed_observation_digest(row.character, &row.globals, &counts, &exact, &actions)
+    });
     (row.globals.clone(), counts, exact, actions, digest)
 }
 
@@ -9136,6 +9252,45 @@ fn packed_observation_digest(
     for values in [counts, exact, actions] {
         update(values.len() as u32);
         values.iter().copied().for_each(&mut update);
+    }
+    digest
+}
+
+fn observation_digest(row: &ObservationV53) -> u64 {
+    let mut digest = 0xcbf2_9ce4_8422_2325u64;
+    let mut update = |value: u32| {
+        digest = (digest ^ value as u64).wrapping_mul(0x100_0000_01b3);
+    };
+    update(VERSION);
+    update(VALUE_MODEL_VERSION);
+    update(row.character as u32);
+    update(row.globals.len() as u32);
+    row.globals.iter().for_each(|value| update(value.to_bits()));
+    update(row.domains.len() as u32);
+    row.domains
+        .iter()
+        .for_each(|domain| update(domain.len() as u32));
+    update(
+        row.domains
+            .iter()
+            .flatten()
+            .map(|record| record.u.len() + record.s.len() + record.c.len() + record.f.len() + 1)
+            .sum::<usize>() as u32,
+    );
+    for record in row.domains.iter().flatten() {
+        record.u.iter().copied().for_each(&mut update);
+        record.s.iter().for_each(|value| update(*value as u32));
+        record.c.iter().copied().for_each(&mut update);
+        record.f.iter().for_each(|value| update(value.to_bits()));
+        update(record.scope as u32);
+    }
+    update((row.candidates.len() * (ACTION_U + ACTION_S + ACTION_C + ACTION_F + 1)) as u32);
+    for candidate in &row.candidates {
+        candidate.u.iter().copied().for_each(&mut update);
+        candidate.s.iter().for_each(|value| update(*value as u32));
+        candidate.c.iter().copied().for_each(&mut update);
+        candidate.f.iter().for_each(|value| update(value.to_bits()));
+        update(candidate.legal as u32);
     }
     digest
 }
@@ -9251,7 +9406,7 @@ fn action_row(
         semantic.push(layout.semantic(Semantic::RunKind, 28));
     }
     row.c[..semantic.len()].copy_from_slice(&semantic);
-    let preview = action_preview(game, content, action);
+    let preview = action_preview_resolved(game, content, action, legal);
     let values = action_preview_values(game, content, action, preview.as_ref());
     let (energy, stars) = game
         .combat()
@@ -9295,14 +9450,25 @@ fn observation_v53(
     layout: Layout,
     bonuses: (i16, i16),
 ) -> ObservationV53 {
-    let (nodes, edges, map_ids, current) = canonical_map(game);
+    observation_v53_with_map(game, content, layout, bonuses, None)
+}
+
+fn observation_v53_with_map(
+    game: &Game,
+    content: &Content,
+    layout: Layout,
+    bonuses: (i16, i16),
+    map: Option<&CanonicalMap>,
+) -> ObservationV53 {
+    let (nodes, edges, map_ids, current) = map
+        .cloned()
+        .unwrap_or_else(|| canonical_map(game, content, layout));
     let mut domains: [Vec<DomainRow>; 16] = std::array::from_fn(|_| Vec::new());
     domains[RUN_DOMAIN].push(run_domain_row(game, bonuses, current));
     domains[PHASE_DOMAIN].push(phase_domain_row(game, content));
-    domains[MAP_NODE_DOMAIN] = nodes;
-    domains[MAP_EDGE_DOMAIN] = edges;
-    state_card_domains(game, content, &mut domains);
-    push_actor_domains(game, content, &mut domains);
+    let mut card_encoding = CardEncoding::new(game, content);
+    state_card_domains(game, content, &mut card_encoding, &mut domains);
+    push_actor_domains(game, content, &card_encoding, &mut domains);
     push_collection_domains(game, content, layout, &mut domains);
     domains[CONTINUATION_DOMAIN] = continuation_domains(game, content);
     let (actions, legal) = candidate_actions(game, content);
@@ -9313,15 +9479,21 @@ fn observation_v53(
         .map(|(action, &legal)| action_row(game, content, layout, &map_ids, action, legal))
         .collect::<Vec<_>>();
     for (scope, action) in actions.iter().enumerate() {
-        for (domain, rows) in candidate_domain_rows(game, content, layout, scope as i32, action)
-            .into_iter()
-            .enumerate()
-        {
-            domains[domain].extend(rows);
-        }
+        candidate_domain_rows(
+            &mut domains,
+            game,
+            content,
+            &mut card_encoding,
+            layout,
+            scope as i32,
+            action,
+        );
     }
     for (domain, rows) in domains.iter_mut().enumerate() {
-        if domain != CONTINUATION_DOMAIN {
+        if !matches!(
+            domain,
+            CONTINUATION_DOMAIN | MAP_NODE_DOMAIN | MAP_EDGE_DOMAIN
+        ) {
             rows.sort_by(|left, right| {
                 left.scope
                     .cmp(&right.scope)
@@ -9333,6 +9505,9 @@ fn observation_v53(
             populate_domain_features(game, content, layout, domain, row);
         }
     }
+    let mut domains = domains.map(DomainRows::Owned);
+    domains[MAP_NODE_DOMAIN] = DomainRows::Shared(nodes);
+    domains[MAP_EDGE_DOMAIN] = DomainRows::Shared(edges);
     ObservationV53 {
         character: game.run.character as u8,
         globals: observation_globals_with_bonuses(game, content, layout, bonuses, true),
@@ -9495,6 +9670,37 @@ fn resample_hidden(game: &mut Game, content: &Content, seed: u64) {
         if !bosses.is_empty() {
             game.bosses[1] = Some(bosses[rng.next() as usize % bosses.len()]);
         }
+    }
+}
+
+fn resample_combat_hidden(game: &mut Game, seed: u64) {
+    canonicalize_combat_hidden(game);
+    resample_canonical_combat_hidden(game, seed);
+}
+
+fn canonicalize_combat_hidden(game: &mut Game) {
+    if let Phase::Combat(combat) = &mut game.phase
+        && combat.choice.is_none()
+    {
+        let (top, bottom) = (combat.known_draw_top, combat.known_draw_bottom);
+        let end = combat.draw.len() - top;
+        combat.draw[bottom..end].sort_by_key(|card| (card_key(card), card.instance));
+    }
+}
+
+fn resample_canonical_combat_hidden(game: &mut Game, seed: u64) {
+    game.seed = seed as u32;
+    game.rngs = Rngs::from_seed(seed);
+    if game.event_rng.is_some() {
+        game.event_rng = Some(Rng::from_seed(seed ^ 0x4556_454e_5452_4e47));
+    }
+    if let Phase::Combat(combat) = &mut game.phase
+        && combat.choice.is_none()
+    {
+        let (top, bottom) = (combat.known_draw_top, combat.known_draw_bottom);
+        let end = combat.draw.len() - top;
+        let unknown = &mut combat.draw[bottom..end];
+        Rng::from_seed(seed ^ 0x4849_4444_454e_524e).shuffle(unknown);
     }
 }
 
@@ -10199,7 +10405,10 @@ impl SemanticEncoderWeights {
     }
 
     fn encode(&self, semantic: &[u32], numeric: &[f32], table: &[f32], width: usize) -> Vec<f32> {
-        let mut out = self.numeric.apply(numeric);
+        self.finish(semantic, table, width, self.numeric.apply(numeric))
+    }
+
+    fn finish(&self, semantic: &[u32], table: &[f32], width: usize, mut out: Vec<f32>) -> Vec<f32> {
         out.iter_mut()
             .zip(&self.bias)
             .for_each(|(value, bias)| *value += bias);
@@ -10290,17 +10499,16 @@ pub struct ValueModel {
     menu_norm_w: Vec<f32>,
     menu_norm_b: Vec<f32>,
     menu_empty: Vec<f32>,
-    value_hidden: LinearWeights,
-    value: LinearWeights,
+    critic_hidden: LinearWeights,
+    critic: LinearWeights,
     policy_hidden: Option<LinearWeights>,
+    policy_split: Option<(Vec<f32>, Vec<f32>)>,
     policy: Option<LinearWeights>,
-    progress_hidden: Option<LinearWeights>,
-    progress: Option<LinearWeights>,
     temperature: f32,
     bias: f32,
     encode_caches: Vec<Mutex<EncodingCache>>,
-    card_cache: Mutex<std::collections::BTreeMap<Vec<u8>, Vec<f32>>>,
-    map_cache: Mutex<std::collections::BTreeMap<Vec<u8>, MapEncoding>>,
+    card_cache: RwLock<std::collections::BTreeMap<Vec<u8>, Vec<f32>>>,
+    map_cache: RwLock<std::collections::BTreeMap<Vec<u8>, MapEncoding>>,
 }
 
 type MapEncoding = std::collections::BTreeMap<u32, Vec<f32>>;
@@ -10310,12 +10518,22 @@ struct EncodingCache {
     groups: HashMap<(usize, u64, u64), Vec<f32>>,
 }
 
+struct CandidateParts {
+    semantic: [u32; ACTION_C],
+    numeric: [f32; ACTION_F],
+    legal: bool,
+    pooled: [f32; MODEL_WIDTH],
+    path: Option<Vec<f32>>,
+    target: Option<Vec<f32>>,
+    count: usize,
+}
+
 struct StateParts {
     state: Vec<f32>,
     groups: [Vec<Vec<f32>>; MODEL_ENTITY_SUMMARIES],
     summaries: [Option<Vec<f32>>; MODEL_ENTITY_SUMMARIES],
     current: Vec<f32>,
-    actions: Vec<Vec<f32>>,
+    candidates: Vec<CandidateParts>,
 }
 
 impl ValueModel {
@@ -10438,10 +10656,10 @@ impl ValueModel {
         let menu_norm_w = read_f32s(&mut input, width)?;
         let menu_norm_b = read_f32s(&mut input, width)?;
         let menu_empty = read_f32s(&mut input, width)?;
-        let value_hidden = LinearWeights::read(&mut input, state_width, head_width)?;
-        let value = LinearWeights::read(&mut input, head_width, 1)?;
-        let (policy_hidden, policy, progress_hidden, progress) = if input.is_empty() {
-            (None, None, None, None)
+        let critic_hidden = LinearWeights::read(&mut input, state_width, head_width)?;
+        let critic = LinearWeights::read(&mut input, head_width, VALUE_CATEGORIES)?;
+        let (policy_hidden, policy) = if input.is_empty() {
+            (None, None)
         } else {
             if take_bytes(&mut input, ACTOR_MAGIC.len())? != ACTOR_MAGIC {
                 return Err(invalid("invalid actor model data"));
@@ -10453,13 +10671,20 @@ impl ValueModel {
                     head_width,
                 )?),
                 Some(LinearWeights::read(&mut input, head_width, 1)?),
-                Some(LinearWeights::read(&mut input, state_width, head_width)?),
-                Some(LinearWeights::read(&mut input, head_width, 1)?),
             )
         };
         if !input.is_empty() {
             return Err(invalid("trailing value model data"));
         }
+        let policy_split = policy_hidden.as_ref().map(|weights| {
+            let mut state = Vec::with_capacity(head_width * state_width);
+            let mut action = Vec::with_capacity(head_width * width);
+            for row in weights.w.chunks_exact(state_width + width) {
+                state.extend(&row[..state_width]);
+                action.extend(&row[state_width..]);
+            }
+            (state, action)
+        });
         Ok(Self {
             layout: Layout::new(content),
             width,
@@ -10515,17 +10740,16 @@ impl ValueModel {
             menu_norm_w,
             menu_norm_b,
             menu_empty,
-            value_hidden,
-            value,
+            critic_hidden,
+            critic,
             policy_hidden,
+            policy_split,
             policy,
-            progress_hidden,
-            progress,
             temperature,
             bias,
             encode_caches: (0..16).map(|_| Mutex::default()).collect(),
-            card_cache: Mutex::default(),
-            map_cache: Mutex::default(),
+            card_cache: RwLock::default(),
+            map_cache: RwLock::default(),
         })
     }
 
@@ -10771,7 +10995,7 @@ impl ValueModel {
 
     fn map(
         &self,
-        domains: &[Vec<DomainRow>; 16],
+        domains: &[DomainRows; 16],
         current: u32,
         cache: &mut EncodingCache,
     ) -> (Vec<f32>, MapEncoding) {
@@ -10796,7 +11020,7 @@ impl ValueModel {
                     .for_each(|value| key.extend(value.to_le_bytes()));
             }
         }
-        let cached = self.map_cache.lock().unwrap().get(&key).cloned();
+        let cached = self.map_cache.read().unwrap().get(&key).cloned();
         let nodes = cached.unwrap_or_else(|| {
             let mut nodes = node_rows
                 .iter()
@@ -10869,7 +11093,7 @@ impl ValueModel {
                     nodes.insert(id, value);
                 }
             }
-            let mut cache = self.map_cache.lock().unwrap();
+            let mut cache = self.map_cache.write().unwrap();
             if cache.len() == 1_024 {
                 cache.clear();
             }
@@ -10961,80 +11185,125 @@ impl ValueModel {
             .collect()
     }
 
-    fn candidate(
+    fn candidate_input(
         &self,
         observation: &ObservationV53,
         index: usize,
         actors: &std::collections::BTreeMap<u32, (u32, Vec<f32>)>,
+        targets: &mut std::collections::BTreeMap<u32, Vec<f32>>,
         nodes: &MapEncoding,
         cache: &mut EncodingCache,
-    ) -> Vec<f32> {
+        defer_adapters: bool,
+    ) -> CandidateParts {
         let candidate = &observation.candidates[index];
-        let mut base = self.action_encoder.encode(
-            &candidate.c,
-            &candidate.f,
-            &self.semantic_embedding,
-            self.width,
-        );
-        for (value, legal) in base
-            .iter_mut()
-            .zip(&self.action_legal[candidate.legal as usize * self.width..][..self.width])
-        {
-            *value += legal;
-        }
-        let mut pooled = vec![0.0; self.width];
+        let mut pooled = [0.0; MODEL_WIDTH];
+        let mut sum = [0.0; MODEL_WIDTH];
         let mut count = 1usize;
         for domain in 0..DOMAIN_NAMES.len() {
-            let values = if domain == CONTINUATION_DOMAIN {
-                self.continuations(
+            sum.fill(0.0);
+            let domain_count = if domain == CONTINUATION_DOMAIN {
+                let values = self.continuations(
                     observation.domains[domain]
                         .iter()
                         .filter(|row| row.scope == index as i32)
                         .collect(),
                     cache,
-                )
+                );
+                for value in &values {
+                    sum.iter_mut()
+                        .zip(value)
+                        .for_each(|(sum, value)| *sum += value);
+                }
+                values.len()
             } else {
-                observation.domains[domain]
+                let mut count = 0;
+                for row in observation.domains[domain]
                     .iter()
                     .filter(|row| row.scope == index as i32)
-                    .map(|row| self.encode(cache, domain, row))
-                    .collect()
-            };
-            let domain_count = values.len();
-            let mut sum = vec![0.0; self.width];
-            for value in values {
-                for (sum, value) in sum.iter_mut().zip(value) {
-                    *sum += value;
+                {
+                    count += 1;
+                    sum.iter_mut()
+                        .zip(self.encode(cache, domain, row))
+                        .for_each(|(sum, value)| *sum += value);
                 }
-            }
+                count
+            };
             for column in 0..self.width {
                 pooled[column] += sum[column] * self.candidate_scale[domain * self.width + column]
                     + domain_count as f32 * self.candidate_bias[domain * self.width + column];
             }
             count += domain_count;
         }
-        if candidate.u[4] != NO_NODE {
-            let path = self.path_adapter.apply(&nodes[&candidate.u[4]]);
-            pooled
-                .iter_mut()
-                .zip(path)
-                .for_each(|(sum, value)| *sum += value);
+        let path = (candidate.u[4] != NO_NODE).then(|| nodes[&candidate.u[4]].clone());
+        if let Some(path) = &path {
+            if !defer_adapters {
+                pooled
+                    .iter_mut()
+                    .zip(self.path_adapter.apply(path))
+                    .for_each(|(sum, value)| *sum += value);
+            }
             count += 1;
         }
-        if candidate.u[1] != 0 {
-            let target = self.target_adapter.apply(&actors[&candidate.u[1]].1);
-            pooled
-                .iter_mut()
-                .zip(target)
-                .for_each(|(sum, value)| *sum += value);
+        let target = (candidate.u[1] != 0).then(|| actors[&candidate.u[1]].1.clone());
+        if let Some(target) = &target {
+            if !defer_adapters {
+                let target = targets
+                    .entry(candidate.u[1])
+                    .or_insert_with(|| self.target_adapter.apply(target));
+                pooled
+                    .iter_mut()
+                    .zip(target.iter())
+                    .for_each(|(sum, value)| *sum += value);
+            }
             count += 1;
         }
-        let divisor = (count as f32).sqrt();
-        pooled.iter_mut().for_each(|value| *value /= divisor);
-        let mut joined = base;
-        joined.extend(pooled);
-        joined.extend(count_features(count));
-        let mut value = self.candidate_combine.apply(&joined);
+        CandidateParts {
+            semantic: candidate.c,
+            numeric: candidate.f,
+            legal: candidate.legal,
+            pooled,
+            path: defer_adapters.then_some(path).flatten(),
+            target: defer_adapters.then_some(target).flatten(),
+            count,
+        }
+    }
+
+    fn finish_candidate(&self, mut candidate: CandidateParts) -> Vec<f32> {
+        if let Some(path) = candidate.path {
+            candidate
+                .pooled
+                .iter_mut()
+                .zip(self.path_adapter.apply(&path))
+                .for_each(|(sum, value)| *sum += value);
+        }
+        if let Some(target) = candidate.target {
+            candidate
+                .pooled
+                .iter_mut()
+                .zip(self.target_adapter.apply(&target))
+                .for_each(|(sum, value)| *sum += value);
+        }
+        let divisor = (candidate.count as f32).sqrt();
+        candidate
+            .pooled
+            .iter_mut()
+            .for_each(|value| *value /= divisor);
+        let mut input = self.action_encoder.encode(
+            &candidate.semantic,
+            &candidate.numeric,
+            &self.semantic_embedding,
+            self.width,
+        );
+        for (value, legal) in input
+            .iter_mut()
+            .zip(&self.action_legal[candidate.legal as usize * self.width..][..self.width])
+        {
+            *value += legal;
+        }
+        input.reserve(self.width + 2);
+        input.extend(candidate.pooled);
+        input.extend(count_features(candidate.count));
+        let mut value = self.candidate_combine.apply(&input);
         layer_norm(&mut value, &self.action_norm_w, &self.action_norm_b);
         value.iter_mut().for_each(|value| *value = value.max(0.0));
         value
@@ -11045,7 +11314,12 @@ impl ValueModel {
         (candidate.u[0], candidate.u[14])
     }
 
-    fn state_parts(&self, observation: &ObservationV53, cache: &mut EncodingCache) -> StateParts {
+    fn state_parts(
+        &self,
+        observation: &ObservationV53,
+        cache: &mut EncodingCache,
+        defer_adapters: bool,
+    ) -> StateParts {
         let state_rows = |domain: usize| {
             observation.domains[domain]
                 .iter()
@@ -11078,7 +11352,7 @@ impl ValueModel {
                     .iter()
                     .for_each(|value| key.extend(value.to_le_bytes()));
             }
-            let cached = self.card_cache.lock().unwrap().get(&key).cloned();
+            let cached = self.card_cache.read().unwrap().get(&key).cloned();
             let mut summary = cached.unwrap_or_else(|| {
                 let mut state = self.card_state[zone * self.width..][..self.width].to_vec();
                 let count = self.card_count.apply(&card_count_features(&rows));
@@ -11089,7 +11363,7 @@ impl ValueModel {
                 let mut sequence = vec![state];
                 sequence.extend(rows.iter().map(|row| self.encode(cache, CARD_DOMAIN, row)));
                 let summary = self.summarize(sequence, &self.card_layers);
-                let mut cache = self.card_cache.lock().unwrap();
+                let mut cache = self.card_cache.write().unwrap();
                 if cache.len() == 16_384 {
                     cache.clear();
                 }
@@ -11168,15 +11442,26 @@ impl ValueModel {
         }
         let (mut current, nodes) = self.map(&observation.domains, current_id, cache);
         normalize_block(&mut current);
-        let actions = (0..observation.candidates.len())
-            .map(|index| self.candidate(observation, index, &actors, &nodes, cache))
+        let mut targets = std::collections::BTreeMap::new();
+        let candidates = (0..observation.candidates.len())
+            .map(|index| {
+                self.candidate_input(
+                    observation,
+                    index,
+                    &actors,
+                    &mut targets,
+                    &nodes,
+                    cache,
+                    defer_adapters,
+                )
+            })
             .collect::<Vec<_>>();
         StateParts {
             state,
             groups,
             summaries,
             current,
-            actions,
+            candidates,
         }
     }
 
@@ -11243,7 +11528,12 @@ impl ValueModel {
         observation: &ObservationV53,
         cache: &mut EncodingCache,
     ) -> (Vec<f32>, Vec<Vec<f32>>) {
-        let parts = self.state_parts(observation, cache);
+        let parts = self.state_parts(observation, cache, false);
+        let actions = parts
+            .candidates
+            .into_iter()
+            .map(|candidate| self.finish_candidate(candidate))
+            .collect();
         let summaries = parts
             .groups
             .into_iter()
@@ -11261,19 +11551,13 @@ impl ValueModel {
                     summary
                 })
             });
-        self.finish_state(
-            observation,
-            parts.state,
-            summaries,
-            parts.current,
-            parts.actions,
-        )
+        self.finish_state(observation, parts.state, summaries, parts.current, actions)
     }
 
     #[cfg(feature = "python")]
     fn state_actions_batch(
         &self,
-        observations: &[ObservationV53],
+        observations: &[&ObservationV53],
     ) -> Vec<(Vec<f32>, Vec<Vec<f32>>)> {
         let mut parts = observations
             .par_iter()
@@ -11286,7 +11570,7 @@ impl ValueModel {
                 if cache.groups.len() > 65_536 {
                     cache.groups.clear();
                 }
-                self.state_parts(observation, &mut cache)
+                self.state_parts(observation, &mut cache, true)
             })
             .collect::<Vec<_>>();
         let counts = parts
@@ -11370,18 +11654,137 @@ impl ValueModel {
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
+        let candidate_counts = parts
+            .iter()
+            .map(|parts| parts.candidates.len())
+            .collect::<Vec<_>>();
+        let numerics = parts
+            .iter()
+            .flat_map(|parts| {
+                parts
+                    .candidates
+                    .iter()
+                    .flat_map(|candidate| candidate.numeric)
+            })
+            .collect::<Vec<_>>();
+        let bases = if numerics.is_empty() {
+            Vec::new()
+        } else {
+            linear_batch(
+                &numerics,
+                ACTION_F,
+                &self.action_encoder.numeric.w,
+                &self.action_encoder.numeric.b,
+            )
+        };
+        let mut bases = bases.chunks_exact(self.width);
+        let paths = parts
+            .iter()
+            .flat_map(|parts| {
+                parts
+                    .candidates
+                    .iter()
+                    .filter_map(|candidate| candidate.path.as_ref())
+                    .flatten()
+                    .copied()
+            })
+            .collect::<Vec<_>>();
+        let paths = linear_batch(
+            &paths,
+            self.width,
+            &self.path_adapter.w,
+            &self.path_adapter.b,
+        );
+        let mut paths = paths.chunks_exact(self.width);
+        let targets = parts
+            .iter()
+            .flat_map(|parts| {
+                parts
+                    .candidates
+                    .iter()
+                    .filter_map(|candidate| candidate.target.as_ref())
+                    .flatten()
+                    .copied()
+            })
+            .collect::<Vec<_>>();
+        let targets = linear_batch(
+            &targets,
+            self.width,
+            &self.target_adapter.w,
+            &self.target_adapter.b,
+        );
+        let mut targets = targets.chunks_exact(self.width);
+        let mut candidate_inputs =
+            Vec::with_capacity(candidate_counts.iter().sum::<usize>() * (2 * self.width + 2));
+        for parts in &mut parts {
+            for mut candidate in parts.candidates.drain(..) {
+                for adapter in [
+                    candidate.path.as_ref().map(|_| paths.next().unwrap()),
+                    candidate.target.as_ref().map(|_| targets.next().unwrap()),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    candidate
+                        .pooled
+                        .iter_mut()
+                        .zip(adapter)
+                        .for_each(|(sum, value)| *sum += value);
+                }
+                let divisor = (candidate.count as f32).sqrt();
+                candidate
+                    .pooled
+                    .iter_mut()
+                    .for_each(|value| *value /= divisor);
+                let mut input = self.action_encoder.finish(
+                    &candidate.semantic,
+                    &self.semantic_embedding,
+                    self.width,
+                    bases.next().unwrap().to_vec(),
+                );
+                for (value, legal) in input
+                    .iter_mut()
+                    .zip(&self.action_legal[candidate.legal as usize * self.width..][..self.width])
+                {
+                    *value += legal;
+                }
+                input.reserve(self.width + 2);
+                input.extend(candidate.pooled);
+                input.extend(count_features(candidate.count));
+                candidate_inputs.extend(input);
+            }
+        }
+        assert!(bases.next().is_none());
+        assert!(paths.next().is_none());
+        assert!(targets.next().is_none());
+        let candidates = if candidate_inputs.is_empty() {
+            Vec::new()
+        } else {
+            linear_batch(
+                &candidate_inputs,
+                2 * self.width + 2,
+                &self.candidate_combine.w,
+                &self.candidate_combine.b,
+            )
+        };
+        let mut candidates = candidates.chunks_exact(self.width).map(|row| {
+            let mut row = row.to_vec();
+            layer_norm(&mut row, &self.action_norm_w, &self.action_norm_b);
+            row.iter_mut().for_each(|value| *value = value.max(0.0));
+            row
+        });
+        let actions = candidate_counts
+            .into_iter()
+            .map(|count| candidates.by_ref().take(count).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        assert!(candidates.next().is_none());
         observations
             .par_iter()
             .zip(parts)
             .zip(summaries)
-            .map(|((observation, parts), summaries)| {
-                self.finish_state(
-                    observation,
-                    parts.state,
-                    summaries,
-                    parts.current,
-                    parts.actions,
-                )
+            .zip(actions)
+            .map(|(((observation, parts), summaries), actions)| {
+                self.finish_state(observation, parts.state, summaries, parts.current, actions)
             })
             .collect()
     }
@@ -11396,14 +11799,9 @@ impl ValueModel {
         observation: &ObservationV53,
         temperature: f32,
         cache: &mut EncodingCache,
-    ) -> io::Result<(Vec<f32>, f32, f32)> {
-        let (policy_hidden, policy, progress_hidden, progress) = match (
-            &self.policy_hidden,
-            &self.policy,
-            &self.progress_hidden,
-            &self.progress,
-        ) {
-            (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
+    ) -> io::Result<(Vec<f32>, f32, f32, Vec<f32>)> {
+        let (policy_hidden, policy) = match (&self.policy_hidden, &self.policy) {
+            (Some(a), Some(b)) => (a, b),
             _ => return Err(invalid("value model has no actor heads")),
         };
         if !temperature.is_finite() || temperature <= 0.0 {
@@ -11435,79 +11833,77 @@ impl ValueModel {
             .iter_mut()
             .filter(|score| score.is_finite())
             .for_each(|score| *score -= normalizer);
-        let value = sigmoid(
-            self.value.apply(&dense_relu(
-                &state,
-                &self.value_hidden.w,
-                &self.value_hidden.b,
-            ))[0],
-        );
-        let progress =
-            progress.apply(&dense_relu(&state, &progress_hidden.w, &progress_hidden.b))[0];
-        Ok((scores, value, progress))
+        let logits = self.critic.apply(&dense_relu(
+            &state,
+            &self.critic_hidden.w,
+            &self.critic_hidden.b,
+        ));
+        let probabilities = softmax(&logits);
+        let expected = probabilities
+            .iter()
+            .enumerate()
+            .map(|(category, probability)| category as f32 * probability)
+            .sum::<f32>()
+            / (VALUE_CATEGORIES - 1) as f32;
+        Ok((
+            scores,
+            probabilities[VALUE_CATEGORIES - 1],
+            expected,
+            probabilities,
+        ))
     }
 
     fn evaluate_batch(
         &self,
         observations: &[&ObservationV53],
-        features: &[&(Vec<f32>, Vec<Vec<f32>>)],
+        features: &[(Vec<f32>, Vec<Vec<f32>>)],
         temperature: f32,
-    ) -> io::Result<Vec<(Vec<f32>, f32, f32)>> {
-        let (policy_hidden, policy, progress_hidden, progress) = match (
-            &self.policy_hidden,
-            &self.policy,
-            &self.progress_hidden,
-            &self.progress,
-        ) {
-            (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
-            _ => return Err(invalid("value model has no actor heads")),
-        };
-        if !temperature.is_finite() || temperature <= 0.0 {
+        rollout_temperature: Option<f32>,
+        values: bool,
+    ) -> io::Result<Vec<(Vec<f32>, f32, f32, Vec<f32>, Option<Vec<f32>>)>> {
+        let (policy_hidden, (state_weights, action_weights), policy) =
+            match (&self.policy_hidden, &self.policy_split, &self.policy) {
+                (Some(a), Some(b), Some(c)) => (a, b, c),
+                _ => return Err(invalid("value model has no actor heads")),
+            };
+        if !temperature.is_finite()
+            || temperature <= 0.0
+            || rollout_temperature.is_some_and(|value| !value.is_finite() || value <= 0.0)
+        {
             return Err(invalid("invalid policy temperature"));
         }
         let mut states = Vec::with_capacity(features.len() * self.state_width);
-        let mut action_inputs = Vec::new();
-        for (state, actions) in features.iter().copied() {
+        let mut action_inputs = Vec::with_capacity(
+            observations
+                .iter()
+                .map(|observation| observation.candidates.len())
+                .sum::<usize>()
+                * self.width,
+        );
+        for (state, actions) in features {
             states.extend(state);
             for action in actions {
                 action_inputs.extend(action);
             }
         }
-        let values = linear_batch(
-            &dense_relu_batch(
-                &states,
-                self.state_width,
-                &self.value_hidden.w,
-                &self.value_hidden.b,
-            ),
-            self.head_width,
-            &self.value.w,
-            &self.value.b,
-        );
-        let progresses = linear_batch(
-            &dense_relu_batch(
-                &states,
-                self.state_width,
-                &progress_hidden.w,
-                &progress_hidden.b,
-            ),
-            self.head_width,
-            &progress.w,
-            &progress.b,
-        );
-        let input_width = self.state_width + self.width;
-        let mut state_weights = Vec::with_capacity(self.head_width * self.state_width);
-        let mut action_weights = Vec::with_capacity(self.head_width * self.width);
-        for weights in policy_hidden.w.chunks_exact(input_width) {
-            state_weights.extend(&weights[..self.state_width]);
-            action_weights.extend(&weights[self.state_width..]);
-        }
-        let state_policy =
-            linear_batch(&states, self.state_width, &state_weights, &policy_hidden.b);
+        let critic_logits = values.then(|| {
+            linear_batch(
+                &dense_relu_batch(
+                    &states,
+                    self.state_width,
+                    &self.critic_hidden.w,
+                    &self.critic_hidden.b,
+                ),
+                self.head_width,
+                &self.critic.w,
+                &self.critic.b,
+            )
+        });
+        let state_policy = linear_batch(&states, self.state_width, state_weights, &policy_hidden.b);
         let action_policy = linear_batch(
             &action_inputs,
             self.width,
-            &action_weights,
+            action_weights,
             &vec![0.0; self.head_width],
         );
         let mut hidden = Vec::with_capacity(action_policy.len());
@@ -11533,31 +11929,51 @@ impl ValueModel {
             .enumerate()
             .map(|(index, &observation)| {
                 let end = offset + observation.candidates.len();
-                let mut log_policy = scores[offset..end]
-                    .iter()
-                    .zip(&observation.candidates)
-                    .map(|(&score, candidate)| {
-                        if candidate.legal {
-                            score / temperature
-                        } else {
-                            f32::NEG_INFINITY
-                        }
-                    })
-                    .collect::<Vec<_>>();
+                let policy = |temperature| {
+                    let mut policy = scores[offset..end]
+                        .iter()
+                        .zip(&observation.candidates)
+                        .map(|(&score, candidate)| {
+                            if candidate.legal {
+                                score / temperature
+                            } else {
+                                f32::NEG_INFINITY
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    let maximum = policy.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let normalizer = policy
+                        .iter()
+                        .filter(|score| score.is_finite())
+                        .map(|score| (score - maximum).exp())
+                        .sum::<f32>()
+                        .ln()
+                        + maximum;
+                    policy
+                        .iter_mut()
+                        .filter(|score| score.is_finite())
+                        .for_each(|score| *score -= normalizer);
+                    policy
+                };
+                let log_policy = policy(temperature);
+                let rollout_policy = rollout_temperature.map(policy);
                 offset = end;
-                let maximum = log_policy.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                let normalizer = log_policy
+                let probabilities = critic_logits.as_ref().map_or_else(Vec::new, |logits| {
+                    softmax(&logits[index * VALUE_CATEGORIES..][..VALUE_CATEGORIES])
+                });
+                let expected = probabilities
                     .iter()
-                    .filter(|score| score.is_finite())
-                    .map(|score| (score - maximum).exp())
+                    .enumerate()
+                    .map(|(category, probability)| category as f32 * probability)
                     .sum::<f32>()
-                    .ln()
-                    + maximum;
-                log_policy
-                    .iter_mut()
-                    .filter(|score| score.is_finite())
-                    .for_each(|score| *score -= normalizer);
-                (log_policy, sigmoid(values[index]), progresses[index])
+                    / (VALUE_CATEGORIES - 1) as f32;
+                (
+                    log_policy,
+                    probabilities.last().copied().unwrap_or_default(),
+                    expected,
+                    probabilities,
+                    rollout_policy,
+                )
             })
             .collect())
     }
@@ -11569,13 +11985,14 @@ impl ValueModel {
             _ => {}
         }
         let observation = observation_v53(game, content, self.layout, (0, 0));
-        let hidden = self.value_hidden.apply(&self.state(&observation));
+        let hidden = self.critic_hidden.apply(&self.state(&observation));
         let hidden = hidden
             .into_iter()
             .map(|value| value.max(0.0))
             .collect::<Vec<_>>();
         debug_assert_eq!(hidden.len(), self.head_width);
-        let logit = self.value.apply(&hidden)[0];
+        let logits = self.critic.apply(&hidden);
+        let logit = logits[VALUE_CATEGORIES - 1] - log_sum_exp(&logits[..VALUE_CATEGORIES - 1]);
         sigmoid(logit / self.temperature + self.bias)
     }
 }
@@ -11741,6 +12158,24 @@ fn sigmoid(value: f32) -> f32 {
     }
 }
 
+fn log_sum_exp(values: &[f32]) -> f32 {
+    let maximum = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    maximum
+        + values
+            .iter()
+            .map(|value| (value - maximum).exp())
+            .sum::<f32>()
+            .ln()
+}
+
+fn softmax(values: &[f32]) -> Vec<f32> {
+    let normalizer = log_sum_exp(values);
+    values
+        .iter()
+        .map(|value| (value - normalizer).exp())
+        .collect()
+}
+
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
@@ -11787,7 +12222,135 @@ mod python {
         types::{PyBytes, PyList, PyTuple},
     };
     use std::collections::{HashMap, HashSet};
+    use std::fmt;
     use std::hash::{BuildHasherDefault, Hasher};
+    use std::path::Path;
+    use tracing::{Event, Level, Subscriber};
+    use tracing_subscriber::{
+        filter::filter_fn,
+        fmt::{FmtContext, FormatEvent, FormatFields, format::Writer},
+        prelude::*,
+        registry::LookupSpan,
+    };
+
+    #[derive(Clone)]
+    struct GlogFormat {
+        role: String,
+    }
+
+    fn native_thread_id() -> u64 {
+        #[cfg(target_os = "macos")]
+        {
+            let mut id = 0;
+            unsafe { libc::pthread_threadid_np(0, &mut id) };
+            id
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            std::hash::Hash::hash(&std::thread::current().id(), &mut hash);
+            hash.finish()
+        }
+    }
+
+    impl<S, N> FormatEvent<S, N> for GlogFormat
+    where
+        S: Subscriber + for<'a> LookupSpan<'a>,
+        N: for<'a> FormatFields<'a> + 'static,
+    {
+        fn format_event(
+            &self,
+            context: &FmtContext<'_, S, N>,
+            mut writer: Writer<'_>,
+            event: &Event<'_>,
+        ) -> fmt::Result {
+            let metadata = event.metadata();
+            let severity = match *metadata.level() {
+                Level::TRACE => 'D',
+                Level::DEBUG => 'D',
+                Level::INFO => 'I',
+                Level::WARN => 'W',
+                Level::ERROR => 'E',
+            };
+            let mut now = unsafe { std::mem::zeroed::<libc::timeval>() };
+            let mut local = unsafe { std::mem::zeroed::<libc::tm>() };
+            unsafe {
+                libc::gettimeofday(&mut now, std::ptr::null_mut());
+                libc::localtime_r(&now.tv_sec, &mut local);
+            }
+            let thread = std::thread::current();
+            let rayon_name = rayon::current_thread_index().map(|index| format!("rayon-{index}"));
+            let thread_name = rayon_name.as_deref().or(thread.name()).unwrap_or("unnamed");
+            let file = metadata
+                .file()
+                .and_then(|file| Path::new(file).file_name())
+                .and_then(|file| file.to_str())
+                .unwrap_or("unknown");
+            write!(
+                writer,
+                "{severity}{:02}{:02} {:02}:{:02}:{:02}.{:06} {:06} {:08} {:<12} {:<16} {:>20}:{:05}] ",
+                local.tm_mon + 1,
+                local.tm_mday,
+                local.tm_hour,
+                local.tm_min,
+                local.tm_sec,
+                now.tv_usec,
+                std::process::id(),
+                native_thread_id(),
+                self.role,
+                thread_name,
+                file,
+                metadata.line().unwrap_or(0),
+            )?;
+            context
+                .field_format()
+                .format_fields(writer.by_ref(), event)?;
+            writeln!(writer)
+        }
+    }
+
+    fn level_enabled(level: &Level, configured: Level) -> bool {
+        let rank = |level: &Level| match *level {
+            Level::ERROR => 0,
+            Level::WARN => 1,
+            Level::INFO => 2,
+            Level::DEBUG => 3,
+            Level::TRACE => 4,
+        };
+        rank(level) <= rank(&configured)
+    }
+
+    #[pyfunction]
+    fn configure_logging(role: String, level: &str) -> PyResult<()> {
+        let configured = match level.to_ascii_uppercase().as_str() {
+            "ERROR" => Level::ERROR,
+            "WARNING" | "WARN" => Level::WARN,
+            "INFO" => Level::INFO,
+            "DEBUG" => Level::DEBUG,
+            other => return Err(PyValueError::new_err(format!("invalid log level {other}"))),
+        };
+        let stdout = tracing_subscriber::fmt::layer()
+            .event_format(GlogFormat { role: role.clone() })
+            .with_ansi(false)
+            .with_writer(std::io::stdout)
+            .with_filter(filter_fn(move |metadata| {
+                level_enabled(metadata.level(), configured)
+                    && matches!(*metadata.level(), Level::TRACE | Level::DEBUG | Level::INFO)
+            }));
+        let stderr = tracing_subscriber::fmt::layer()
+            .event_format(GlogFormat { role })
+            .with_ansi(false)
+            .with_writer(std::io::stderr)
+            .with_filter(filter_fn(move |metadata| {
+                level_enabled(metadata.level(), configured)
+                    && matches!(*metadata.level(), Level::WARN | Level::ERROR)
+            }));
+        tracing_subscriber::registry()
+            .with(stdout)
+            .with(stderr)
+            .try_init()
+            .map_err(|error| PyValueError::new_err(error.to_string()))
+    }
 
     struct FastHasher(u64);
 
@@ -11905,7 +12468,11 @@ mod python {
     }
 
     fn compact_packed_observation(row: &ObservationV53) -> Vec<u8> {
-        let (globals, counts, exact, actions, digest) = packed_observation(row);
+        compact_packed_observation_known(row, None)
+    }
+
+    fn compact_packed_observation_known(row: &ObservationV53, digest: Option<u64>) -> Vec<u8> {
+        let (globals, counts, exact, actions, digest) = packed_observation_known(row, digest);
         let exact = compress_words(&exact);
         let exact_len = exact.len();
         let width = ACTION_U + ACTION_S + ACTION_C + ACTION_F + 1;
@@ -12131,7 +12698,8 @@ mod python {
             .ok_or_else(|| PyValueError::new_err("numeric rows must be contiguous"))?;
         let semantic_width = semantic.len() / rows;
         let numeric_width = numeric.len() / rows;
-        let mut unique = FastMap::with_capacity_and_hasher(rows, BuildHasherDefault::default());
+        let mut unique =
+            FastMap::with_capacity_and_hasher(rows.min(65_536), BuildHasherDefault::default());
         let mut first = Vec::new();
         let mut inverse = Vec::with_capacity(rows);
         for (index, (semantic, numeric)) in semantic
@@ -12613,6 +13181,2196 @@ mod python {
         resample_archive: bool,
         archive_depth: usize,
         policy: Option<ValueModel>,
+        searched_turns: Vec<Option<u16>>,
+    }
+
+    struct SearchEdge {
+        row: CandidateRow,
+        candidate: usize,
+        occurrence: usize,
+        kind_occurrence: usize,
+        prior: f32,
+        behavior: f32,
+        rank: usize,
+        visits: u32,
+        value_sum: f32,
+        children: Vec<(usize, u32)>,
+        terminal_visits: u32,
+        terminal_value_sum: f32,
+        invalid: bool,
+    }
+
+    struct SearchNode {
+        value: f32,
+        value_samples: u32,
+        packed: Option<Vec<u8>>,
+        action_count: usize,
+        depth: usize,
+        visits: u32,
+        ranked: Vec<usize>,
+        edges: Vec<SearchEdge>,
+    }
+
+    impl SearchNode {
+        fn new(
+            candidates: Vec<CandidateRow>,
+            log_policy: &[f32],
+            value: f32,
+            depth: usize,
+            behavior_exponent: f32,
+            packed: Option<Vec<u8>>,
+        ) -> Self {
+            let action_count = candidates.len();
+            let behavior_normalizer = log_policy
+                .iter()
+                .filter(|probability| probability.is_finite())
+                .map(|probability| (probability * behavior_exponent).exp())
+                .sum::<f32>();
+            let mut occurrences = FastMap::<u64, usize>::with_capacity_and_hasher(
+                candidates.len(),
+                BuildHasherDefault::default(),
+            );
+            let mut kind_counts = [0; ACTION_KINDS];
+            let mut edges = Vec::with_capacity(action_count);
+            for (candidate, (row, probability)) in candidates
+                .into_iter()
+                .zip(log_policy.iter().copied())
+                .enumerate()
+            {
+                let occurrence = occurrences
+                    .entry(public_candidate_digest(&row))
+                    .or_default();
+                let current_occurrence = *occurrence;
+                *occurrence += 1;
+                let kind = action_kind(&row.action);
+                let kind_occurrence = kind_counts[kind];
+                kind_counts[kind] += usize::from(row.legal);
+                if row.legal && probability.is_finite() {
+                    edges.push(SearchEdge {
+                        row,
+                        candidate,
+                        occurrence: current_occurrence,
+                        kind_occurrence,
+                        prior: probability.exp(),
+                        behavior: (probability * behavior_exponent).exp() / behavior_normalizer,
+                        rank: 0,
+                        visits: 0,
+                        value_sum: 0.0,
+                        children: Vec::new(),
+                        terminal_visits: 0,
+                        terminal_value_sum: 0.0,
+                        invalid: false,
+                    });
+                }
+            }
+            let mut order = (0..edges.len()).collect::<Vec<_>>();
+            order.sort_by(|&left, &right| edges[right].prior.total_cmp(&edges[left].prior));
+            for (rank, &edge) in order.iter().enumerate() {
+                edges[edge].rank = rank;
+            }
+            Self {
+                value,
+                value_samples: 1,
+                packed,
+                action_count,
+                depth,
+                visits: 0,
+                ranked: order,
+                edges,
+            }
+        }
+
+        fn select(&self, exploration: f32, lane: usize) -> Option<usize> {
+            let lane = lane % 16;
+            let mut unvisited = [0; 16];
+            let mut unvisited_count = 0;
+            for &index in &self.ranked {
+                if !self.edges[index].invalid && self.edges[index].visits == 0 {
+                    if unvisited_count < unvisited.len() {
+                        unvisited[unvisited_count] = index;
+                    }
+                    unvisited_count += 1;
+                }
+            }
+            if unvisited_count > 0 {
+                return Some(unvisited[lane % unvisited_count]);
+            }
+            let visits = self.visits as f32;
+            let root = (visits + lane as f32).sqrt();
+            let mut best = None;
+            for (index, edge) in self.edges.iter().enumerate() {
+                if edge.invalid {
+                    continue;
+                }
+                let virtual_visits =
+                    lane / self.edges.len() + usize::from(edge.rank < lane % self.edges.len());
+                let score = edge.value_sum / edge.visits as f32
+                    + exploration * edge.prior * root
+                        / (1 + edge.visits as usize + virtual_visits) as f32;
+                if best.is_none_or(|(_, best_score): (usize, f32)| {
+                    best_score.total_cmp(&score) != std::cmp::Ordering::Greater
+                }) {
+                    best = Some((index, score));
+                }
+            }
+            best.map(|(index, _)| index)
+        }
+    }
+
+    fn search_candidate<'a>(
+        observation: &'a ObservationV53,
+        edge: &SearchEdge,
+    ) -> Option<&'a CandidateRow> {
+        if let Some(candidate) = observation.candidates.get(edge.candidate)
+            && candidate.legal
+            && candidate.action == edge.row.action
+            && same_public_candidate(candidate, &edge.row)
+        {
+            return Some(candidate);
+        }
+        observation
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.legal && same_public_candidate(candidate, &edge.row))
+            .nth(edge.occurrence)
+            .or_else(|| {
+                observation.candidates.iter().find(|candidate| {
+                    candidate.legal && same_public_candidate(candidate, &edge.row)
+                })
+            })
+            .or_else(|| {
+                if !matches!(edge.row.action, Action::Choose(_)) {
+                    return None;
+                }
+                let count = observation
+                    .candidates
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.legal && matches!(candidate.action, Action::Choose(_))
+                    })
+                    .count();
+                (count > 0).then(|| {
+                    observation
+                        .candidates
+                        .iter()
+                        .filter(|candidate| {
+                            candidate.legal && matches!(candidate.action, Action::Choose(_))
+                        })
+                        .nth(edge.kind_occurrence % count)
+                        .unwrap()
+                })
+            })
+            .or_else(|| {
+                observation
+                    .candidates
+                    .get(edge.candidate)
+                    .filter(|candidate| candidate.legal)
+            })
+    }
+
+    fn search_terminal_value(game: &Game, progress: bool) -> Option<f32> {
+        match game.phase {
+            Phase::Won => Some(1.0),
+            Phase::Dead if progress => {
+                Some(canonical_progress(game) as f32 / (VALUE_CATEGORIES - 1) as f32)
+            }
+            Phase::Dead => Some(0.0),
+            _ => None,
+        }
+    }
+
+    fn heuristic_combat_value(game: &Game) -> f32 {
+        let player = game.combat().map_or_else(
+            || game.run.hp.max(0) as f32 / game.run.max_hp.max(1) as f32,
+            |combat| combat.player.hp.max(0) as f32 / combat.player.max_hp.max(1) as f32,
+        );
+        let enemy = game.combat().map_or(0.0, |combat| {
+            let hp = combat
+                .enemies
+                .iter()
+                .map(|enemy| enemy.creature.hp.max(0) as i32)
+                .sum::<i32>();
+            let maximum = combat
+                .enemies
+                .iter()
+                .map(|enemy| enemy.creature.max_hp.max(0) as i32)
+                .sum::<i32>();
+            hp as f32 / maximum.max(1) as f32
+        });
+        player - 0.1 * enemy
+    }
+
+    struct SearchTree {
+        root: Game,
+        root_observation: ObservationV53,
+        root_digest: u64,
+        map: CanonicalMap,
+        root_turn: u16,
+        simulations: usize,
+        budget: usize,
+        turns: usize,
+        max_depth: usize,
+        nodes: Vec<SearchNode>,
+        lookup: FastMap<(u64, usize), usize>,
+        games: Option<Vec<Game>>,
+        progress: bool,
+        behavior_exponent: f32,
+        pack_visits: u32,
+        capture_children: bool,
+        heuristic: bool,
+    }
+
+    struct SearchLeaf {
+        path: SearchPath,
+        observation: ObservationV53,
+        digest: u64,
+        depth: usize,
+        game: Option<Game>,
+    }
+
+    struct SearchPath {
+        steps: Vec<SearchStep>,
+        packed: Vec<(Option<usize>, Vec<u8>)>,
+    }
+
+    struct SearchStep {
+        node: usize,
+        edge: usize,
+        child: Option<usize>,
+    }
+
+    enum SearchResult {
+        Value(SearchPath, f32),
+        Leaf(SearchLeaf),
+        Invalid(SearchPath),
+    }
+
+    impl SearchTree {
+        fn new(
+            root: &Game,
+            observation: &ObservationV53,
+            content: &Content,
+            layout: Layout,
+            log_policy: &[f32],
+            value: f32,
+            budget: usize,
+            turns: usize,
+            max_depth: usize,
+            capture_games: bool,
+            progress: bool,
+            behavior_exponent: f32,
+            pack_visits: u32,
+            capture_children: bool,
+            heuristic: bool,
+        ) -> Self {
+            let digest = observation_digest(observation);
+            let capacity = budget
+                .saturating_mul(if turns == 0 { max_depth.min(16) } else { 1 })
+                .saturating_add(1);
+            let mut lookup =
+                FastMap::with_capacity_and_hasher(capacity, BuildHasherDefault::default());
+            lookup.insert((digest, 0), 0);
+            let games = capture_games.then(|| vec![root.clone()]);
+            let mut root = root.clone();
+            canonicalize_combat_hidden(&mut root);
+            let root_turn = root.combat().map_or(0, |combat| combat.turn);
+            let map = canonical_map(&root, content, layout);
+            let mut nodes = Vec::with_capacity(capacity);
+            nodes.push(SearchNode::new(
+                observation.candidates.clone(),
+                log_policy,
+                value,
+                0,
+                behavior_exponent,
+                Some(compact_packed_observation_known(observation, Some(digest))),
+            ));
+            Self {
+                root,
+                root_observation: observation.clone(),
+                root_digest: digest,
+                map,
+                root_turn,
+                simulations: 0,
+                budget,
+                turns,
+                max_depth,
+                nodes,
+                lookup,
+                games,
+                progress,
+                behavior_exponent,
+                pack_visits,
+                capture_children,
+                heuristic,
+            }
+        }
+
+        fn horizon(&self, game: &Game) -> bool {
+            game.combat().is_none()
+                || self.turns > 0
+                    && game.combat().is_some_and(|combat| {
+                        combat.turn >= self.root_turn.saturating_add(self.turns as u16)
+                    })
+        }
+
+        fn simulate(
+            &self,
+            content: &Content,
+            layout: Layout,
+            bonuses: (i16, i16),
+            seed: u64,
+            exploration: f32,
+            lane: usize,
+        ) -> Result<SearchResult, String> {
+            let mut game = self.root.clone();
+            resample_canonical_combat_hidden(&mut game, seed);
+            let mut observation = None;
+            let mut node = 0usize;
+            let mut path = SearchPath {
+                steps: Vec::with_capacity(8),
+                packed: Vec::new(),
+            };
+            for depth in 1..=self.max_depth {
+                let (current, current_digest) = observation
+                    .as_ref()
+                    .map(|(observation, digest)| (observation, *digest))
+                    .unwrap_or((&self.root_observation, self.root_digest));
+                let node_packed = self.nodes[node].packed.is_some()
+                    || path
+                        .packed
+                        .iter()
+                        .any(|(packed_node, _)| *packed_node == Some(node));
+                let should_pack = !node_packed
+                    && self.nodes[node].visits + (lane % 16) as u32 + 1 >= self.pack_visits;
+                let pack_children = self.capture_children && (node_packed || should_pack);
+                let Some(edge) =
+                    self.nodes[node].select(exploration, lane.wrapping_add(depth * 17))
+                else {
+                    return Ok(SearchResult::Invalid(path));
+                };
+                if should_pack {
+                    path.packed.push((
+                        Some(node),
+                        compact_packed_observation_known(current, Some(current_digest)),
+                    ));
+                }
+                let search_edge = &self.nodes[node].edges[edge];
+                let candidate = search_candidate(current, search_edge).ok_or_else(|| {
+                    format!(
+                        "MCTS public action mismatch: wanted {:?}, have {:?}",
+                        search_edge.row.action,
+                        current
+                            .candidates
+                            .iter()
+                            .filter(|candidate| candidate.legal)
+                            .map(|candidate| &candidate.action)
+                            .collect::<Vec<_>>()
+                    )
+                })?;
+                let action = candidate.action.clone();
+                let was_combat = game.combat().is_some();
+                game.step(content, action)
+                    .map_err(|error| format!("MCTS step failed: {error:?}"))?;
+                if !was_combat && game.combat().is_some() {
+                    apply_training_bonuses(&mut game, content, bonuses.0, bonuses.1);
+                }
+                if matches!(game.phase, Phase::Won | Phase::Dead) {
+                    let value = if self.heuristic {
+                        heuristic_combat_value(&game)
+                    } else {
+                        search_terminal_value(&game, self.progress).unwrap()
+                    };
+                    path.steps.push(SearchStep {
+                        node,
+                        edge,
+                        child: None,
+                    });
+                    return Ok(SearchResult::Value(path, value));
+                }
+                let next_observation =
+                    observation_v53_with_map(&game, content, layout, bonuses, Some(&self.map));
+                let digest = observation_digest(&next_observation);
+                let next = self.lookup.get(&(digest, depth)).copied();
+                let child_packed = (pack_children
+                    && next.is_none_or(|index| self.nodes[index].packed.is_none()))
+                .then(|| compact_packed_observation_known(&next_observation, Some(digest)));
+                if let Some(packed) = child_packed {
+                    path.packed.push((next, packed));
+                }
+                if self.horizon(&game) {
+                    path.steps.push(SearchStep {
+                        node,
+                        edge,
+                        child: next,
+                    });
+                    return Ok(if let Some(index) = next {
+                        SearchResult::Value(path, self.nodes[index].value)
+                    } else {
+                        SearchResult::Leaf(SearchLeaf {
+                            path,
+                            observation: next_observation,
+                            digest,
+                            depth,
+                            game: (self.games.is_some() || self.heuristic || self.turns == 0)
+                                .then_some(game),
+                        })
+                    });
+                }
+                if depth >= self.max_depth {
+                    path.steps.push(SearchStep {
+                        node,
+                        edge,
+                        child: next,
+                    });
+                    return Ok(SearchResult::Invalid(path));
+                }
+                if let Some(next) = next {
+                    path.steps.push(SearchStep {
+                        node,
+                        edge,
+                        child: Some(next),
+                    });
+                    node = next;
+                    observation = Some((next_observation, digest));
+                } else {
+                    path.steps.push(SearchStep {
+                        node,
+                        edge,
+                        child: None,
+                    });
+                    return Ok(SearchResult::Leaf(SearchLeaf {
+                        path,
+                        observation: next_observation,
+                        digest,
+                        depth,
+                        game: (self.games.is_some() || self.heuristic || self.turns == 0)
+                            .then_some(game),
+                    }));
+                }
+            }
+            unreachable!()
+        }
+
+        fn backup(&mut self, path: &mut SearchPath, value: f32) {
+            for (node, packed) in path.packed.drain(..) {
+                let node = node.expect("unexpanded MCTS packed observation");
+                if self.nodes[node].packed.is_none() {
+                    self.nodes[node].packed = Some(packed);
+                }
+            }
+            for step in &path.steps {
+                self.nodes[step.node].visits += 1;
+                let edge = &mut self.nodes[step.node].edges[step.edge];
+                edge.visits += 1;
+                edge.value_sum += value;
+                if let Some(child) = step.child {
+                    if let Some((_, count)) = edge
+                        .children
+                        .iter_mut()
+                        .find(|(candidate, _)| *candidate == child)
+                    {
+                        *count += 1;
+                    } else {
+                        edge.children.push((child, 1));
+                    }
+                } else {
+                    edge.terminal_visits += 1;
+                    edge.terminal_value_sum += value;
+                }
+            }
+            self.simulations += 1;
+        }
+
+        fn invalidate(&mut self, path: &mut SearchPath) {
+            if let Some(step) = path.steps.last() {
+                if self.nodes[step.node].packed.is_none() {
+                    if let Some(index) = path
+                        .packed
+                        .iter()
+                        .position(|(node, _)| *node == Some(step.node))
+                    {
+                        self.nodes[step.node].packed = Some(path.packed.swap_remove(index).1);
+                    }
+                }
+                self.nodes[step.node].edges[step.edge].invalid = true;
+            }
+            self.simulations += 1;
+        }
+
+        fn expand(
+            &mut self,
+            observation: ObservationV53,
+            digest: u64,
+            depth: usize,
+            mut path: SearchPath,
+            mut duplicates: Vec<SearchPath>,
+            log_policy: &[f32],
+            value: f32,
+            game: Option<Game>,
+        ) {
+            let child = self.insert(observation, digest, depth, log_policy, value, game, None);
+            path.steps
+                .last_mut()
+                .expect("MCTS leaf has an empty path")
+                .child = Some(child);
+            path.packed
+                .iter_mut()
+                .filter(|(node, _)| node.is_none())
+                .for_each(|(node, _)| *node = Some(child));
+            self.backup(&mut path, value);
+            for path in &mut duplicates {
+                path.steps
+                    .last_mut()
+                    .expect("MCTS leaf has an empty path")
+                    .child = Some(child);
+                path.packed
+                    .iter_mut()
+                    .filter(|(node, _)| node.is_none())
+                    .for_each(|(node, _)| *node = Some(child));
+                self.backup(path, value);
+            }
+        }
+
+        fn insert(
+            &mut self,
+            observation: ObservationV53,
+            digest: u64,
+            depth: usize,
+            log_policy: &[f32],
+            value: f32,
+            game: Option<Game>,
+            packed: Option<Vec<u8>>,
+        ) -> usize {
+            let key = (digest, depth);
+            if let Some(&index) = self.lookup.get(&key) {
+                let child = &mut self.nodes[index];
+                child.value = (child.value * child.value_samples as f32 + value)
+                    / (child.value_samples + 1) as f32;
+                child.value_samples += 1;
+                if child.packed.is_none() {
+                    child.packed = packed;
+                }
+                return index;
+            }
+            let index = self.nodes.len();
+            self.lookup.insert(key, index);
+            self.nodes.push(SearchNode::new(
+                observation.candidates,
+                log_policy,
+                value,
+                depth,
+                self.behavior_exponent,
+                packed,
+            ));
+            if let Some(games) = &mut self.games {
+                games.push(game.expect("captured MCTS node has no game"));
+            }
+            index
+        }
+
+        fn expand_rollout(&mut self, mut leaf: PendingLeaf, rollout: Vec<RolloutStep>, value: f32) {
+            for step in rollout {
+                let RolloutStep {
+                    game,
+                    observation,
+                    policy,
+                    digest,
+                    choice,
+                    depth,
+                } = step;
+                let packed = (self.capture_children
+                    || self.lookup.get(&(digest, depth)).is_some_and(|&index| {
+                        let node = &self.nodes[index];
+                        node.packed.is_none()
+                            && node.visits + 1 >= self.pack_visits
+                            && node
+                                .edges
+                                .iter()
+                                .filter(|edge| edge.visits > 0 || edge.candidate == choice)
+                                .take(2)
+                                .count()
+                                >= 2
+                    }))
+                .then(|| compact_packed_observation_known(&observation, Some(digest)));
+                let child = self.insert(observation, digest, depth, &policy, value, game, packed);
+                let previous = leaf.path.steps.last_mut().expect("empty rollout path");
+                previous.child = Some(child);
+                leaf.path
+                    .packed
+                    .iter_mut()
+                    .filter(|(node, _)| node.is_none())
+                    .for_each(|(node, _)| *node = Some(child));
+                let edge = self.nodes[child]
+                    .edges
+                    .iter()
+                    .position(|edge| edge.candidate == choice)
+                    .expect("rollout action is absent from its node");
+                leaf.path.steps.push(SearchStep {
+                    node: child,
+                    edge,
+                    child: None,
+                });
+            }
+            self.backup(&mut leaf.path, value);
+        }
+
+        fn expectimax(&self) -> (Vec<f32>, Vec<Vec<Option<f32>>>) {
+            let mut values = self.nodes.iter().map(|node| node.value).collect::<Vec<_>>();
+            let mut actions = self
+                .nodes
+                .iter()
+                .map(|node| vec![None; node.edges.len()])
+                .collect::<Vec<_>>();
+            let maximum_depth = self.nodes.iter().map(|node| node.depth).max().unwrap_or(0);
+            for depth in (0..=maximum_depth).rev() {
+                for (index, node) in self
+                    .nodes
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, node)| node.depth == depth)
+                {
+                    for (edge_index, edge) in node.edges.iter().enumerate() {
+                        let visits = edge.visits;
+                        if edge.invalid || visits == 0 {
+                            continue;
+                        }
+                        let value = edge.terminal_value_sum
+                            + edge
+                                .children
+                                .iter()
+                                .map(|(child, count)| *count as f32 * values[*child])
+                                .sum::<f32>();
+                        actions[index][edge_index] = Some(value / visits as f32);
+                    }
+                    if let Some(value) = actions[index]
+                        .iter()
+                        .flatten()
+                        .copied()
+                        .max_by(f32::total_cmp)
+                    {
+                        values[index] = value;
+                    }
+                }
+            }
+            (values, actions)
+        }
+
+        fn target(
+            &self,
+            node: usize,
+            values: &[Option<f32>],
+            temperature: f32,
+        ) -> Option<Vec<f32>> {
+            let mut target = vec![0.0; self.nodes[node].action_count];
+            let maximum = values
+                .iter()
+                .flatten()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max);
+            if !maximum.is_finite() || values.iter().flatten().count() < 2 {
+                return None;
+            }
+            let mut sum = 0.0;
+            for (edge, value) in self.nodes[node].edges.iter().zip(values) {
+                if let Some(value) = value {
+                    target[edge.candidate] = ((*value - maximum) / temperature).exp();
+                    sum += target[edge.candidate];
+                }
+            }
+            target.iter_mut().for_each(|value| *value /= sum);
+            Some(target)
+        }
+
+        fn consistency(&self, node: usize) -> SearchConsistency {
+            let mut children = HashMap::<usize, f32>::new();
+            let mut covered = 0.0;
+            let mut terminal_value = 0.0;
+            for edge in &self.nodes[node].edges {
+                if edge.invalid || edge.visits == 0 {
+                    continue;
+                }
+                let scale = edge.behavior / edge.visits as f32;
+                covered += scale * edge.terminal_visits as f32;
+                terminal_value += scale * edge.terminal_value_sum;
+                for (child, count) in &edge.children {
+                    if self.nodes[*child].packed.is_some() {
+                        covered += scale * *count as f32;
+                        *children.entry(*child).or_default() += scale * *count as f32;
+                    }
+                }
+            }
+            let mut children = children.into_iter().collect::<Vec<_>>();
+            children.sort_by_key(|&(child, _)| child);
+            let (packed, weights) = children
+                .into_iter()
+                .map(|(child, weight)| {
+                    (
+                        self.nodes[child]
+                            .packed
+                            .clone()
+                            .expect("consistency child was not packed"),
+                        weight,
+                    )
+                })
+                .unzip();
+            SearchConsistency {
+                packed,
+                weights,
+                self_weight: (1.0 - covered).max(0.0),
+                terminal_value,
+            }
+        }
+    }
+
+    fn same_public_candidate(left: &CandidateRow, right: &CandidateRow) -> bool {
+        left.u == right.u
+            && left.s == right.s
+            && left.c == right.c
+            && left.f == right.f
+            && left.legal == right.legal
+    }
+
+    fn public_candidate_digest(row: &CandidateRow) -> u64 {
+        let mut digest = 0xcbf2_9ce4_8422_2325u64;
+        for value in row
+            .u
+            .iter()
+            .copied()
+            .chain(row.s.iter().map(|&value| value as u32))
+            .chain(row.c.iter().copied())
+            .chain(row.f.iter().map(|value| value.to_bits()))
+            .chain(std::iter::once(row.legal as u32))
+        {
+            digest = (digest ^ value as u64).wrapping_mul(0x100_0000_01b3);
+        }
+        digest
+    }
+
+    #[derive(Default)]
+    struct SearchStats {
+        turn_starts: usize,
+        roots: usize,
+        simulations: usize,
+        leaves: usize,
+        nodes: usize,
+        batches: usize,
+        targets: usize,
+        micros: u64,
+        simulate_micros: u64,
+        encode_micros: u64,
+        inference_micros: u64,
+        backup_micros: u64,
+        rollout_steps: usize,
+        rollout_completed: usize,
+        rollout_invalid: usize,
+        rollout_micros: u64,
+        timed_out: bool,
+    }
+
+    struct ExpertTarget {
+        packed: Vec<u8>,
+        target: Vec<f32>,
+        visits: u32,
+        depth: usize,
+        consistency: SearchConsistency,
+    }
+
+    #[derive(Default)]
+    struct SearchConsistency {
+        packed: Vec<Vec<u8>>,
+        weights: Vec<f32>,
+        self_weight: f32,
+        terminal_value: f32,
+    }
+
+    struct PendingLeaf {
+        tree: usize,
+        observation: ObservationV53,
+        digest: u64,
+        depth: usize,
+        path: SearchPath,
+        duplicates: Vec<SearchPath>,
+        game: Option<Game>,
+    }
+
+    struct RolloutStep {
+        game: Option<Game>,
+        observation: ObservationV53,
+        policy: Vec<f32>,
+        digest: u64,
+        choice: usize,
+        depth: usize,
+    }
+
+    struct CombatRollout {
+        value: Option<f32>,
+        steps: Vec<RolloutStep>,
+    }
+
+    fn sample_policy(log_policy: &[f32], random: &mut u64) -> Option<usize> {
+        let draw = random_f32(random);
+        let mut cumulative = 0.0;
+        log_policy
+            .iter()
+            .enumerate()
+            .filter(|(_, probability)| probability.is_finite())
+            .find_map(|(index, probability)| {
+                cumulative += probability.exp();
+                (cumulative >= draw).then_some(index)
+            })
+            .or_else(|| log_policy.iter().rposition(|value| value.is_finite()))
+    }
+
+    fn rollout_combat(
+        model: &ValueModel,
+        trees: &[SearchTree],
+        leaves: &mut [PendingLeaf],
+        initial: &[(Vec<f32>, f32, f32, Vec<f32>, Option<Vec<f32>>)],
+        content: &Content,
+        layout: Layout,
+        bonuses: (i16, i16),
+        random: &mut u64,
+        temperature: f32,
+        prior_temperature: f32,
+        deadline: Option<std::time::Instant>,
+        stats: &mut SearchStats,
+    ) -> Result<Option<Vec<CombatRollout>>, String> {
+        let started = std::time::Instant::now();
+        let mut games = leaves
+            .iter_mut()
+            .map(|leaf| {
+                if trees[leaf.tree].games.is_some() {
+                    leaf.game.clone()
+                } else {
+                    leaf.game.take()
+                }
+                .expect("combat rollout leaf has no game")
+            })
+            .collect::<Vec<_>>();
+        let mut depths = leaves.iter().map(|leaf| leaf.depth).collect::<Vec<_>>();
+        let mut values = vec![None; leaves.len()];
+        let mut paths = leaves
+            .iter()
+            .map(|leaf| Vec::with_capacity((trees[leaf.tree].max_depth - leaf.depth).min(16)))
+            .collect::<Vec<_>>();
+        let mut pending = (0..leaves.len()).collect::<Vec<_>>();
+        let mut indices = Vec::with_capacity(leaves.len());
+        let mut terminal = Vec::with_capacity(leaves.len());
+        let mut actions = vec![None; leaves.len()];
+        let mut first = true;
+        loop {
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                stats.rollout_micros += started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+                return Ok(None);
+            }
+            indices.clear();
+            terminal.clear();
+            for index in pending.drain(..) {
+                let game = &games[index];
+                let tree = &trees[leaves[index].tree];
+                if matches!(game.phase, Phase::Won | Phase::Dead) {
+                    values[index] = Some(if tree.heuristic {
+                        if matches!(game.phase, Phase::Dead) {
+                            0.0
+                        } else {
+                            1.0 + 0.1 * heuristic_combat_value(game)
+                        }
+                    } else {
+                        search_terminal_value(game, tree.progress).unwrap()
+                    });
+                    stats.rollout_completed += 1;
+                } else if game.combat().is_none() {
+                    if tree.heuristic {
+                        values[index] = Some(1.0 + 0.1 * heuristic_combat_value(game));
+                        stats.rollout_completed += 1;
+                    } else {
+                        indices.push(index);
+                        terminal.push(true);
+                    }
+                } else if depths[index] >= tree.max_depth {
+                    stats.rollout_invalid += 1;
+                } else {
+                    indices.push(index);
+                    terminal.push(false);
+                }
+            }
+            if indices.is_empty() {
+                break;
+            }
+            if first {
+                for (&index, &terminal) in indices.iter().zip(&terminal) {
+                    let output = &initial[index];
+                    if terminal {
+                        values[index] = Some(if trees[leaves[index].tree].progress {
+                            output.2
+                        } else {
+                            output.1
+                        });
+                        stats.rollout_completed += 1;
+                    } else {
+                        let choice = sample_policy(
+                            output.4.as_ref().expect("combat rollout policy missing"),
+                            random,
+                        )
+                        .ok_or_else(|| "combat rollout has no legal action".to_owned())?;
+                        actions[index] =
+                            Some(leaves[index].observation.candidates[choice].action.clone());
+                        paths[index].push(RolloutStep {
+                            game: trees[leaves[index].tree]
+                                .games
+                                .is_some()
+                                .then(|| games[index].clone()),
+                            observation: leaves[index].observation.clone(),
+                            policy: output.0.clone(),
+                            digest: leaves[index].digest,
+                            choice,
+                            depth: depths[index],
+                        });
+                        depths[index] += 1;
+                        stats.rollout_steps += 1;
+                    }
+                }
+                first = false;
+            } else {
+                let observations = indices
+                    .par_iter()
+                    .map(|&index| {
+                        observation_v53_with_map(
+                            &games[index],
+                            content,
+                            layout,
+                            bonuses,
+                            Some(&trees[leaves[index].tree].map),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let rows = observations.iter().collect::<Vec<_>>();
+                let encoded = model.state_actions_batch(&rows);
+                let outputs = model
+                    .evaluate_batch(
+                        &rows,
+                        &encoded,
+                        temperature,
+                        None,
+                        terminal.iter().any(|&terminal| terminal),
+                    )
+                    .map_err(|error| error.to_string())?;
+                let digests = observations
+                    .par_iter()
+                    .zip(&terminal)
+                    .map(|(observation, &terminal)| {
+                        (!terminal).then(|| observation_digest(observation))
+                    })
+                    .collect::<Vec<_>>();
+                for ((((index, terminal), output), observation), digest) in indices
+                    .iter()
+                    .copied()
+                    .zip(terminal.iter().copied())
+                    .zip(outputs)
+                    .zip(observations)
+                    .zip(digests)
+                {
+                    if terminal {
+                        values[index] = Some(if trees[leaves[index].tree].progress {
+                            output.2
+                        } else {
+                            output.1
+                        });
+                        stats.rollout_completed += 1;
+                    } else {
+                        let choice = sample_policy(&output.0, random)
+                            .ok_or_else(|| "combat rollout has no legal action".to_owned())?;
+                        let mut policy = output
+                            .0
+                            .iter()
+                            .map(|value| value * temperature / prior_temperature)
+                            .collect::<Vec<_>>();
+                        let maximum = policy.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                        let normalizer = policy
+                            .iter()
+                            .filter(|value| value.is_finite())
+                            .map(|value| (value - maximum).exp())
+                            .sum::<f32>()
+                            .ln()
+                            + maximum;
+                        policy
+                            .iter_mut()
+                            .filter(|value| value.is_finite())
+                            .for_each(|value| *value -= normalizer);
+                        actions[index] = Some(observation.candidates[choice].action.clone());
+                        paths[index].push(RolloutStep {
+                            game: trees[leaves[index].tree]
+                                .games
+                                .is_some()
+                                .then(|| games[index].clone()),
+                            digest: digest.expect("combat rollout observation digest missing"),
+                            observation,
+                            policy,
+                            choice,
+                            depth: depths[index],
+                        });
+                        depths[index] += 1;
+                        stats.rollout_steps += 1;
+                    }
+                }
+            }
+            pending.extend(
+                indices
+                    .iter()
+                    .copied()
+                    .zip(&terminal)
+                    .filter_map(|(index, terminal)| (!terminal).then_some(index)),
+            );
+            games
+                .par_iter_mut()
+                .zip(actions.par_iter_mut())
+                .try_for_each(|(game, action)| {
+                    if let Some(action) = action.take() {
+                        game.step(content, action)
+                            .map_err(|error| format!("combat rollout step failed: {error:?}"))?;
+                    }
+                    Ok::<_, String>(())
+                })?;
+        }
+        stats.rollout_micros += started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        Ok(Some(
+            values
+                .into_iter()
+                .zip(paths)
+                .map(|(value, steps)| CombatRollout { value, steps })
+                .collect(),
+        ))
+    }
+
+    fn run_mcts(
+        model: &ValueModel,
+        trees: &mut [SearchTree],
+        content: &Content,
+        layout: Layout,
+        bonuses: (i16, i16),
+        random: &mut u64,
+        batch_size: usize,
+        prior_temperature: f32,
+        policy_temperature: f32,
+        exploration: f32,
+        deadline: Option<std::time::Instant>,
+        stats: &mut SearchStats,
+    ) -> Result<(), String> {
+        let mut cursor = 0;
+        let mut tasks = Vec::with_capacity(batch_size);
+        let mut leaves = Vec::<PendingLeaf>::with_capacity(batch_size);
+        let mut leaf_lookup = FastMap::<(usize, u64, usize), usize>::default();
+        let mut updates: Vec<Vec<(SearchPath, Option<f32>)>> =
+            (0..trees.len()).map(|_| Vec::new()).collect();
+        let mut expansions: Vec<Vec<(PendingLeaf, Vec<f32>, f32)>> =
+            (0..trees.len()).map(|_| Vec::new()).collect();
+        let mut rollout_expansions: Vec<Vec<(PendingLeaf, Vec<RolloutStep>, f32)>> =
+            (0..trees.len()).map(|_| Vec::new()).collect();
+        while trees.iter().any(|tree| tree.simulations < tree.budget) {
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                stats.timed_out = true;
+                break;
+            }
+            tasks.clear();
+            for lane in 0..16 {
+                for offset in 0..trees.len() {
+                    let tree = (cursor + offset) % trees.len();
+                    let search = &trees[tree];
+                    if search.simulations + lane < search.budget {
+                        tasks.push((tree, random_u64(random), lane));
+                        if tasks.len() == batch_size {
+                            break;
+                        }
+                    }
+                }
+                if tasks.len() == batch_size {
+                    break;
+                }
+            }
+            cursor = (cursor + tasks.len()) % trees.len();
+            let started = std::time::Instant::now();
+            let results = tasks
+                .par_iter()
+                .map(|&(tree, seed, lane)| {
+                    trees[tree]
+                        .simulate(content, layout, bonuses, seed, exploration, lane)
+                        .map(|result| (tree, result))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            stats.simulate_micros += started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+            let started = std::time::Instant::now();
+            leaves.clear();
+            leaf_lookup.clear();
+            updates.iter_mut().for_each(Vec::clear);
+            for (tree_index, result) in results {
+                match result {
+                    SearchResult::Value(path, value) => {
+                        updates[tree_index].push((path, Some(value)))
+                    }
+                    SearchResult::Invalid(path) => updates[tree_index].push((path, None)),
+                    SearchResult::Leaf(leaf) => {
+                        let key = (tree_index, leaf.digest, leaf.depth);
+                        if trees[tree_index].turns != 0 {
+                            if let Some(&index) = leaf_lookup.get(&key) {
+                                leaves[index].duplicates.push(leaf.path);
+                                continue;
+                            }
+                            leaf_lookup.insert(key, leaves.len());
+                        }
+                        leaves.push(PendingLeaf {
+                            tree: tree_index,
+                            observation: leaf.observation,
+                            digest: leaf.digest,
+                            depth: leaf.depth,
+                            path: leaf.path,
+                            duplicates: Vec::new(),
+                            game: leaf.game,
+                        });
+                    }
+                }
+            }
+            trees
+                .par_iter_mut()
+                .zip(&mut updates)
+                .for_each(|(tree, updates)| {
+                    for (mut path, value) in updates.drain(..) {
+                        if let Some(value) = value {
+                            tree.backup(&mut path, value);
+                        } else {
+                            tree.invalidate(&mut path);
+                        }
+                    }
+                });
+            if leaves.is_empty() {
+                stats.backup_micros += started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+                continue;
+            }
+            stats.backup_micros += started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+            let rows = leaves
+                .iter()
+                .map(|leaf| &leaf.observation)
+                .collect::<Vec<_>>();
+            let started = std::time::Instant::now();
+            let features = model.state_actions_batch(&rows);
+            stats.encode_micros += started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+            let started = std::time::Instant::now();
+            let rollout = trees.iter().any(|tree| tree.turns == 0);
+            let evaluated = model
+                .evaluate_batch(
+                    &rows,
+                    &features,
+                    prior_temperature,
+                    rollout.then_some(policy_temperature),
+                    !rollout || trees.iter().any(|tree| !tree.heuristic),
+                )
+                .map_err(|error| error.to_string())?;
+            stats.inference_micros += started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+            let mut rollout_values = if rollout {
+                let Some(values) = rollout_combat(
+                    model,
+                    trees,
+                    &mut leaves,
+                    &evaluated,
+                    content,
+                    layout,
+                    bonuses,
+                    random,
+                    policy_temperature,
+                    prior_temperature,
+                    deadline,
+                    stats,
+                )?
+                else {
+                    stats.timed_out = true;
+                    break;
+                };
+                Some(values)
+            } else {
+                None
+            };
+            tracing::debug!(
+                tasks = tasks.len(),
+                leaves = leaves.len(),
+                trees = trees.len(),
+                "mcts_wave"
+            );
+            stats.leaves += leaves.len();
+            stats.batches += 1;
+            let started = std::time::Instant::now();
+            expansions.iter_mut().for_each(Vec::clear);
+            rollout_expansions.iter_mut().for_each(Vec::clear);
+            for (index, (mut leaf, (policy, win, progress, _, _))) in
+                leaves.drain(..).zip(evaluated).enumerate()
+            {
+                let value = if let Some(rollouts) = &rollout_values {
+                    rollouts[index].value
+                } else if trees[leaf.tree].heuristic {
+                    Some(heuristic_combat_value(
+                        leaf.game.as_ref().expect("heuristic leaf has no game"),
+                    ))
+                } else if trees[leaf.tree].progress {
+                    Some(progress)
+                } else {
+                    Some(win)
+                };
+                if let Some(value) = value {
+                    if let Some(rollouts) = &mut rollout_values {
+                        rollout_expansions[leaf.tree].push((
+                            leaf,
+                            std::mem::take(&mut rollouts[index].steps),
+                            value,
+                        ));
+                    } else {
+                        expansions[leaf.tree].push((leaf, policy, value));
+                    }
+                } else {
+                    trees[leaf.tree].invalidate(&mut leaf.path);
+                }
+            }
+            trees
+                .par_iter_mut()
+                .zip(&mut expansions)
+                .zip(&mut rollout_expansions)
+                .for_each(|((tree, expansions), rollouts)| {
+                    for (leaf, rollout, value) in rollouts.drain(..) {
+                        tree.expand_rollout(leaf, rollout, value);
+                    }
+                    for (leaf, policy, value) in expansions.drain(..) {
+                        tree.expand(
+                            leaf.observation,
+                            leaf.digest,
+                            leaf.depth,
+                            leaf.path,
+                            leaf.duplicates,
+                            &policy,
+                            value,
+                            leaf.game,
+                        );
+                    }
+                });
+            stats.backup_micros += started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        }
+        Ok(())
+    }
+
+    fn mcts_targets(
+        model: &ValueModel,
+        games: &[Game],
+        observations: &[ObservationV53],
+        outputs: &[(Vec<f32>, f32, f32, Vec<f32>, Option<Vec<f32>>)],
+        turn_starts: &[bool],
+        content: &Content,
+        layout: Layout,
+        bonuses: (i16, i16),
+        random: &mut u64,
+        fraction: f32,
+        simulations: usize,
+        boss_simulations: usize,
+        turns: usize,
+        max_depth: usize,
+        batch_size: usize,
+        min_visits: u32,
+        max_targets: usize,
+        prior_temperature: f32,
+        q_temperature: f32,
+        exploration: f32,
+        policy_temperature: f32,
+        value_consistency: bool,
+        heuristic: bool,
+        timeout: f64,
+    ) -> Result<(Vec<ExpertTarget>, SearchStats), String> {
+        let turn_start_count = observations
+            .iter()
+            .zip(turn_starts)
+            .filter(|(observation, turn_start)| {
+                **turn_start
+                    && observation
+                        .candidates
+                        .iter()
+                        .filter(|row| row.legal)
+                        .count()
+                        >= 2
+            })
+            .count();
+        let mut trees = games
+            .iter()
+            .zip(observations)
+            .zip(outputs)
+            .zip(turn_starts)
+            .filter_map(
+                |(((game, observation), (log_policy, _, progress, _, _)), turn_start)| {
+                    if !turn_start
+                        || observation
+                            .candidates
+                            .iter()
+                            .filter(|row| row.legal)
+                            .count()
+                            < 2
+                    {
+                        return None;
+                    }
+                    let forced = matches!(game.room, Room::Elite | Room::Boss);
+                    let budget = if forced && boss_simulations > 0 {
+                        boss_simulations
+                    } else if simulations > 0 && random_f32(random) < fraction {
+                        simulations
+                    } else {
+                        return None;
+                    };
+                    let mut prior = log_policy
+                        .iter()
+                        .map(|value| value * policy_temperature / prior_temperature)
+                        .collect::<Vec<_>>();
+                    let maximum = prior.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let normalizer = prior
+                        .iter()
+                        .filter(|value| value.is_finite())
+                        .map(|value| (value - maximum).exp())
+                        .sum::<f32>()
+                        .ln()
+                        + maximum;
+                    prior
+                        .iter_mut()
+                        .filter(|value| value.is_finite())
+                        .for_each(|value| *value -= normalizer);
+                    Some(SearchTree::new(
+                        game,
+                        observation,
+                        content,
+                        layout,
+                        &prior,
+                        *progress,
+                        budget,
+                        turns,
+                        max_depth,
+                        false,
+                        true,
+                        prior_temperature / policy_temperature,
+                        min_visits,
+                        value_consistency,
+                        heuristic,
+                    ))
+                },
+            )
+            .collect::<Vec<_>>();
+        let mut stats = SearchStats {
+            turn_starts: turn_start_count,
+            roots: trees.len(),
+            ..SearchStats::default()
+        };
+        let deadline = if timeout > 0.0 {
+            Some(
+                std::time::Instant::now()
+                    .checked_add(
+                        std::time::Duration::try_from_secs_f64(timeout)
+                            .map_err(|_| "invalid MCTS timeout")?,
+                    )
+                    .ok_or("invalid MCTS timeout")?,
+            )
+        } else {
+            None
+        };
+        run_mcts(
+            model,
+            &mut trees,
+            content,
+            layout,
+            bonuses,
+            random,
+            batch_size,
+            prior_temperature,
+            policy_temperature,
+            exploration,
+            deadline,
+            &mut stats,
+        )?;
+        let mut targets = Vec::new();
+        for tree in trees {
+            stats.simulations += tree.simulations;
+            stats.nodes += tree.nodes.len();
+            if tree.simulations < tree.budget {
+                continue;
+            }
+            let (_, action_values) = tree.expectimax();
+            let mut nodes = tree
+                .nodes
+                .iter()
+                .enumerate()
+                .map(|(index, node)| (index, node.visits))
+                .filter(|(index, visits)| {
+                    *visits >= min_visits && action_values[*index].iter().flatten().count() >= 2
+                })
+                .collect::<Vec<_>>();
+            nodes.sort_by_key(|&(index, visits)| (std::cmp::Reverse(visits), index));
+            for (index, visits) in nodes.into_iter().take(max_targets) {
+                if let Some(target) = tree.target(index, &action_values[index], q_temperature) {
+                    targets.push(ExpertTarget {
+                        packed: tree.nodes[index]
+                            .packed
+                            .clone()
+                            .expect("eligible search target was not packed"),
+                        target,
+                        visits,
+                        depth: tree.nodes[index].depth,
+                        consistency: if value_consistency {
+                            tree.consistency(index)
+                        } else {
+                            SearchConsistency {
+                                self_weight: 1.0,
+                                ..SearchConsistency::default()
+                            }
+                        },
+                    });
+                }
+            }
+        }
+        stats.targets = targets.len();
+        Ok((targets, stats))
+    }
+
+    struct ExactLeaf {
+        value: f32,
+        player_hp: i16,
+        enemy_hp: i32,
+        depth: usize,
+        weight: usize,
+        rng: bool,
+        state: serde_json::Value,
+    }
+
+    fn exact_leaf_state(game: &Game, content: &Content) -> serde_json::Value {
+        let card = |card: &Card| {
+            format!(
+                "{}+{}:{}:{}:{}:{:?}",
+                content.cards[card.id as usize].id,
+                card.upgrades,
+                card.cost_delta,
+                card.value,
+                card.free as u8,
+                card.cost_override,
+            )
+        };
+        let powers = |creature: &Creature| {
+            creature
+                .powers
+                .iter()
+                .map(|power| {
+                    format!(
+                        "{}:{}:{}",
+                        content.powers[power.id as usize].id, power.amount, power.value
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let common = serde_json::json!({
+            "phase": phase_index(&game.phase),
+            "actions": game.actions(content).len(),
+            "gold": game.run.gold,
+            "potions": game.run.potions.iter().map(|id| id.map(|id| content.potions[id as usize].id)).collect::<Vec<_>>(),
+        });
+        match &game.phase {
+            Phase::Combat(combat) => serde_json::json!({
+                "common": common,
+                "turn": combat.turn,
+                "energy": combat.energy,
+                "stars": combat.stars,
+                "player_block": combat.player.block,
+                "player_powers": powers(&combat.player),
+                "hand": combat.hand.iter().map(&card).collect::<Vec<_>>(),
+                "draw": combat.draw.iter().map(&card).collect::<Vec<_>>(),
+                "discard": combat.discard.iter().map(&card).collect::<Vec<_>>(),
+                "exhaust": combat.exhaust.iter().map(&card).collect::<Vec<_>>(),
+                "enemies": combat.enemies.iter().map(|enemy| serde_json::json!({
+                    "id": content.enemies[enemy.creature.id as usize].id,
+                    "hp": enemy.creature.hp,
+                    "block": enemy.creature.block,
+                    "move": enemy.move_index,
+                    "powers": powers(&enemy.creature),
+                })).collect::<Vec<_>>(),
+            }),
+            Phase::Rewards(rewards) => serde_json::json!({
+                "common": common,
+                "reward_gold": rewards.gold,
+                "cards": rewards.cards.iter().map(&card).collect::<Vec<_>>(),
+                "card_rewards": rewards.card_rewards.iter().map(|reward| format!("{reward:?}")).collect::<Vec<_>>(),
+                "relics": rewards.relics.iter().map(|id| content.relics[*id as usize].id).collect::<Vec<_>>(),
+                "reward_potions": rewards.potions.iter().map(|id| content.potions[*id as usize].id).collect::<Vec<_>>(),
+                "removals": rewards.removals,
+            }),
+            _ => common,
+        }
+    }
+
+    struct ExactResult {
+        value: f32,
+        rng: bool,
+    }
+
+    struct ExactSearch<'a> {
+        model: &'a ValueModel,
+        content: &'a Content,
+        layout: Layout,
+        bonuses: (i16, i16),
+        map: CanonicalMap,
+        root_turn: u16,
+        turns: usize,
+        max_depth: usize,
+        max_states: usize,
+        states: usize,
+        transitions: usize,
+        rng_transitions: usize,
+        stochastic_splits: usize,
+        leaves: Vec<ExactLeaf>,
+        action_values: Vec<f32>,
+        choices: HashMap<(u64, usize), (Vec<u8>, usize)>,
+        record_leaves: bool,
+        heuristic: bool,
+        cache: EncodingCache,
+        progress: bool,
+    }
+
+    impl ExactSearch<'_> {
+        fn enter(&mut self) -> Result<(), String> {
+            if self.states >= self.max_states {
+                return Err(format!(
+                    "exhaustive search exceeded {} public states",
+                    self.max_states
+                ));
+            }
+            self.states += 1;
+            Ok(())
+        }
+
+        fn horizon(&self, game: &Game) -> bool {
+            game.combat().is_none()
+                || self.turns > 0
+                    && game.combat().is_some_and(|combat| {
+                        combat.turn >= self.root_turn.saturating_add(self.turns as u16)
+                    })
+        }
+
+        fn leaf(
+            &mut self,
+            particles: &[Game],
+            observation: Option<&ObservationV53>,
+            depth: usize,
+            rng: bool,
+        ) -> Result<ExactResult, String> {
+            let game = &particles[0];
+            let value = if self.heuristic {
+                heuristic_combat_value(game)
+            } else if let Some(value) = search_terminal_value(game, self.progress) {
+                value
+            } else {
+                let row =
+                    observation.ok_or_else(|| "missing exhaustive leaf observation".to_owned())?;
+                let output = self
+                    .model
+                    .evaluate(row, 1.0, &mut self.cache)
+                    .map_err(|error| error.to_string())?;
+                if self.progress { output.2 } else { output.1 }
+            };
+            self.record_leaf(game, particles.len(), depth, rng, value);
+            Ok(ExactResult { value, rng })
+        }
+
+        fn record_leaf(&mut self, game: &Game, weight: usize, depth: usize, rng: bool, value: f32) {
+            if self.record_leaves {
+                let (player_hp, enemy_hp) = game.combat().map_or((game.run.hp, 0), |combat| {
+                    (
+                        combat.player.hp,
+                        combat
+                            .enemies
+                            .iter()
+                            .map(|enemy| enemy.creature.hp.max(0) as i32)
+                            .sum(),
+                    )
+                });
+                self.leaves.push(ExactLeaf {
+                    value,
+                    player_hp,
+                    enemy_hp,
+                    depth,
+                    weight,
+                    rng,
+                    state: exact_leaf_state(game, self.content),
+                });
+            }
+        }
+
+        fn flush_leaves(
+            &mut self,
+            pending: &mut Vec<(f32, usize, Option<Game>, ObservationV53)>,
+            depth: usize,
+            rng: bool,
+        ) -> Result<f32, String> {
+            if pending.is_empty() {
+                return Ok(0.0);
+            }
+            if self.heuristic {
+                return Ok(pending
+                    .drain(..)
+                    .map(|(weight, count, game, _)| {
+                        let game = game.expect("heuristic leaf has no game");
+                        let value = heuristic_combat_value(&game);
+                        self.record_leaf(&game, count, depth, rng, value);
+                        weight * value
+                    })
+                    .sum());
+            }
+            if pending.len() == 1 {
+                let (weight, count, game, observation) = pending.pop().unwrap();
+                let output = self
+                    .model
+                    .evaluate(&observation, 1.0, &mut self.cache)
+                    .map_err(|error| error.to_string())?;
+                let value = if self.progress { output.2 } else { output.1 };
+                if let Some(game) = game.as_ref() {
+                    self.record_leaf(game, count, depth, rng, value);
+                }
+                return Ok(weight * value);
+            }
+            let evaluated = pending
+                .par_iter()
+                .map(|(_, _, _, observation)| {
+                    let index =
+                        rayon::current_thread_index().unwrap_or(0) % self.model.encode_caches.len();
+                    self.model
+                        .evaluate(
+                            observation,
+                            1.0,
+                            &mut self.model.encode_caches[index].lock().unwrap(),
+                        )
+                        .map_err(|error| error.to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(pending
+                .drain(..)
+                .zip(evaluated)
+                .map(|((weight, count, game, _), (_, win, progress, _))| {
+                    let value = if self.progress { progress } else { win };
+                    if let Some(game) = game.as_ref() {
+                        self.record_leaf(game, count, depth, rng, value);
+                    }
+                    weight * value
+                })
+                .sum())
+        }
+
+        fn solve(
+            &mut self,
+            particles: Vec<Game>,
+            row: Option<ObservationV53>,
+            depth: usize,
+            rng: bool,
+        ) -> Result<ExactResult, String> {
+            self.enter()?;
+            if matches!(particles[0].phase, Phase::Won | Phase::Dead) || self.horizon(&particles[0])
+            {
+                return self.leaf(&particles, row.as_ref(), depth, rng);
+            }
+            if depth >= self.max_depth {
+                return Ok(ExactResult {
+                    value: f32::NEG_INFINITY,
+                    rng,
+                });
+            }
+            let row = row.ok_or_else(|| "missing exhaustive observation".to_owned())?;
+            let policy = row
+                .candidates
+                .iter()
+                .map(|candidate| {
+                    if candidate.legal {
+                        0.0
+                    } else {
+                        f32::NEG_INFINITY
+                    }
+                })
+                .collect::<Vec<_>>();
+            let node = SearchNode::new(row.candidates.clone(), &policy, 0.0, depth, 1.0, None);
+            if node.edges.is_empty() {
+                return self.leaf(&particles, Some(&row), depth, rng);
+            }
+            let mut actions = (0..node.edges.len())
+                .map(|_| Vec::with_capacity(particles.len()))
+                .collect::<Vec<_>>();
+            for (particle, game) in particles.iter().enumerate() {
+                let observation = (particle > 0).then(|| {
+                    observation_v53_with_map(
+                        game,
+                        self.content,
+                        self.layout,
+                        self.bonuses,
+                        Some(&self.map),
+                    )
+                });
+                let observation = observation.as_ref().unwrap_or(&row);
+                for (actions, edge) in actions.iter_mut().zip(&node.edges) {
+                    actions.push(
+                        search_candidate(observation, edge)
+                            .ok_or_else(|| "exhaustive public action mismatch".to_owned())?
+                            .action
+                            .clone(),
+                    );
+                }
+            }
+            let mut best = f32::NEG_INFINITY;
+            let mut best_choice = 0;
+            let mut any_rng = rng;
+            let mut groups = HashMap::<u64, (Option<ObservationV53>, Vec<Game>)>::new();
+            for (edge, actions) in node.edges.iter().zip(actions) {
+                groups.clear();
+                let mut action_rng = false;
+                let content = self.content;
+                let layout = self.layout;
+                let bonuses = self.bonuses;
+                let map = &self.map;
+                let successors = particles
+                    .par_iter()
+                    .zip(actions.into_par_iter())
+                    .map(|(game, action)| {
+                        let mut next = game.clone();
+                        let action_rng = next
+                            .step_with_rng(content, action)
+                            .map_err(|error| format!("exhaustive step failed: {error:?}"))?;
+                        let (digest, observation) = match next.phase {
+                            Phase::Won => (u64::MAX, None),
+                            Phase::Dead => (u64::MAX - 1, None),
+                            _ => {
+                                let observation = observation_v53_with_map(
+                                    &next,
+                                    content,
+                                    layout,
+                                    bonuses,
+                                    Some(map),
+                                );
+                                (observation_digest(&observation), Some(observation))
+                            }
+                        };
+                        Ok((next, action_rng, digest, observation))
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                for (next, next_rng, digest, observation) in successors {
+                    action_rng |= next_rng;
+                    groups
+                        .entry(digest)
+                        .or_insert_with(|| (observation, Vec::new()))
+                        .1
+                        .push(next);
+                }
+                self.transitions += particles.len();
+                self.rng_transitions += usize::from(action_rng);
+                self.stochastic_splits += usize::from(groups.len() > 1);
+                let branch_rng = rng || action_rng || groups.len() > 1;
+                let mut value = 0.0;
+                let mut pending = Vec::new();
+                for (_, (observation, group)) in groups.drain() {
+                    let weight = group.len() as f32 / particles.len() as f32;
+                    if self.horizon(&group[0])
+                        && !matches!(group[0].phase, Phase::Won | Phase::Dead)
+                    {
+                        self.enter()?;
+                        let count = group.len();
+                        let game = (self.record_leaves || self.heuristic)
+                            .then(|| group.into_iter().next().unwrap());
+                        pending.push((weight, count, game, observation.unwrap()));
+                    } else {
+                        any_rng |= !pending.is_empty() && branch_rng;
+                        value += self.flush_leaves(&mut pending, depth + 1, branch_rng)?;
+                        let result = self.solve(group, observation, depth + 1, branch_rng)?;
+                        value += weight * result.value;
+                        any_rng |= result.rng;
+                    }
+                }
+                if !pending.is_empty() {
+                    any_rng |= branch_rng;
+                }
+                value += self.flush_leaves(&mut pending, depth + 1, branch_rng)?;
+                if depth == 0 {
+                    self.action_values.push(value);
+                }
+                if value > best {
+                    best = value;
+                    best_choice = edge.candidate;
+                }
+            }
+            if best.is_finite() {
+                self.choices.insert(
+                    (observation_digest(&row), depth),
+                    (compact_packed_observation(&row), best_choice),
+                );
+            }
+            Ok(ExactResult {
+                value: best,
+                rng: any_rng,
+            })
+        }
+    }
+
+    fn exact_search<'a>(
+        model: &'a ValueModel,
+        game: &Game,
+        content: &'a Content,
+        layout: Layout,
+        bonuses: (i16, i16),
+        root_turn: u16,
+        turns: usize,
+        max_depth: usize,
+        samples: usize,
+        max_states: usize,
+        seed: u64,
+        record_leaves: bool,
+        progress: bool,
+        heuristic: bool,
+    ) -> Result<(ExactResult, ExactSearch<'a>), String> {
+        let mut random = seed.max(1);
+        let particles = (0..samples)
+            .map(|_| {
+                let mut particle = game.clone();
+                resample_combat_hidden(&mut particle, random_u64(&mut random));
+                particle
+            })
+            .collect::<Vec<_>>();
+        let map = canonical_map(&particles[0], content, layout);
+        let row = observation_v53_with_map(&particles[0], content, layout, bonuses, Some(&map));
+        let mut search = ExactSearch {
+            model,
+            content,
+            layout,
+            bonuses,
+            map,
+            root_turn,
+            turns,
+            max_depth,
+            max_states,
+            states: 0,
+            transitions: 0,
+            rng_transitions: 0,
+            stochastic_splits: 0,
+            leaves: Vec::new(),
+            action_values: Vec::new(),
+            choices: HashMap::new(),
+            record_leaves,
+            heuristic,
+            cache: EncodingCache::default(),
+            progress,
+        };
+        let result = search.solve(particles, Some(row), 0, false)?;
+        Ok((result, search))
+    }
+
+    fn search_diagnostic(
+        model: &ValueModel,
+        game: &Game,
+        content: &Content,
+        layout: Layout,
+        bonuses: (i16, i16),
+        simulations: usize,
+        turns: usize,
+        max_depth: usize,
+        batch_size: usize,
+        prior_temperature: f32,
+        exploration: f32,
+        policy_temperature: f32,
+        exact_samples: usize,
+        max_exact_states: usize,
+        seed: u64,
+        progress: bool,
+        q_temperature: f32,
+    ) -> Result<serde_json::Value, String> {
+        let observation = observation_v53(game, content, layout, bonuses);
+        let (log_policy, win, progress_value, _) = model
+            .evaluate(
+                &observation,
+                policy_temperature,
+                &mut EncodingCache::default(),
+            )
+            .map_err(|error| error.to_string())?;
+        let value = if progress { progress_value } else { win };
+        let mut prior = log_policy
+            .iter()
+            .map(|value| value * policy_temperature / prior_temperature)
+            .collect::<Vec<_>>();
+        let maximum = prior.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let normalizer = prior
+            .iter()
+            .filter(|value| value.is_finite())
+            .map(|value| (value - maximum).exp())
+            .sum::<f32>()
+            .ln()
+            + maximum;
+        prior
+            .iter_mut()
+            .filter(|value| value.is_finite())
+            .for_each(|value| *value -= normalizer);
+        let mut tree = SearchTree::new(
+            game,
+            &observation,
+            content,
+            layout,
+            &prior,
+            value,
+            simulations,
+            turns,
+            max_depth,
+            true,
+            progress,
+            1.0,
+            u32::MAX,
+            false,
+            false,
+        );
+        let mut random = seed.max(1);
+        let mut stats = SearchStats {
+            roots: 1,
+            ..SearchStats::default()
+        };
+        run_mcts(
+            model,
+            std::slice::from_mut(&mut tree),
+            content,
+            layout,
+            bonuses,
+            &mut random,
+            batch_size,
+            prior_temperature,
+            policy_temperature,
+            exploration,
+            None,
+            &mut stats,
+        )?;
+        let root_turn = tree.root_turn;
+        let (root_exact, exact) = exact_search(
+            model,
+            game,
+            content,
+            layout,
+            bonuses,
+            root_turn,
+            turns,
+            max_depth,
+            exact_samples,
+            max_exact_states,
+            seed ^ 0x4558_4143_5452_4e47,
+            true,
+            progress,
+            false,
+        )?;
+        let (search_values, search_actions) = tree.expectimax();
+        let games = tree
+            .games
+            .as_ref()
+            .expect("diagnostic MCTS did not capture games");
+        let mut nodes = Vec::with_capacity(tree.nodes.len());
+        for (index, (node, game)) in tree.nodes.iter().zip(games).enumerate() {
+            let visits = node.edges.iter().map(|edge| edge.visits).sum::<u32>();
+            let (result, exact_actions, search) = if index == 0 {
+                (
+                    ExactResult {
+                        value: root_exact.value,
+                        rng: root_exact.rng,
+                    },
+                    exact.action_values.clone(),
+                    None,
+                )
+            } else {
+                let (result, search) = exact_search(
+                    model,
+                    game,
+                    content,
+                    layout,
+                    bonuses,
+                    root_turn,
+                    turns,
+                    max_depth.saturating_sub(node.depth).max(1),
+                    exact_samples,
+                    max_exact_states,
+                    seed ^ index as u64,
+                    false,
+                    progress,
+                    false,
+                )?;
+                let action_values = search.action_values.clone();
+                (result, action_values, Some(search))
+            };
+            let target = tree.target(index, &search_actions[index], q_temperature);
+            let actions = node
+                .edges
+                .iter()
+                .zip(&search_actions[index])
+                .zip(exact_actions)
+                .map(|((edge, approximate), exact)| {
+                    serde_json::json!({
+                        "action": format!("{:?}", edge.row.action),
+                        "visits": edge.visits,
+                        "prior": edge.prior,
+                        "rollout_mean": (edge.visits > 0).then(|| edge.value_sum / edge.visits as f32),
+                        "approximate": approximate,
+                        "exact": exact,
+                        "target": target.as_ref().map(|target| target[edge.candidate]),
+                    })
+                })
+                .collect::<Vec<_>>();
+            nodes.push(serde_json::json!({
+                "node": index,
+                "depth": node.depth,
+                "visits": visits,
+                "model_value": node.value,
+                "approximate": search_values[index],
+                "exact": result.value,
+                "absolute_error": (search_values[index] - result.value).abs(),
+                "rng": result.rng,
+                "exact_states": search.as_ref().map_or(exact.states, |search| search.states),
+                "exact_transitions": search.as_ref().map_or(exact.transitions, |search| search.transitions),
+                "rng_transitions": search.as_ref().map_or(exact.rng_transitions, |search| search.rng_transitions),
+                "stochastic_splits": search.as_ref().map_or(exact.stochastic_splits, |search| search.stochastic_splits),
+                "actions": actions,
+            }));
+        }
+        let root_node = &tree.nodes[0];
+        let policy_choice = root_node
+            .edges
+            .iter()
+            .enumerate()
+            .max_by(|left, right| {
+                log_policy[left.1.candidate].total_cmp(&log_policy[right.1.candidate])
+            })
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+        let search_choice = root_node
+            .edges
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, edge)| edge.visits)
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+        let search_q_choice = root_node
+            .edges
+            .iter()
+            .enumerate()
+            .filter_map(|(index, _)| search_actions[0][index].map(|value| (index, value)))
+            .max_by(|left, right| left.1.total_cmp(&right.1))
+            .map(|(index, _)| index)
+            .unwrap_or(search_choice);
+        let q_target = tree
+            .target(0, &search_actions[0], q_temperature)
+            .ok_or_else(|| "root has insufficient Q estimates".to_owned())?;
+        let policy_value = root_node
+            .edges
+            .iter()
+            .zip(&exact.action_values)
+            .map(|(edge, value)| log_policy[edge.candidate].exp() * value)
+            .sum::<f32>();
+        let q_target_value = root_node
+            .edges
+            .iter()
+            .zip(&exact.action_values)
+            .map(|(edge, value)| q_target[edge.candidate] * value)
+            .sum::<f32>();
+        let q_target_entropy = -q_target
+            .iter()
+            .filter(|value| **value > 0.0)
+            .map(|value| value * value.ln())
+            .sum::<f32>();
+        let root_actions = root_node
+            .edges
+            .iter()
+            .enumerate()
+            .zip(&exact.action_values)
+            .map(|((index, edge), exact)| {
+                serde_json::json!({
+                    "action": format!("{:?}", edge.row.action),
+                    "policy": log_policy[edge.candidate].exp(),
+                    "search_prior": edge.prior,
+                    "visits": edge.visits,
+                    "rollout_mean": (edge.visits > 0).then(|| edge.value_sum / edge.visits as f32),
+                    "approximate": search_actions[0][index],
+                    "exact": exact,
+                    "q_target": q_target[edge.candidate],
+                })
+            })
+            .collect::<Vec<_>>();
+        let leaves = exact
+            .leaves
+            .iter()
+            .map(|leaf| {
+                serde_json::json!({
+                    "value": leaf.value,
+                    "player_hp": leaf.player_hp,
+                    "enemy_hp": leaf.enemy_hp,
+                    "depth": leaf.depth,
+                    "weight": leaf.weight,
+                    "rng": leaf.rng,
+                    "state": leaf.state,
+                })
+            })
+            .collect::<Vec<_>>();
+        let combat = game
+            .combat()
+            .ok_or_else(|| "diagnostic root is not in combat".to_owned())?;
+        Ok(serde_json::json!({
+            "root": {
+                "seed": game.seed,
+                "character": game.run.character,
+                "act": game.run.act,
+                "floor": game.run.floor,
+                "turn": combat.turn,
+                "player_hp": combat.player.hp,
+                "enemy_hp": combat.enemies.iter().map(|enemy| enemy.creature.hp.max(0) as i32).sum::<i32>(),
+            },
+            "settings": {
+                "simulations": simulations,
+                "turns": turns,
+                "max_depth": max_depth,
+                "exact_samples": exact_samples,
+                "max_exact_states": max_exact_states,
+                "objective": if progress { "progress" } else { "win" },
+                "q_temperature": q_temperature,
+            },
+            "mcts": {
+                "simulations": tree.simulations,
+                "nodes": tree.nodes.len(),
+                "leaves": stats.leaves,
+                "batches": stats.batches,
+            },
+            "exact": {
+                "value": root_exact.value,
+                "rng": root_exact.rng,
+                "states": exact.states,
+                "transitions": exact.transitions,
+                "rng_transitions": exact.rng_transitions,
+                "stochastic_splits": exact.stochastic_splits,
+                "leaves": leaves.len(),
+            },
+            "root_policy": {
+                "policy_expected_value": policy_value,
+                "policy_greedy_value": exact.action_values.get(policy_choice),
+                "search_selected_value": exact.action_values.get(search_choice),
+                "search_q_selected_value": exact.action_values.get(search_q_choice),
+                "optimal_value": root_exact.value,
+                "policy_expected_gap": root_exact.value - policy_value,
+                "q_target_expected_value": q_target_value,
+                "q_target_gap": root_exact.value - q_target_value,
+                "q_target_entropy": q_target_entropy,
+                "policy_greedy_gap": exact.action_values.get(policy_choice).map(|value| root_exact.value - value),
+                "search_gap": exact.action_values.get(search_choice).map(|value| root_exact.value - value),
+                "search_q_gap": exact.action_values.get(search_q_choice).map(|value| root_exact.value - value),
+                "actions": root_actions,
+            },
+            "nodes": nodes,
+            "leaves": leaves,
+        }))
+    }
+
+    fn random_u64(random: &mut u64) -> u64 {
+        *random ^= *random << 13;
+        *random ^= *random >> 7;
+        *random ^= *random << 17;
+        *random
+    }
+
+    fn random_f32(random: &mut u64) -> f32 {
+        (random_u64(random) >> 40) as f32 / (1u32 << 24) as f32
     }
 
     fn action_descriptor(
@@ -14427,6 +17185,7 @@ mod python {
                 resample_archive: true,
                 archive_depth: 0,
                 policy: None,
+                searched_turns: vec![None; size],
                 content,
                 layout,
             };
@@ -14539,6 +17298,7 @@ mod python {
             self.plans = vec![vec![]];
             self.starts.clear();
             self.root_ids = vec![usize::MAX];
+            self.searched_turns = vec![None];
             Ok(())
         }
 
@@ -14565,6 +17325,7 @@ mod python {
             self.plans = vec![vec![]; self.games.len()];
             self.starts.clear();
             self.root_ids = vec![usize::MAX; self.games.len()];
+            self.searched_turns = vec![None; self.games.len()];
             Ok(())
         }
 
@@ -14763,6 +17524,50 @@ mod python {
                 });
             self.actions.iter_mut().for_each(Vec::clear);
             self.plans.iter_mut().for_each(Vec::clear);
+            Ok(())
+        }
+
+        #[pyo3(signature = (source, indices, repeats=1, seed=None))]
+        fn copy_resampled(
+            &mut self,
+            source: PyRef<'_, Batch>,
+            indices: Vec<usize>,
+            repeats: usize,
+            seed: Option<u64>,
+        ) -> PyResult<()> {
+            if repeats == 0 || indices.len() * repeats != self.games.len() {
+                return Err(PyValueError::new_err("invalid repeat count"));
+            }
+            let roots = indices
+                .iter()
+                .map(|&index| {
+                    source
+                        .games
+                        .get(index)
+                        .cloned()
+                        .ok_or_else(|| PyValueError::new_err("invalid environment index"))
+                })
+                .collect::<PyResult<Vec<_>>>()?;
+            let mut random = seed.map(Rng::from_seed);
+            let seeds = (0..self.games.len())
+                .map(|_| random.as_mut().map_or_else(|| self.random_u64(), Rng::next))
+                .collect::<Vec<_>>();
+            let content = &self.content;
+            self.games
+                .par_iter_mut()
+                .zip(seeds)
+                .enumerate()
+                .for_each(|(index, (game, seed))| {
+                    *game = roots[index / repeats].clone();
+                    resample_hidden(game, content, seed);
+                });
+            self.training_strength = source.training_strength;
+            self.training_dexterity = source.training_dexterity;
+            self.actions.iter_mut().for_each(Vec::clear);
+            self.plans.iter_mut().for_each(Vec::clear);
+            self.starts.clear();
+            self.root_ids.fill(usize::MAX);
+            self.searched_turns.fill(None);
             Ok(())
         }
 
@@ -15227,7 +18032,7 @@ mod python {
                 .collect()
         }
 
-        fn stats(&self) -> Vec<(u8, u8, i16, i16, u8, u16, i16, i32, f32)> {
+        fn stats(&self) -> Vec<(u8, u8, i16, i16, u8, u16, i16, i32, f32, u8)> {
             let content = &self.content;
             self.games
                 .iter()
@@ -15269,6 +18074,7 @@ mod python {
                         player_hp,
                         enemy_hp,
                         teacher_state_score(game, content),
+                        canonical_progress(game),
                     )
                 })
                 .collect()
@@ -15781,14 +18587,315 @@ mod python {
             Ok(())
         }
 
-        #[pyo3(signature = (temperature=1.0, sample=true, advance=false))]
+        #[pyo3(signature = (
+            index=0,
+            simulations=128,
+            turns=1,
+            max_depth=64,
+            batch_size=256,
+            prior_temperature=1.0,
+            exploration=1.5,
+            policy_temperature=0.8,
+            exact_samples=16,
+            max_exact_states=100_000,
+            seed=1,
+            progress=false,
+            q_temperature=0.002,
+        ))]
+        fn search_diagnostics(
+            &self,
+            py: Python<'_>,
+            index: usize,
+            simulations: usize,
+            turns: usize,
+            max_depth: usize,
+            batch_size: usize,
+            prior_temperature: f32,
+            exploration: f32,
+            policy_temperature: f32,
+            exact_samples: usize,
+            max_exact_states: usize,
+            seed: u64,
+            progress: bool,
+            q_temperature: f32,
+        ) -> PyResult<String> {
+            if simulations == 0
+                || max_depth == 0
+                || batch_size == 0
+                || exact_samples == 0
+                || max_exact_states == 0
+                || !prior_temperature.is_finite()
+                || prior_temperature <= 0.0
+                || !exploration.is_finite()
+                || exploration < 0.0
+                || !policy_temperature.is_finite()
+                || policy_temperature <= 0.0
+                || !q_temperature.is_finite()
+                || q_temperature <= 0.0
+            {
+                return Err(PyValueError::new_err("invalid search diagnostic settings"));
+            }
+            let game = self
+                .games
+                .get(index)
+                .ok_or_else(|| PyValueError::new_err("invalid environment index"))?;
+            if game.combat().is_none() {
+                return Err(PyValueError::new_err("diagnostic root is not in combat"));
+            }
+            let model = self
+                .policy
+                .as_ref()
+                .ok_or_else(|| PyValueError::new_err("policy is not loaded"))?;
+            let result = py.allow_threads(|| {
+                search_diagnostic(
+                    model,
+                    game,
+                    &self.content,
+                    self.layout,
+                    (self.training_strength, self.training_dexterity),
+                    simulations,
+                    turns,
+                    max_depth,
+                    batch_size,
+                    prior_temperature,
+                    exploration,
+                    policy_temperature,
+                    exact_samples,
+                    max_exact_states,
+                    seed,
+                    progress,
+                    q_temperature,
+                )
+            });
+            serde_json::to_string_pretty(&result.map_err(PyValueError::new_err)?)
+                .map_err(|error| PyValueError::new_err(error.to_string()))
+        }
+
+        #[pyo3(signature = (
+            indices,
+            turns=1,
+            max_depth=64,
+            samples=16,
+            max_states=100_000,
+            seed=1,
+            progress=true,
+            heuristic=false,
+        ))]
+        fn exact_choices(
+            &self,
+            py: Python<'_>,
+            indices: Vec<usize>,
+            turns: usize,
+            max_depth: usize,
+            samples: usize,
+            max_states: usize,
+            seed: u64,
+            progress: bool,
+            heuristic: bool,
+        ) -> PyResult<
+            Vec<(
+                i64,
+                f32,
+                u64,
+                u64,
+                u64,
+                bool,
+                Vec<(Vec<u8>, i64, u64)>,
+                String,
+            )>,
+        > {
+            if max_depth == 0 || samples == 0 || max_states == 0 {
+                return Err(PyValueError::new_err("invalid exact-search settings"));
+            }
+            let model = self
+                .policy
+                .as_ref()
+                .ok_or_else(|| PyValueError::new_err("policy is not loaded"))?;
+            let content = &self.content;
+            let layout = self.layout;
+            let bonuses = (self.training_strength, self.training_dexterity);
+            Ok(py.allow_threads(|| {
+                indices
+                    .par_iter()
+                    .map(|&index| {
+                        let result = (|| {
+                            let game = self
+                                .games
+                                .get(index)
+                                .ok_or_else(|| "invalid environment index".to_owned())?;
+                            let root_turn = game
+                                .combat()
+                                .ok_or_else(|| "exact-search root is not in combat".to_owned())?
+                                .turn;
+                            let observation = observation_v53(game, content, layout, bonuses);
+                            let search_seed = seed
+                                ^ game.seed as u64
+                                ^ observation_digest(&observation).rotate_left(17);
+                            let (result, search) = exact_search(
+                                model,
+                                game,
+                                content,
+                                layout,
+                                bonuses,
+                                root_turn,
+                                turns,
+                                max_depth,
+                                samples,
+                                max_states,
+                                search_seed,
+                                false,
+                                progress,
+                                heuristic,
+                            )?;
+                            let policy = observation
+                                .candidates
+                                .iter()
+                                .map(|candidate| {
+                                    if candidate.legal {
+                                        0.0
+                                    } else {
+                                        f32::NEG_INFINITY
+                                    }
+                                })
+                                .collect::<Vec<_>>();
+                            let node = SearchNode::new(
+                                observation.candidates.clone(),
+                                &policy,
+                                0.0,
+                                0,
+                                1.0,
+                                None,
+                            );
+                            if search.action_values.len() != node.edges.len() {
+                                return Err(
+                                    "exact search returned incomplete root actions".to_owned()
+                                );
+                            }
+                            let edge = search
+                                .action_values
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, value)| value.is_finite())
+                                .max_by(|left, right| left.1.total_cmp(right.1))
+                                .map(|(edge, _)| edge)
+                                .ok_or_else(|| "exact-search root has no action".to_owned())?;
+                            let mut choices = search
+                                .choices
+                                .into_iter()
+                                .map(|((_digest, depth), (row, choice))| {
+                                    (row, choice as i64, depth as u64)
+                                })
+                                .collect::<Vec<_>>();
+                            choices.sort_by_key(|(_, _, depth)| *depth);
+                            Ok::<_, String>((
+                                node.edges[edge].candidate as i64,
+                                result.value,
+                                search.states as u64,
+                                search.transitions as u64,
+                                search.rng_transitions as u64,
+                                result.rng,
+                                choices,
+                            ))
+                        })();
+                        match result {
+                            Ok((
+                                choice,
+                                value,
+                                states,
+                                transitions,
+                                rng_transitions,
+                                rng,
+                                plan,
+                            )) => (
+                                choice,
+                                value,
+                                states,
+                                transitions,
+                                rng_transitions,
+                                rng,
+                                plan,
+                                String::new(),
+                            ),
+                            Err(error) => (-1, 0.0, 0, 0, 0, false, Vec::new(), error),
+                        }
+                    })
+                    .collect()
+            }))
+        }
+
+        #[pyo3(signature = (
+            temperature=1.0,
+            sample=true,
+            advance=false,
+            mcts_fraction=0.0,
+            mcts_simulations=0,
+            mcts_boss_simulations=0,
+            mcts_turns=1,
+            mcts_max_depth=64,
+            mcts_batch_size=256,
+            mcts_min_visits=16,
+            mcts_max_targets=64,
+            mcts_prior_temperature=1.0,
+            mcts_q_temperature=0.002,
+            mcts_exploration=1.5,
+            mcts_value_consistency=false,
+            mcts_heuristic=false,
+            mcts_timeout=0.0,
+        ))]
         fn policy<'py>(
             &mut self,
             py: Python<'py>,
             temperature: f32,
             sample: bool,
             advance: bool,
+            mcts_fraction: f32,
+            mcts_simulations: usize,
+            mcts_boss_simulations: usize,
+            mcts_turns: usize,
+            mcts_max_depth: usize,
+            mcts_batch_size: usize,
+            mcts_min_visits: u32,
+            mcts_max_targets: usize,
+            mcts_prior_temperature: f32,
+            mcts_q_temperature: f32,
+            mcts_exploration: f32,
+            mcts_value_consistency: bool,
+            mcts_heuristic: bool,
+            mcts_timeout: f64,
         ) -> PyResult<Bound<'py, PyTuple>> {
+            if !(0.0..=1.0).contains(&mcts_fraction)
+                || mcts_max_depth == 0
+                || mcts_batch_size == 0
+                || mcts_min_visits == 0
+                || mcts_max_targets == 0
+                || !mcts_prior_temperature.is_finite()
+                || mcts_prior_temperature <= 0.0
+                || !mcts_q_temperature.is_finite()
+                || mcts_q_temperature <= 0.0
+                || !mcts_exploration.is_finite()
+                || mcts_exploration < 0.0
+                || !mcts_timeout.is_finite()
+                || mcts_timeout < 0.0
+            {
+                return Err(PyValueError::new_err("invalid MCTS settings"));
+            }
+            let search_enabled = mcts_simulations > 0 || mcts_boss_simulations > 0;
+            let turn_starts = self
+                .games
+                .iter()
+                .zip(&mut self.searched_turns)
+                .map(|(game, searched)| {
+                    let Some(turn) = game.combat().map(|combat| combat.turn) else {
+                        *searched = None;
+                        return false;
+                    };
+                    let fresh = search_enabled && *searched != Some(turn);
+                    if search_enabled {
+                        *searched = Some(turn);
+                    }
+                    fresh
+                })
+                .collect::<Vec<_>>();
             let model = self
                 .policy
                 .as_ref()
@@ -15826,36 +18933,103 @@ mod python {
             let outputs = model
                 .evaluate_batch(
                     &rows.iter().collect::<Vec<_>>(),
-                    &features.iter().collect::<Vec<_>>(),
+                    &features,
                     temperature,
+                    None,
+                    true,
                 )
                 .map_err(|error| PyValueError::new_err(error.to_string()))?;
+            let mut random = self.random;
+            let mut search_random = random ^ 0x4d43_5453_524e_4701;
+            let (expert_targets, search_stats) = if search_enabled {
+                let started = std::time::Instant::now();
+                let (targets, mut stats) = py
+                    .allow_threads(|| {
+                        mcts_targets(
+                            model,
+                            &self.games,
+                            &rows,
+                            &outputs,
+                            &turn_starts,
+                            content,
+                            layout,
+                            bonuses,
+                            &mut search_random,
+                            mcts_fraction,
+                            mcts_simulations,
+                            mcts_boss_simulations,
+                            mcts_turns,
+                            mcts_max_depth,
+                            mcts_batch_size,
+                            mcts_min_visits,
+                            mcts_max_targets,
+                            mcts_prior_temperature,
+                            mcts_q_temperature,
+                            mcts_exploration,
+                            temperature,
+                            mcts_value_consistency,
+                            mcts_heuristic,
+                            mcts_timeout,
+                        )
+                    })
+                    .map_err(PyValueError::new_err)?;
+                stats.micros = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+                if stats.roots > 0 {
+                    tracing::debug!(
+                        turn_starts = stats.turn_starts,
+                        roots = stats.roots,
+                        simulations = stats.simulations,
+                        leaves = stats.leaves,
+                        nodes = stats.nodes,
+                        batches = stats.batches,
+                        targets = stats.targets,
+                        elapsed_us = stats.micros,
+                        simulate_us = stats.simulate_micros,
+                        encode_us = stats.encode_micros,
+                        inference_us = stats.inference_micros,
+                        backup_us = stats.backup_micros,
+                        rollout_steps = stats.rollout_steps,
+                        rollout_completed = stats.rollout_completed,
+                        rollout_invalid = stats.rollout_invalid,
+                        rollout_us = stats.rollout_micros,
+                        timed_out = stats.timed_out,
+                        "mcts"
+                    );
+                    if stats.timed_out {
+                        tracing::warn!(
+                            roots = stats.roots,
+                            simulations = stats.simulations,
+                            elapsed_us = stats.micros,
+                            "mcts_timeout"
+                        );
+                    } else if stats.micros > 5_000_000 {
+                        tracing::warn!(
+                            roots = stats.roots,
+                            simulations = stats.simulations,
+                            elapsed_us = stats.micros,
+                            "slow_mcts"
+                        );
+                    }
+                }
+                (targets, stats)
+            } else {
+                (Vec::new(), SearchStats::default())
+            };
             let mut characters = Vec::with_capacity(rows.len());
             let mut choices = Vec::with_capacity(rows.len());
             let mut log_probabilities = Vec::with_capacity(rows.len());
-            let mut values = Vec::with_capacity(rows.len());
-            let mut progress_values = Vec::with_capacity(rows.len());
+            let mut critic_probabilities = Vec::with_capacity(rows.len() * VALUE_CATEGORIES);
             let mut packed_rows = Vec::with_capacity(rows.len());
             let mut selected_actions = Vec::with_capacity(rows.len());
             self.actions.clear();
             if advance {
                 self.actions.resize_with(rows.len(), Vec::new);
             }
-            for (((row, packed), _features), (log_policy, value, progress)) in
+            for (((row, packed), _features), (log_policy, _win, _expected, probabilities, _)) in
                 rows.into_iter().zip(packed).zip(features).zip(outputs)
             {
                 let choice = if sample {
-                    let draw = self.random_f32();
-                    let mut cumulative = 0.0;
-                    log_policy
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, probability)| probability.is_finite())
-                        .find_map(|(index, probability)| {
-                            cumulative += probability.exp();
-                            (cumulative >= draw).then_some(index)
-                        })
-                        .or_else(|| log_policy.iter().rposition(|value| value.is_finite()))
+                    sample_policy(&log_policy, &mut random)
                 } else {
                     log_policy
                         .iter()
@@ -15868,8 +19042,7 @@ mod python {
                 characters.push(row.character);
                 choices.push(choice as i64);
                 log_probabilities.push(log_policy[choice]);
-                values.push(value);
-                progress_values.push(progress);
+                critic_probabilities.extend(probabilities);
                 if advance {
                     selected_actions.push(row.candidates[choice].action.clone());
                 } else {
@@ -15882,6 +19055,57 @@ mod python {
                 }
                 packed_rows.push(PyBytes::new(py, &packed));
             }
+            self.random = random;
+            let expert_targets = expert_targets
+                .into_iter()
+                .map(|target| {
+                    if target.consistency.self_weight == 1.0 {
+                        return PyTuple::new(
+                            py,
+                            [
+                                PyBytes::new(py, &target.packed).into_any(),
+                                ndarray::Array1::from_vec(target.target)
+                                    .into_pyarray(py)
+                                    .into_any(),
+                                target.visits.into_pyobject(py)?.into_any(),
+                                target.depth.into_pyobject(py)?.into_any(),
+                            ],
+                        )
+                        .map(Bound::into_any);
+                    }
+                    let children = PyTuple::new(
+                        py,
+                        target
+                            .consistency
+                            .packed
+                            .iter()
+                            .map(|packed| PyBytes::new(py, packed)),
+                    )?;
+                    PyTuple::new(
+                        py,
+                        [
+                            PyBytes::new(py, &target.packed).into_any(),
+                            ndarray::Array1::from_vec(target.target)
+                                .into_pyarray(py)
+                                .into_any(),
+                            target.visits.into_pyobject(py)?.into_any(),
+                            target.depth.into_pyobject(py)?.into_any(),
+                            children.into_any(),
+                            ndarray::Array1::from_vec(target.consistency.weights)
+                                .into_pyarray(py)
+                                .into_any(),
+                            target.consistency.self_weight.into_pyobject(py)?.into_any(),
+                            target
+                                .consistency
+                                .terminal_value
+                                .into_pyobject(py)?
+                                .into_any(),
+                        ],
+                    )
+                    .map(Bound::into_any)
+                })
+                .collect::<PyResult<Vec<_>>>()?;
+            let batch = characters.len();
             let mut output = vec![
                 ndarray::Array1::from_vec(characters)
                     .into_pyarray(py)
@@ -15892,13 +19116,33 @@ mod python {
                 ndarray::Array1::from_vec(log_probabilities)
                     .into_pyarray(py)
                     .into_any(),
-                ndarray::Array1::from_vec(values)
-                    .into_pyarray(py)
-                    .into_any(),
-                ndarray::Array1::from_vec(progress_values)
+                ndarray::Array2::from_shape_vec((batch, VALUE_CATEGORIES), critic_probabilities)
+                    .unwrap()
                     .into_pyarray(py)
                     .into_any(),
                 PyTuple::new(py, packed_rows)?.into_any(),
+                PyTuple::new(py, expert_targets)?.into_any(),
+                vec![
+                    search_stats.roots as u64,
+                    search_stats.simulations as u64,
+                    search_stats.leaves as u64,
+                    search_stats.nodes as u64,
+                    search_stats.batches as u64,
+                    search_stats.targets as u64,
+                    search_stats.turn_starts as u64,
+                    search_stats.micros,
+                    search_stats.simulate_micros,
+                    search_stats.encode_micros,
+                    search_stats.inference_micros,
+                    search_stats.backup_micros,
+                    search_stats.rollout_steps as u64,
+                    search_stats.rollout_completed as u64,
+                    search_stats.rollout_invalid as u64,
+                    search_stats.rollout_micros,
+                    search_stats.timed_out as u64,
+                ]
+                .into_pyobject(py)?
+                .into_any(),
             ];
             if advance {
                 let paths = selected_actions
@@ -16107,6 +19351,7 @@ mod python {
                 );
                 self.actions[index].clear();
                 self.plans[index].clear();
+                self.searched_turns[index] = None;
             }
             Ok(())
         }
@@ -16226,6 +19471,7 @@ mod python {
     #[pymodule]
     fn sts2_sim(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module.add_class::<Batch>()?;
+        module.add_function(wrap_pyfunction!(configure_logging, module)?)?;
         module.add_function(wrap_pyfunction!(unique_rows, module)?)?;
         module.add_function(wrap_pyfunction!(unique_feature_rows, module)?)?;
         module.add_function(wrap_pyfunction!(unique_graphs, module)?)?;
@@ -16517,6 +19763,29 @@ mod python {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_progress_matches_route_geometry() {
+        let content = foundation_content();
+        let mut game = Game::new_character_ascension(&content, 0, 0, 1).unwrap();
+        for (act, floor, compass, expected) in [
+            (1, 0, None, 0),
+            (1, 15, None, 15),
+            (2, 0, None, 25),
+            (2, 6, None, 31),
+            (2, 7, None, 33),
+            (2, 10, None, 37),
+            (2, 10, Some(2), 35),
+            (2, 17, None, 44),
+            (3, 0, None, 54),
+            (3, 18, None, 72),
+        ] {
+            game.run.act = act;
+            game.run.floor = floor;
+            game.golden_compass = compass;
+            assert_eq!(canonical_progress(&game), expected);
+        }
+    }
 
     fn assert_entity_pool_swap_distinct(left_kind: usize, right_kind: usize) {
         let ids = [[3.0, 0.0, 0.0], [0.0, 2.0, 0.0]];
@@ -19756,8 +23025,8 @@ mod tests {
             .iter()
             .position(|node| node.floor == floor)
             .unwrap();
-        treasure_first.map.nodes[node].room = Room::Treasure;
-        treasure_reordered.map.nodes[node].room = Room::Treasure;
+        std::sync::Arc::make_mut(&mut treasure_first.map.nodes)[node].room = Room::Treasure;
+        std::sync::Arc::make_mut(&mut treasure_reordered.map.nodes)[node].room = Room::Treasure;
         treasure_first.step(&content, Action::Path(node)).unwrap();
         treasure_reordered
             .step(&content, Action::Path(node))
@@ -20288,7 +23557,9 @@ mod tests {
         game.run.hp -= 1;
         assert_ne!(state_signature(&game, layout), before);
         let before = state_signature(&game, layout);
-        game.map.nodes[0].next.clear();
+        std::sync::Arc::make_mut(&mut game.map.nodes)[0]
+            .next
+            .clear();
         assert_ne!(state_signature(&game, layout), before);
         game.run
             .relics
@@ -20900,7 +24171,8 @@ mod tests {
                     room: Room::Elite,
                     next: vec![],
                 },
-            ],
+            ]
+            .into(),
             current: None,
         };
         game.phase = Phase::Map;
@@ -21076,7 +24348,8 @@ mod tests {
                 lane: 0,
                 room: Room::Combat,
                 next: vec![],
-            }],
+            }]
+            .into(),
             current: None,
         };
         resample_hidden(&mut game, &content, 9);
@@ -21782,8 +25055,7 @@ mod tests {
             + width
             + head_width * state_width
             + head_width
-            + head_width
-            + 1;
+            + VALUE_CATEGORIES * (head_width + 1);
         bytes.resize(bytes.len() + floats * 4, 0);
         let path = std::env::temp_dir().join(format!("sts2-value-{}.bin", std::process::id()));
         fs::write(&path, bytes).unwrap();
@@ -21805,18 +25077,18 @@ mod tests {
                 .len(),
             MODEL_STATE_WIDTH
         );
-        assert_eq!(model.win_probability(&game, &content), 0.5);
+        assert!((model.win_probability(&game, &content) - 1.0 / 83.0).abs() < 1e-7);
         let cached = (
-            model.card_cache.lock().unwrap().len(),
-            model.map_cache.lock().unwrap().len(),
+            model.card_cache.read().unwrap().len(),
+            model.map_cache.read().unwrap().len(),
         );
         assert_eq!(cached, (CARD_ZONES, 1));
-        assert_eq!(model.win_probability(&game, &content), 0.5);
+        assert!((model.win_probability(&game, &content) - 1.0 / 83.0).abs() < 1e-7);
         assert_eq!(
             cached,
             (
-                model.card_cache.lock().unwrap().len(),
-                model.map_cache.lock().unwrap().len(),
+                model.card_cache.read().unwrap().len(),
+                model.map_cache.read().unwrap().len(),
             )
         );
         game.phase = Phase::Won;
@@ -22061,6 +25333,7 @@ mod tests {
         game.begin_act(&content, 0).unwrap();
         let observation = observation_v53(&game, &content, layout, (3, 4));
         let (globals, counts, mut exact, actions, digest) = packed_observation(&observation);
+        assert_eq!(observation_digest(&observation), digest);
         assert_eq!(globals, observation.globals);
         assert_eq!(globals.len(), PUBLIC_GLOBALS);
         assert!(globals.iter().all(|value| value.is_finite()));
@@ -22095,7 +25368,8 @@ mod tests {
                     room: Room::Elite,
                     next: vec![],
                 },
-            ],
+            ]
+            .into(),
             current: Some(0),
         };
         game.fur_coat_act = Some(game.run.act);
@@ -22183,18 +25457,18 @@ mod tests {
         for bags in [&mut second.relic_deques, &mut second.shared_relic_deques] {
             bags.iter_mut().for_each(|bag| bag.reverse());
         }
-        second
-            .map
-            .nodes
+        std::sync::Arc::make_mut(&mut second.map.nodes)
             .iter_mut()
             .for_each(|node| node.next.reverse());
         let nodes = second.map.nodes.len();
-        second.map.nodes.reverse();
-        second.map.nodes.iter_mut().for_each(|node| {
-            node.next
-                .iter_mut()
-                .for_each(|next| *next = nodes - 1 - *next)
-        });
+        std::sync::Arc::make_mut(&mut second.map.nodes).reverse();
+        std::sync::Arc::make_mut(&mut second.map.nodes)
+            .iter_mut()
+            .for_each(|node| {
+                node.next
+                    .iter_mut()
+                    .for_each(|next| *next = nodes - 1 - *next)
+            });
         second.map.current = second.map.current.map(|current| nodes - 1 - current);
         assert_eq!(
             state_tokens(&first, &content, layout),
@@ -22282,7 +25556,7 @@ mod tests {
         game.run.potions[0] = Some(0);
         assert_ne!(state_tokens(&game, &content, layout), base);
         let base = state_tokens(&game, &content, layout);
-        game.map.nodes[0].room = Room::Elite;
+        std::sync::Arc::make_mut(&mut game.map.nodes)[0].room = Room::Elite;
         assert_ne!(state_tokens(&game, &content, layout), base);
         game.crystal = Some(CrystalSphere {
             cells: vec![None; 121],
@@ -23626,16 +26900,15 @@ mod tests {
                 node.next = node.next.iter().map(|&next| inverse[next]).collect();
                 node
             })
-            .collect();
+            .collect::<Vec<_>>()
+            .into();
         second.map.current = first.map.current.map(|current| inverse[current]);
         assert_eq!(
             v53_bytes(&observation_v53(&first, &content, layout, (0, 0))),
             v53_bytes(&observation_v53(&second, &content, layout, (0, 0)))
         );
         let mut changed = first.clone();
-        let node = changed
-            .map
-            .nodes
+        let node = std::sync::Arc::make_mut(&mut changed.map.nodes)
             .iter_mut()
             .find(|node| node.next.len() > 1)
             .unwrap();
@@ -23721,7 +26994,7 @@ mod tests {
         {
             assert_eq!(batched[&candidate.u[4]], reference[&candidate.u[4]]);
         }
-        let mut changed = observation.domains[MAP_EDGE_DOMAIN].clone();
+        let mut changed = observation.domains[MAP_EDGE_DOMAIN].to_vec();
         changed[0].u[2] += 1;
         let changed = changed.iter().collect::<Vec<_>>();
         assert_ne!(
@@ -24262,7 +27535,19 @@ mod tests {
             .iter()
             .find(|row| row.u[4] == card.id as u32 && row.u[6] == u16::MAX as u32)
             .unwrap();
-        let mut expected = card_domain_row(&game, &content, STATE_SCOPE, 0, 0, 0, 0, card, 0);
+        let mut encoding = CardEncoding::new(&game, &content);
+        let mut expected = card_domain_row(
+            &game,
+            &content,
+            &mut encoding,
+            STATE_SCOPE,
+            0,
+            0,
+            0,
+            0,
+            card,
+            0,
+        );
         populate_domain_features(&game, &content, layout, CARD_DOMAIN, &mut expected);
         assert_eq!(
             (actual.c.clone(), actual.f.clone()),
@@ -24307,9 +27592,11 @@ mod tests {
             second.domains[PHASE_DOMAIN][0].c
         );
 
+        let mut encoding = CardEncoding::new(&game, &content);
         let mut plain = card_domain_row(
             &game,
             &content,
+            &mut encoding,
             STATE_SCOPE,
             0,
             0,
@@ -24324,6 +27611,7 @@ mod tests {
         let mut variant = card_domain_row(
             &game,
             &content,
+            &mut encoding,
             STATE_SCOPE,
             0,
             0,
@@ -24594,7 +27882,7 @@ mod tests {
             slot: 0,
             target: Some(0),
         };
-        let (_, _, map_ids, _) = canonical_map(&game);
+        let (_, _, map_ids, _) = canonical_map(&game, &content, layout);
         let overkill = action_row(&game, &content, layout, &map_ids, &action, true);
         assert_eq!(
             (overkill.f[4], overkill.f[8], overkill.f[19]),
@@ -25004,9 +28292,20 @@ mod tests {
         let mut game = Game::new_character_ascension(&content, 6101, 0, 10).unwrap();
         game.begin_act(&content, 0).unwrap();
         let card = game.run.deck[0];
-        let card_row = |zone, kind, rank| {
-            let mut row =
-                card_domain_row(&game, &content, STATE_SCOPE, zone, 0, kind, rank, card, 0);
+        let mut encoding = CardEncoding::new(&game, &content);
+        let mut card_row = |zone, kind, rank| {
+            let mut row = card_domain_row(
+                &game,
+                &content,
+                &mut encoding,
+                STATE_SCOPE,
+                zone,
+                0,
+                kind,
+                rank,
+                card,
+                0,
+            );
             populate_domain_features(&game, &content, layout, CARD_DOMAIN, &mut row);
             row
         };
