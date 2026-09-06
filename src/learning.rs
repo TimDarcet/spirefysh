@@ -9899,12 +9899,16 @@ impl TokenEncoderWeights {
     }
 }
 
-type MapEncoding = std::collections::BTreeMap<u32, Vec<f32>>;
+struct MapEncoding {
+    nodes: std::collections::BTreeMap<u32, Vec<f32>>,
+    key_values: Vec<Vec<f32>>,
+    current: Mutex<HashMap<u32, Vec<f32>>>,
+}
 
 #[derive(Default)]
 struct EncodingCache {
     rows: HashMap<(u64, u64), Vec<f32>>,
-    maps: HashMap<Vec<u8>, MapEncoding>,
+    maps: HashMap<Vec<u8>, Arc<MapEncoding>>,
 }
 
 struct GruWeights {
@@ -10298,7 +10302,7 @@ impl ValueModel {
         observation: &ObservationV56,
         current: u32,
         cache: &mut EncodingCache,
-    ) -> (Vec<f32>, MapEncoding) {
+    ) -> (Vec<f32>, Arc<MapEncoding>) {
         let nodes = observation.domains[MAP_NODE_DOMAIN]
             .iter()
             .filter(|row| row.scope == STATE_SCOPE)
@@ -10333,7 +10337,7 @@ impl ValueModel {
             let mut encoded = nodes
                 .iter()
                 .map(|row| (row.u[0], self.encode(cache, MAP_NODE_DOMAIN, row)))
-                .collect::<MapEncoding>();
+                .collect::<std::collections::BTreeMap<_, _>>();
             let mut levels = nodes.iter().map(|row| row.u[8]).collect::<Vec<_>>();
             levels.sort_unstable();
             levels.dedup();
@@ -10346,7 +10350,7 @@ impl ValueModel {
                             normalized(value, &self.graph_norm_w, &self.graph_norm_b),
                         )
                     })
-                    .collect::<MapEncoding>();
+                    .collect::<std::collections::BTreeMap<_, _>>();
                 let updates = nodes
                     .iter()
                     .filter(|row| row.u[8] == level && row.u[9] > 0)
@@ -10391,20 +10395,29 @@ impl ValueModel {
             if cache.maps.len() == 1024 {
                 cache.maps.clear();
             }
-            cache.maps.insert(key, encoded.clone());
+            let key_values = encoded
+                .values()
+                .map(|value| {
+                    self.graph_key_value.apply(&normalized(
+                        value,
+                        &self.graph_norm_w,
+                        &self.graph_norm_b,
+                    ))
+                })
+                .collect();
+            let encoded = Arc::new(MapEncoding {
+                nodes: encoded,
+                key_values,
+                current: Mutex::default(),
+            });
+            cache.maps.insert(key, Arc::clone(&encoded));
             encoded
         });
-        let normalized_nodes = encoded
-            .values()
-            .map(|value| {
-                self.graph_key_value.apply(&normalized(
-                    value,
-                    &self.graph_norm_w,
-                    &self.graph_norm_b,
-                ))
-            })
-            .collect::<Vec<_>>();
-        let mut selected = encoded[&current].clone();
+        let cached = encoded.current.lock().unwrap().get(&current).cloned();
+        if let Some(selected) = cached {
+            return (selected, encoded);
+        }
+        let mut selected = encoded.nodes[&current].clone();
         let query = self.graph_query.apply(&normalized(
             &selected,
             &self.graph_norm_w,
@@ -10414,7 +10427,7 @@ impl ValueModel {
             .iter_mut()
             .zip(
                 self.graph_out
-                    .apply(&self.attention(&query, &normalized_nodes, 0)),
+                    .apply(&self.attention(&query, &encoded.key_values, 0)),
             )
         {
             *left += right;
@@ -10427,6 +10440,11 @@ impl ValueModel {
         for (left, right) in selected.iter_mut().zip(self.graph_ff2.apply(&hidden)) {
             *left += right;
         }
+        encoded
+            .current
+            .lock()
+            .unwrap()
+            .insert(current, selected.clone());
         (selected, encoded)
     }
 
@@ -10702,7 +10720,7 @@ impl ValueModel {
             if candidate.u[4] != NO_NODE {
                 action
                     .iter_mut()
-                    .zip(&nodes[&candidate.u[4]])
+                    .zip(&nodes.nodes[&candidate.u[4]])
                     .for_each(|(left, right)| *left += right);
             }
             action = self.tag(action, 13, None);
