@@ -10227,41 +10227,46 @@ impl ValueModel {
         layer: &TransformerLayer,
         selected: impl IntoIterator<Item = usize>,
     ) -> Vec<Vec<f32>> {
-        let qkv = sequence
+        let normalized_rows = sequence
             .iter()
-            .map(|row| {
-                linear(
-                    &normalized(row, &layer.norm1_w, &layer.norm1_b),
-                    &layer.qkv_w,
-                    &layer.qkv_b,
-                )
-            })
+            .map(|row| normalized(row, &layer.norm1_w, &layer.norm1_b))
             .collect::<Vec<_>>();
-        selected
+        let qkv = linear_batch(&normalized_rows, &layer.qkv_w, &layer.qkv_b);
+        let selected = selected.into_iter().collect::<Vec<_>>();
+        let attention = selected
+            .iter()
+            .map(|&index| self.attention(&qkv[index][..self.width], &qkv, self.width))
+            .collect::<Vec<_>>();
+        let projected = linear_batch(&attention, &layer.out_w, &layer.out_b);
+        let mut rows = selected
             .into_iter()
-            .map(|index| {
+            .zip(projected)
+            .map(|(index, projected)| {
                 let mut row = sequence[index].clone();
-                let value = self.attention(&qkv[index][..self.width], &qkv, self.width);
-                for (left, right) in row
-                    .iter_mut()
-                    .zip(linear(&value, &layer.out_w, &layer.out_b))
-                {
-                    *left += right;
-                }
-                let hidden = dense_gelu(
-                    &normalized(&row, &layer.norm2_w, &layer.norm2_b),
-                    &layer.linear1_w,
-                    &layer.linear1_b,
-                );
-                for (left, right) in
-                    row.iter_mut()
-                        .zip(linear(&hidden, &layer.linear2_w, &layer.linear2_b))
-                {
+                for (left, right) in row.iter_mut().zip(projected) {
                     *left += right;
                 }
                 row
             })
-            .collect()
+            .collect::<Vec<_>>();
+        let normalized_rows = rows
+            .iter()
+            .map(|row| normalized(row, &layer.norm2_w, &layer.norm2_b))
+            .collect::<Vec<_>>();
+        let mut hidden = linear_batch(&normalized_rows, &layer.linear1_w, &layer.linear1_b);
+        hidden
+            .iter_mut()
+            .flatten()
+            .for_each(|value| *value = gelu(*value));
+        for (row, projected) in
+            rows.iter_mut()
+                .zip(linear_batch(&hidden, &layer.linear2_w, &layer.linear2_b))
+        {
+            for (left, right) in row.iter_mut().zip(projected) {
+                *left += right;
+            }
+        }
+        rows
     }
 
     fn transform(&self, sequence: &mut Vec<Vec<f32>>, layer: &TransformerLayer) {
@@ -10936,6 +10941,60 @@ fn linear(input: &[f32], weights: &[f32], bias: &[f32]) -> Vec<f32> {
         .collect()
 }
 
+fn linear_batch(input: &[Vec<f32>], weights: &[f32], bias: &[f32]) -> Vec<Vec<f32>> {
+    if input.len() < 2 {
+        return input.iter().map(|row| linear(row, weights, bias)).collect();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        #[link(name = "Accelerate", kind = "framework")]
+        unsafe extern "C" {
+            fn cblas_sgemm(
+                order: i32,
+                transpose_a: i32,
+                transpose_b: i32,
+                rows: i32,
+                columns: i32,
+                inner: i32,
+                alpha: f32,
+                left: *const f32,
+                left_stride: i32,
+                right: *const f32,
+                right_stride: i32,
+                beta: f32,
+                output: *mut f32,
+                output_stride: i32,
+            );
+        }
+        let rows = input.len();
+        let inner = input[0].len();
+        let columns = bias.len();
+        let input = input.concat();
+        let mut output = bias.repeat(rows);
+        unsafe {
+            cblas_sgemm(
+                101,
+                111,
+                112,
+                rows as i32,
+                columns as i32,
+                inner as i32,
+                1.0,
+                input.as_ptr(),
+                inner as i32,
+                weights.as_ptr(),
+                inner as i32,
+                1.0,
+                output.as_mut_ptr(),
+                columns as i32,
+            );
+        }
+        return output.chunks_exact(columns).map(<[f32]>::to_vec).collect();
+    }
+    #[cfg(not(target_os = "macos"))]
+    input.iter().map(|row| linear(row, weights, bias)).collect()
+}
+
 fn dense_relu(input: &[f32], weights: &[f32], bias: &[f32]) -> Vec<f32> {
     linear(input, weights, bias)
         .into_iter()
@@ -10944,23 +11003,21 @@ fn dense_relu(input: &[f32], weights: &[f32], bias: &[f32]) -> Vec<f32> {
 }
 
 fn dense_gelu(input: &[f32], weights: &[f32], bias: &[f32]) -> Vec<f32> {
-    linear(input, weights, bias)
-        .into_iter()
-        .map(|value| {
-            let x = value / 2.0f32.sqrt();
-            let sign = x.signum();
-            let x = x.abs();
-            let t = 1.0 / (1.0 + 0.3275911 * x);
-            let erf = sign
-                * (1.0
-                    - (((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736)
-                        * t
-                        + 0.254829592)
-                        * t
-                        * (-x * x).exp()));
-            value * 0.5 * (1.0 + erf)
-        })
-        .collect()
+    linear(input, weights, bias).into_iter().map(gelu).collect()
+}
+
+fn gelu(value: f32) -> f32 {
+    let x = value / 2.0f32.sqrt();
+    let sign = x.signum();
+    let x = x.abs();
+    let t = 1.0 / (1.0 + 0.3275911 * x);
+    let erf = sign
+        * (1.0
+            - (((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t
+                + 0.254829592)
+                * t
+                * (-x * x).exp()));
+    value * 0.5 * (1.0 + erf)
 }
 
 fn normalized(input: &[f32], weight: &[f32], bias: &[f32]) -> Vec<f32> {
