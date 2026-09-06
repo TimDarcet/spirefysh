@@ -15,7 +15,7 @@ use std::{
 
 const MAGIC: &[u8; 8] = b"STSVALUE";
 const VERSION: u32 = 56;
-const VALUE_MODEL_VERSION: u32 = 71;
+const VALUE_MODEL_VERSION: u32 = 72;
 const VALUE_CATEGORIES: usize = 83;
 const TOKEN_CATEGORICAL: usize = 10;
 const TOKEN_NUMERIC: usize = 24;
@@ -79,10 +79,10 @@ const PHASES: usize = 14;
 const ENCHANTMENTS: usize = 22;
 const MAP_FLOORS: usize = 18;
 const PUBLIC_GLOBALS: usize = 0;
-const MODEL_WIDTH: usize = 64;
-const MODEL_LAYERS: usize = 2;
-const MODEL_HEADS: usize = 4;
-const MODEL_FEEDFORWARD: usize = 128;
+const MODEL_WIDTH: usize = 128;
+const MODEL_LAYERS: usize = 4;
+const MODEL_HEADS: usize = 8;
+const MODEL_FEEDFORWARD: usize = 384;
 const POSITION_CAPS: [u32; 14] = [32, 64, 16, 64, 256, 256, 256, 256, 256, 256, 11, 11, 4, 4];
 #[cfg(test)]
 const ENEMY_SLOTS: usize = 8;
@@ -10022,7 +10022,7 @@ impl ValueModel {
         let pooling = <[u8; 13]>::try_from(take_bytes(&mut input, 13)?).unwrap();
         let actor = take_bytes(&mut input, 1)?[0] != 0;
         let layout = Layout::new(content);
-        if (width, layers, heads, feedforward) != (64, 2, 4, 128)
+        if (width, layers, heads, feedforward) != (128, 4, 8, 384)
             || domains as usize != DOMAIN_NAMES.len()
             || concepts as usize != Semantic::Count as usize
             || concept_vocab as usize != layout.concept_vocab()
@@ -26009,10 +26009,10 @@ mod tests {
     #[test]
     fn v56_layout_uses_explicit_token_dimensions_and_positions() {
         let layout = Layout::new(&foundation_content());
-        assert_eq!((VERSION, VALUE_MODEL_VERSION), (56, 71));
+        assert_eq!((VERSION, VALUE_MODEL_VERSION), (56, 72));
         assert_eq!(
             (MODEL_WIDTH, MODEL_LAYERS, MODEL_HEADS, MODEL_FEEDFORWARD),
-            (64, 2, 4, 128)
+            (128, 4, 8, 384)
         );
         for (semantic, size) in [
             (Semantic::EnemyPosition, 33),

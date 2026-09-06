@@ -29,12 +29,12 @@ import sts2_sim
 
 
 FEATURE_VERSION = 56
-MODEL_VERSION = 71
+MODEL_VERSION = 72
 CATEGORIES = 83
 MAX_PROGRESS = 72
 PRECISIONS = ("fp32", "bf16")
 WINNING_CAPACITY = 0
-CHANGE = "V71: explicit 64-D tokens in one global transformer."
+CHANGE = "V72: 128-D tokens and a four-layer global transformer."
 COLLECTION_POOLING = ("sum", "transformer", "global_tokens")
 EFFECT_POOLING = (
     "sum_into_actor", "transformer_into_actor", "sum_token", "transformer_token",
@@ -1113,7 +1113,7 @@ class TokenEncoder(nn.Module):
 
 
 class Agent(nn.Module):
-    def __init__(self, layout, width=64, layers=2, heads=4, feedforward=128, head_width=None,
+    def __init__(self, layout, width=128, layers=4, heads=8, feedforward=384, head_width=None,
                  pooling=None):
         nn.Module.__init__(self)
         self.layout = dict(layout)
@@ -1124,12 +1124,13 @@ class Agent(nn.Module):
                                           ("_c", semantic), ("_f", numeric))}
         expected |= {"domain_count": len(TOKEN_SPECS), "action_u": ACTION_FIELDS[0],
                      "action_s": ACTION_FIELDS[1], "action_c": ACTION_FIELDS[2],
-                     "action_f": ACTION_FIELDS[3], "globals": 0, "model_width": 64,
-                     "model_layers": 2, "model_heads": 4, "model_feedforward": 128,
-                     "action_width": 64}
+                     "action_f": ACTION_FIELDS[3], "globals": 0, "model_width": 128,
+                     "model_layers": 4, "model_heads": 8, "model_feedforward": 384,
+                     "action_width": 128}
         if any(self.layout.get(key) != value for key, value in expected.items()):
             raise ValueError("incompatible observation schema")
-        if (width, layers, heads, feedforward) != (64, 2, 4, 128) or head_width not in (None, 64):
+        if (width, layers, heads, feedforward) != (128, 4, 8, 384) \
+                or head_width not in (None, 128):
             raise ValueError("invalid architecture")
         self.width, self.layers, self.heads, self.feedforward = width, layers, heads, feedforward
         self.head_width = width
@@ -1177,7 +1178,7 @@ class Agent(nn.Module):
             if self.pooling["continuation"] == "gru" else None
         self.actor_norm = nn.LayerNorm(width)
         self.action_norm = nn.LayerNorm(width)
-        self.global_transformer = transformer(2)
+        self.global_transformer = transformer(layers)
         self.global_norm = nn.LayerNorm(width)
 
         self.graph_norm = nn.LayerNorm(width)
@@ -1636,7 +1637,7 @@ def architecture(model):
         "domains": [name for name, *_ in TOKEN_SPECS], "card_zones": model.card_zones,
         "globals": model.layout["globals"], "entity_collections": model.entity_collections,
         "state_width": model.state_width, "policy_input": model.width,
-        "map_layers": 1, "global_layers": 2, "local_layers": 1,
+        "map_layers": 1, "global_layers": model.layers, "local_layers": 1,
         "attention": "fully_bidirectional",
         "activation": "gelu", "dropout": 0,
         "token_encoder": "LayerNorm(sum(categorical)+Linear(numeric,bias=False))",
@@ -1644,7 +1645,7 @@ def architecture(model):
         "policy_factorization": "one linear logit per transformed legal action token",
         "policy_entropy": ["candidate", "normalized", "effective_actions"],
         "map": "reverse-topological sparse attention; current/entry query over all contextual nodes",
-        "move_history": "one-layer 64-D GRU",
+        "move_history": f"one-layer {model.width}-D GRU",
         "continuations": "normalized execution queue",
         "candidate_context": "explicit selected payload, destination, and enemy identity+position",
         "card_zone_names": ["deck", "hand", "draw", "discard", "exhaust"],
@@ -3218,7 +3219,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         "Bounded queue → policy-lag and action-ratio freshness filters",
         f"{'Character-balanced' if args.character_balanced else 'Uniform'} reusable rows; "
         f"prefilter forced/stale/ratio-invalid; priority −{args.priority_decay:g} per use",
-        f"{model.layers}-layer card encoder + party/enemy/map summaries + action-object menu → heads",
+        f"{model.layers}-layer global Transformer over state, entity, and action tokens → heads",
         f"{CATEGORIES}-class terminal-progress critic; detached backward λ={args.critic_lambda:g} targets",
         "Critic loss balanced by EMA character/phase/canonical-floor frequency",
         "Turn-start native MCTS → expectimax-Q targets and policy-expectation critic transitions",
@@ -5001,7 +5002,7 @@ def dashboard(target):
                     version_manifest["layout"],
                     *(saved.get(key, default) for key, default in zip(
                         ("width", "layers", "heads", "feedforward", "head_width"),
-                        (64, 2, 4, 128, 64),
+                        (128, 4, 8, 384, 128),
                     )),
                     pooling=saved.get("pooling"),
                 )
@@ -5167,7 +5168,7 @@ def train(args):
         args.width, args.layers, args.heads, args.feedforward = loaded
     else:
         config = tuple(value if value is not None else default for value, default in zip(
-            (args.width, args.layers, args.heads, args.feedforward), (64, 2, 4, 128)
+            (args.width, args.layers, args.heads, args.feedforward), (128, 4, 8, 384)
         ))
         args.width, args.layers, args.heads, args.feedforward = config
         pooling = {name: getattr(args, name + "_pooling") or default
@@ -6004,7 +6005,7 @@ def probe():
     layout = dict(env.token_layout())
     assert (layout["version"], layout["model_width"], layout["model_layers"],
             layout["model_heads"], layout["model_feedforward"], layout["state_width"],
-            layout["action_width"], layout["entity_summaries"]) == (56, 64, 2, 4, 128, 64, 64, 0)
+            layout["action_width"], layout["entity_summaries"]) == (56, 128, 4, 8, 384, 128, 128, 0)
     for name, size in {
         "enemy_position": 33, "power_position": 65, "orb_position": 17,
         "map_floor_position": 65, "deck_origin": 257, "draw_top_position": 257,
@@ -6106,7 +6107,7 @@ def probe():
     assert critic.shape == (len(noncombat[0]), CATEGORIES)
     assert np.array_equal(model._sequence_lengths.cpu(), expected_lengths(no_actions, model.pooling))
 
-    sequence = torch.randn(1, 3, 64)
+    sequence = torch.randn(1, 3, model.width)
     forward, _ = model.move_gru(sequence)
     backward, _ = model.move_gru(sequence.flip(1))
     assert not torch.allclose(forward[:, -1], backward[:, -1])
@@ -6177,7 +6178,7 @@ def probe():
             pass
         incompatible = torch.load(checkpoint, weights_only=False)
         incompatible["architecture"]["position_caps"]["enemy"] = 32
-        incompatible["model_version"] = 70
+        incompatible["model_version"] = 71
         torch.save(incompatible, checkpoint)
         try:
             load(checkpoint, target)
