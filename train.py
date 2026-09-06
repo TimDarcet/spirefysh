@@ -2445,6 +2445,10 @@ def sampling_steps(produced, budget, envs, limit):
     return max(0, min(limit, (budget - produced + envs - 1) // envs))
 
 
+def bounded_mcts_timeout(requested, watchdog):
+    return min(requested or watchdog / 2, watchdog / 2)
+
+
 class RolloutCollector:
     def __init__(self, args, sampler_session, stage, reservoir, iteration=0, worker=0,
                  generation=0):
@@ -2551,8 +2555,10 @@ class RolloutCollector:
                     mcts_exploration=args.mcts_exploration,
                     mcts_value_consistency=getattr(args, "search_consistency_weight", 0) > 0,
                     mcts_heuristic=args.mcts_heuristic,
-                    mcts_timeout=args.mcts_timeout,
+                    mcts_timeout=bounded_mcts_timeout(args.mcts_timeout, args.sampler_timeout),
                 )
+                if heartbeat is not None:
+                    heartbeat[self.worker] = time.monotonic()
                 characters = np.asarray(characters, np.uint8)
                 critic_probability = np.asarray(critic_probability, np.float16)
                 search_stats += np.asarray(step_search_stats, np.int64)
@@ -5942,6 +5948,9 @@ def finalize(args):
 
 def probe():
     target = torch.device("cpu")
+    assert bounded_mcts_timeout(0, 120) == 60
+    assert bounded_mcts_timeout(20, 120) == 20
+    assert bounded_mcts_timeout(200, 120) == 60
     env = sts2_sim.Batch(2, 84, 0)
     layout = dict(env.token_layout())
     assert (layout["version"], layout["model_width"], layout["model_layers"],

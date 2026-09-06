@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 use crate::game::{event_page, relic_deques};
 use crate::*;
 use serde_json::Value;
@@ -1588,10 +1590,8 @@ fn run_game_from_snapshot(
             rng
         });
     match state["room_model_id"].as_str().unwrap_or_default() {
-        "EVENT.SLIPPERY_BRIDGE" => {
-            if !run.deck.is_empty() {
-                event_rng.as_mut().unwrap().below(run.deck.len() as u32);
-            }
+        "EVENT.SLIPPERY_BRIDGE" if !run.deck.is_empty() => {
+            event_rng.as_mut().unwrap().below(run.deck.len() as u32);
         }
         "EVENT.PUNCH_OFF" => {
             event_data[0] = event_rng.as_mut().unwrap().below(8) as i64 + 91;
@@ -2003,14 +2003,14 @@ fn trace_event(content: &Content, wanted: &str) -> Result<Id, String> {
 
 fn trace_act(content: &Content, state: &Value) -> Option<Id> {
     let model = state["room_model_id"].as_str()?;
-    if let Some(encounter) = trace_encounter(content, state) {
-        if let Some(index) = content.acts.iter().position(|act| {
+    if let Some(encounter) = trace_encounter(content, state)
+        && let Some(index) = content.acts.iter().position(|act| {
             act.encounters.contains(&encounter)
                 || act.elites.contains(&encounter)
                 || act.bosses.contains(&encounter)
-        }) {
-            return Some(index as Id);
-        }
+        })
+    {
+        return Some(index as Id);
     }
     if let Ok(event) = trace_event(content, model)
         && let Some(index) = content
@@ -2206,8 +2206,6 @@ fn action_from_snapshot(
                 .position(|relic| relic.id == format!("RELIC.{name}"))
             {
                 Ok(Action::EventRelic(index, relic as Id))
-            } else if id.contains("TINKER_TIME.pages.CHOOSE_RIDER") {
-                Ok(Action::Event(index))
             } else {
                 Ok(Action::Event(index))
             }
@@ -2583,7 +2581,10 @@ fn advance_history(
     action: &Value,
 ) {
     if action["kind"] == "end_turn"
-        && before["combat"]["round"].as_u64().unwrap_or_default() % 3 == 0
+        && before["combat"]["round"]
+            .as_u64()
+            .unwrap_or_default()
+            .is_multiple_of(3)
         && array(&before["combat"]["enemies"])
             .iter()
             .any(|enemy| enemy["model_id"] == "MONSTER.AEONGLASS")

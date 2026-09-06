@@ -108,14 +108,14 @@ if [[ -d "$local_mods_dir" && -n "$(find "$local_mods_dir" -mindepth 1 -maxdepth
   exit 2
 fi
 
-dotnet run --project "$repo_root/tools/Spirefysh.ProfileGuard" -- \
-  verify "$profile_dir" "$profile_snapshot"
+dotnet run --project "$repo_root/tools/Spirefysh.Tools" -- \
+  profile verify "$profile_dir" "$profile_snapshot"
 
 build_output=$(mktemp -d /tmp/spirefysh-bridge-preflight.XXXXXX)
 trap 'rm -rf -- "$build_output"' EXIT INT TERM
 SPIREFYSH_ADVISOR_PACKAGE=0 SPIREFYSH_BRIDGE_OUTPUT_DIR="$build_output" zsh "$script_dir/build.zsh" "$game_data_dir"
-dotnet run --project "$repo_root/tools/Spirefysh.OracleProbe" -- \
-  "$game_data_dir/sts2.dll" validate-bridge "$build_output/Spirefysh.Bridge.dll"
+dotnet run --project "$repo_root/tools/Spirefysh.Tools" -- \
+  bridge "$game_data_dir/sts2.dll" "$build_output/Spirefysh.Bridge.dll"
 
 print "live-oracle preflight valid=true"
 print "game_sha256=$actual_game_hash"
