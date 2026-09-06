@@ -5243,8 +5243,6 @@ def train(args):
         raise ValueError("invalid checkpoint stage")
     if args.decisions and args.decisions < decisions:
         raise ValueError("--decisions precedes the checkpoint")
-    if args.decisions and (args.decisions - decisions) % args.envs:
-        raise ValueError("remaining decisions must be divisible by environments")
     if args.promote_now and (not source or args.decisions != decisions):
         raise ValueError("--promote-now requires an unchanged checkpoint decision target")
     initial = None
