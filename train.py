@@ -3565,7 +3565,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             search_children.extend(children)
         values = {key: dataset.data[key][selected].copy() for key in dataset.data}
         replay = reservoir.sample(len(selected) // 9, rng)
-        return selected, order, size, rows, expert_ids, expert_rows, expert_targets, \
+        return selected, rows, expert_ids, expert_rows, expert_targets, \
             expert_visits_batch, expert_depths_batch, values, replay, search_groups, \
             search_children, packer.submit(
             prepare, rows + expert_rows + [sample[0] for sample in replay] + search_children
@@ -3922,7 +3922,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     break
                 continue
             update_started = time.monotonic()
-            (selected, order, cursor, rows, expert_ids, expert_rows, expert_targets,
+            (selected, rows, expert_ids, expert_rows, expert_targets,
              expert_visits_batch, expert_depths_batch, values, replay, search_groups, search_children,
              packed) = pending.pop(0)
             if not rows:
@@ -3969,81 +3969,15 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 else log_ratio.abs() <= args.max_log_ratio
             invalid = ~fresh.detach().cpu().numpy()
             rejected = selected[invalid].tolist()
-            if rejected:
-                selected = selected[~invalid].tolist()
-                target_size = len(rows)
-                while len(selected) < target_size and cursor < len(order):
-                    candidate = order[cursor:cursor + target_size - len(selected)]
-                    cursor += len(candidate)
-                    candidate_rows = [dataset.rows[index] for index in candidate]
-                    candidate_values = {
-                        key: dataset.data[key][candidate].copy() for key in dataset.data
-                    }
-                    started_screen = time.monotonic()
-                    candidate_inputs = upload(prepare(candidate_rows)[0], target)
-                    candidate_lengths = np.asarray([
-                        packed_action_count(row) for row in candidate_rows
-                    ], np.int64)
-                    candidate_choice = torch.as_tensor(
-                        np.cumsum(candidate_lengths) - candidate_lengths + candidate_values["action"],
-                        device=target,
-                    )
-                    with torch.inference_mode():
-                        candidate_logits = predict(
-                            model, candidate_inputs, args.precision, args.policy_temperature,
-                            policy_only=True, flat_policy=True,
-                        )
-                    candidate_valid = (
-                        candidate_logits[candidate_choice]
-                        - torch.as_tensor(candidate_values["old"], device=target)
-                    ).abs() <= args.max_log_ratio
-                    screen_seconds += time.monotonic() - started_screen
-                    candidate_valid = candidate_valid.cpu().numpy()
-                    selected.extend(candidate[candidate_valid].tolist())
-                    rejected.extend(candidate[~candidate_valid].tolist())
-                if not selected:
-                    dataset.ratio_dropped += len(rejected)
-                    dataset.discard(np.asarray(rejected, np.int64))
-                    handled += len(rejected)
-                    continue
-                selected = np.asarray(selected, np.int64)
-                rows = [dataset.rows[index] for index in selected]
-                values = {key: dataset.data[key][selected].copy() for key in dataset.data}
-                replay = []
-                flat_policy = True
-                unpack_started = time.monotonic()
-                inputs = upload(prepare(rows + expert_rows + search_children)[0], target)
-                unpack_seconds += time.monotonic() - unpack_started
-                action = torch.as_tensor(values["action"], device=target)
-                old = torch.as_tensor(values["old"], device=target)
-                lengths = np.asarray([packed_action_count(row) for row in rows], np.int64)
-                choice_index = torch.as_tensor(
-                    np.cumsum(lengths) - lengths + values["action"], device=target,
-                )
-                forward_started = time.monotonic()
-                all_logits, all_critic_logits = predict(
-                    model, inputs, args.precision, args.policy_temperature, flat_policy=flat_policy,
-                )
-                forward_seconds += time.monotonic() - forward_started
-                critic_logits = all_critic_logits[:len(rows)]
-                legal = inputs[6][:len(rows)]
-                policy_actions = int(lengths.sum())
-                expert_actions = int(expert_lengths.sum())
-                logits = all_logits[:policy_actions]
-                expert_logits = all_logits[policy_actions:policy_actions + expert_actions]
-                log_ratio = logits[choice_index] - old
-                if not (log_ratio.abs() <= args.max_log_ratio).all():
-                    raise RuntimeError("batch eligibility changed after screening")
-            selected = np.asarray(selected, np.int64)
+            selected = np.asarray(selected, np.int64)[~invalid]
             expired = dataset.use(selected, args.priority_decay)
             removed = np.asarray(rejected + expired.tolist(), np.int64)
             dataset.ratio_dropped += len(rejected)
             if len(removed):
                 dataset.discard(np.unique(removed))
             handled += len(removed)
-            policy_lags.extend((updates - values["version"]).tolist())
-            fresh = torch.ones_like(log_ratio, dtype=torch.bool)
-            mask = torch.ones_like(log_ratio)
+            policy_lags.extend((updates - values["version"][~invalid]).tolist())
+            mask = fresh.to(log_ratio.dtype)
             fresh_count = mask.sum()
             denominator = fresh_count.clamp_min(1)
             safe_log_ratio = torch.where(fresh, log_ratio, torch.zeros_like(log_ratio))
@@ -4056,30 +3990,26 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             _, entropy_weight, _ = curriculum_weights(
                 stage, stage_decisions + handled, auxiliary_decisions + handled, args, progress_active
             )
-            batch_target = torch.as_tensor(values["critic_target"], device=target)
+            if not fresh_rows:
+                update_elapsed = time.monotonic() - update_started
+                update_seconds += update_elapsed
+                update_durations.append(update_elapsed)
+                backward_durations.append(0.)
+                continue
+            batch_target = torch.as_tensor(values["critic_target"][fresh_cpu], device=target)
             critic_weights = critic_balance.weights(
-                values["character"], values["phase"], values["canonical"],
+                values["character"][fresh_cpu], values["phase"][fresh_cpu],
+                values["canonical"][fresh_cpu],
             )
             critic_weights = torch.as_tensor(critic_weights, device=target)
-            category_loss = -batch_target * critic_logits.log_softmax(-1)
+            category_loss = -batch_target * critic_logits[fresh].log_softmax(-1)
             value_loss = (category_loss.sum(1) * critic_weights).mean()
             critic_loss = args.value_weight * value_loss
             critic_parameters = tuple(model.critic.parameters())
             critic_balance.record_loss(
-                values["critic_target"].astype(np.float64),
+                values["critic_target"][fresh_cpu].astype(np.float64),
                 (category_loss.detach() * critic_weights[:, None]).cpu().numpy(),
             )
-            if not fresh_rows:
-                backward_started = time.monotonic()
-                optimizer.zero_grad(set_to_none=True); critic_loss.backward(inputs=critic_parameters)
-                critic_only_step(model, optimizer, critic_parameters); publish()
-                critic_only_updates += 1
-                backward_seconds = time.monotonic() - backward_started
-                backward_durations.append(backward_seconds)
-                update_elapsed = time.monotonic() - update_started
-                update_seconds += update_elapsed
-                update_durations.append(update_elapsed)
-                continue
             policy_update_attempts += int(not args.critic_only)
             if not args.critic_only and kl_value > args.target_kl:
                 dataset.kl_dropped += fresh_rows
@@ -4246,7 +4176,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 optimizer.zero_grad(set_to_none=True)
                 retry_logits = predict(
                     model, inputs, args.precision, args.policy_temperature,
-                )[1][:len(rows)]
+                )[1][:len(rows)][fresh]
                 retry_critic_loss = args.value_weight * (
                     -batch_target * retry_logits.log_softmax(-1)
                 ).sum(1).mul(critic_weights).mean()
@@ -4281,7 +4211,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     (expert_head_grad / ppo_head_grad.clamp_min(1e-12)).detach()
                 )
                 losses["expert_ppo_grad_cosine"].append(expert_ppo_grad_cosine.detach())
-            probabilities = critic_probabilities(critic_logits.detach())
+            probabilities = critic_probabilities(critic_logits[fresh].detach())
             losses["critic_loss"].append(value_loss.detach())
             if search_groups:
                 losses["search_consistency_loss"].append(search_consistency_loss.detach())
@@ -4345,7 +4275,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 represented_actions = max(packed_action_count(row) for row in packed)
                 emit_event({"time": time.time(), "event": "slow_update", "metrics": {
                     "seconds": update_elapsed,
-                    "fresh": len(rows), "replay": len(replay),
+                    "fresh": fresh_rows, "replay": len(replay),
                     "state_tokens_max": max(packed_state_count(row) for row in packed),
                     "represented_actions_max": represented_actions,
                     "state_attention_pairs": sum((packed_state_count(row) + 1) ** 2 for row in packed),
