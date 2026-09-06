@@ -2505,6 +2505,11 @@ def bounded_mcts_timeout(requested, watchdog):
     return min(requested or watchdog / 2, watchdog / 2)
 
 
+def sampler_wedged(heartbeat, observed_stale, now, timeout):
+    return (now - heartbeat > timeout and observed_stale is not None
+            and now - observed_stale > timeout / 10)
+
+
 class RolloutCollector:
     def __init__(self, args, sampler_session, stage, reservoir, iteration=0, worker=0,
                  generation=0):
@@ -3266,6 +3271,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
     sampler_generations = [0] * args.samplers
     sampler_restarts = [0] * args.samplers
     sampler_wedges = [0] * args.samplers
+    sampler_restart_streaks = [0] * args.samplers
+    sampler_stale_since = [None] * args.samplers
     sampler_exhausted = [False] * args.samplers
     watchdog_dropped = queue_full_waits = 0
     queue_put_seconds = queue_delay_sum = 0.0
@@ -3304,6 +3311,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
     def start_worker(worker):
         heartbeat[worker] = time.monotonic()
         progress[worker] = 0
+        sampler_stale_since[worker] = None
         process = worker_type(target=collect_worker, args=(
             actor, collector_args, sampler_session, stage,
             reservoir.capacity, pending_capacity, sampler_iterations[worker], worker,
@@ -3333,6 +3341,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         worker, generation, version, result = item
         if generation != sampler_generations[worker]:
             return
+        sampler_restart_streaks[worker] = 0
         sampler_versions[worker] = version
         sampler_iterations[worker] = result["iteration"]
         latest_sampler_version = min(sampler_versions)
@@ -3610,6 +3619,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             "policy_lag_mean": float(np.mean(policy_lags)) if policy_lags else 0,
             "sampler_heartbeats": [time.monotonic() - value for value in heartbeat[:]],
             "sampler_restarts": sampler_restarts, "sampler_wedges": sampler_wedges,
+            "sampler_restart_streaks": sampler_restart_streaks,
             "watchdog_dropped_steps": watchdog_dropped,
             "sample_queue_capacity": sample_capacity, "sample_queue_peak": queue_peak,
             "sample_queue_packets": queue_packets,
@@ -3664,7 +3674,14 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         for worker, process in enumerate(workers):
             if sampler_exhausted[worker]:
                 continue
-            wedged = process.is_alive() and now - heartbeat[worker] > args.sampler_timeout
+            stale = process.is_alive() and now - heartbeat[worker] > args.sampler_timeout
+            if not stale:
+                sampler_stale_since[worker] = None
+            elif sampler_stale_since[worker] is None:
+                sampler_stale_since[worker] = now
+            wedged = process.is_alive() and sampler_wedged(
+                heartbeat[worker], sampler_stale_since[worker], now, args.sampler_timeout,
+            )
             failed = not process.is_alive() and (
                 threaded or process.exitcode not in (None, 0)
             )
@@ -3697,11 +3714,12 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 "generation": sampler_generations[worker], "wedged": wedged,
                 "exitcode": process.exitcode, "dropped": dropped,
             }, logging.WARNING)
-            if (sampler_restarts[worker] >= args.sampler_restarts or stop.is_set()
+            if (sampler_restart_streaks[worker] >= args.sampler_restarts or stop.is_set()
                     or time.monotonic() >= deadline or decisions >= budget):
                 sampler_exhausted[worker] = True
                 continue
             sampler_restarts[worker] += 1
+            sampler_restart_streaks[worker] += 1
             sampler_generations[worker] += 1
             while True:
                 try:
@@ -3712,7 +3730,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             emit_event({
                 "time": time.time(), "event": "sampler_restart", "worker": worker,
                 "generation": sampler_generations[worker],
-                "restarts": sampler_restarts[worker],
+                "restarts": sampler_restarts[worker], "streak": sampler_restart_streaks[worker],
             })
 
     try:
@@ -4350,6 +4368,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         "policy_lag_mean": float(np.mean(policy_lags)) if policy_lags else 0,
         "sampler_heartbeats": [time.monotonic() - value for value in heartbeat[:]],
         "sampler_restarts": sampler_restarts, "sampler_wedges": sampler_wedges,
+        "sampler_restart_streaks": sampler_restart_streaks,
         "watchdog_dropped_steps": watchdog_dropped,
         "sample_queue_capacity": sample_capacity, "sample_queue_peak": queue_peak,
         "sample_queue_packets": queue_packets,
@@ -6005,6 +6024,9 @@ def probe():
     assert bounded_mcts_timeout(0, 120) == 60
     assert bounded_mcts_timeout(20, 120) == 20
     assert bounded_mcts_timeout(200, 120) == 60
+    assert not sampler_wedged(0, None, 200, 120)
+    assert not sampler_wedged(0, 195, 200, 120)
+    assert sampler_wedged(0, 180, 200, 120)
     env = sts2_sim.Batch(2, 84, 0)
     layout = dict(env.token_layout())
     assert (layout["version"], layout["model_width"], layout["model_layers"],
