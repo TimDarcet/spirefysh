@@ -10221,6 +10221,109 @@ impl ValueModel {
         output
     }
 
+    fn attention_batch(&self, qkv: &[f32], selected: &[usize]) -> Vec<f32> {
+        let rows = qkv.len() / (3 * self.width);
+        let dimension = self.width / self.heads;
+        let mut output = vec![0.0; selected.len() * self.width];
+        #[cfg(target_os = "macos")]
+        {
+            #[link(name = "Accelerate", kind = "framework")]
+            unsafe extern "C" {
+                fn cblas_sgemm(
+                    order: i32,
+                    transpose_a: i32,
+                    transpose_b: i32,
+                    rows: i32,
+                    columns: i32,
+                    inner: i32,
+                    alpha: f32,
+                    left: *const f32,
+                    left_stride: i32,
+                    right: *const f32,
+                    right_stride: i32,
+                    beta: f32,
+                    output: *mut f32,
+                    output_stride: i32,
+                );
+            }
+            let dense = selected.len() == rows && selected.iter().copied().eq(0..rows);
+            let mut query = vec![0.0; selected.len() * dimension];
+            let mut scores = vec![0.0; selected.len() * rows];
+            for head in 0..self.heads {
+                let column = head * dimension;
+                let (query, stride) = if dense {
+                    (&qkv[column..], 3 * self.width)
+                } else {
+                    for (target, &source) in query.chunks_exact_mut(dimension).zip(selected) {
+                        target
+                            .copy_from_slice(&qkv[source * 3 * self.width + column..][..dimension]);
+                    }
+                    (&query[..], dimension)
+                };
+                unsafe {
+                    cblas_sgemm(
+                        101,
+                        111,
+                        112,
+                        selected.len() as i32,
+                        rows as i32,
+                        dimension as i32,
+                        (dimension as f32).sqrt().recip(),
+                        query.as_ptr(),
+                        stride as i32,
+                        qkv[self.width + column..].as_ptr(),
+                        (3 * self.width) as i32,
+                        0.0,
+                        scores.as_mut_ptr(),
+                        rows as i32,
+                    );
+                }
+                for score in scores.chunks_exact_mut(rows) {
+                    let peak = score.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    score
+                        .iter_mut()
+                        .for_each(|value| *value = (*value - peak).exp());
+                    let total = score.iter().sum::<f32>();
+                    score.iter_mut().for_each(|value| *value /= total);
+                }
+                unsafe {
+                    cblas_sgemm(
+                        101,
+                        111,
+                        111,
+                        selected.len() as i32,
+                        dimension as i32,
+                        rows as i32,
+                        1.0,
+                        scores.as_ptr(),
+                        rows as i32,
+                        qkv[2 * self.width + column..].as_ptr(),
+                        (3 * self.width) as i32,
+                        0.0,
+                        output[column..].as_mut_ptr(),
+                        self.width as i32,
+                    );
+                }
+            }
+            return output;
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let qkv = qkv
+                .chunks_exact(3 * self.width)
+                .map(<[f32]>::to_vec)
+                .collect::<Vec<_>>();
+            for (target, &source) in output.chunks_exact_mut(self.width).zip(selected) {
+                target.copy_from_slice(&self.attention(
+                    &qkv[source][..self.width],
+                    &qkv,
+                    self.width,
+                ));
+            }
+            output
+        }
+    }
+
     fn transformed(
         &self,
         sequence: &[Vec<f32>],
@@ -10229,41 +10332,38 @@ impl ValueModel {
     ) -> Vec<Vec<f32>> {
         let normalized_rows = sequence
             .iter()
-            .map(|row| normalized(row, &layer.norm1_w, &layer.norm1_b))
+            .flat_map(|row| normalized(row, &layer.norm1_w, &layer.norm1_b))
             .collect::<Vec<_>>();
-        let qkv = linear_batch(&normalized_rows, &layer.qkv_w, &layer.qkv_b);
+        let qkv = linear_batch(&normalized_rows, sequence.len(), &layer.qkv_w, &layer.qkv_b);
         let selected = selected.into_iter().collect::<Vec<_>>();
-        let attention = selected
-            .iter()
-            .map(|&index| self.attention(&qkv[index][..self.width], &qkv, self.width))
-            .collect::<Vec<_>>();
-        let projected = linear_batch(&attention, &layer.out_w, &layer.out_b);
+        let attention = self.attention_batch(&qkv, &selected);
+        let projected = linear_batch(&attention, selected.len(), &layer.out_w, &layer.out_b);
         let mut rows = selected
             .into_iter()
-            .zip(projected)
+            .zip(projected.chunks_exact(self.width))
             .map(|(index, projected)| {
                 let mut row = sequence[index].clone();
                 for (left, right) in row.iter_mut().zip(projected) {
-                    *left += right;
+                    *left += *right;
                 }
                 row
             })
             .collect::<Vec<_>>();
         let normalized_rows = rows
             .iter()
-            .map(|row| normalized(row, &layer.norm2_w, &layer.norm2_b))
+            .flat_map(|row| normalized(row, &layer.norm2_w, &layer.norm2_b))
             .collect::<Vec<_>>();
-        let mut hidden = linear_batch(&normalized_rows, &layer.linear1_w, &layer.linear1_b);
-        hidden
-            .iter_mut()
-            .flatten()
-            .for_each(|value| *value = gelu(*value));
-        for (row, projected) in
-            rows.iter_mut()
-                .zip(linear_batch(&hidden, &layer.linear2_w, &layer.linear2_b))
-        {
+        let mut hidden = linear_batch(
+            &normalized_rows,
+            rows.len(),
+            &layer.linear1_w,
+            &layer.linear1_b,
+        );
+        hidden.iter_mut().for_each(|value| *value = gelu(*value));
+        let projected = linear_batch(&hidden, rows.len(), &layer.linear2_w, &layer.linear2_b);
+        for (row, projected) in rows.iter_mut().zip(projected.chunks_exact(self.width)) {
             for (left, right) in row.iter_mut().zip(projected) {
-                *left += right;
+                *left += *right;
             }
         }
         rows
@@ -10941,9 +11041,9 @@ fn linear(input: &[f32], weights: &[f32], bias: &[f32]) -> Vec<f32> {
         .collect()
 }
 
-fn linear_batch(input: &[Vec<f32>], weights: &[f32], bias: &[f32]) -> Vec<Vec<f32>> {
-    if input.len() < 2 {
-        return input.iter().map(|row| linear(row, weights, bias)).collect();
+fn linear_batch(input: &[f32], rows: usize, weights: &[f32], bias: &[f32]) -> Vec<f32> {
+    if rows < 2 {
+        return linear(input, weights, bias);
     }
     #[cfg(target_os = "macos")]
     {
@@ -10966,10 +11066,8 @@ fn linear_batch(input: &[Vec<f32>], weights: &[f32], bias: &[f32]) -> Vec<Vec<f3
                 output_stride: i32,
             );
         }
-        let rows = input.len();
-        let inner = input[0].len();
+        let inner = input.len() / rows;
         let columns = bias.len();
-        let input = input.concat();
         let mut output = bias.repeat(rows);
         unsafe {
             cblas_sgemm(
@@ -10989,10 +11087,13 @@ fn linear_batch(input: &[Vec<f32>], weights: &[f32], bias: &[f32]) -> Vec<Vec<f3
                 columns as i32,
             );
         }
-        return output.chunks_exact(columns).map(<[f32]>::to_vec).collect();
+        return output;
     }
     #[cfg(not(target_os = "macos"))]
-    input.iter().map(|row| linear(row, weights, bias)).collect()
+    input
+        .chunks_exact(input.len() / rows)
+        .flat_map(|row| linear(row, weights, bias))
+        .collect()
 }
 
 fn dense_relu(input: &[f32], weights: &[f32], bias: &[f32]) -> Vec<f32> {
