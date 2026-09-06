@@ -28,13 +28,32 @@ from torch import nn
 import sts2_sim
 
 
-FEATURE_VERSION = 55
-MODEL_VERSION = 70
+FEATURE_VERSION = 56
+MODEL_VERSION = 71
 CATEGORIES = 83
 MAX_PROGRESS = 72
 PRECISIONS = ("fp32", "bf16")
 WINNING_CAPACITY = 0
-CHANGE = "V70: spaced act transitions and frozen-policy critic training."
+CHANGE = "V71: explicit 64-D tokens in one global transformer."
+COLLECTION_POOLING = ("sum", "transformer", "global_tokens")
+EFFECT_POOLING = (
+    "sum_into_actor", "transformer_into_actor", "sum_token", "transformer_token",
+    "global_tokens",
+)
+CONTINUATION_POOLING = ("sum", "transformer", "gru", "global_tokens")
+POSITION_CAPS = {
+    "enemy": 32, "power": 64, "orb": 16, "map_floor": 64,
+    "deck_origin": 256, "draw_top": 256, "draw_bottom": 256,
+    "relic": 256, "wax": 256, "continuation": 256,
+    "crystal_row": 11, "crystal_column": 11, "crystal_width": 4, "crystal_height": 4,
+}
+POOLING_DEFAULTS = {
+    "relic": "global_tokens", "deck": "global_tokens", "draw": "global_tokens",
+    "exhaust": "global_tokens", "discard": "global_tokens", "hand": "global_tokens",
+    "orb": "global_tokens", "potion": "global_tokens",
+    "enemy_effect": "global_tokens", "friendly_effect": "global_tokens",
+    "continuation": "gru", "phase": "transformer", "generation_pool": "sum",
+}
 STAGES = [(0, bonus) for bonus in (24, 20, 16, 12, 8, 4, 0)] + [
     (ascension, 0) for ascension in range(1, 11)
 ]
@@ -1009,107 +1028,137 @@ def device():
     return torch.device("cpu")
 
 
-DOMAIN_SPECS = (
-    ("run", 24, 16, 6, 36), ("phase", 16, 8, 12, 16), ("card", 20, 16, 73, 23),
-    ("actor", 12, 16, 5, 27), ("power", 8, 4, 5, 8), ("history", 6, 28, 4, 32),
+TOKEN_SPECS = (
+    ("run", 24, 16, 6, 36), ("phase", 16, 8, 16, 16), ("card", 20, 16, 73, 23),
+    ("actor", 12, 16, 5, 27), ("power", 8, 4, 5, 8), ("history", 6, 29, 4, 32),
     ("status", 20, 8, 72, 17), ("relic", 12, 4, 8, 16), ("potion", 6, 2, 5, 6),
     ("orb", 6, 2, 5, 6), ("event", 4, 1, 4, 4), ("encounter", 4, 0, 3, 4),
-    ("crystal", 8, 2, 5, 10), ("continuation", 24, 16, 80, 24),
+    ("crystal", 8, 2, 6, 10), ("continuation", 24, 16, 80, 24),
     ("map_node", 12, 0, 7, 8), ("map_edge", 8, 0, 2, 4),
 )
-DOMAIN = {name: index for index, (name, *_shape) in enumerate(DOMAIN_SPECS)}
+DOMAIN = {name: index for index, (name, *_shape) in enumerate(TOKEN_SPECS)}
 ACTION_FIELDS = (15, 12, 8, 20)
 SEMANTIC_NAMES = (
-    "character", "card", "power", "relic", "potion", "enemy", "enemy_move", "orb",
+    "character", "card", "power", "relic", "potion", "enemy", "enemy_move", "orb", "orb_timing",
     "event", "encounter_normal", "encounter_elite", "encounter_boss", "enchantment",
     "card_type", "rarity", "room", "target", "pile", "phase", "action", "effect",
-    "run_effect", "condition", "filter", "card_op", "scale", "actor_slot", "position",
+    "run_effect", "condition", "filter", "card_op", "scale",
+    "enemy_position", "power_position", "orb_position", "map_floor_position", "deck_origin",
+    "draw_top_position", "draw_bottom_position", "relic_position", "wax_position",
+    "continuation_position", "crystal_row", "crystal_column", "crystal_width", "crystal_height",
     "flag_bit", "turn_flag_bit", "tag_bit", "run_kind", "phase_kind", "card_zone",
-    "card_role", "order_kind", "actor_kind", "power_source", "history_kind", "status_kind",
+    "card_role", "actor_kind", "power_source", "history_kind", "status_kind",
     "relic_kind", "potion_kind", "orb_kind", "event_kind", "encounter_kind", "crystal_kind",
     "continuation_kind", "continuation_variant", "map_node_kind", "map_edge_kind",
     "route_kind", "requirement", "tinker_rider", "conveyor_dish", "boolean",
+    "token_role", "collection",
 )
 
 
-class SemanticEncoder(nn.Module):
-    def __init__(self, semantic, numeric, width):
+class ConceptEmbeddings(nn.Module):
+    def __init__(self, layout, width):
         super().__init__()
-        self.field = nn.Parameter(torch.ones(semantic, width) + torch.randn(semantic, width) * .02)
+        self.starts = tuple(layout[name + "_semantic_start"] for name in SEMANTIC_NAMES)
+        self.sizes = tuple(layout[name + "_semantic_count"] for name in SEMANTIC_NAMES)
+        self.tables = nn.ModuleList(nn.Embedding(size + 1, width, padding_idx=0)
+                                    for size in self.sizes)
+        self.num_embeddings = layout["concept_vocab"]
+
+    def forward(self, codes):
+        output = self.tables[0].weight.new_zeros((*codes.shape, self.tables[0].embedding_dim))
+        for start, size, table in zip(self.starts, self.sizes, self.tables):
+            present = (codes >= start) & (codes < start + size)
+            output += table(torch.where(present, codes - start + 1, 0))
+        return output
+
+    def flattened(self):
+        return torch.cat((self.tables[0].weight[:1] * 0,
+                          *(table.weight[1:] for table in self.tables)))
+
+    def local(self, name, index):
+        return self.tables[SEMANTIC_NAMES.index(name)].weight[index + 1]
+
+
+class TokenEncoder(nn.Module):
+    def __init__(self, _categorical, numeric, width):
+        super().__init__()
         self.numeric = nn.Linear(numeric, width, bias=False)
-        self.bias = nn.Parameter(torch.zeros(width))
         self.norm = nn.LayerNorm(width)
 
-    def forward(self, semantic, numeric, embedding):
-        if not len(semantic):
-            return self.bias.new_empty((0, len(self.bias)))
-        if semantic.device.type == "mps":
-            return _FusedSemantic.apply(
-                semantic, numeric, embedding.weight, self.field, self.numeric.weight,
-                self.bias, self.norm.weight, self.norm.bias,
-            )
-        present = semantic != 0
-        categorical = (embedding(semantic.long()) * self.field * present[:, :, None]).sum(1)
-        categorical = categorical / present.sum(1).clamp_min(1).sqrt()[:, None]
-        return torch.relu(self.norm(categorical + self.numeric(numeric) + self.bias))
+    def forward(self, categorical, numeric, embeddings):
+        if not len(categorical):
+            return self.norm.weight.new_empty((0, len(self.norm.weight)))
+        return self.norm(embeddings(categorical.long()).sum(1) + self.numeric(numeric))
 
 
 class Agent(nn.Module):
-    def __init__(self, layout, width=64, layers=2, heads=4, feedforward=128, head_width=None):
-        super().__init__()
+    def __init__(self, layout, width=64, layers=2, heads=4, feedforward=128, head_width=None,
+                 pooling=None):
+        nn.Module.__init__(self)
         self.layout = dict(layout)
         if self.layout["version"] != FEATURE_VERSION:
             raise ValueError("incompatible observation layout")
-        expected = {name + suffix: value for name, unsigned, signed, semantic, numeric in DOMAIN_SPECS
+        expected = {name + suffix: value for name, unsigned, signed, semantic, numeric in TOKEN_SPECS
                     for suffix, value in (("_u", unsigned), ("_s", signed),
                                           ("_c", semantic), ("_f", numeric))}
-        expected |= {"domain_count": len(DOMAIN_SPECS), "action_u": ACTION_FIELDS[0],
+        expected |= {"domain_count": len(TOKEN_SPECS), "action_u": ACTION_FIELDS[0],
                      "action_s": ACTION_FIELDS[1], "action_c": ACTION_FIELDS[2],
-                     "action_f": ACTION_FIELDS[3], "card_zones": 5, "globals": 0,
-                     "entity_summaries": 11, "base_state_width": 1088, "state_width": 1152,
-                     "model_width": 64, "model_layers": 2, "model_heads": 4,
-                     "model_feedforward": 128, "action_width": 64, "head_width": 112,
-                     "card_known_position_semantic": 7,
-                     "continuation_branch_semantic": 3, "continuation_path_semantic": 4,
-                     "continuation_list_semantic": 5, "continuation_order_semantic": 6,
-                     "map_node_floor_semantic": 2, "map_node_lane_semantic": 3}
+                     "action_f": ACTION_FIELDS[3], "globals": 0, "model_width": 64,
+                     "model_layers": 2, "model_heads": 4, "model_feedforward": 128,
+                     "action_width": 64}
         if any(self.layout.get(key) != value for key, value in expected.items()):
             raise ValueError("incompatible observation schema")
-        ranges = sorted((self.layout[name + "_semantic_start"], self.layout[name + "_semantic_count"])
-                        for name in SEMANTIC_NAMES)
-        if (not ranges or ranges[0][0] != 1 or any(count < 1 for _start, count in ranges)
-                or any(start + count != next_start
-                       for (start, count), (next_start, _next_count) in zip(ranges, ranges[1:]))
-                or ranges[-1][0] + ranges[-1][1] != self.layout.get("semantic_vocab")):
-            raise ValueError("invalid semantic namespaces")
-        if (width, layers, heads, feedforward) != (64, 2, 4, 128) or head_width not in (None, 112):
+        if (width, layers, heads, feedforward) != (64, 2, 4, 128) or head_width not in (None, 64):
             raise ValueError("invalid architecture")
         self.width, self.layers, self.heads, self.feedforward = width, layers, heads, feedforward
-        self.character_start = 0
+        self.head_width = width
+        self.state_width = width
         self.card_zones = 5
-        self.entity_collections = 11
-        self.base_state_width = (self.card_zones + self.entity_collections + 1) * width
-        self.state_width = self.base_state_width + width
-        self.semantic = nn.Embedding(self.layout["semantic_vocab"], width, padding_idx=0)
+        self.entity_collections = 0
+        self.pooling = POOLING_DEFAULTS | (pooling or {})
+        for name in ("relic", "deck", "draw", "exhaust", "discard", "hand", "orb", "potion"):
+            if self.pooling[name] not in COLLECTION_POOLING:
+                raise ValueError(f"invalid {name} pooling")
+        for name in ("enemy_effect", "friendly_effect"):
+            if self.pooling[name] not in EFFECT_POOLING:
+                raise ValueError(f"invalid {name} pooling")
+        if self.pooling["continuation"] not in CONTINUATION_POOLING:
+            raise ValueError("invalid continuation pooling")
+        if self.pooling["phase"] not in ("sum", "transformer") \
+                or self.pooling["generation_pool"] not in ("sum", "transformer"):
+            raise ValueError("invalid summary pooling")
+
+        self.concepts = ConceptEmbeddings(self.layout, width)
         self.encoders = nn.ModuleDict({
-            name: SemanticEncoder(semantic, numeric, width)
-            for name, _unsigned, _signed, semantic, numeric in DOMAIN_SPECS
+            name: TokenEncoder(semantic, numeric, width)
+            for name, _unsigned, _signed, semantic, numeric in TOKEN_SPECS
         })
-        self.action_encoder = SemanticEncoder(ACTION_FIELDS[2], ACTION_FIELDS[3], width)
-        self.card_state = nn.Parameter(torch.randn(self.card_zones, width) * .02)
-        self.card_count = nn.Linear(6, width, bias=False)
-        card_layer = nn.TransformerEncoderLayer(
-            width, heads, feedforward, dropout=0, batch_first=True, norm_first=True, activation="relu"
-        )
-        self.card_transformer = nn.TransformerEncoder(card_layer, layers, enable_nested_tensor=False)
-        self.effect_tuple = nn.Linear(width, width)
-        self.history_tuple = nn.Linear(width, width)
-        self.actor_pool = nn.Linear(width + 2, width)
-        self.actor_state = nn.Parameter(torch.randn(2, width) * .02)
-        self.actor_mlp = nn.Sequential(nn.Linear(3 * width, width), nn.LayerNorm(width), nn.ReLU())
-        self.entity_tuple = nn.Linear(width, width)
-        self.entity_pool = nn.Linear(width + 2, width)
-        self.entity_state = nn.Parameter(torch.randn(self.entity_collections, width) * .02)
+        self.action_encoder = TokenEncoder(ACTION_FIELDS[2], ACTION_FIELDS[3], width)
+        summary_names = (*POOLING_DEFAULTS, "card_pool", "relic_pool", "encounter_pool", "event_pool")
+        self.summary_seed = nn.ParameterDict({name: nn.Parameter(torch.randn(width) * .02)
+                                              for name in summary_names})
+
+        def transformer(layer_count=1):
+            layer = nn.TransformerEncoderLayer(
+                width, heads, feedforward, dropout=0, batch_first=True,
+                norm_first=True, activation="gelu",
+            )
+            return nn.TransformerEncoder(layer, layer_count, enable_nested_tensor=False)
+
+        self.pool_transformers = nn.ModuleDict()
+        for name, mode in self.pooling.items():
+            if mode in ("transformer", "transformer_into_actor", "transformer_token"):
+                key = "generation_pool" if name == "generation_pool" else name
+                if key not in self.pool_transformers:
+                    self.pool_transformers[key] = transformer()
+        self.move_gru = nn.GRU(width, width, batch_first=True)
+        self.continuation_gru = nn.GRU(width, width, batch_first=True) \
+            if self.pooling["continuation"] == "gru" else None
+        self.actor_norm = nn.LayerNorm(width)
+        self.action_norm = nn.LayerNorm(width)
+        self.global_transformer = transformer(2)
+        self.global_norm = nn.LayerNorm(width)
+
         self.graph_norm = nn.LayerNorm(width)
         self.graph_query = nn.Linear(width, width)
         self.graph_key_value = nn.Linear(width, 2 * width)
@@ -1117,161 +1166,28 @@ class Agent(nn.Module):
         self.graph_out = nn.Linear(width, width)
         self.graph_degree = nn.Linear(2, width, bias=False)
         self.graph_ff_norm = nn.LayerNorm(width)
-        self.graph_ff = nn.Sequential(nn.Linear(width, feedforward), nn.ReLU(), nn.Linear(feedforward, width))
-        self.continuation_relation = nn.Linear(6, width, bias=False)
-        self.continuation_tuple = nn.Linear(2 * width, width)
-        self.continuation_pool = nn.Linear(width + 2, width)
-        self.continuation_parent = nn.Linear(2 * width, width)
-        self.continuation_norm = nn.LayerNorm(width)
-        nn.init.normal_(self.graph_edge.weight, std=.01)
-        nn.init.normal_(self.graph_out.weight, std=.01)
-        nn.init.normal_(self.graph_degree.weight, std=.01)
-        self.candidate_scale = nn.Parameter(torch.ones(len(DOMAIN_SPECS), width))
-        self.candidate_bias = nn.Parameter(torch.zeros(len(DOMAIN_SPECS), width))
-        self.candidate_combine = nn.Linear(2 * width + 2, width)
-        self.path_adapter = nn.Linear(width, width, bias=False)
-        self.target_adapter = nn.Linear(width, width, bias=False)
-        self.action_legal = nn.Embedding(2, width)
-        self.action_norm = nn.LayerNorm(width)
-        self.menu_object = nn.Linear(width + 2, width)
-        self.menu_query = nn.Linear(self.base_state_width, width)
-        self.menu_key_value = nn.Linear(width, 2 * width)
-        self.menu_out = nn.Linear(width, width)
-        self.menu_count = nn.Linear(2, width, bias=False)
-        self.menu_norm = nn.LayerNorm(width)
-        self.menu_empty = nn.Parameter(torch.randn(width) * .02)
-        self.head_width = head_width or 112
-        self.policy = nn.Sequential(
-            nn.Linear(self.state_width + width, self.head_width), nn.ReLU(), nn.Linear(self.head_width, 1),
+        self.graph_ff = nn.Sequential(
+            nn.Linear(width, feedforward), nn.GELU(), nn.Linear(feedforward, width),
         )
-        self.critic = nn.Sequential(
-            nn.Linear(self.state_width, self.head_width), nn.ReLU(),
-            nn.Linear(self.head_width, CATEGORIES),
-        )
+        self.policy = nn.Linear(width, 1)
+        self.critic = nn.Linear(width, CATEGORIES)
         self._graph_cache = {}
-        self.cache_stats = {"card_hit": 0, "card_miss": 0, "graph_hit": 0, "graph_miss": 0}
-        nn.init.normal_(self.policy[-1].weight, std=0.01)
-        nn.init.zeros_(self.policy[-1].bias)
-        nn.init.zeros_(self.critic[-1].weight)
-        nn.init.zeros_(self.critic[-1].bias)
+        self.cache_stats = {"graph_hit": 0, "graph_miss": 0}
+        nn.init.normal_(self.policy.weight, std=.01)
+        nn.init.zeros_(self.policy.bias)
+        nn.init.zeros_(self.critic.weight)
+        nn.init.zeros_(self.critic.bias)
 
     def load_state_dict(self, state_dict, strict=True, assign=False):
         self._graph_cache.clear()
         self.cache_stats = dict.fromkeys(self.cache_stats, 0)
-        return super().load_state_dict(state_dict, strict, assign=assign)
+        return nn.Module.load_state_dict(self, state_dict, strict, assign)
 
     def train(self, mode=True):
         if mode:
             self._graph_cache.clear()
             self.cache_stats = dict.fromkeys(self.cache_stats, 0)
-        return super().train(mode)
-
-    def encode_domains(self, domains):
-        return tuple(self.encoders[name](*values[:2], self.semantic)[:values[2]]
-                     for (name, *_), values in zip(DOMAIN_SPECS, domains))
-
-    def encode_sequence(self, encoded, index, start, transformer, summary_only=False):
-        offsets, destination, sequence, row, position, max_length, groups = index
-        if encoded.device.type != "mps" or self.width // self.heads not in (16, 32):
-            lengths = offsets[1:] - offsets[:-1]
-            valid = torch.arange(max_length, device=encoded.device)[None] < lengths[:, None]
-            current = encoded.new_zeros((len(lengths), max_length, self.width))
-            current[:groups, 0] = start.to(current.dtype)
-            if len(encoded):
-                current[row, position] = encoded
-            for layer in transformer.layers[:-1] if summary_only else transformer.layers:
-                heads = layer.self_attn.num_heads
-                qkv = nn.functional.linear(
-                    layer.norm1(current), layer.self_attn.in_proj_weight,
-                    layer.self_attn.in_proj_bias,
-                ).reshape(len(lengths), max_length, 3, heads, self.width // heads)
-                query, key, value = (part.transpose(1, 2) for part in qkv.unbind(2))
-                attended = nn.functional.scaled_dot_product_attention(
-                    query, key, value, attn_mask=valid[:, None, None],
-                    dropout_p=layer.self_attn.dropout if self.training else 0,
-                ).transpose(1, 2).reshape(len(lengths), max_length, self.width)
-                current = current + layer.dropout1(layer.self_attn.out_proj(attended))
-                current = current + layer.dropout2(layer.linear2(layer.dropout(
-                    layer.activation(layer.linear1(layer.norm2(current)))
-                )))
-            if summary_only:
-                layer = transformer.layers[-1]
-                normalized = layer.norm1(current)
-                weight, bias = layer.self_attn.in_proj_weight, layer.self_attn.in_proj_bias
-                query = nn.functional.linear(
-                    normalized[:, :1], weight[:self.width], bias[:self.width]
-                ).reshape(len(lengths), 1, self.heads, -1).transpose(1, 2)
-                key, value = nn.functional.linear(
-                    normalized, weight[self.width:], bias[self.width:]
-                ).reshape(len(lengths), max_length, 2, self.heads, -1).unbind(2)
-                attended = nn.functional.scaled_dot_product_attention(
-                    query, key.transpose(1, 2), value.transpose(1, 2),
-                    attn_mask=valid[:, None, None], dropout_p=0,
-                ).transpose(1, 2).reshape(len(lengths), 1, self.width)
-                current = current[:, :1] + layer.dropout1(layer.self_attn.out_proj(attended))
-                current = current + layer.dropout2(layer.linear2(layer.dropout(
-                    layer.activation(layer.linear1(layer.norm2(current)))
-                )))
-            if transformer.norm is not None:
-                current = transformer.norm(current)
-            return current[:groups, 0], encoded.new_empty((0, self.width)) if summary_only else current[row, position]
-        current = encoded.new_zeros((len(sequence), self.width))
-        current[offsets[:groups]] = start.to(current.dtype)
-        current[destination] = encoded
-        for layer in transformer.layers[:-1] if summary_only else transformer.layers:
-            qkv = nn.functional.linear(
-                layer.norm1(current), layer.self_attn.in_proj_weight, layer.self_attn.in_proj_bias
-            )
-            attended = _RaggedAttention.apply(qkv, offsets, sequence, layer.self_attn.num_heads)
-            current = current + layer.dropout1(layer.self_attn.out_proj(attended))
-            current = current + layer.dropout2(layer.linear2(layer.dropout(
-                layer.activation(layer.linear1(layer.norm2(current)))
-            )))
-        if summary_only:
-            layer = transformer.layers[-1]
-            normalized = layer.norm1(current)
-            weight, bias = layer.self_attn.in_proj_weight, layer.self_attn.in_proj_bias
-            starts = offsets[:-1]
-            query = nn.functional.linear(normalized[starts], weight[:self.width], bias[:self.width])
-            key_value = nn.functional.linear(normalized, weight[self.width:], bias[self.width:])
-            attended = _RaggedSummaryAttention.apply(
-                query, key_value, offsets, sequence, layer.self_attn.num_heads
-            )
-            current = current[starts] + layer.dropout1(layer.self_attn.out_proj(attended))
-            current = current + layer.dropout2(layer.linear2(layer.dropout(
-                layer.activation(layer.linear1(layer.norm2(current)))
-            )))
-        if transformer.norm is not None:
-            current = transformer.norm(current)
-        return (current[:groups], encoded.new_empty((0, self.width))) if summary_only else (
-            current[offsets[:groups]], current[destination]
-        )
-
-    def pool(self, encoded, source, group, count, groups, state, tuple_linear, pool_linear,
-             source_count=None):
-        if not groups:
-            return encoded.new_empty((0, self.width))
-        if len(source):
-            values = encoded[source] if tuple_linear is None else torch.relu(tuple_linear(encoded[source]))
-            if source_count is not None and len(source) > source_count:
-                values = values.clone(); values[source_count:] = 0
-            pooled = encoded.new_zeros((len(count), self.width)).index_add(
-                0, group, values.to(encoded.dtype),
-            )
-        else:
-            pooled = encoded.new_zeros((len(count), self.width))
-        pooled = pooled / count.clamp_min(1).sqrt()[:, None]
-        exact = count[:, None].to(pooled.dtype)
-        pooled = pool_linear(torch.cat((pooled, exact / 64, exact.log1p() / 5), 1))
-        return torch.relu(pooled + state.to(pooled.dtype))[:groups]
-
-    def encode_cards(self, encoded, cards):
-        source, sequence, zones, inverse, source_count, counts = cards
-        states = self.card_state[zones] + self.card_count(counts.to(encoded.dtype))
-        values = encoded[source]
-        if len(source) > source_count:
-            values = values.clone(); values[source_count:] = 0
-        return self.encode_sequence(values, sequence, states, self.card_transformer, True)[0][inverse]
+        return nn.Module.train(self, mode)
 
     def attend(self, query, key_value, sequence):
         offsets, rows, position, max_length = sequence
@@ -1290,7 +1206,7 @@ class Agent(nn.Module):
 
     @staticmethod
     def group_log_softmax(score, legal, index):
-        offsets, group, position, maximum = index
+        offsets, group, _position, _maximum = index
         if score.device.type == "mps":
             return _RaggedLogSoftmax.apply(score.masked_fill(~legal, -torch.inf), offsets)
         score = score.masked_fill(~legal, -torch.inf)
@@ -1303,32 +1219,17 @@ class Agent(nn.Module):
         value = score - torch.where(torch.isfinite(normalizer), normalizer, 0)[group]
         return torch.where(legal, value, torch.zeros_like(value))
 
-    def score(self, state, action, row):
-        return self.policy(torch.cat((state[row], action), 1)).squeeze(-1)
-
-    def decide(self, state, action, action_row, action_flat, actions, legal, sequence,
-               action_count, temperature=1, flat=False):
-        scores = self.group_log_softmax(
-            self.score(state, action, action_row)[:action_count] / temperature,
-            legal[:action_count], sequence,
-        )
-        if flat:
-            return scores
-        policy = scores.new_zeros(len(state) * actions).scatter(
-            0, action_flat[:action_count], scores,
-        ).reshape(len(state), actions)
-        return policy
-
     def encode_map(self, encoded, index):
-        node_source, edge_source, levels, offsets, current, current_inverse, current_source, current_sequence, keys = index
+        node_source, edge_source, levels, offsets, current, current_inverse, current_source, \
+            current_sequence, keys = index
         cached = [self._graph_cache.get(key) for key in keys]
-        if not self.training and node_source.device.type == "cpu" and all(value is not None for value in cached):
+        if not self.training and node_source.device.type == "cpu" and all(x is not None for x in cached):
             self.cache_stats["graph_hit"] += len(keys)
             nodes = torch.cat(cached)
         else:
             if not self.training and node_source.device.type == "cpu":
-                self.cache_stats["graph_hit"] += sum(value is not None for value in cached)
-                self.cache_stats["graph_miss"] += sum(value is None for value in cached)
+                self.cache_stats["graph_hit"] += sum(x is not None for x in cached)
+                self.cache_stats["graph_miss"] += sum(x is None for x in cached)
             nodes = encoded[DOMAIN["map_node"]][node_source]
             if not self.training and node_source.device.type == "cpu":
                 ranges = offsets.tolist()
@@ -1340,8 +1241,7 @@ class Agent(nn.Module):
                 attended = self.attend(
                     self.graph_query(self.graph_norm(nodes[parents])),
                     self.graph_key_value(self.graph_norm(nodes[children]))
-                    + self.graph_edge(edges[edge_rows]),
-                    sequence,
+                    + self.graph_edge(edges[edge_rows]), sequence,
                 )
                 features = torch.stack((degree / 8, degree.log1p() / 3), 1).to(nodes.dtype)
                 updated = nodes[parents] + self.graph_out(attended) + self.graph_degree(features)
@@ -1349,9 +1249,9 @@ class Agent(nn.Module):
                 nodes.index_copy_(0, parents[:count], updated[:count])
             if not self.training and node_source.device.type == "cpu":
                 offsets = offsets.tolist()
-                for index, key in enumerate(keys):
-                    if cached[index] is None:
-                        self._graph_cache[key] = nodes[offsets[index]:offsets[index + 1]].detach()
+                for graph, key in enumerate(keys):
+                    if cached[graph] is None:
+                        self._graph_cache[key] = nodes[offsets[graph]:offsets[graph + 1]].detach()
                 while len(self._graph_cache) > 8192:
                     self._graph_cache.pop(next(iter(self._graph_cache)))
         selected = nodes[current]
@@ -1363,154 +1263,319 @@ class Agent(nn.Module):
         selected = selected + self.graph_ff(self.graph_ff_norm(selected))
         return selected[current_inverse], nodes
 
-    def encode_continuations(self, encoded, index):
-        source, levels = index
-        values = encoded[source]
-        for parents, children, group, count, relation in levels:
-            pooled = values.new_zeros((len(parents), self.width))
-            if len(children):
-                related = self.continuation_relation(relation.to(values.dtype))
-                messages = torch.relu(self.continuation_tuple(torch.cat((values[children], related), 1)))
-                pooled = pooled.index_add(0, group, messages.to(values.dtype))
-            pooled = pooled / count.clamp_min(1).sqrt()[:, None]
-            exact = count[:, None].to(values.dtype)
-            pooled = self.continuation_pool(torch.cat((pooled, exact / 64, exact.log1p() / 5), 1))
-            parent = self.continuation_parent(torch.cat((values[parents], pooled), 1))
-            values = values.index_copy(
-                0, parents, torch.relu(self.continuation_norm(parent)).to(values.dtype),
-            )
-        return values
+    def encode_domains(self, domains):
+        return tuple(self.encoders[name](*values[:2], self.concepts)[:values[2]]
+                     for (name, *_), values in zip(TOKEN_SPECS, domains))
 
-    def encode_state(self, globals_, domains, encoded, index):
-        cards, actors, entities, continuation_index, continuation_roots, map_ = index
-        card = self.encode_cards(encoded[DOMAIN["card"]], cards)
-        base_source, actor_groups, history, effects = actors
-        history_domain, history_source, history_group, history_count, history_source_count = history
-        history = self.pool(
-            encoded[history_domain], history_source, history_group, history_count, len(base_source),
-            self.actor_state[0], self.history_tuple, self.actor_pool, history_source_count,
-        )
+    def _tag(self, values, role, collection=None):
+        tagged = values + self.concepts.local("token_role", role).to(values.dtype)
+        return tagged if collection is None else \
+            tagged + self.concepts.local("collection", collection).to(values.dtype)
+
+    @staticmethod
+    def _domain_rows(domains, encoded, domain, predicate=None, scope_value=-1):
+        _semantic, _numeric, _count, u, row, scope, inverse = domains[domain]
+        selected = scope == scope_value
+        if predicate is not None:
+            selected &= predicate(u)
+        source = selected.nonzero().squeeze(1)
+        return encoded[domain][inverse[source]], row[source], u[source]
+
+    @staticmethod
+    def _ordered(values, group):
+        if len(group) < 2:
+            return values, group
+        order = torch.argsort(group, stable=True)
+        return values[order], group[order]
+
+    def _sequence(self, values, group, groups, seed, transformer):
+        order = torch.argsort(group, stable=True)
+        inverse = torch.empty_like(order)
+        inverse[order] = torch.arange(len(order), device=order.device)
+        values, group = values[order], group[order]
+        counts = torch.bincount(group, minlength=groups)
+        if values.device.type == "mps" and self.width // self.heads in (16, 32):
+            lengths = counts + 1
+            offsets = torch.cat((counts.new_zeros(1), lengths.cumsum(0)))
+            starts = torch.repeat_interleave(offsets[:-1], counts)
+            position = torch.arange(len(values), device=values.device) \
+                - torch.repeat_interleave(counts.cumsum(0) - counts, counts) + 1
+            destination = starts + position
+            current = values.new_zeros((int(offsets[-1]), self.width))
+            current[offsets[:-1]] = seed.to(values.dtype)
+            current[destination] = values
+            sequence = torch.repeat_interleave(torch.arange(groups, device=values.device), lengths)
+            for layer in transformer.layers:
+                qkv = nn.functional.linear(
+                    layer.norm1(current), layer.self_attn.in_proj_weight,
+                    layer.self_attn.in_proj_bias,
+                )
+                attended = _RaggedAttention.apply(
+                    qkv, offsets.to(torch.int32), sequence.to(torch.int32),
+                    layer.self_attn.num_heads,
+                )
+                current = current + layer.self_attn.out_proj(attended)
+                current = current + layer.linear2(layer.activation(layer.linear1(layer.norm2(current))))
+            items = current[destination][inverse] if len(values) else values
+            return current[offsets[:-1]], items
+        maximum = int(counts.max().item()) if len(counts) else 0
+        sequence = values.new_zeros((groups, maximum + 1, self.width))
+        sequence[:, 0] = seed.to(values.dtype)
+        if len(values):
+            starts = torch.repeat_interleave(counts.cumsum(0) - counts, counts)
+            position = torch.arange(len(values), device=values.device) - starts + 1
+            sequence[group, position] = values
+        valid = torch.arange(maximum + 1, device=values.device)[None] <= counts[:, None]
+        sequence = transformer(sequence, src_key_padding_mask=~valid)
+        items = sequence[group, position][inverse] if len(values) else values
+        return sequence[:, 0], items
+
+    def _summarize(self, values, group, groups, name, mode, transformer_name=None):
+        seed = self.summary_seed[name]
+        if mode == "sum":
+            summary = values.new_zeros((groups, self.width))
+            if len(values):
+                summary.index_add_(0, group, values.to(summary.dtype))
+        elif mode == "gru":
+            values, group = self._ordered(values, group)
+            counts = torch.bincount(group, minlength=groups)
+            maximum = int(counts.max().item()) if len(counts) else 0
+            padded = values.new_zeros((groups, maximum, self.width))
+            if len(values):
+                starts = torch.repeat_interleave(counts.cumsum(0) - counts, counts)
+                position = torch.arange(len(values), device=values.device) - starts
+                padded[group, position] = values
+                output, _ = self.continuation_gru(padded)
+                present = (counts > 0).nonzero().squeeze(1)
+                summary = values.new_zeros((groups, self.width)).index_copy(
+                    0, present, output[present, counts[present] - 1],
+                )
+            else:
+                summary = values.new_zeros((groups, self.width))
+        else:
+            summary, _ = self._sequence(values, group, groups, seed,
+                                        self.pool_transformers[transformer_name or name])
+        return summary
+
+    def _collection(self, values, rows, active, name):
+        collection = ("deck", "hand", "draw", "discard", "exhaust", "relic", "potion", "orb").index(name)
+        mode = self.pooling[name]
+        if mode == "global_tokens":
+            return self._tag(values, 9, collection), rows
+        summary = self._summarize(values, rows, int(active.max().item()) + 1 if len(active) else 0,
+                                  name, mode)
+        return self._tag(summary[active], 14, collection), active
+
+    def _actors(self, domains, encoded, batch):
+        actors, rows, u = self._domain_rows(domains, encoded, DOMAIN["actor"])
+        if not len(actors):
+            return actors, rows, u, [], []
+        order = torch.argsort(rows * (1 << 20) + u[:, 0], stable=True)
+        actors, rows, u = actors[order], rows[order], u[order]
+        keys = rows * (1 << 20) + u[:, 0]
+
+        history, history_rows, history_u = self._domain_rows(domains, encoded, DOMAIN["history"])
+        if len(history):
+            history_keys = history_rows * (1 << 20) + history_u[:, 0]
+            group = torch.searchsorted(keys, history_keys)
+            valid = group < len(keys)
+            valid &= keys[group.clamp_max(len(keys) - 1)] == history_keys
+            player = valid & (history_u[:, 1] == 0)
+            if player.any():
+                actors = actors.index_add(0, group[player], history[player].to(actors.dtype))
+            moves = valid & (history_u[:, 1] == 1)
+            if moves.any():
+                history_semantic, _numeric, _count, _u, _row, _scope, history_inverse = \
+                    domains[DOMAIN["history"]]
+                raw = (domains[DOMAIN["history"]][5] == -1).nonzero().squeeze(1)[moves]
+                move_values = self.concepts(
+                    history_semantic[history_inverse[raw], :1]
+                ).squeeze(1)
+                move_values, move_group = self._ordered(move_values, group[moves])
+                counts = torch.bincount(move_group, minlength=len(actors))
+                maximum = int(counts.max().item())
+                padded = move_values.new_zeros((len(actors), maximum, self.width))
+                starts = torch.repeat_interleave(counts.cumsum(0) - counts, counts)
+                position = torch.arange(len(move_values), device=move_values.device) - starts
+                padded[move_group, position] = move_values
+                output, _ = self.move_gru(padded)
+                present = (counts > 0).nonzero().squeeze(1)
+                move = move_values.new_zeros((len(actors), self.width)).index_copy(
+                    0, present, output[present, counts[present] - 1],
+                )
+                actors = actors + move
+
         effect_values, effect_groups = [], []
-        effect_count = None
-        for domain, source, group, count, source_count in effects:
-            if len(source):
-                values = torch.relu(self.effect_tuple(encoded[domain][source]))
-                if len(source) > source_count:
-                    values = values.clone(); values[source_count:] = 0
-                effect_values.append(values)
-                effect_groups.append(group)
-            effect_count = count if effect_count is None else effect_count + count
-        effect_values = torch.cat(effect_values) if effect_values else encoded[0].new_empty((0, self.width))
-        effect_groups = torch.cat(effect_groups) if effect_groups else base_source.new_empty(0)
-        effects = self.pool(
-            effect_values, torch.arange(len(effect_values), device=effect_values.device),
-            effect_groups, effect_count, len(base_source), self.actor_state[1], None, self.actor_pool,
-        )
-        actor = (
-            self.actor_mlp(torch.cat((encoded[DOMAIN["actor"]][base_source], history, effects), 1))
-            if len(base_source) else encoded[DOMAIN["actor"]].new_empty((0, self.width))
-        )
-        continuation = self.encode_continuations(
-            encoded[DOMAIN["continuation"]], continuation_index,
-        )
-        current, nodes = self.encode_map(encoded, map_)
-        batch = len(globals_)
-        summaries = []
-        for collection, (domain, source, group, count, source_count) in enumerate(entities[:2]):
-            summaries.append(self.pool(
-                encoded[domain], source, group, count, batch,
-                self.entity_state[collection], self.entity_tuple, self.entity_pool, source_count,
-            ))
-        for collection, (source, rows, count, source_count) in enumerate(actor_groups, 2):
-            summaries.append(self.pool(
-                actor, source, rows, count, batch,
-                self.entity_state[collection], self.entity_tuple, self.entity_pool, source_count,
-            ))
-        for collection, (domain, source, group, count, source_count) in enumerate(entities[2:], 4):
-            summaries.append(self.pool(
-                encoded[domain], source, group, count, batch,
-                self.entity_state[collection], self.entity_tuple, self.entity_pool, source_count,
-            ))
-        roots, root_rows, root_count, root_source_count = continuation_roots
-        summaries.append(self.pool(
-            continuation, roots, root_rows, root_count, batch,
-            self.entity_state[-1], self.entity_tuple, self.entity_pool, root_source_count,
-        ))
-        card = nn.functional.layer_norm(card, (self.width,))
-        summaries = [nn.functional.layer_norm(summary, (self.width,)) for summary in summaries]
-        current = nn.functional.layer_norm(current, (self.width,))
-        state = torch.cat((card.reshape(batch, -1), *summaries, current), 1)
-        if state.shape[1] != self.base_state_width:
-            raise ValueError("invalid base state width")
-        return state, nodes, actor, continuation
+        for domain in (DOMAIN["power"], DOMAIN["status"]):
+            values, effect_rows, effect_u = self._domain_rows(domains, encoded, domain)
+            if not len(values):
+                continue
+            effect_keys = effect_rows * (1 << 20) + effect_u[:, 0]
+            group = torch.searchsorted(keys, effect_keys)
+            valid = group < len(keys)
+            valid &= keys[group.clamp_max(len(keys) - 1)] == effect_keys
+            effect_values.append(values[valid])
+            effect_groups.append(group[valid])
+        effects = torch.cat(effect_values) if effect_values else actors.new_empty((0, self.width))
+        effect_group = torch.cat(effect_groups) if effect_groups else rows.new_empty(0)
+        extra_values, extra_rows = [], []
+        for name, family in (("friendly_effect", u[:, 1] < 2), ("enemy_effect", u[:, 1] == 2)):
+            actor_index = family.nonzero().squeeze(1)
+            if not len(actor_index):
+                continue
+            lookup = rows.new_full((len(actors),), -1)
+            lookup[actor_index] = torch.arange(len(actor_index), device=rows.device)
+            selected = lookup[effect_group] >= 0 if len(effect_group) else effect_group.bool()
+            values = effects[selected]
+            local_group = lookup[effect_group[selected]]
+            mode = self.pooling[name]
+            if mode == "global_tokens":
+                extra_values.append(self._tag(values, 10, 8 + (name == "enemy_effect")))
+                extra_rows.append(rows[effect_group[selected]])
+                continue
+            pooled_mode = "transformer" if mode.startswith("transformer") else "sum"
+            summary = self._summarize(values, local_group, len(actor_index), name, pooled_mode)
+            if mode.endswith("into_actor"):
+                actors = actors.index_add(0, actor_index, summary.to(actors.dtype))
+            else:
+                extra_values.append(self._tag(summary, 10, 8 + (name == "enemy_effect")))
+                extra_rows.append(rows[actor_index])
+        actors = self.actor_norm(self._tag(actors, 8))
+        return actors, rows, u, extra_values, extra_rows
 
-    def encode_actions(self, encoded, continuation, actor, values, index, nodes):
+    def _actions(self, domains, encoded, values, index, nodes):
         semantic, numeric = values
-        action_row, action_flat, legal, _sequence, actions, sources, path, target, _menu, \
-            policy_sequence, action_count = index
-        base = self.action_encoder(semantic, numeric, self.semantic)
-        pooled = base.new_zeros(base.shape); count = base.new_ones(len(base))
-        for domain, (source, group, domain_count, inverse, groups, source_count) in enumerate(sources):
-            summed = pooled.new_zeros((groups, self.width))
-            if len(source):
-                values = continuation[source] if domain == DOMAIN["continuation"] else encoded[domain][source]
-                if len(source) > source_count:
-                    values = values.clone(); values[source_count:] = 0
-                summed = summed.index_add(0, group, values.to(summed.dtype))
-            pooled = pooled + (
-                summed * self.candidate_scale[domain] + domain_count[:, None] * self.candidate_bias[domain]
-            )[inverse]
-            count = count + domain_count[inverse]
-        for index, values, adapter in ((path, nodes, self.path_adapter),):
-            present = index >= 0
-            if present.any():
-                selected = present.nonzero().squeeze(1)
-                pooled = pooled.index_add(0, selected, adapter(values[index[present]]).to(pooled.dtype))
-                count = count + present.to(count.dtype)
-        present = target >= 0
+        action_row, action_flat, _legal, policy_sequence, actions, path, action_count = index
+        action = self.action_encoder(semantic[:action_count], numeric[:action_count], self.concepts)
+        attached = action.new_zeros(action.shape)
+        for domain in range(len(TOKEN_SPECS)):
+            _semantic, _numeric, _count, _u, _row, scope, inverse = domains[domain]
+            selected = (scope >= 0).nonzero().squeeze(1)
+            if len(selected):
+                attached.index_add_(0, scope[selected], encoded[domain][inverse[selected]].to(attached.dtype))
+        present = path[:action_count] >= 0
         if present.any():
-            selected = present.nonzero().squeeze(1)
-            pooled = pooled.index_add(0, selected, self.target_adapter(actor[target[present]]).to(pooled.dtype))
-            count = count + present.to(count.dtype)
-        exact = count[:, None].to(pooled.dtype)
-        action = self.candidate_combine(torch.cat((
-            base + self.action_legal(legal.long()), pooled / count.clamp_min(1).sqrt()[:, None],
-            exact / 64, exact.log1p() / 5,
-        ), 1))
-        action = torch.relu(self.action_norm(action))
-        return action, action_row, action_flat, actions, legal, policy_sequence, action_count
+            attached[present] += nodes[path[:action_count][present]]
+        action = self.action_norm(self._tag(action + attached, 13))
+        return action, action_row[:action_count], action_flat[:action_count], actions, policy_sequence
 
-    def encode_menu(self, state, action, index):
-        object_group, target_count, rows, sequence = index
-        action = action[:len(object_group)]
-        objects = action.new_zeros((len(target_count), self.width)).index_add(0, object_group, action)
-        exact = target_count[:, None].to(action.dtype)
-        objects = torch.relu(self.menu_object(torch.cat((
-            objects / exact.clamp_min(1), exact / 64, exact.log1p() / 5,
-        ), 1)))
-        menu = self.menu_norm(self.menu_empty.to(state.dtype)).repeat(len(state), 1)
-        if len(rows):
-            query = self.menu_query(state[rows])
-            count = (sequence[0][1:] - sequence[0][:-1])[:, None].to(state.dtype)
-            value = self.menu_out(self.attend(query, self.menu_key_value(objects), sequence)) \
-                + self.menu_count(torch.cat((count / 64, count.log1p() / 5), 1))
-            menu = menu.index_copy(0, rows, self.menu_norm(value).to(menu.dtype))
-        return menu
+    def _continuations(self, domains, encoded):
+        values, rows, u = self._domain_rows(domains, encoded, DOMAIN["continuation"])
+        if not len(values):
+            return values, rows
+        order = torch.argsort(rows * (1 << 32) + u[:, 8], stable=True)
+        values, rows, u = values[order], rows[order], u[order]
+        keys = rows * (1 << 32) + u[:, 2]
+        first = torch.ones(len(keys), dtype=torch.bool, device=keys.device)
+        first[1:] = keys[1:] != keys[:-1]
+        group = first.cumsum(0) - 1
+        items = values.new_zeros((int(group[-1]) + 1, self.width))
+        items.index_add_(0, group, values)
+        return items, rows[first]
 
-    def forward(self, _character, globals_, domains, state_index, action_values, action_index,
+    def encode_state(self, domains, encoded, index, action_values, action_index):
+        batch = int(domains[DOMAIN["run"]][4].max().item()) + 1
+        current, nodes = self.encode_map(encoded, index)
+        action, action_rows, action_flat, actions, policy_sequence = self._actions(
+            domains, encoded, action_values, action_index, nodes,
+        )
+        values, rows = [], []
+        add = lambda value, row: (values.append(value), rows.append(row))
+
+        run, run_rows, _ = self._domain_rows(domains, encoded, DOMAIN["run"])
+        add(self._tag(run, 1), run_rows)
+        phase, phase_rows, _ = self._domain_rows(domains, encoded, DOMAIN["phase"])
+        phase_values, phase_groups = [phase], [phase_rows]
+        for domain in range(len(TOKEN_SPECS)):
+            item, item_rows, _ = self._domain_rows(
+                domains, encoded, domain, scope_value=-2,
+            )
+            if len(item):
+                phase_values.append(item); phase_groups.append(item_rows)
+        phase = self._summarize(torch.cat(phase_values), torch.cat(phase_groups), batch,
+                                "phase", self.pooling["phase"])
+        add(self._tag(phase, 2), torch.arange(batch, device=phase.device))
+        add(self._tag(current, 3), torch.arange(batch, device=current.device))
+
+        pool_specs = (
+            ("card_pool", DOMAIN["card"], lambda u: u[:, 0] == 13),
+            ("relic_pool", DOMAIN["relic"], lambda u: (u[:, 0] == 1) | (u[:, 0] == 2)),
+            ("encounter_pool", DOMAIN["encounter"], lambda u: u[:, 0] <= 2),
+            ("event_pool", DOMAIN["event"], lambda u: u[:, 0] == 0),
+        )
+        for name, domain, predicate in pool_specs:
+            item, item_rows, _ = self._domain_rows(domains, encoded, domain, predicate)
+            summary = self._summarize(
+                item, item_rows, batch, name, self.pooling["generation_pool"],
+                transformer_name="generation_pool",
+            )
+            role = ("card_pool", "relic_pool", "encounter_pool", "event_pool").index(name) + 4
+            add(self._tag(summary, role), torch.arange(batch, device=summary.device))
+
+        actors, actor_rows, actor_u, effect_values, effect_rows = self._actors(domains, encoded, batch)
+        combat_rows = actor_rows[actor_u[:, 1] == 0]
+        for name, domain, predicate, active in (
+            ("deck", DOMAIN["card"], lambda u: u[:, 0] == 0, torch.arange(batch, device=run.device)),
+            ("hand", DOMAIN["card"], lambda u: u[:, 0] == 1, combat_rows),
+            ("draw", DOMAIN["card"], lambda u: u[:, 0] == 2, combat_rows),
+            ("discard", DOMAIN["card"], lambda u: u[:, 0] == 3, combat_rows),
+            ("exhaust", DOMAIN["card"], lambda u: u[:, 0] == 4, combat_rows),
+            ("relic", DOMAIN["relic"], lambda u: u[:, 0] == 0, torch.arange(batch, device=run.device)),
+            ("potion", DOMAIN["potion"], lambda u: u[:, 0] == 0, torch.arange(batch, device=run.device)),
+            ("orb", DOMAIN["orb"], None, combat_rows),
+        ):
+            item, item_rows, item_u = self._domain_rows(domains, encoded, domain, predicate)
+            if name == "relic" and len(item):
+                stored, stored_rows, _ = self._domain_rows(
+                    domains, encoded, DOMAIN["card"], lambda u: u[:, 0] == 8,
+                )
+                payload = item.new_zeros((batch, self.width))
+                if len(stored):
+                    payload.index_add_(0, stored_rows, stored.to(payload.dtype))
+                pael = item_u[:, 9] != 0
+                item = item + pael[:, None] * payload[item_rows]
+            item, item_rows = self._collection(item, item_rows, active, name)
+            add(item, item_rows)
+        add(actors, actor_rows)
+        values.extend(effect_values); rows.extend(effect_rows)
+
+        continuation, continuation_rows = self._continuations(domains, encoded)
+        mode = self.pooling["continuation"]
+        if mode == "global_tokens":
+            add(self._tag(continuation, 11, 10), continuation_rows)
+        else:
+            add(self._tag(self._summarize(
+                    continuation, continuation_rows, batch, "continuation", mode), 14, 10),
+                torch.arange(batch, device=run.device))
+        crystal, crystal_rows, _ = self._domain_rows(domains, encoded, DOMAIN["crystal"])
+        add(self._tag(crystal, 12), crystal_rows)
+        add(action, action_rows)
+
+        values = torch.cat(values)
+        rows = torch.cat(rows)
+        self._sequence_lengths = torch.bincount(rows, minlength=batch) + 1
+        state, transformed = self._sequence(
+            values, rows, batch, self.concepts.local("token_role", 0), self.global_transformer,
+        )
+        transformed = self.global_norm(transformed)
+        action = transformed[-len(action):] if len(action) else action
+        return self.global_norm(state), action, action_rows, action_flat, actions, policy_sequence
+
+    def forward(self, _character, _globals, domains, state_index, action_values, action_index,
                 return_state=False, policy_only=False, flat_policy=False, temperature=1):
         encoded = self.encode_domains(domains)
-        state, nodes, actor, continuation = self.encode_state(globals_, domains, encoded, state_index)
-        action, action_row, action_flat, actions, legal, sequence, action_count = self.encode_actions(
-            encoded, continuation, actor, action_values, action_index, nodes,
+        state, action, action_row, action_flat, actions, sequence = self.encode_state(
+            domains, encoded, state_index, action_values, action_index,
         )
-        state = torch.cat((state, self.encode_menu(state, action, action_index[8])), 1)
-        if state.shape[1] != self.state_width:
-            raise ValueError("invalid state width")
-        policy = self.decide(
-            state, action, action_row, action_flat, actions, legal, sequence, action_count,
-            temperature, flat_policy,
-        )
+        scores = self.policy(action).squeeze(-1) / temperature
+        legal = torch.ones_like(scores, dtype=torch.bool)
+        scores = self.group_log_softmax(scores, legal, sequence)
+        if flat_policy:
+            policy = scores
+        else:
+            policy = scores.new_zeros(len(state) * actions).scatter(
+                0, action_flat, scores,
+            ).reshape(len(state), actions)
         if policy_only:
             return policy
         output = policy, self.critic(state)
@@ -1521,29 +1586,28 @@ def architecture(model):
     return {
         "width": model.width, "layers": model.layers, "heads": model.heads,
         "feedforward": model.feedforward, "head_width": model.head_width,
-        "domains": [name for name, *_ in DOMAIN_SPECS], "card_zones": model.card_zones,
+        "domains": [name for name, *_ in TOKEN_SPECS], "card_zones": model.card_zones,
         "globals": model.layout["globals"], "entity_collections": model.entity_collections,
-        "base_state_width": model.base_state_width, "state_width": model.state_width,
-        "policy_input": model.state_width + model.width,
-        "map_layers": 1, "fusion_layers": 0,
-        "final_attention": "query_only",
-        "actor_hierarchy": "player+optional Osty party pool; separate enemy pool",
-        "actor_effects": "power/status encoders -> one owner-grouped effect pool",
-        "tuple_pool": "sum/sqrt(count)+count/64+log1p(count)/5",
-        "state_block_norm": "parameterless LayerNorm per 64-d block before concatenation",
-        "candidate_attention": "target leaves -> mean action objects -> state-query attention",
-        "policy_factorization": "one shared direct candidate scorer",
-        "menu_invariance": "explicit object IDs; target means; candidate-permutation invariant",
+        "state_width": model.state_width, "policy_input": model.width,
+        "map_layers": 1, "global_layers": 2, "local_layers": 1,
+        "attention": "fully_bidirectional",
+        "activation": "gelu", "dropout": 0,
+        "token_encoder": "LayerNorm(sum(categorical)+Linear(numeric,bias=False))",
+        "sum_pooling": "unnormalized",
+        "policy_factorization": "one linear logit per transformed legal action token",
         "policy_entropy": ["candidate", "normalized", "effective_actions"],
         "map": "reverse-topological sparse attention; current/entry query over all contextual nodes",
-        "integer_encoding": "namespaced semantic IDs + field-specific float32 auxiliaries",
-        "continuations": "bottom-up parent/branch/path relational pooling",
-        "candidate_context": "complete public payload, Path context, and contextual target actor",
+        "move_history": "one-layer 64-D GRU",
+        "continuations": "normalized execution queue",
+        "candidate_context": "explicit selected payload, destination, and enemy identity+position",
         "card_zone_names": ["deck", "hand", "draw", "discard", "exhaust"],
-        "state_summaries": ["run", "phase", "party", "enemies", "relics", "potions", "orbs",
-                            "events", "encounters", "crystal", "continuations", "current_map_node",
-                            "available_actions"],
-        "semantic_vocab": model.semantic.num_embeddings, "candidate_numeric": ACTION_FIELDS[3],
+        "fixed_tokens": ["state", "run", "phase", "current_map_node", "card_pool",
+                         "relic_pool", "encounter_pool", "event_pool"],
+        "concept_vocab": model.concepts.num_embeddings,
+        "semantic_tables": dict(zip(SEMANTIC_NAMES, model.concepts.sizes)),
+        "position_caps": POSITION_CAPS,
+        "pooling": model.pooling,
+        "candidate_numeric": ACTION_FIELDS[3],
         "value_heads": [f"terminal_progress_categorical_{CATEGORIES}"],
         "winning_reservoir": WINNING_CAPACITY,
     }
@@ -1732,8 +1796,6 @@ def flat_domains(observation):
     batch = len(observation[0]); legal = observation_legal(observation)
     flat = len(observation[3]) == 7
     represented = None if flat else np.asarray(observation[3][4], bool)
-    if not flat and np.any(~represented.any(1)):
-        raise ValueError("state without represented candidate")
     if flat:
         action_row, action_position = map(lambda value: np.asarray(value, np.int32), observation[3][4:6])
     else:
@@ -1741,7 +1803,7 @@ def flat_domains(observation):
         lookup = np.full(represented.shape, -1, np.int32)
         lookup[action_row, action_position] = np.arange(len(action_row), dtype=np.int32)
     domains = []
-    for (name, unsigned, signed, semantic, numeric), values in zip(DOMAIN_SPECS, observation[2]):
+    for (name, unsigned, signed, semantic, numeric), values in zip(TOKEN_SPECS, observation[2]):
         values = tuple(map(np.asarray, values))
         if flat:
             u, s, c, f, row, scope = values
@@ -1785,153 +1847,34 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
     globals_ = np.asarray(globals_, np.float32)
     if globals_.shape != (batch, model.layout["globals"]) or not np.isfinite(globals_).all():
         raise ValueError("invalid public globals")
-    pad_sequences = model.training and model.card_state.device.type == "mps" and batch <= 8192
-    bucket = lambda count: 0 if not count else min(
-        size for power in range(max(1, (count - 1).bit_length()), 64)
-        for size in (3 * (1 << power) // 4, 1 << power) if size >= count
-    )
     tensor = lambda value: torch.as_tensor(value, dtype=torch.long, device=target)
-    def grouped(source, group, groups):
-        source, group = np.asarray(source, np.int32), np.asarray(group, np.int32)
-        count = len(source)
-        if pad_sequences and count:
-            size = bucket(count)
-            source = np.pad(source, (0, size - count))
-            group = np.pad(group, (0, size - count))
-        counts = np.bincount(group[:count], minlength=bucket(groups) if pad_sequences else groups)
-        return (torch.as_tensor(source, device=target), torch.as_tensor(group, device=target),
-                torch.as_tensor(counts.astype(np.float32), device=target), count)
     domain_tensors = []
-    domain_inverse = []
-    for (name, *_), (_u, _s, semantic, numeric, _row, _scope) in zip(DOMAIN_SPECS, domains):
-        if semantic.max(initial=0) >= model.semantic.num_embeddings:
+    inverse_rows = []
+    for (name, *_), (u, _s, semantic, numeric, row, scope) in zip(TOKEN_SPECS, domains):
+        if semantic.max(initial=0) >= model.concepts.num_embeddings:
             raise ValueError(f"invalid {name} semantic id")
         if len(semantic):
-            first, inverse = map(
-                np.asarray, sts2_sim.unique_feature_rows(semantic, numeric.view(np.uint32)),
-            )
+            first, inverse = map(np.asarray, sts2_sim.unique_feature_rows(
+                semantic, numeric.view(np.uint32),
+            ))
         else:
             first = inverse = np.empty(0, np.intp)
-        count = len(first)
-        size = bucket(count) if pad_sequences else count
         domain_tensors.append((
-            torch.as_tensor(np.pad(semantic[first], ((0, size - count), (0, 0))).astype(np.int32),
-                            device=target),
-            torch.as_tensor(np.pad(numeric[first], ((0, size - count), (0, 0))), device=target),
-            count,
+            torch.as_tensor(semantic[first].astype(np.int32), device=target),
+            torch.as_tensor(numeric[first], device=target), len(first),
+            torch.as_tensor(u.astype(np.int64), device=target),
+            torch.as_tensor(row.astype(np.int64), device=target),
+            torch.as_tensor(scope.astype(np.int64), device=target),
+            torch.as_tensor(inverse.astype(np.int64), device=target),
         ))
-        domain_inverse.append(inverse)
+        inverse_rows.append(inverse)
     domain_tensors = tuple(domain_tensors)
-    state_source = [np.flatnonzero(scope < 0).astype(np.int32)
-                    for _u, _s, _c, _f, _row, scope in domains]
-    card_u, _card_s, _card_c, _card_f, card_row, _card_scope = domains[DOMAIN["card"]]
-    card_source = state_source[DOMAIN["card"]]
-    card_group = card_row * model.card_zones + card_u[:, 0].astype(np.int32)
-    if len(card_source) and (card_group[card_source].min() < 0 or card_group[card_source].max() >= batch * model.card_zones):
-        raise ValueError("invalid card zone")
-    card_source = ordered(card_source, card_group, card_u[:, 2], card_u[:, 3])
-    card_group = card_group[card_source]
-    card_counts = np.bincount(card_group, minlength=batch * model.card_zones)
-    card_top = np.bincount(card_group, card_u[card_source, 2] == 1,
-                           minlength=batch * model.card_zones)
-    card_bottom = np.bincount(card_group, card_u[card_source, 2] == 2,
-                              minlength=batch * model.card_zones)
-    positions = np.arange(len(card_group), dtype=np.int32) - np.repeat(
-        np.cumsum(card_counts) - card_counts, card_counts
-    )
-    card_keys = np.full(
-        (batch * model.card_zones, card_counts.max(initial=0) + 1),
-        np.iinfo(np.uint32).max, np.uint32,
-    )
-    card_keys[:, 0] = np.arange(batch * model.card_zones) % model.card_zones
-    card_keys[card_group, positions + 1] = domain_inverse[DOMAIN["card"]][card_source]
-    empty = np.full((model.card_zones, card_keys.shape[1]), np.iinfo(np.uint32).max, np.uint32)
-    empty[:, 0] = np.arange(model.card_zones)
-    first, card_inverse = map(np.asarray, sts2_sim.unique_rows(np.concatenate((empty, card_keys))))
-    card_inverse = card_inverse[model.card_zones:].astype(np.int32)
-    representatives = first[first >= model.card_zones].astype(np.int32) - model.card_zones
-    keep = np.zeros(batch * model.card_zones, bool); keep[representatives] = True
-    card_source, card_group = card_source[keep[card_group]], card_inverse[card_group[keep[card_group]]]
-    card_zones = np.r_[np.arange(model.card_zones),
-                       np.arange(batch * model.card_zones) % model.card_zones][first]
-    card_counts = np.stack((card_counts / 64, np.log1p(card_counts) / 5,
-                            card_top / 64, np.log1p(card_top) / 5,
-                            card_bottom / 64, np.log1p(card_bottom) / 5), 1).astype(np.float32)
-    card_counts = np.concatenate((np.zeros((model.card_zones, 6), np.float32), card_counts))[first]
-    card_groups = len(first)
-    actor_u, _actor_s, _actor_c, _actor_f, actor_rows, _actor_scope = domains[DOMAIN["actor"]]
-    base_source = ordered(state_source[DOMAIN["actor"]], actor_rows, actor_u[:, 0])
-    actor_keys = (actor_rows[base_source].astype(np.uint64) << 32) | actor_u[base_source, 0]
-    if len(actor_keys) != len(np.unique(actor_keys)):
-        raise ValueError("duplicate actor")
-    children = []
-    for domain in (DOMAIN["history"], DOMAIN["power"], DOMAIN["status"]):
-        u, _s, _c, _f, row, scope = domains[domain]
-        source = state_source[domain]
-        keys = (row[source].astype(np.uint64) << 32) | u[source, 0]
-        group = np.searchsorted(actor_keys, keys)
-        valid = group < len(actor_keys)
-        if not valid.all() or np.any(actor_keys[group] != keys):
-            raise ValueError("actor child without actor")
-        group = group.astype(np.int32)
-        order = np.argsort(group, kind="stable")
-        source, group = source[order], group[order]
-        children.append((domain, *grouped(
-            domain_inverse[domain][source], group, len(base_source),
-        )))
-    entities = []
-    for name in ("run", "phase", "relic", "potion", "orb", "event", "encounter", "crystal"):
-        domain = DOMAIN[name]; _u, _s, _c, _f, row, _scope = domains[domain]
-        source = ordered(state_source[domain], row)
-        group = row[source].astype(np.int32)
-        entities.append((domain, *grouped(domain_inverse[domain][source], group, batch)))
-    cont_u, _cont_s, _cont_c, _cont_f, cont_row, cont_scope = domains[DOMAIN["continuation"]]
-    context = np.where(cont_scope < 0, cont_row, batch + cont_scope).astype(np.int64)
-    cont_source = ordered(np.arange(len(cont_u), dtype=np.int32), context, cont_u[:, 5], cont_u[:, 2])
-    cont_position = np.full(len(cont_u), -1, np.int32); cont_position[cont_source] = np.arange(len(cont_source))
-    frame = {(int(context[source]), int(cont_u[source, 2])): int(cont_position[source])
-             for source in cont_source}
-    if len(frame) != len(cont_source):
-        raise ValueError("duplicate continuation frame")
-    no_node = np.iinfo(np.uint32).max
-    parent = np.full(len(cont_source), -1, np.int32)
-    for position, source in enumerate(cont_source):
-        if cont_u[source, 3] != no_node:
-            parent[position] = frame.get((int(context[source]), int(cont_u[source, 3])), -1)
-            if parent[position] < 0 or cont_u[cont_source[parent[position]], 5] >= cont_u[source, 5]:
-                parent_path = None if parent[position] < 0 else int(
-                    cont_u[cont_source[parent[position]], 5]
-                )
-                raise ValueError(
-                    f"invalid continuation parent row={int(cont_row[source])} "
-                    f"scope={int(cont_scope[source])} context={int(context[source])} "
-                    f"frame={int(cont_u[source, 2])} parent={int(cont_u[source, 3])} "
-                    f"path={int(cont_u[source, 5])} parent_path={parent_path}"
-                )
-    child_counts = np.bincount(parent[parent >= 0], minlength=len(cont_source))
-    if np.any(child_counts != cont_u[cont_source, 9]):
-        raise ValueError("invalid continuation arity")
-    continuation_levels = []
-    for depth in sorted(np.unique(cont_u[cont_source, 5]), reverse=True):
-        parents = np.flatnonzero(cont_u[cont_source, 5] == depth)
-        lookup = np.full(len(cont_source), -1, np.int32); lookup[parents] = np.arange(len(parents))
-        selected = np.flatnonzero((parent >= 0) & (lookup[parent] >= 0))
-        group = lookup[parent[selected]]
-        relation = domains[DOMAIN["continuation"]][3][cont_source[selected], 16:22]
-        continuation_levels.append((
-            tensor(parents), tensor(selected), tensor(group),
-            torch.as_tensor(np.bincount(group, minlength=len(parents)).astype(np.float32), device=target),
-            torch.as_tensor(relation, device=target),
-        ))
-    roots = np.flatnonzero(parent < 0)
-    continuation_index = (tensor(domain_inverse[DOMAIN["continuation"]][cont_source]),
-                          tuple(continuation_levels))
-    continuation_roots = roots[cont_scope[cont_source[roots]] < 0]
-    continuation_rows = cont_row[cont_source[roots]][cont_scope[cont_source[roots]] < 0]
-    node_u, _node_s, node_c, node_f, node_row, _node_scope = domains[DOMAIN["map_node"]]
-    edge_u, _edge_s, edge_c, edge_f, edge_row, _edge_scope = domains[DOMAIN["map_edge"]]
-    node_source = ordered(state_source[DOMAIN["map_node"]], node_row, node_u[:, 0])
-    edge_source = ordered(state_source[DOMAIN["map_edge"]], edge_row, edge_u[:, 0], edge_u[:, 1])
+
+    node_u, _node_s, node_c, node_f, node_row, node_scope = domains[DOMAIN["map_node"]]
+    edge_u, _edge_s, edge_c, edge_f, edge_row, edge_scope = domains[DOMAIN["map_edge"]]
+    node_source = ordered(np.flatnonzero(node_scope == -1).astype(np.int32), node_row, node_u[:, 0])
+    edge_source = ordered(np.flatnonzero(edge_scope == -1).astype(np.int32),
+                          edge_row, edge_u[:, 0], edge_u[:, 1])
     node_offsets = np.r_[0, np.cumsum(np.bincount(node_row[node_source], minlength=batch))]
     edge_offsets = np.r_[0, np.cumsum(np.bincount(edge_row[edge_source], minlength=batch))]
     node_groups = [node_source[node_offsets[row]:node_offsets[row + 1]] for row in range(batch)]
@@ -1945,22 +1888,20 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
         inverse = inverse.astype(np.int32)
         graph_keys = ()
     else:
-        graph_keys = tuple((node_u[nodes].tobytes(), node_c[nodes].tobytes(), node_f[nodes].tobytes(),
-                            edge_u[edges].tobytes(), edge_c[edges].tobytes(), edge_f[edges].tobytes())
-                           for nodes, edges in zip(node_groups, edge_groups))
-        unique = {}
-        representatives = []
-        inverse = np.empty(batch, np.int32)
+        graph_keys = tuple((
+            node_u[nodes].tobytes(), node_c[nodes].tobytes(), node_f[nodes].tobytes(),
+            edge_u[edges].tobytes(), edge_c[edges].tobytes(), edge_f[edges].tobytes(),
+        ) for nodes, edges in zip(node_groups, edge_groups))
+        unique, representatives, inverse = {}, [], np.empty(batch, np.int32)
         for row, key in enumerate(graph_keys):
             if key not in unique:
-                unique[key] = len(representatives)
-                representatives.append(row)
+                unique[key] = len(representatives); representatives.append(row)
             inverse[row] = unique[key]
     node_source = np.concatenate([node_groups[row] for row in representatives])
     edge_source = np.concatenate([edge_groups[row] for row in representatives])
     node_offsets = np.r_[0, np.cumsum([len(node_groups[row]) for row in representatives])]
     graph_for_node = np.repeat(np.arange(len(representatives)), np.diff(node_offsets))
-    missing_graph = np.asarray([
+    missing = np.asarray([
         model.training or target.type != "cpu" or graph_keys[row] not in model._graph_cache
         for row in representatives
     ])
@@ -1985,38 +1926,19 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
     levels = []
     for level in sorted(np.unique(topo[edge_src]), reverse=True):
         selected = np.flatnonzero(topo[edge_src] == level)
-        order = np.argsort(edge_src[selected], kind="stable"); selected = selected[order]
+        selected = selected[np.argsort(edge_src[selected], kind="stable")]
         parents, group = np.unique(edge_src[selected], return_inverse=True)
-        selected = selected[missing_graph[graph_for_node[parents]][group]]
-        if not len(selected):
-            continue
-        parents, group = np.unique(edge_src[selected], return_inverse=True)
-        levels.append((parents, edge_dst[selected], selected, group,
-                       node_u[node_source[parents], 9].astype(np.float32)))
-    if pad_sequences and levels:
-        padded = []
-        for parents, destinations, edge_rows, group, degree in levels:
-            count = len(parents)
-            edge_count = len(destinations)
-            edge_size = bucket(edge_count)
-            parent_size = bucket(count + (edge_size > edge_count))
-            extra = edge_size - len(destinations)
-            padded.append((
-                tensor(np.pad(parents, (0, parent_size - count))),
-                tensor(np.pad(destinations, (0, extra))), tensor(np.pad(edge_rows, (0, extra))),
-                candidate_index(np.r_[group, np.full(extra, count, np.int32)],
-                                parent_size, target, True),
-                torch.as_tensor(np.pad(degree, (0, parent_size - count)), device=target),
-                count, edge_count,
+        selected = selected[missing[graph_for_node[parents]][group]]
+        if len(selected):
+            parents, group = np.unique(edge_src[selected], return_inverse=True)
+            levels.append((
+                tensor(parents), tensor(edge_dst[selected]), tensor(selected),
+                candidate_index(group, len(parents), target),
+                torch.as_tensor(node_u[node_source[parents], 9].astype(np.float32), device=target),
+                len(parents), len(selected),
             ))
-        levels = padded
-    else:
-        levels = [(tensor(parents), tensor(destinations), tensor(edge_rows),
-                   candidate_index(group, len(parents), target),
-                   torch.as_tensor(degree, device=target), len(parents), len(destinations))
-                  for parents, destinations, edge_rows, group, degree in levels]
-    run_u, _run_s, _run_c, _run_f, run_row, _run_scope = domains[DOMAIN["run"]]
-    run_source = state_source[DOMAIN["run"]]
+    run_u, _run_s, _run_c, _run_f, run_row, run_scope = domains[DOMAIN["run"]]
+    run_source = np.flatnonzero(run_scope == -1)
     current_id = np.full(batch, np.iinfo(np.uint32).max, np.uint32)
     current_id[run_row[run_source]] = run_u[run_source, 23]
     current = np.full(batch, -1, np.int32)
@@ -2027,8 +1949,7 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
     entry = node_lookup[:, 0]
     if np.any(current[present] < 0) or np.any(entry < 0):
         raise ValueError("current map node is missing")
-    position = np.where(current >= 0, current, entry)
-    current, current_inverse = np.unique(position, return_inverse=True)
+    current, current_inverse = np.unique(np.where(current >= 0, current, entry), return_inverse=True)
     current_graph = np.searchsorted(node_offsets[1:], current, side="right")
     current_count = np.diff(node_offsets)[current_graph]
     current_source = np.concatenate([
@@ -2036,92 +1957,19 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
         for graph in current_graph
     ])
     current_group = np.repeat(np.arange(len(current), dtype=np.int32), current_count)
-    map_index = (tensor(domain_inverse[DOMAIN["map_node"]][node_source]),
-                 tensor(domain_inverse[DOMAIN["map_edge"]][edge_source]), tuple(levels),
-                 tensor(node_offsets), tensor(current), tensor(current_inverse), tensor(current_source),
-                 candidate_index(current_group, len(current), target),
-                 tuple(graph_keys[row] for row in representatives) if graph_keys else ())
-    actor_rows = actor_rows[base_source].astype(np.int32)
-    actor_kinds = actor_u[base_source, 1].astype(np.int32)
-    actor_groups = tuple(grouped(
-        source, actor_rows[source], batch,
-    ) for source in (np.flatnonzero(actor_kinds < 2), np.flatnonzero(actor_kinds == 2)))
-    continuation_roots = grouped(continuation_roots, continuation_rows, batch)
-    card_source_count = len(card_source)
-    card_size = bucket(card_source_count) if pad_sequences else card_source_count
-    state_index = (
-        (tensor(np.pad(domain_inverse[DOMAIN["card"]][card_source],
-                       (0, card_size - card_source_count))),
-         sequence_index(card_group, card_groups, target, pad_sequences, card_size),
-         tensor(card_zones), tensor(card_inverse), card_source_count,
-         torch.as_tensor(card_counts, device=target)),
-        (tensor(domain_inverse[DOMAIN["actor"]][base_source]), actor_groups,
-         children[0], tuple(children[1:])),
-        tuple(entities), continuation_index, continuation_roots, map_index,
+    map_index = (
+        tensor(inverse_rows[DOMAIN["map_node"]][node_source]),
+        tensor(inverse_rows[DOMAIN["map_edge"]][edge_source]), tuple(levels),
+        tensor(node_offsets), tensor(current), tensor(current_inverse), tensor(current_source),
+        candidate_index(current_group, len(current), target),
+        tuple(graph_keys[row] for row in representatives) if graph_keys else (),
     )
-    action_u, action_s, action_c, action_f = action
+
+    action_u, _action_s, action_c, action_f = action
     action_count = len(action_u)
-    policy_sequence = candidate_index(action_row, batch, target)
-    action_size = bucket(action_count) if pad_sequences else action_count
-    action_width = (
-        bucket(max(actions, (action_size + batch - 1) // batch))
-        if pad_sequences else actions
-    )
-    candidate_sources = []
-    for domain, (u, s, _c, _f, _row, scope) in enumerate(domains):
-        if domain == DOMAIN["continuation"]:
-            selected = roots[cont_scope[cont_source[roots]] >= 0]
-            group = cont_scope[cont_source[selected]]
-            source, group, domain_count, source_count = grouped(selected, group, action_size)
-            candidate_sources.append((
-                source, group, domain_count, tensor(np.arange(action_size, dtype=np.int32)),
-                len(domain_count), source_count,
-            ))
-            continue
-        source = np.flatnonzero(scope >= 0).astype(np.int32)
-        group = scope[source]
-        order = np.argsort(group, kind="stable"); source, group = source[order], group[order]
-        counts = np.bincount(group, minlength=len(action_row))
-        if counts.max(initial=0) <= 1:
-            unique_source, inverse_source = np.unique(
-                domain_inverse[domain][source], return_inverse=True
-            )
-            inverse = np.zeros(len(action_row), np.int32)
-            inverse[group] = inverse_source + 1
-            groups = len(unique_source) + 1
-            source, group, domain_count, source_count = grouped(
-                unique_source, np.arange(1, groups), groups,
-            )
-            candidate_sources.append((
-                source, group, domain_count,
-                tensor(np.pad(inverse, (0, action_size - len(inverse)))),
-                len(domain_count), source_count,
-            ))
-            continue
-        positions = np.arange(len(group), dtype=np.int32) - np.repeat(np.cumsum(counts) - counts, counts)
-        keys = np.full((len(action_row), counts.max()), np.iinfo(np.uint32).max, np.uint32)
-        keys[group, positions] = domain_inverse[domain][source]
-        keys.sort(1)
-        empty = np.full((1, keys.shape[1]), np.iinfo(np.uint32).max, np.uint32)
-        first, inverse = map(np.asarray, sts2_sim.unique_rows(np.vstack((empty, keys))))
-        inverse = inverse[1:].astype(np.int32)
-        representatives = first[first > 0].astype(np.int32) - 1
-        keep = np.zeros(len(action_row), bool); keep[representatives] = True
-        source, group = source[keep[group]], inverse[group[keep[group]]]
-        source, group, domain_count, source_count = grouped(
-            domain_inverse[domain][source], group, len(first),
-        )
-        candidate_sources.append((
-            source, group, domain_count,
-            tensor(np.pad(inverse, (0, action_size - len(inverse)))),
-            len(domain_count), source_count,
-        ))
-    if action_c.max(initial=0) >= model.semantic.num_embeddings:
+    if action_c.max(initial=0) >= model.concepts.num_embeddings:
         raise ValueError("invalid action semantic id")
-    action_c = np.pad(action_c, ((0, action_size - action_count), (0, 0)))
-    action_f = np.pad(action_f, ((0, action_size - action_count), (0, 0)))
-    action_legal = np.pad(legal[action_row, action_position], (0, action_size - action_count))
-    path = np.full(len(action_row), -1, np.int32)
+    path = np.full(action_count, -1, np.int32)
     path_id = action_u[:, 4]
     present = path_id != np.iinfo(np.uint32).max
     if path_id[present].max(initial=0) > max_node:
@@ -2129,49 +1977,18 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
     path[present] = node_lookup[action_row[present], path_id[present].astype(np.intp)]
     if np.any(path[present] < 0):
         raise ValueError("path candidate references missing node")
-    path = np.pad(path, (0, action_size - action_count), constant_values=-1)
-    actor_target = np.full(len(action_row), -1, np.int32)
-    owner = action_u[:, 1]
-    present = (owner != 0) & (owner != np.iinfo(np.uint32).max)
-    keys = (action_row[present].astype(np.uint64) << 32) | owner[present]
-    group = np.searchsorted(actor_keys, keys)
-    valid = group < len(actor_keys)
-    if not valid.all() or np.any(actor_keys[group] != keys):
-        raise ValueError("candidate target references missing actor")
-    actor_target[present] = group
-    actor_target = np.pad(actor_target, (0, action_size - action_count), constant_values=-1)
-    object_keys = np.column_stack((action_row.astype(np.uint32), action_u[:, 0], action_u[:, 14]))
-    object_first, object_group = map(np.asarray, sts2_sim.unique_rows(object_keys))
-    object_group = object_group.astype(np.int32)
-    object_rows = action_row[object_first].astype(np.int32)
-    object_count = np.bincount(object_group, minlength=len(object_rows)).astype(np.float32)
-    menu_rows = np.unique(object_rows)
-    menu_lookup = np.full(batch, -1, np.int32); menu_lookup[menu_rows] = np.arange(len(menu_rows))
-    menu_sequence = candidate_index(menu_lookup[object_rows], len(menu_rows), target, True)
-    menu_index = (
-        tensor(object_group), torch.as_tensor(object_count, device=target),
-        tensor(menu_rows), menu_sequence,
+    action_flat = action_row * actions + action_position
+    action_legal = legal[action_row, action_position]
+    action_index = (
+        tensor(action_row), tensor(action_flat), torch.as_tensor(action_legal, device=target),
+        candidate_index(action_row, batch, target, True), actions, tensor(path), action_count,
     )
-    action_flat = action_row * action_width + action_position
-    if action_size > action_count:
-        occupied = np.zeros(batch * action_width, bool); occupied[action_flat] = True
-        dummy_flat = np.flatnonzero(~occupied)[:action_size - action_count]
-        if len(dummy_flat) != action_size - action_count:
-            raise ValueError("insufficient padded action capacity")
-        action_row = np.pad(action_row, (0, action_size - action_count))
-        action_row[action_count:] = dummy_flat // action_width
-        action_flat = np.r_[action_flat, dummy_flat]
-    padded_legal = np.pad(legal, ((0, 0), (0, action_width - actions)))
-    action_index = tuple(torch.as_tensor(value, device=target) for value in (
-        action_row, action_flat, action_legal,
-    )) + (candidate_index(action_row, batch, target), action_width, tuple(candidate_sources),
-          tensor(path), tensor(actor_target), menu_index, policy_sequence, action_count)
     return (
         torch.as_tensor(character, dtype=torch.long, device=target),
-        torch.as_tensor(globals_, device=target), domain_tensors, state_index,
-        tuple(torch.as_tensor(value, device=target) for value in (
-            action_c.astype(np.int32), action_f.astype(np.float32),
-        )), action_index, torch.as_tensor(padded_legal, device=target),
+        torch.as_tensor(globals_, device=target), domain_tensors, map_index,
+        (torch.as_tensor(action_c.astype(np.int32), device=target),
+         torch.as_tensor(action_f.astype(np.float32), device=target)),
+        action_index, torch.as_tensor(legal, device=target),
     )
 
 
@@ -2214,7 +2031,7 @@ def validate_packed(row):
         raise ValueError("invalid packed observation arrays")
     character, digest = int(character), int(digest)
     if character == np.iinfo(np.uint8).max:
-        if (digest or globals_.any() or counts.shape != (len(DOMAIN_SPECS),) or counts.any() or len(exact)
+        if (digest or globals_.any() or counts.shape != (len(TOKEN_SPECS),) or counts.any() or len(exact)
                 or actions.shape != (0, sum(ACTION_FIELDS) + 1)):
             raise ValueError("invalid inactive observation")
     elif not 0 <= character < 5:
@@ -2237,7 +2054,7 @@ def packed_legal_count(row):
 
 
 def packed_state_count(row):
-    return sum(struct.unpack_from(f"<{len(DOMAIN_SPECS)}I", row, 32)) \
+    return sum(struct.unpack_from(f"<{len(TOKEN_SPECS)}I", row, 32)) \
         if isinstance(row, bytes) else int(row[2].sum())
 
 
@@ -2266,10 +2083,10 @@ def _pack_batch(observation):
     remap[action_row, action_position] = np.arange(len(action_row)) - np.repeat(
         action_offsets, action_counts
     )
-    counts = np.empty((batch, len(DOMAIN_SPECS)), np.uint32)
+    counts = np.empty((batch, len(TOKEN_SPECS)), np.uint32)
     pieces = [[] for _ in range(batch)]
     for domain, ((name, unsigned, signed, semantic, numeric), values) in enumerate(
-        zip(DOMAIN_SPECS, observation[2])
+        zip(TOKEN_SPECS, observation[2])
     ):
         u, s, c, f, scope, mask = map(np.asarray, values)
         row, _position = np.nonzero(mask.astype(bool))
@@ -2393,7 +2210,7 @@ class WinningReservoir:
         self.wins += wins
         self.skipped += skipped
         self.forced += forced
-        groups = self.by_character(None)
+        groups = self.by_character()
         added = 0
         for item in rows:
             character = packed_character(item[0])
@@ -2453,7 +2270,7 @@ class WinningReservoir:
         seen = list(state.get("character_seen", map(len, groups)))
         self.character_seen = [max(len(group), seen[index]) for index, group in enumerate(groups)]
 
-    def by_character(self, character_start):
+    def by_character(self):
         groups = [[] for _ in range(5)]
         for index, (row, *_rest) in enumerate(self.rows):
             character = packed_character(row)
@@ -3742,7 +3559,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             "sample_queue_full_waits": queue_full_waits,
             "sample_queue_put_seconds": queue_put_seconds,
             "winning_reservoir": len(reservoir.rows), "winning_seen": reservoir.seen,
-            "winning_character_rows": list(map(len, reservoir.by_character(model.character_start))),
+            "winning_character_rows": list(map(len, reservoir.by_character())),
             "winning_episodes": reservoir.wins, "winning_added": winning_added,
             "winning_skipped": reservoir.skipped, "winning_forced_skipped": reservoir.forced,
             "winning_replayed": winning_replayed,
@@ -4482,7 +4299,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         "sample_queue_full_waits": queue_full_waits,
         "sample_queue_put_seconds": queue_put_seconds,
         "winning_reservoir": len(reservoir.rows), "winning_seen": reservoir.seen,
-            "winning_character_rows": list(map(len, reservoir.by_character(model.character_start))),
+        "winning_character_rows": list(map(len, reservoir.by_character())),
         "winning_episodes": reservoir.wins, "winning_added": winning_added,
         "winning_skipped": reservoir.skipped, "winning_forced_skipped": reservoir.forced,
         "winning_replayed": winning_replayed,
@@ -4970,27 +4787,9 @@ def save_checkpoint(path, model, optimizer, manifest, stage, decisions, sampler_
     return sha256_file(path)
 
 
-def migrate_optimizer(state, parameter_count):
-    groups = state["param_groups"]
-    parameters = [parameter for group in groups for parameter in group["params"]]
-    if len(parameters) == parameter_count:
-        return True
-    if len(groups) != 1 or len(parameters) != parameter_count + 15:
-        return False
-    embeddings = parameters[2:18]
-    rows = [state["state"].get(parameter) for parameter in embeddings]
-    if any(rows):
-        if not all(rows):
-            return False
-        state["state"][embeddings[0]] = {
-            key: torch.cat([row[key] for row in rows])
-            if torch.is_tensor(value) and value.ndim else value
-            for key, value in rows[0].items()
-        }
-    for parameter in embeddings[1:]:
-        state["state"].pop(parameter, None)
-    groups[0]["params"] = parameters[:3] + parameters[18:]
-    return True
+def optimizer_compatible(state, parameter_count):
+    return len([parameter for group in state["param_groups"] for parameter in group["params"]]) \
+        == parameter_count
 
 
 def optimizer_groups(model, policy_multiplier, critic_multiplier):
@@ -5144,7 +4943,15 @@ def dashboard(target):
             version_manifest = manifest | manifest.get("version_history", {}).get(str(version), {})
             version_manifest["model_version"] = version
             if version == MODEL_VERSION:
-                current = Agent(version_manifest["layout"])
+                saved = version_manifest.get("architecture", {})
+                current = Agent(
+                    version_manifest["layout"],
+                    *(saved.get(key, default) for key, default in zip(
+                        ("width", "layers", "heads", "feedforward", "head_width"),
+                        (64, 2, 4, 128, 64),
+                    )),
+                    pooling=saved.get("pooling"),
+                )
                 version_manifest |= {
                     "architecture": architecture(current), "change": CHANGE,
                     "feature_version": FEATURE_VERSION,
@@ -5298,13 +5105,21 @@ def train(args):
         loaded = (model.width, model.layers, model.heads, model.feedforward)
         if any(value is not None and value != saved for value, saved in zip(requested, loaded)):
             raise ValueError(f"checkpoint architecture {loaded} does not match requested {requested}")
+        requested_pooling = {
+            name: getattr(args, name + "_pooling") for name in POOLING_DEFAULTS
+            if getattr(args, name + "_pooling") is not None
+        }
+        if any(model.pooling[name] != mode for name, mode in requested_pooling.items()):
+            raise ValueError("checkpoint pooling configuration cannot be changed")
         args.width, args.layers, args.heads, args.feedforward = loaded
     else:
         config = tuple(value if value is not None else default for value, default in zip(
             (args.width, args.layers, args.heads, args.feedforward), (64, 2, 4, 128)
         ))
         args.width, args.layers, args.heads, args.feedforward = config
-        model = Agent(layout, *config).to(target)
+        pooling = {name: getattr(args, name + "_pooling") or default
+                   for name, default in POOLING_DEFAULTS.items()}
+        model = Agent(layout, *config, pooling=pooling).to(target)
     fused_optimizer = target.type != "cpu"
     parameter_groups, group_indices = optimizer_groups(
         model, args.head_learning_rate_multiplier, args.critic_learning_rate_multiplier,
@@ -5608,7 +5423,7 @@ def load(path, target):
     live = sts2_sim.Batch(1, 0, None, ascension=0)
     layout = dict(live.token_layout())
     version = checkpoint.get("model_version")
-    if checkpoint.get("schema") != 1 or version not in (68, 69, MODEL_VERSION):
+    if checkpoint.get("schema") != 1 or version != MODEL_VERSION:
         raise ValueError("incompatible checkpoint")
     if checkpoint.get("feature_version") != FEATURE_VERSION or layout["version"] != FEATURE_VERSION:
         raise ValueError("incompatible feature version")
@@ -5618,33 +5433,16 @@ def load(path, target):
     try:
         model = Agent(layout, *(config[key] for key in (
             "width", "layers", "heads", "feedforward", "head_width"
-        ))).to(target)
+        )), pooling=config["pooling"]).to(target)
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError("invalid checkpoint architecture") from error
-    if version == MODEL_VERSION and config != architecture(model):
+    if config != architecture(model):
         raise ValueError("incompatible model architecture")
     state = checkpoint["model"]
-    if version in (68, 69):
-        migrated = model.state_dict()
-        for key in migrated:
-            if key in state and state[key].shape == migrated[key].shape \
-                    and not key.startswith("critic.2."):
-                migrated[key] = state[key]
-        if version == 68:
-            for suffix in ("weight", "bias"):
-                migrated[f"critic.0.{suffix}"] = state[f"progress_value.0.{suffix}"]
-        else:
-            mapping = [(old, old) for old in range(16)] \
-                + [(old, old + 10) for old in range(16, 35)] \
-                + [(34, 54)] + [(old, old + 20) for old in range(35, 53)] + [(53, 82)]
-            for old, new in mapping:
-                migrated["critic.2.weight"][new] = state["critic.2.weight"][old]
-                migrated["critic.2.bias"][new] = state["critic.2.bias"][old]
-        state = migrated
     missing, unexpected = model.load_state_dict(state, strict=True)
     if missing or unexpected:
-        raise ValueError("incompatible model migration")
-    checkpoint["_optimizer_compatible"] = version == MODEL_VERSION and migrate_optimizer(
+        raise ValueError("incompatible model parameters")
+    checkpoint["_optimizer_compatible"] = optimizer_compatible(
         checkpoint["optimizer"], len(tuple(model.parameters()))
     )
     checkpoint["_source_model_version"] = version
@@ -5958,14 +5756,21 @@ def export_value_model(path, model, fingerprint, temperature, bias, actor=False)
         path.parent.mkdir(parents=True, exist_ok=True)
     parts = [
         b"STSVALUE", struct.pack("<IIQ", MODEL_VERSION, FEATURE_VERSION, fingerprint),
-        struct.pack("<18I", model.width, model.layers, model.heads, model.feedforward,
-                    model.card_zones, len(DOMAIN_SPECS), model.layout["globals"], 2,
-                    model.entity_collections, model.head_width,
-                    ACTION_FIELDS[0], ACTION_FIELDS[1], ACTION_FIELDS[3],
-                    model.semantic.num_embeddings, ACTION_FIELDS[2], ACTION_FIELDS[3],
-                    6, model.state_width),
-        struct.pack("<64I", *(value for _name, unsigned, signed, semantic, numeric in DOMAIN_SPECS
+        struct.pack("<10I", model.width, model.layers, model.heads, model.feedforward,
+                    len(TOKEN_SPECS), len(SEMANTIC_NAMES), model.concepts.num_embeddings,
+                    ACTION_FIELDS[2], ACTION_FIELDS[3], CATEGORIES),
+        struct.pack("<64I", *(value for _name, unsigned, signed, semantic, numeric in TOKEN_SPECS
                               for value in (unsigned, signed, semantic, numeric))),
+        struct.pack(f"<{len(SEMANTIC_NAMES)}I", *model.concepts.sizes),
+        struct.pack(f"<{len(POSITION_CAPS)}I", *POSITION_CAPS.values()),
+        bytes([
+            (COLLECTION_POOLING.index(mode) if index < 8 else
+             EFFECT_POOLING.index(mode) if index < 10 else
+             CONTINUATION_POOLING.index(mode) if index == 10 else
+             ("sum", "transformer").index(mode))
+            for index, mode in enumerate(model.pooling.values())
+        ]),
+        bytes([actor]),
         struct.pack("<2f", temperature, bias),
     ]
 
@@ -5987,7 +5792,7 @@ def export_value_model(path, model, fingerprint, temperature, bias, actor=False)
         add(module.weight); add(module.bias)
 
     def add_encoder(module):
-        add(module.field); add(module.numeric.weight); add(module.bias); add_norm(module.norm)
+        add(module.numeric.weight); add_norm(module.norm)
 
     def add_transformer(transformer):
         for layer in transformer.layers:
@@ -5999,37 +5804,35 @@ def export_value_model(path, model, fingerprint, temperature, bias, actor=False)
             ):
                 add(value)
 
-    add(model.semantic.weight)
-    for name, *_shape in DOMAIN_SPECS:
+    def add_gru(gru):
+        add(gru.weight_ih_l0); add(gru.bias_ih_l0)
+        add(gru.weight_hh_l0); add(gru.bias_hh_l0)
+
+    add(model.concepts.flattened())
+    for name, *_shape in TOKEN_SPECS:
         add_encoder(model.encoders[name])
     add_encoder(model.action_encoder)
-    add(model.card_state); add(model.card_count.weight)
-    add_transformer(model.card_transformer)
-    for module in (model.effect_tuple, model.history_tuple, model.actor_pool):
-        add_linear(module)
-    add(model.actor_state); add_linear(model.actor_mlp[0]); add_norm(model.actor_mlp[1])
-    for module in (model.entity_tuple, model.entity_pool):
-        add_linear(module)
-    add(model.entity_state); add_norm(model.graph_norm)
+    for name in (*POOLING_DEFAULTS, "card_pool", "relic_pool", "encounter_pool", "event_pool"):
+        add(model.summary_seed[name])
+    for index, (name, mode) in enumerate(model.pooling.items()):
+        if (index < 8 and mode == "transformer") \
+                or (index < 10 and mode.startswith("transformer")) \
+                or (index == 10 and mode == "transformer") \
+                or (index >= 11 and mode == "transformer"):
+            add_transformer(model.pool_transformers[name])
+    add_gru(model.move_gru)
+    if model.continuation_gru is not None:
+        add_gru(model.continuation_gru)
+    add_norm(model.actor_norm); add_norm(model.action_norm)
+    add_transformer(model.global_transformer); add_norm(model.global_norm)
+    add_norm(model.graph_norm)
     for module in (model.graph_query, model.graph_key_value, model.graph_edge, model.graph_out,
                    model.graph_degree):
         add_linear(module)
     add_norm(model.graph_ff_norm); add_linear(model.graph_ff[0]); add_linear(model.graph_ff[2])
-    add(model.continuation_relation.weight); add_linear(model.continuation_tuple)
-    add_linear(model.continuation_pool); add_linear(model.continuation_parent)
-    add_norm(model.continuation_norm)
-    add(model.candidate_scale); add(model.candidate_bias); add_linear(model.candidate_combine)
-    add_linear(model.path_adapter); add_linear(model.target_adapter); add(model.action_legal.weight)
-    add_norm(model.action_norm)
-    for module in (model.menu_object, model.menu_query, model.menu_key_value, model.menu_out,
-                   model.menu_count):
-        add_linear(module)
-    add_norm(model.menu_norm); add(model.menu_empty)
-    add_linear(model.critic[0]); add_linear(model.critic[2])
     if actor:
-        flush()
-        parts.append(b"STSACTOR")
-        add_linear(model.policy[0]); add_linear(model.policy[2])
+        add_linear(model.policy)
+    add_linear(model.critic)
     flush()
     data = b"".join(parts)
     if path is None:
@@ -6141,560 +5944,232 @@ def finalize(args):
     print(json.dumps(report, indent=2))
 
 
-def probe_candidate_policy(model, target):
-    state = torch.randn(1, model.state_width, device=target)
-    action = torch.randn(3, model.width, device=target)
-    row = torch.zeros(3, dtype=torch.long, device=target)
-    legal = torch.ones(3, dtype=torch.bool, device=target)
-    sequence = candidate_index(np.zeros(3, np.int32), 1, target)
-    base = model.decide(state, action, row, torch.arange(3, device=target), 3, legal, sequence, 3)
-    value = model.critic(state)
-    permutation = torch.tensor((2, 0, 1), device=target)
-    permuted = model.decide(
-        state, action[permutation], row, permutation, 3, legal, sequence, 3,
-    )
-    permuted_value = model.critic(state)
-    assert torch.allclose(base, permuted, atol=1e-6, rtol=1e-6)
-    assert torch.allclose(value, permuted_value, atol=1e-6, rtol=1e-6)
-    single_sequence = candidate_index(np.zeros(1, np.int32), 1, target)
-    single = model.decide(
-        state, action[:1], row[:1], row[:1], 1, legal[:1], single_sequence, 1,
-    )
-    assert single.item() == 0
-
-
-def probe_action_menu(model, target):
-    state = torch.randn(1, model.base_state_width, device=target)
-    actions = torch.randn(2, model.width, device=target)
-    grouped = (
-        torch.zeros(2, dtype=torch.long, device=target), torch.full((1,), 2., device=target),
-        torch.zeros(1, dtype=torch.long, device=target),
-        candidate_index(np.zeros(1, np.int32), 1, target),
-    )
-    assert torch.allclose(
-        model.encode_menu(state, actions, grouped), model.encode_menu(state, actions.flip(0), grouped),
-        atol=1e-6, rtol=1e-6,
-    )
-    assert not torch.allclose(
-        model.encode_menu(state, actions, grouped),
-        model.encode_menu(state, torch.stack((actions[0], actions[1] + 1)), grouped),
-    )
-    single = (
-        torch.zeros(1, dtype=torch.long, device=target), torch.ones(1, device=target),
-        torch.zeros(1, dtype=torch.long, device=target),
-        candidate_index(np.zeros(1, np.int32), 1, target),
-    )
-    assert torch.allclose(
-        model.encode_menu(state, actions[:1], single),
-        model.encode_menu(state + torch.randn_like(state), actions[:1], single),
-        atol=1e-6, rtol=1e-6,
-    )
-    separate = (
-        torch.arange(2, device=target), torch.ones(2, device=target),
-        torch.zeros(1, dtype=torch.long, device=target),
-        candidate_index(np.zeros(2, np.int32), 1, target),
-    )
-    assert not torch.allclose(
-        model.encode_menu(state, actions, separate),
-        model.encode_menu(state + torch.randn_like(state), actions, separate),
-    )
-    empty = (
-        torch.empty(0, dtype=torch.long, device=target), torch.empty(0, device=target),
-        torch.empty(0, dtype=torch.long, device=target), candidate_index([], 0, target, True),
-    )
-    assert torch.allclose(
-        model.encode_menu(state, actions[:0], empty)[0], model.menu_norm(model.menu_empty),
-    )
-
-
 def probe():
-    torch.manual_seed(7); np.random.seed(7)
-    record = logging.LogRecord(
-        "probe", logging.INFO, "/tmp/CommandPhaseTelemetryWave112.cs", 7, "message", (), None,
-    )
-    record.native_tid = 1
-    formatted = GlogFormatter("probe").format(record)
-    assert "CommandPhaseTelemetryWave112.cs:00007] message" in formatted
-    assert bands([])["mean"] is None
-    assert episode_summary([])["floor_mean"] is None
-    promotion = [
-        (character, (int(index < 9), 1, 0, 0, 0, index))
-        for character in range(5) for index in range(40)
-    ]
-    ready, result = promotion_sample(promotion, 200, .2)
-    assert ready and all(row["runs"] == 40 and row["win_rate"] == .225
-                         for row in result["characters"])
-    promotion[8] = (0, (0, 1, 0, 0, 0, 8))
-    assert not promotion_sample(promotion, 200, .2)[0]
-    assert not promotion_sample(promotion[:199], 200, .2)[0]
-    accelerator = device(); target = torch.device("cpu")
-    schedule = argparse.Namespace(
-        progress_decisions=5_000_000, progress_beta=None,
-        entropy_start=.01, entropy_end=.001,
-    )
-    legacy = {"decisions": 5_317_231, "auxiliary_decisions": 5_317_231,
-              "stage_decisions": 32_768}
-    assert resume_stage_decisions(legacy, 0) == 5_317_231
-    for stage in range(7):
-        beta, entropy, state = curriculum_weights(stage, 0, 5_317_231, schedule, True)
-        assert abs(beta - .1) < 1e-7 and entropy == state["entropy_start"]
-    assert curriculum_weights(7, 0, 5_317_231, schedule, False)[0] == 0
-    try:
-        resume_stage_decisions({"decisions": 5_317_231, "auxiliary_decisions": 5_317_231}, 1)
-        raise AssertionError("accepted ambiguous legacy stage clock")
-    except ValueError:
-        pass
-
-    env = sts2_sim.Batch(8, 71, 0)
+    target = torch.device("cpu")
+    env = sts2_sim.Batch(2, 84, 0)
     layout = dict(env.token_layout())
-    assert layout["version"] == FEATURE_VERSION
-    assert (layout["model_width"], layout["model_layers"], layout["model_heads"],
-            layout["model_feedforward"], layout["card_zones"], layout["entity_summaries"],
-            layout["globals"], layout["state_width"], layout["action_width"],
-            layout["head_width"]) == (64, 2, 4, 128, 5, 11, 0, 1152, 64, 112)
-    for name, unsigned, signed, semantic, numeric in DOMAIN_SPECS:
-        assert tuple(layout[name + suffix] for suffix in ("_u", "_s", "_c", "_f")) == (
-            unsigned, signed, semantic, numeric,
-        )
-    assert tuple(layout["action_" + suffix] for suffix in ("u", "s", "c", "f")) == ACTION_FIELDS
-    ranges = [(layout[name + "_semantic_start"], layout[name + "_semantic_count"])
-              for name in SEMANTIC_NAMES]
-    assert ranges[0][0] == 1 and all(
-        start + count == next_start for (start, count), (next_start, _) in zip(ranges, ranges[1:])
-    )
-    assert ranges[-1][0] + ranges[-1][1] == layout["semantic_vocab"]
+    assert (layout["version"], layout["model_width"], layout["model_layers"],
+            layout["model_heads"], layout["model_feedforward"], layout["state_width"],
+            layout["action_width"], layout["entity_summaries"]) == (56, 64, 2, 4, 128, 64, 64, 0)
+    for name, size in {
+        "enemy_position": 33, "power_position": 65, "orb_position": 17,
+        "map_floor_position": 65, "deck_origin": 257, "draw_top_position": 257,
+        "draw_bottom_position": 257, "relic_position": 257, "wax_position": 257,
+        "continuation_position": 257, "crystal_row": 11, "crystal_column": 11,
+        "crystal_width": 4, "crystal_height": 4,
+    }.items():
+        assert layout[name + "_semantic_count"] == size
+
+    for _ in range(3):
+        observation = env.observe_tokens()
+        legal = np.asarray(observation[3][4])
+        choices = [int(np.flatnonzero(row)[0]) for row in legal]
+        env.step(choices)
+    combat = env.observe_tokens()
+    noncombat = sts2_sim.Batch(2, 71, 0).observe_tokens()
+
+    def expected_lengths(observation, pooling):
+        domains, action_rows, _positions, _legal = flat_domains(observation)
+        batch = len(observation[0])
+        counts = np.full(batch, 8, np.int64)
+        def rows(domain, predicate=lambda _u: True):
+            u, _s, _c, _f, row, scope = domains[DOMAIN[domain]]
+            selected = (scope == -1) & predicate(u)
+            return u[selected], row[selected]
+        def collection(name, domain, predicate, active):
+            _u, row = rows(domain, predicate)
+            item = np.bincount(row, minlength=batch)
+            counts[active] += item[active] if pooling[name] == "global_tokens" else 1
+        actor_u, actor_rows = rows("actor")
+        combat_rows = np.unique(actor_rows)
+        all_rows = np.arange(batch)
+        collection("deck", "card", lambda u: u[:, 0] == 0, all_rows)
+        collection("relic", "relic", lambda u: u[:, 0] == 0, all_rows)
+        collection("potion", "potion", lambda u: u[:, 0] == 0, all_rows)
+        for name, zone in (("hand", 1), ("draw", 2), ("discard", 3), ("exhaust", 4)):
+            collection(name, "card", lambda u, zone=zone: u[:, 0] == zone, combat_rows)
+        collection("orb", "orb", lambda _u: True, combat_rows)
+        continuation_u, continuation_rows = rows("continuation")
+        for row in range(batch):
+            q = len(np.unique(continuation_u[continuation_rows == row, 2]))
+            counts[row] += q if pooling["continuation"] == "global_tokens" else 1
+        _crystal_u, crystal_rows = rows("crystal")
+        counts += np.bincount(crystal_rows, minlength=batch)
+        counts += np.bincount(action_rows, minlength=batch)
+        for row in combat_rows:
+            actors = actor_u[actor_rows == row]
+            counts[row] += len(actors)
+            for name, enemy in (("friendly_effect", False), ("enemy_effect", True)):
+                owners = actors[(actors[:, 1] == 2) == enemy, 0]
+                effect_count = 0
+                for domain in ("power", "status"):
+                    effect_u, effect_rows = rows(domain)
+                    effect_count += np.isin(effect_u[effect_rows == row, 0], owners).sum()
+                mode = pooling[name]
+                counts[row] += 0 if mode.endswith("into_actor") else \
+                    effect_count if mode == "global_tokens" else len(owners)
+        return counts
+
+    configs = [{}]
+    for name in ("relic", "deck", "draw", "exhaust", "discard", "hand", "orb", "potion"):
+        configs.extend(({name: mode} for mode in COLLECTION_POOLING))
+    for name in ("enemy_effect", "friendly_effect"):
+        configs.extend(({name: mode} for mode in EFFECT_POOLING))
+    configs.extend(({"continuation": mode} for mode in CONTINUATION_POOLING))
+    configs.extend(({"phase": mode} for mode in ("sum", "transformer")))
+    configs.extend(({"generation_pool": mode} for mode in ("sum", "transformer")))
+    with tempfile.TemporaryDirectory() as parity_directory:
+        for number, config in enumerate(configs):
+            torch.manual_seed(number)
+            model = Agent(layout, pooling=config).eval()
+            model.critic.weight.data.normal_(std=.1); model.critic.bias.data.normal_(std=.1)
+            for observation in (noncombat, combat):
+                inputs = tensors(observation, target, model)
+                with torch.no_grad():
+                    policy, critic = predict(model, inputs, "fp32")
+                assert policy.shape[0] == critic.shape[0] == 2 and critic.shape[1] == CATEGORIES
+                assert torch.isfinite(policy).all() and torch.isfinite(critic).all()
+                assert np.array_equal(model._sequence_lengths.cpu(),
+                                      expected_lengths(observation, model.pooling))
+            exported = Path(parity_directory) / f"{number}.bin"
+            export_value_model(exported, model, env.fingerprint(), 1, 0)
+            rust = np.asarray(env.rust_values(str(exported)))
+            python = critic_win_logit(critic).sigmoid().numpy()
+            assert np.max(np.abs(python - rust)) <= 1e-5
 
     model = Agent(layout).eval()
-    assert model.base_state_width == 1088 and model.state_width == 1152
-    assert not hasattr(model, "fusion_transformer")
-    probe_candidate_policy(model, target)
-    probe_action_menu(model, target)
-    observation = env.observe_tokens()
-    flat_observation = env.observe_tokens(flat=True)
-    assert np.asarray(observation[1]).shape == (8, 0)
-    python_rows, rust_rows = pack_batch(observation), pack_batch(flat_observation)
-    for rows in (python_rows, rust_rows):
-        for packed in rows:
-            validate_packed(packed)
-    def arrays(value):
-        if isinstance(value, (tuple, list)):
-            return [array for item in value for array in arrays(item)]
-        return [np.asarray(value)]
-    assert all(np.array_equal(left, right) for left, right in zip(
-        arrays(sts2_sim.unpack_packed_observations(python_rows)),
-        arrays(sts2_sim.unpack_packed_observations(list(rust_rows))),
-    ))
-
-    active = np.arange(8) % 2 == 0
-    mixed = env.observe_tokens(active.tolist())
-    mixed_rows = pack_batch(mixed)
-    mixed_inputs = unpack([mixed_rows[index] for index in np.flatnonzero(active)], target, model)
+    empty_domains = []
+    for values in noncombat[2]:
+        values = [np.array(value, copy=True) for value in values]
+        values[5][values[4] >= 0] = 0
+        empty_domains.append(tuple(values))
+    empty_actions = [np.array(value, copy=True) for value in noncombat[3]]
+    empty_actions[4].fill(0); empty_actions[5].fill(0)
+    no_actions = (*noncombat[:2], tuple(empty_domains), tuple(empty_actions), *noncombat[4:])
     with torch.no_grad():
-        assert len(predict(model, mixed_inputs, "fp32")[0]) == int(active.sum())
+        policy, critic = predict(model, tensors(no_actions, target, model), "fp32")
+    assert policy.shape == empty_actions[5].shape and not policy.any()
+    assert critic.shape == (len(noncombat[0]), CATEGORIES)
+    assert np.array_equal(model._sequence_lengths.cpu(), expected_lengths(no_actions, model.pooling))
 
-    row = python_rows[0]
-    represented = np.asarray(observation[3][4], bool)
-    action_u, action_s, _action_c, action_f = (
-        np.ascontiguousarray(np.asarray(value)[represented]) for value in observation[3][:4]
-    )
-    sts2_sim.validate_action_features(action_u, action_s, action_f)
-    corrupted_f = action_f.copy(); corrupted_f[0, 0] += .125
-    try:
-        sts2_sim.validate_action_features(action_u, action_s, corrupted_f)
-        raise AssertionError("accepted inconsistent action auxiliaries")
-    except ValueError:
-        pass
-    for field in (3, 4):
-        corrupted = list(row); corrupted[field] = np.array(row[field], copy=True)
-        words = corrupted[field].view(np.uint32)
-        words.flat[0] ^= np.uint32(1)
-        for operation in (lambda row=tuple(corrupted): validate_packed(row),
-                          lambda row=tuple(corrupted): unpack([row], target, model)):
-            try:
-                operation(); raise AssertionError("accepted corrupted packed observation")
-            except ValueError:
-                pass
+    sequence = torch.randn(1, 3, 64)
+    forward, _ = model.move_gru(sequence)
+    backward, _ = model.move_gru(sequence.flip(1))
+    assert not torch.allclose(forward[:, -1], backward[:, -1])
+    inputs = tensors(combat, target, model)
+    with torch.no_grad():
+        original = predict(model, inputs, "fp32")
+    permutation = np.arange(np.asarray(combat[3][4]).shape[1])[::-1]
+    inverse = np.argsort(permutation)
+    permuted_domains = []
+    for values in combat[2]:
+        values = [np.array(value, copy=True) for value in values]
+        scoped = values[4] >= 0
+        values[4][scoped] = inverse[values[4][scoped]]
+        permuted_domains.append(tuple(values))
+    permuted_actions = tuple(np.asarray(value)[:, permutation] for value in combat[3])
+    permuted_observation = (combat[0], combat[1], tuple(permuted_domains),
+                            permuted_actions, combat[4], combat[5])
+    with torch.no_grad():
+        permuted = predict(model, tensors(permuted_observation, target, model), "fp32")
+    assert torch.allclose(original[0], permuted[0][:, inverse], atol=1e-6)
+    assert torch.allclose(original[1], permuted[1], atol=1e-6)
 
-    sampled_probabilities = np.zeros((2, CATEGORIES), np.float32)
-    sampled_probabilities[(0, 1), (10, 20)] = 1
-    trajectory = {
-        "rows": [row, row], "choices": [0, 0], "old_log": [0., 0.],
-        "critic_probabilities": sampled_probabilities, "canonical_progress": [4, 5],
-        "phases": [1, 2], "win_rewards": [0., 0], "terminals": [False, True],
-        "characters": [0, 0], "versions": [3, 3],
+    mixed = {
+        "relic": "transformer", "deck": "sum", "draw": "transformer",
+        "hand": "sum", "discard": "sum", "exhaust": "transformer",
+        "orb": "sum", "potion": "transformer", "friendly_effect": "transformer_into_actor",
+        "enemy_effect": "sum_token", "continuation": "global_tokens",
+        "phase": "sum", "generation_pool": "sum",
     }
-    dataset = ExperienceDataset()
-    assert dataset.add(
-        {"trajectories": [trajectory]}, argparse.Namespace(critic_lambda=.5),
-    ) == (2, 0, 0)
-    assert dataset.data["critic_target"][1, 5] == 1
-    assert dataset.data["critic_target"][0, 5] == .5
-    assert dataset.data["critic_target"][0, 20] == .5
-    limited = ExperienceDataset()
-    assert limited.add(
-        {"trajectories": [trajectory]}, argparse.Namespace(critic_lambda=1.), 1,
-    ) == (1, 0, 1)
-    selected = dataset.sample(2, np.random.default_rng(19))
-    before = dataset.data["priority"].copy()
-    expired = dataset.use(selected)
-    assert np.allclose(dataset.data["priority"][selected], before[selected] - 3)
-    dataset.discard(expired)
-    assert len(dataset) == 2 - len(expired)
-    mismatched = copy.deepcopy(trajectory); mismatched["terminals"][-1] = False
-    try:
-        ExperienceDataset().add(
-            {"trajectories": [mismatched]},
-            argparse.Namespace(critic_lambda=1.),
-        )
-        raise AssertionError("accepted incomplete trajectory")
-    except ValueError:
-        pass
-    balance = CriticBalance(.9)
-    weights = balance.weights(np.array([0, 0, 1]), np.array([1, 1, 2]), np.array([4, 4, 5]))
-    assert np.isclose(weights.mean(), 1) and .25 / 4 <= weights.min() / weights.max() <= 1
-    balance.record_loss(np.ones((3, CATEGORIES)) / CATEGORIES,
-                        np.ones((3, CATEGORIES)) / CATEGORIES)
-    assert balance.report()["critic_weight_ess"] <= 3
-
-    inputs = tensors(observation, target, model)
-    object_group, object_count, menu_rows, _menu_sequence = inputs[5][8]
-    assert torch.equal(torch.bincount(object_group).float(), object_count)
-    assert torch.equal(menu_rows, torch.arange(8))
-    card_counts = inputs[3][0][-1]
-    assert card_counts.shape[1] == 6
-    for count, logarithm in ((0, 1), (2, 3), (4, 5)):
-        assert torch.allclose(card_counts[:, logarithm], (card_counts[:, count] * 64).log1p() / 5)
-    codes = torch.zeros((2, DOMAIN_SPECS[DOMAIN["phase"]][3]), dtype=torch.long)
-    codes[:, 0] = torch.tensor((layout["phase_semantic_start"],
-                                layout["phase_semantic_start"] + 1))
-    numeric = torch.zeros((2, DOMAIN_SPECS[DOMAIN["phase"]][4]))
-    identity = model.encoders["phase"](codes, numeric, model.semantic)
-    assert not torch.allclose(identity[:1], identity[1:])
-    numeric[1, 0] = 1 / 128
-    assert not torch.allclose(
-        model.encoders["phase"](codes[:1], numeric[:1], model.semantic),
-        model.encoders["phase"](codes[:1], numeric[1:], model.semantic),
-    )
-    gradient = torch.autograd.grad(identity.sum(), model.encoders["phase"].field)[0]
-    assert gradient[0].abs().sum() > 0
-
-    position = layout["position_semantic_start"] + 1
-    order = layout["order_kind_semantic_start"]
-    card_position = torch.zeros((2, DOMAIN_SPECS[DOMAIN["card"]][3]), dtype=torch.long)
-    card_position[:, layout["card_known_position_semantic"]] = position
-    card_position[:, 2] = torch.tensor((order + 1, order + 2))
-    card_position = model.encoders["card"](
-        card_position, torch.zeros((2, DOMAIN_SPECS[DOMAIN["card"]][4])), model.semantic,
-    )
-    assert not torch.allclose(card_position[:1], card_position[1:])
-    for name, slots in (
-        ("map_node", (layout["map_node_floor_semantic"], layout["map_node_lane_semantic"])),
-        ("continuation", tuple(layout[f"continuation_{role}_semantic"]
-                               for role in ("branch", "path", "list", "order"))),
-    ):
-        semantic = torch.zeros((len(slots), DOMAIN_SPECS[DOMAIN[name]][3]), dtype=torch.long)
-        semantic[torch.arange(len(slots)), torch.tensor(slots)] = position
-        encoded_position = model.encoders[name](
-            semantic, torch.zeros((len(slots), DOMAIN_SPECS[DOMAIN[name]][4])), model.semantic,
-        )
-        assert all(not torch.allclose(encoded_position[left:left + 1], encoded_position[right:right + 1])
-                   for left in range(len(slots)) for right in range(left + 1, len(slots)))
-
-    base = torch.randn(4, model.width)
-    relation = torch.tensor(((.125, 0, 0, .03125, .015625, 0),
-                             (.25, 0, 0, .03125, .015625, 0)))
-    def tree(children):
-        level = (torch.tensor((0, 1)), torch.tensor(children), torch.tensor((0, 1)),
-                 torch.ones(2), relation)
-        return model.encode_continuations(base, (torch.arange(4), (level,)))[:2].sum(0)
-    assert not torch.allclose(tree((2, 3)), tree((3, 2)))
-
+    torch.manual_seed(12)
+    model = Agent(layout, pooling=mixed).eval()
+    model.critic.weight.data.normal_(std=.1); model.critic.bias.data.normal_(std=.1)
+    inputs = tensors(combat, target, model)
     with torch.no_grad():
-        model.critic[-1].weight.normal_(std=.1); model.critic[-1].bias.fill_(.03)
-        full = model(*inputs[:6], return_state=True)
-        output, state = full[:2], full[2]
-        assert state.shape == (8, 1152)
-        blocks = state[:, :model.base_state_width].reshape(8, -1, model.width)
-        assert torch.allclose(blocks.mean(2), torch.zeros_like(blocks[:, :, 0]), atol=1e-5)
-        assert torch.equal(output[0], predict(model, inputs, "fp32", policy_only=True))
-        flat_policy = predict(model, inputs, "fp32", policy_only=True, flat_policy=True)
-        assert torch.equal(flat_policy, output[0].reshape(-1)[inputs[5][1]])
-        flat_output = predict(model, tensors(flat_observation, target, model), "fp32")
-        replay_output = predict(model, unpack([row, row], target, model), "fp32")
-    flat_error = [float((left - right).abs().max()) for left, right in zip(output, flat_output)]
-    assert max(flat_error) <= 1e-5, flat_error
-    assert all(torch.allclose(value[:1], restored[:1], atol=1e-5, rtol=1e-5)
-               for value, restored in zip(output, replay_output))
-
-    count = represented.shape[1]
-    permutation = np.arange(count)[::-1]; inverse = np.argsort(permutation)
-    candidate_domains = []
-    for values in observation[2]:
-        u, s, c, f, scope, mask = (np.array(value, copy=True) for value in values)
-        selected = (scope >= 0) & mask.astype(bool)
-        scope[selected] = inverse[scope[selected]]
-        candidate_domains.append((u, s, c, f, scope, mask))
-    candidate_observation = (
-        np.array(observation[0], copy=True), np.array(observation[1], copy=True),
-        tuple(candidate_domains),
-        tuple(np.asarray(value)[:, permutation].copy() for value in observation[3]),
-    )
-    with torch.no_grad():
-        permuted = predict(model, _tensors(candidate_observation, target, model), "fp32")
-    assert torch.allclose(output[0], permuted[0][:, inverse], atol=1e-5, rtol=1e-5)
-    assert torch.allclose(output[1], permuted[1], atol=1e-5, rtol=1e-5)
-
-    candidate_batch = next(index for index, mask in enumerate(represented) if mask.sum() > 1)
-    candidate = int(np.flatnonzero(represented[candidate_batch])[0])
-    illegal = copy.deepcopy(observation[:4])
-    illegal_actions = [np.array(value, copy=True) for value in illegal[3]]
-    illegal_actions[5][candidate_batch, candidate] = 0
-    illegal = (illegal[0], illegal[1], illegal[2], tuple(illegal_actions))
-    absent_domains = []
-    for values in illegal[2]:
-        u, s, c, f, scope, mask = (np.array(value, copy=True) for value in values)
-        mask[candidate_batch, scope[candidate_batch] == candidate] = 0
-        absent_domains.append((u, s, c, f, scope, mask))
-    absent_actions = [np.array(value, copy=True) for value in illegal[3]]
-    absent_actions[4][candidate_batch, candidate] = 0
-    absent = (illegal[0], illegal[1], tuple(absent_domains), tuple(absent_actions))
-    padded = copy.deepcopy(absent)
-    padded_actions = [np.array(value, copy=True) for value in padded[3]]
-    padded_actions[0][candidate_batch, candidate] = np.iinfo(np.uint32).max
-    padded_actions[1][candidate_batch, candidate] = np.iinfo(np.int32).min
-    padded_actions[2][candidate_batch, candidate] = np.iinfo(np.uint32).max
-    padded_actions[3][candidate_batch, candidate] = np.inf
-    padded = (padded[0], padded[1], padded[2], tuple(padded_actions))
-    with torch.no_grad():
-        illegal_inputs = _tensors(illegal, target, model)
-        absent_inputs = _tensors(absent, target, model)
-        illegal_full = model(*illegal_inputs[:6], return_state=True)
-        absent_full = model(*absent_inputs[:6], return_state=True)
-        illegal_output, absent_output = illegal_full[:2], absent_full[:2]
-        padded_output = predict(model, _tensors(padded, target, model), "fp32")
-    assert not torch.allclose(illegal_full[2], absent_full[2])
-    assert all(torch.allclose(left, right, atol=1e-6, rtol=1e-6)
-               for left, right in zip(absent_output, padded_output))
-
-    relic = [np.array(value, copy=True) for value in observation[2][DOMAIN["relic"]]]
-    for value in relic:
-        value[:] = value[:, ::-1]
-    domains = list(observation[2]); domains[DOMAIN["relic"]] = tuple(relic)
-    with torch.no_grad():
-        unordered = predict(model, _tensors(
-            (observation[0], observation[1], tuple(domains), observation[3]), target, model,
-        ), "fp32")
-    assert all(torch.allclose(left, right, atol=1e-5, rtol=1e-5)
-               for left, right in zip(output, unordered))
-
-    target_env = sts2_sim.Batch(4, 911, 0)
-    target_group = None
-    for _ in range(256):
-        target_observation = target_env.observe_tokens()
-        target_u = np.asarray(target_observation[3][0])
-        target_represented = np.asarray(target_observation[3][4], bool)
-        target_legal = np.asarray(target_observation[3][5], bool)
-        target_present = target_represented & (target_u[:, :, 1] != 0) & (
-            target_u[:, :, 1] != np.iinfo(np.uint32).max
-        )
-        for batch_row in range(len(target_u)):
-            groups = {}
-            for column in np.flatnonzero(target_present[batch_row]):
-                groups.setdefault((int(target_u[batch_row, column, 0]), int(target_u[batch_row, column, 14])), []).append(column)
-            target_group = next((
-                (batch_row, columns) for columns in groups.values()
-                if len(columns) > 1 and len(set(target_u[batch_row, columns, 1])) > 1
-            ), None)
-            if target_group:
-                break
-        if target_group:
-            break
-        target_env.step(target_legal.argmax(1).tolist())
-    assert target_group is not None
-    target_inputs = tensors(target_observation, target, model)
-    assert np.array_equal(target_inputs[5][7].numpy() >= 0, target_present[target_represented])
-    encoded = model.encode_domains(target_inputs[2])
-    _state, nodes, actors, continuations = model.encode_state(
-        target_inputs[1], target_inputs[2], encoded, target_inputs[3],
-    )
-    joined = model.encode_actions(
-        encoded, continuations, actors, target_inputs[4], target_inputs[5], nodes,
-    )[0]
-    detached_index = (*target_inputs[5][:7], torch.full_like(target_inputs[5][7], -1),
-                      *target_inputs[5][8:])
-    detached = model.encode_actions(
-        encoded, continuations, actors, target_inputs[4], detached_index, nodes,
-    )[0]
-    selected = target_inputs[5][7] >= 0
-    assert not torch.allclose(joined[selected], detached[selected])
-    if (~selected).any():
-        assert torch.allclose(joined[~selected], detached[~selected])
-    target_row, columns = target_group
-    flat = np.full(target_represented.shape, -1, np.int32)
-    flat[target_represented] = np.arange(target_represented.sum())
-    leaves = torch.as_tensor(flat[target_row, columns], device=target)
-    assert target_inputs[5][8][0][leaves].unique().numel() == 1
-    assert not torch.allclose(joined[leaves[0]], joined[leaves[1]])
-
-    dense = copy.deepcopy(model).cpu()
-    sequence_row = np.repeat(np.arange(4), (0, 1, 2, 16))
-    sequence = sequence_index(sequence_row, 4, target)
-    values = torch.randn(len(sequence_row), model.width, requires_grad=True)
-    starts = torch.randn(4, model.width, requires_grad=True)
-    query = dense.encode_sequence(values, sequence, starts, dense.card_transformer, True)[0]
-    query_grad = torch.autograd.grad(query.sum(), (values, starts), retain_graph=True)
-    complete = dense.encode_sequence(values, sequence, starts, dense.card_transformer)[0]
-    complete_grad = torch.autograd.grad(complete.sum(), (values, starts))
-    assert torch.allclose(query, complete, atol=1e-5, rtol=1e-5)
-    assert all(torch.allclose(left, right, atol=1e-5, rtol=1e-5)
-               for left, right in zip(query_grad, complete_grad))
-
-    full_critic = copy.deepcopy(model).train(); selected_critic = copy.deepcopy(model).train()
-    full_inputs = tensors(observation, target, full_critic)
-    selected_inputs = tensors(observation, target, selected_critic)
-    full_loss = sum(value.square().mean() for value in predict(full_critic, full_inputs, "fp32")[1:])
-    selected_loss = sum(
-        value.square().mean() for value in predict(selected_critic, selected_inputs, "fp32")[1:]
-    )
-    full_loss.backward()
-    selected_parameters = tuple(selected_critic.critic.parameters())
-    selected_loss.backward(inputs=selected_parameters)
-    full_parameters = dict(full_critic.named_parameters())
-    selected_ids = {id(parameter) for parameter in selected_parameters}
-    assert all(torch.equal(parameter.grad, full_parameters[name].grad)
-               for name, parameter in selected_critic.named_parameters()
-               if id(parameter) in selected_ids)
-    assert all(parameter.grad is None for parameter in selected_critic.parameters()
-               if id(parameter) not in selected_ids)
-
-    trusted = copy.deepcopy(model).train()
-    trusted_inputs = tensors(observation, target, trusted)
-    logits, value = predict(trusted, trusted_inputs, "fp32")
-    loss = logits.masked_fill(~trusted_inputs[6], 0).sum() + value.sum()
-    loss.backward()
-    assert all(parameter.grad is None or parameter.grad.isfinite().all()
-               for parameter in trusted.parameters())
-    if accelerator.type in ("mps", "cuda"):
-        mixed = copy.deepcopy(model).to(accelerator).train()
-        mixed_inputs = tensors(observation, accelerator, mixed)
-        logits, value = predict(mixed, mixed_inputs, "bf16")
-        loss = logits.masked_fill(~mixed_inputs[6], 0).sum() + value.sum()
-        loss.backward()
-        assert loss.isfinite() and all(
-            parameter.grad is None or parameter.grad.isfinite().all()
-            for parameter in mixed.parameters()
-        )
-        actor = Agent(mixed.layout, mixed.width, mixed.layers, mixed.heads,
-                      mixed.feedforward, mixed.head_width).cpu().eval()
-        actor.load_state_dict({key: value.detach().cpu() for key, value in mixed.state_dict().items()})
-        pickle.dumps(actor)
-
-    cached = copy.deepcopy(model).cpu().eval()
-    cached_inputs = unpack([row, row], target, cached)
-    with torch.no_grad():
-        cached_output = predict(cached, cached_inputs, "fp32")
-        repeated_output = predict(cached, cached_inputs, "fp32")
-    assert cached.cache_stats["graph_hit"]
-    assert all(torch.equal(left, right) for left, right in zip(cached_output, repeated_output))
-
-    parity_env = sts2_sim.Batch(8, 72, 0)
-    parity_inputs = tensors(parity_env.observe_tokens(), target, model)
-    with torch.no_grad():
-        python_value = (
-            critic_win_logit(predict(model, parity_inputs, "fp32")[1]) / .83 - .17
-        ).sigmoid().numpy()
+        python = (critic_win_logit(predict(model, inputs, "fp32")[1]) / .83 - .17).sigmoid().numpy()
     with tempfile.TemporaryDirectory() as directory:
         exported = Path(directory) / "value.bin"
-        export_value_model(exported, model, parity_env.fingerprint(), .83, -.17)
-        rust_value = np.asarray(parity_env.rust_values(str(exported)))
-    parity_error = float(np.max(np.abs(rust_value - python_value)))
-    assert parity_error <= 1e-5, parity_error
-    actor = export_value_model(None, model, parity_env.fingerprint(), 1, 0, True)
-    plain = sts2_sim.Batch(8, 73, 0); searched = sts2_sim.Batch(8, 73, 0)
-    timed = sts2_sim.Batch(8, 73, 0)
-    plain.load_policy(actor); searched.load_policy(actor); timed.load_policy(actor)
-    actor_inputs = tensors(plain.observe_tokens(), target, model)
-    with torch.no_grad():
-        python_critic = critic_probabilities(predict(model, actor_inputs, "fp32")[1]).numpy()
-    native_critic = np.asarray(plain.policy(1, False, False)[3])
-    assert native_critic.shape == (8, CATEGORIES)
-    assert np.max(np.abs(native_critic - python_critic)) <= 1e-5
-    assert all(len(row) == 10 and 0 <= row[9] <= 52 for row in plain.stats())
-    mcts_roots = mcts_targets = consistency_targets = plain_targets = 0
-    rollout_steps = timeout_roots = 0
-    for step in range(16):
-        base = plain.policy(1, True, True)
-        consistency = bool(step % 2)
-        preview = searched.policy(
-            1, False, False, mcts_fraction=1, mcts_simulations=4,
-            mcts_boss_simulations=8, mcts_turns=0, mcts_max_depth=32,
-            mcts_batch_size=32, mcts_min_visits=1, mcts_max_targets=8,
-            mcts_prior_temperature=1, mcts_q_temperature=.002, mcts_exploration=1.5,
-            mcts_value_consistency=consistency,
-        )
-        shadow = searched.policy(
-            1, True, True, mcts_fraction=1, mcts_simulations=4,
-            mcts_boss_simulations=8, mcts_turns=0, mcts_max_depth=32,
-            mcts_batch_size=32, mcts_min_visits=1, mcts_max_targets=8,
-            mcts_prior_temperature=1, mcts_q_temperature=.002, mcts_exploration=1.5,
-        )
-        assert np.array_equal(base[1], shadow[1]) \
-            and repr(plain.stats()) == repr(searched.stats()) and plain.seeds() == searched.seeds()
-        timed_preview = timed.policy(
-            1, False, False, mcts_fraction=1, mcts_simulations=4,
-            mcts_boss_simulations=8, mcts_turns=0, mcts_max_depth=32,
-            mcts_batch_size=32, mcts_min_visits=1, mcts_max_targets=8,
-            mcts_timeout=1e-9,
-        )
-        timed_step = timed.policy(1, True, True)
-        assert np.array_equal(base[1], timed_step[1]) \
-            and repr(plain.stats()) == repr(timed.stats()) and plain.seeds() == timed.seeds()
-        assert timed_preview[6][16] == int(bool(timed_preview[6][0])) and not timed_preview[5]
-        assert shadow[6][0] == 0
-        assert preview[6][0] == preview[6][6]
-        for target_row in preview[5]:
-            row, expert, visits, depth, *extra = target_row
-            assert len(expert) == packed_action_count(row) and np.isclose(sum(expert), 1)
-            assert visits >= 1 and 0 <= depth <= 32
-            if consistency:
-                children, weights, self_weight, terminal_value = extra
-                assert len(extra) == 4 and len(children) == len(weights)
-                assert 0 <= self_weight <= 1 and 0 <= sum(weights) + self_weight <= 1.002
-                assert 0 <= terminal_value <= 1 - self_weight + .002
-                consistency_targets += 1
-            else:
-                assert not extra
-                plain_targets += 1
-        mcts_roots += preview[6][0]; mcts_targets += preview[6][5]
-        rollout_steps += preview[6][12]; timeout_roots += timed_preview[6][0]
-        done = np.flatnonzero(base[8]).tolist()
-        if done:
-            plain.reset(done, 0); searched.reset(done, 0); timed.reset(done, 0)
-    assert mcts_roots and mcts_targets and consistency_targets and plain_targets
-    assert rollout_steps and timeout_roots
-    parameters = sum(parameter.numel() for parameter in model.parameters())
-    assert 700_000 <= parameters <= 1_500_000
-    print(json.dumps({
-        "device": str(accelerator), "layout": layout, "parameters": parameters,
-        "state_width": model.state_width,
-        "candidate_permutation_error": max(
-            float((output[0] - permuted[0][:, inverse]).abs().max()),
-            float((output[1] - permuted[1]).abs().max()),
-        ),
-        "rust_parity_error": parity_error, "mcts_roots": mcts_roots,
-    }))
+        export_value_model(exported, model, env.fingerprint(), .83, -.17)
+        rust = np.asarray(env.rust_values(str(exported)))
+        invalid_binary = bytearray(exported.read_bytes())
+        cap_offset = 8 + 16 + 40 + 64 * 4 + len(SEMANTIC_NAMES) * 4
+        struct.pack_into("<I", invalid_binary, cap_offset,
+                         struct.unpack_from("<I", invalid_binary, cap_offset)[0] + 1)
+        invalid_path = Path(directory) / "invalid.bin"
+        invalid_path.write_bytes(invalid_binary)
+        try:
+            env.rust_values(str(invalid_path))
+            raise AssertionError("accepted incompatible binary architecture")
+        except (OSError, ValueError):
+            pass
+        env.load_policy(export_value_model(None, model, env.fingerprint(), 1, 0, actor=True))
+        assert len(env.policy(sample=False, advance=False)[0]) == 2
+        checkpoint = Path(directory) / "checkpoint.pt"
+        torch.save({
+            "schema": 1, "model_version": MODEL_VERSION, "feature_version": FEATURE_VERSION,
+            "fingerprint": env.fingerprint(), "layout": layout, "architecture": architecture(model),
+            "model": model.state_dict(), "optimizer": {"state": {}, "param_groups": []},
+        }, checkpoint)
+        restored, _ = load(checkpoint, target)
+        assert restored.pooling == model.pooling
+        incompatible = torch.load(checkpoint, weights_only=False)
+        incompatible["architecture"]["position_caps"]["enemy"] = 31
+        torch.save(incompatible, checkpoint)
+        try:
+            load(checkpoint, target)
+            raise AssertionError("accepted incompatible checkpoint architecture")
+        except ValueError:
+            pass
+        incompatible = torch.load(checkpoint, weights_only=False)
+        incompatible["architecture"]["position_caps"]["enemy"] = 32
+        incompatible["model_version"] = 70
+        torch.save(incompatible, checkpoint)
+        try:
+            load(checkpoint, target)
+            raise AssertionError("accepted pre-v71 checkpoint")
+        except ValueError:
+            pass
+    assert np.max(np.abs(python - rust)) <= 1e-5
+    train_model = Agent(layout, pooling=mixed).train()
+    inputs = tensors(combat, target, train_model)
+    policy, critic = predict(train_model, inputs, "fp32")
+    (policy.sum() + critic.sum()).backward()
+    assert all(parameter.grad is None or parameter.grad.isfinite().all()
+               for parameter in train_model.parameters())
+    accelerator = device()
+    if accelerator.type in ("mps", "cuda"):
+        accelerated = Agent(layout, pooling=mixed).to(accelerator).train()
+        inputs = tensors(combat, accelerator, accelerated)
+        policy, critic = predict(accelerated, inputs, "bf16")
+        (policy.sum() + critic.sum()).backward()
+        assert all(parameter.grad is None or parameter.grad.isfinite().all()
+                   for parameter in accelerated.parameters())
+    print("probe ok")
 
 
 def parser():
     root = argparse.ArgumentParser()
     commands = root.add_subparsers(dest="command", required=True)
     run = commands.add_parser("train")
-    run.add_argument("--output", default="target/v63")
+    run.add_argument("--output", default="target/v71")
     run.add_argument("--checkpoint")
     run.add_argument("--width", type=int)
     run.add_argument("--layers", type=int)
     run.add_argument("--heads", type=int)
     run.add_argument("--feedforward", type=int)
+    for name in ("relic", "deck", "draw", "exhaust", "discard", "hand", "orb", "potion"):
+        run.add_argument(f"--{name}-pooling", choices=COLLECTION_POOLING,
+                         default=None)
+    for name in ("enemy-effect", "friendly-effect"):
+        run.add_argument(f"--{name}-pooling", choices=EFFECT_POOLING,
+                         default=None)
+    run.add_argument("--continuation-pooling", choices=CONTINUATION_POOLING,
+                     default=None)
+    run.add_argument("--phase-pooling", choices=("sum", "transformer"),
+                     default=None)
+    run.add_argument("--generation-pool-pooling", choices=("sum", "transformer"),
+                     default=None)
     run.add_argument("--precision", choices=PRECISIONS, default="bf16")
     run.add_argument("--start-stage", type=int, default=0)
     run.add_argument("--hours", type=float, default=0)

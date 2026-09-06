@@ -2208,7 +2208,7 @@ impl Game {
         None
     }
 
-    fn event_allowed(&self, content: &Content, id: Id) -> bool {
+    pub(crate) fn event_allowed(&self, content: &Content, id: Id) -> bool {
         let removable = self
             .run
             .deck
