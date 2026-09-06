@@ -9904,7 +9904,7 @@ type MapEncoding = std::collections::BTreeMap<u32, Vec<f32>>;
 #[derive(Default)]
 struct EncodingCache {
     rows: HashMap<(u64, u64), Vec<f32>>,
-    groups: HashMap<(usize, u64, u64), Vec<f32>>,
+    maps: HashMap<Vec<u8>, MapEncoding>,
 }
 
 struct GruWeights {
@@ -10140,8 +10140,32 @@ impl ValueModel {
         (candidate.u[0], candidate.u[14])
     }
 
-    fn encode(&self, domain: usize, row: &DomainRow) -> Vec<f32> {
-        self.encoders[domain].encode(&row.c, &row.f, &self.semantic_embedding, self.width)
+    fn encode_values(
+        &self,
+        cache: &mut EncodingCache,
+        domain: usize,
+        semantic: &[u32],
+        numeric: &[f32],
+        encoder: &TokenEncoderWeights,
+    ) -> Vec<f32> {
+        let mut key = (0xcbf2_9ce4_8422_2325, 0x9e37_79b9_7f4a_7c15);
+        for value in std::iter::once(domain as u32)
+            .chain(semantic.iter().copied())
+            .chain(numeric.iter().map(|value| value.to_bits()))
+        {
+            key.0 = (key.0 ^ value as u64).wrapping_mul(0x100_0000_01b3);
+            key.1 = (key.1 ^ value as u64).wrapping_mul(0x9e37_79b1_85eb_ca87);
+        }
+        if let Some(value) = cache.rows.get(&key) {
+            return value.clone();
+        }
+        let value = encoder.encode(semantic, numeric, &self.semantic_embedding, self.width);
+        cache.rows.insert(key, value.clone());
+        value
+    }
+
+    fn encode(&self, cache: &mut EncodingCache, domain: usize, row: &DomainRow) -> Vec<f32> {
+        self.encode_values(cache, domain, &row.c, &row.f, &self.encoders[domain])
     }
 
     fn tag(&self, mut value: Vec<f32>, role: u32, collection: Option<u32>) -> Vec<f32> {
@@ -10162,38 +10186,43 @@ impl ValueModel {
         value
     }
 
-    fn attention(&self, query: &[f32], keys_values: &[Vec<f32>]) -> Vec<f32> {
+    fn attention(&self, query: &[f32], keys_values: &[Vec<f32>], offset: usize) -> Vec<f32> {
         let dimension = self.width / self.heads;
         let mut output = vec![0.0; self.width];
+        if keys_values.is_empty() {
+            return output;
+        }
+        let mut weights = vec![0.0; keys_values.len()];
         for head in 0..self.heads {
             let columns = head * dimension..(head + 1) * dimension;
-            let scores = keys_values
-                .iter()
-                .map(|row| {
-                    query[columns.clone()]
-                        .iter()
-                        .zip(&row[columns.clone()])
-                        .map(|(left, right)| left * right)
-                        .sum::<f32>()
-                        / (dimension as f32).sqrt()
-                })
-                .collect::<Vec<_>>();
-            let peak = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let weights = scores
-                .iter()
-                .map(|score| (score - peak).exp())
-                .collect::<Vec<_>>();
+            for (weight, row) in weights.iter_mut().zip(keys_values) {
+                *weight = query[columns.clone()]
+                    .iter()
+                    .zip(&row[offset..][columns.clone()])
+                    .map(|(left, right)| left * right)
+                    .sum::<f32>()
+                    / (dimension as f32).sqrt();
+            }
+            let peak = weights.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            weights
+                .iter_mut()
+                .for_each(|score| *score = (*score - peak).exp());
             let total = weights.iter().sum::<f32>();
-            for (row, weight) in keys_values.iter().zip(weights) {
+            for (row, weight) in keys_values.iter().zip(weights.iter().copied()) {
                 for column in columns.clone() {
-                    output[column] += weight / total * row[self.width + column];
+                    output[column] += weight / total * row[offset + self.width + column];
                 }
             }
         }
         output
     }
 
-    fn transform(&self, sequence: &mut [Vec<f32>], layer: &TransformerLayer) {
+    fn transformed(
+        &self,
+        sequence: &[Vec<f32>],
+        layer: &TransformerLayer,
+        selected: impl IntoIterator<Item = usize>,
+    ) -> Vec<Vec<f32>> {
         let qkv = sequence
             .iter()
             .map(|row| {
@@ -10204,35 +10233,36 @@ impl ValueModel {
                 )
             })
             .collect::<Vec<_>>();
-        let keys_values = qkv
-            .iter()
-            .map(|row| row[self.width..].to_vec())
-            .collect::<Vec<_>>();
-        let attended = qkv
-            .iter()
-            .map(|row| self.attention(&row[..self.width], &keys_values))
-            .collect::<Vec<_>>();
-        for (row, value) in sequence.iter_mut().zip(attended) {
-            for (left, right) in row
-                .iter_mut()
-                .zip(linear(&value, &layer.out_w, &layer.out_b))
-            {
-                *left += right;
-            }
-        }
-        for row in sequence {
-            let hidden = dense_gelu(
-                &normalized(row, &layer.norm2_w, &layer.norm2_b),
-                &layer.linear1_w,
-                &layer.linear1_b,
-            );
-            for (left, right) in
-                row.iter_mut()
-                    .zip(linear(&hidden, &layer.linear2_w, &layer.linear2_b))
-            {
-                *left += right;
-            }
-        }
+        selected
+            .into_iter()
+            .map(|index| {
+                let mut row = sequence[index].clone();
+                let value = self.attention(&qkv[index][..self.width], &qkv, self.width);
+                for (left, right) in row
+                    .iter_mut()
+                    .zip(linear(&value, &layer.out_w, &layer.out_b))
+                {
+                    *left += right;
+                }
+                let hidden = dense_gelu(
+                    &normalized(&row, &layer.norm2_w, &layer.norm2_b),
+                    &layer.linear1_w,
+                    &layer.linear1_b,
+                );
+                for (left, right) in
+                    row.iter_mut()
+                        .zip(linear(&hidden, &layer.linear2_w, &layer.linear2_b))
+                {
+                    *left += right;
+                }
+                row
+            })
+            .collect()
+    }
+
+    fn transform(&self, sequence: &mut Vec<Vec<f32>>, layer: &TransformerLayer) {
+        let transformed = self.transformed(sequence, layer, 0..sequence.len());
+        *sequence = transformed;
     }
 
     fn summarize(&self, name: usize, mode: u8, values: Vec<Vec<f32>>) -> Vec<f32> {
@@ -10263,74 +10293,107 @@ impl ValueModel {
         }
     }
 
-    fn map(&self, observation: &ObservationV56, current: u32) -> (Vec<f32>, MapEncoding) {
+    fn map(
+        &self,
+        observation: &ObservationV56,
+        current: u32,
+        cache: &mut EncodingCache,
+    ) -> (Vec<f32>, MapEncoding) {
         let nodes = observation.domains[MAP_NODE_DOMAIN]
             .iter()
             .filter(|row| row.scope == STATE_SCOPE)
             .collect::<Vec<_>>();
-        let edges = observation.domains[MAP_EDGE_DOMAIN]
-            .iter()
-            .filter(|row| row.scope == STATE_SCOPE)
-            .map(|row| (row, self.encode(MAP_EDGE_DOMAIN, row)))
-            .collect::<Vec<_>>();
-        let mut encoded = nodes
-            .iter()
-            .map(|row| (row.u[0], self.encode(MAP_NODE_DOMAIN, row)))
-            .collect::<MapEncoding>();
-        let mut levels = nodes.iter().map(|row| row.u[8]).collect::<Vec<_>>();
-        levels.sort_unstable();
-        levels.dedup();
-        for level in levels.into_iter().rev() {
-            let normalized_nodes = encoded
+        let mut key = Vec::new();
+        for domain in [MAP_NODE_DOMAIN, MAP_EDGE_DOMAIN] {
+            key.extend((domain as u32).to_le_bytes());
+            for row in observation.domains[domain]
                 .iter()
-                .map(|(&id, value)| {
-                    (
-                        id,
-                        normalized(value, &self.graph_norm_w, &self.graph_norm_b),
-                    )
-                })
-                .collect::<MapEncoding>();
-            let updates = nodes
-                .iter()
-                .filter(|row| row.u[8] == level && row.u[9] > 0)
-                .map(|row| {
-                    let id = row.u[0];
-                    let query = self.graph_query.apply(&normalized_nodes[&id]);
-                    let children = edges
-                        .iter()
-                        .filter(|(edge, _)| edge.u[0] == id)
-                        .map(|(edge, value)| {
-                            self.graph_key_value
-                                .apply(&normalized_nodes[&edge.u[1]])
-                                .into_iter()
-                                .zip(self.graph_edge.apply(value))
-                                .map(|(left, right)| left + right)
-                                .collect::<Vec<_>>()
-                        })
-                        .collect::<Vec<_>>();
-                    let mut value = encoded[&id].clone();
-                    let attention = self.graph_out.apply(&self.attention(&query, &children));
-                    let degree = self
-                        .graph_degree
-                        .apply(&[row.u[9] as f32 / 8.0, (row.u[9] as f32).ln_1p() / 3.0]);
-                    for column in 0..self.width {
-                        value[column] += attention[column] + degree[column];
-                    }
-                    let hidden = dense_gelu(
-                        &normalized(&value, &self.graph_ff_norm_w, &self.graph_ff_norm_b),
-                        &self.graph_ff1.w,
-                        &self.graph_ff1.b,
-                    );
-                    for (left, right) in value.iter_mut().zip(self.graph_ff2.apply(&hidden)) {
-                        *left += right;
-                    }
-                    (id, value)
-                })
-                .collect::<Vec<_>>();
-            for (id, value) in updates {
-                encoded.insert(id, value);
+                .filter(|row| row.scope == STATE_SCOPE)
+            {
+                row.u
+                    .iter()
+                    .for_each(|value| key.extend(value.to_le_bytes()));
+                row.s
+                    .iter()
+                    .for_each(|value| key.extend(value.to_le_bytes()));
+                row.c
+                    .iter()
+                    .for_each(|value| key.extend(value.to_le_bytes()));
+                row.f
+                    .iter()
+                    .for_each(|value| key.extend(value.to_le_bytes()));
             }
         }
+        let encoded = cache.maps.get(&key).cloned().unwrap_or_else(|| {
+            let edges = observation.domains[MAP_EDGE_DOMAIN]
+                .iter()
+                .filter(|row| row.scope == STATE_SCOPE)
+                .map(|row| (row, self.encode(cache, MAP_EDGE_DOMAIN, row)))
+                .collect::<Vec<_>>();
+            let mut encoded = nodes
+                .iter()
+                .map(|row| (row.u[0], self.encode(cache, MAP_NODE_DOMAIN, row)))
+                .collect::<MapEncoding>();
+            let mut levels = nodes.iter().map(|row| row.u[8]).collect::<Vec<_>>();
+            levels.sort_unstable();
+            levels.dedup();
+            for level in levels.into_iter().rev() {
+                let normalized_nodes = encoded
+                    .iter()
+                    .map(|(&id, value)| {
+                        (
+                            id,
+                            normalized(value, &self.graph_norm_w, &self.graph_norm_b),
+                        )
+                    })
+                    .collect::<MapEncoding>();
+                let updates = nodes
+                    .iter()
+                    .filter(|row| row.u[8] == level && row.u[9] > 0)
+                    .map(|row| {
+                        let id = row.u[0];
+                        let query = self.graph_query.apply(&normalized_nodes[&id]);
+                        let children = edges
+                            .iter()
+                            .filter(|(edge, _)| edge.u[0] == id)
+                            .map(|(edge, value)| {
+                                self.graph_key_value
+                                    .apply(&normalized_nodes[&edge.u[1]])
+                                    .into_iter()
+                                    .zip(self.graph_edge.apply(value))
+                                    .map(|(left, right)| left + right)
+                                    .collect::<Vec<_>>()
+                            })
+                            .collect::<Vec<_>>();
+                        let mut value = encoded[&id].clone();
+                        let attention = self.graph_out.apply(&self.attention(&query, &children, 0));
+                        let degree = self
+                            .graph_degree
+                            .apply(&[row.u[9] as f32 / 8.0, (row.u[9] as f32).ln_1p() / 3.0]);
+                        for column in 0..self.width {
+                            value[column] += attention[column] + degree[column];
+                        }
+                        let hidden = dense_gelu(
+                            &normalized(&value, &self.graph_ff_norm_w, &self.graph_ff_norm_b),
+                            &self.graph_ff1.w,
+                            &self.graph_ff1.b,
+                        );
+                        for (left, right) in value.iter_mut().zip(self.graph_ff2.apply(&hidden)) {
+                            *left += right;
+                        }
+                        (id, value)
+                    })
+                    .collect::<Vec<_>>();
+                for (id, value) in updates {
+                    encoded.insert(id, value);
+                }
+            }
+            if cache.maps.len() == 1024 {
+                cache.maps.clear();
+            }
+            cache.maps.insert(key, encoded.clone());
+            encoded
+        });
         let normalized_nodes = encoded
             .values()
             .map(|value| {
@@ -10347,10 +10410,13 @@ impl ValueModel {
             &self.graph_norm_w,
             &self.graph_norm_b,
         ));
-        for (left, right) in selected.iter_mut().zip(
-            self.graph_out
-                .apply(&self.attention(&query, &normalized_nodes)),
-        ) {
+        for (left, right) in selected
+            .iter_mut()
+            .zip(
+                self.graph_out
+                    .apply(&self.attention(&query, &normalized_nodes, 0)),
+            )
+        {
             *left += right;
         }
         let hidden = dense_gelu(
@@ -10379,7 +10445,11 @@ impl ValueModel {
         )]
     }
 
-    fn actors(&self, observation: &ObservationV56) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
+    fn actors(
+        &self,
+        observation: &ObservationV56,
+        cache: &mut EncodingCache,
+    ) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
         let mut actors = observation.domains[ACTOR_DOMAIN]
             .iter()
             .filter(|row| row.scope == STATE_SCOPE)
@@ -10389,12 +10459,12 @@ impl ValueModel {
         let mut effects_out = Vec::new();
         for actor in actors {
             let owner = actor.u[0];
-            let mut value = self.encode(ACTOR_DOMAIN, actor);
+            let mut value = self.encode(cache, ACTOR_DOMAIN, actor);
             for history in observation.domains[HISTORY_DOMAIN]
                 .iter()
                 .filter(|row| row.scope == STATE_SCOPE && row.u[0] == owner && row.u[1] == 0)
             {
-                let encoded = self.encode(HISTORY_DOMAIN, history);
+                let encoded = self.encode(cache, HISTORY_DOMAIN, history);
                 value
                     .iter_mut()
                     .zip(encoded)
@@ -10416,15 +10486,15 @@ impl ValueModel {
                 .iter_mut()
                 .zip(history)
                 .for_each(|(left, right)| *left += right);
-            let effects = [POWER_DOMAIN, STATUS_DOMAIN]
-                .into_iter()
-                .flat_map(|domain| {
+            let mut effects = Vec::new();
+            for domain in [POWER_DOMAIN, STATUS_DOMAIN] {
+                effects.extend(
                     observation.domains[domain]
                         .iter()
-                        .filter(move |row| row.scope == STATE_SCOPE && row.u[0] == owner)
-                        .map(move |row| self.encode(domain, row))
-                })
-                .collect::<Vec<_>>();
+                        .filter(|row| row.scope == STATE_SCOPE && row.u[0] == owner)
+                        .map(|row| self.encode(cache, domain, row)),
+                );
+            }
             let index = if actor.u[1] == 2 { 8 } else { 9 };
             let mode = self.pooling[index];
             if mode == 4 {
@@ -10451,7 +10521,11 @@ impl ValueModel {
         (values, effects_out)
     }
 
-    fn continuation_items(&self, observation: &ObservationV56) -> Vec<Vec<f32>> {
+    fn continuation_items(
+        &self,
+        observation: &ObservationV56,
+        cache: &mut EncodingCache,
+    ) -> Vec<Vec<f32>> {
         let mut rows = observation.domains[CONTINUATION_DOMAIN]
             .iter()
             .filter(|row| row.scope == STATE_SCOPE)
@@ -10462,7 +10536,7 @@ impl ValueModel {
             if items.last().is_none_or(|(id, _)| *id != row.u[2]) {
                 items.push((row.u[2], vec![0.0; self.width]));
             }
-            let encoded = self.encode(CONTINUATION_DOMAIN, row);
+            let encoded = self.encode(cache, CONTINUATION_DOMAIN, row);
             items
                 .last_mut()
                 .unwrap()
@@ -10474,7 +10548,11 @@ impl ValueModel {
         items.into_iter().map(|(_, value)| value).collect()
     }
 
-    fn state_actions_uncached(&self, observation: &ObservationV56) -> (Vec<f32>, Vec<Vec<f32>>) {
+    fn state_actions(
+        &self,
+        observation: &ObservationV56,
+        cache: &mut EncodingCache,
+    ) -> (Vec<f32>, Vec<Vec<f32>>) {
         let state_rows = |domain: usize| {
             observation.domains[domain]
                 .iter()
@@ -10483,17 +10561,17 @@ impl ValueModel {
         };
         let run = state_rows(RUN_DOMAIN);
         let current_id = run[0].u[23];
-        let (map, nodes) = self.map(observation, current_id);
+        let (map, nodes) = self.map(observation, current_id, cache);
         let mut phase = state_rows(PHASE_DOMAIN)
             .into_iter()
-            .map(|row| self.encode(PHASE_DOMAIN, row))
+            .map(|row| self.encode(cache, PHASE_DOMAIN, row))
             .collect::<Vec<_>>();
         for domain in 0..DOMAIN_NAMES.len() {
             phase.extend(
                 observation.domains[domain]
                     .iter()
                     .filter(|row| row.scope == PHASE_SCOPE)
-                    .map(|row| self.encode(domain, row)),
+                    .map(|row| self.encode(cache, domain, row)),
             );
         }
         let generation = [
@@ -10512,12 +10590,12 @@ impl ValueModel {
                     EVENT_DOMAIN => row.u[0] == 0,
                     _ => false,
                 })
-                .map(|row| self.encode(domain, row))
+                .map(|row| self.encode(cache, domain, row))
                 .collect();
             self.tag(self.summarize(seed, self.pooling[12], values), role, None)
         });
         let mut tokens = vec![
-            self.tag(self.encode(RUN_DOMAIN, run[0]), 1, None),
+            self.tag(self.encode(cache, RUN_DOMAIN, run[0]), 1, None),
             self.tag(self.summarize(11, self.pooling[11], phase), 2, None),
             self.tag(map, 3, None),
         ];
@@ -10526,18 +10604,18 @@ impl ValueModel {
         let deck = cards
             .iter()
             .filter(|row| row.u[0] == 0)
-            .map(|row| self.encode(CARD_DOMAIN, row))
+            .map(|row| self.encode(cache, CARD_DOMAIN, row))
             .collect();
         tokens.append(&mut self.collection(deck, 1, 0));
         let mut relics = state_rows(RELIC_DOMAIN)
             .into_iter()
             .filter(|row| row.u[0] == 0)
-            .map(|row| (row, self.encode(RELIC_DOMAIN, row)))
+            .map(|row| (row, self.encode(cache, RELIC_DOMAIN, row)))
             .collect::<Vec<_>>();
         let stored = cards
             .iter()
             .filter(|row| row.u[0] == PAEL_ZONE as u32)
-            .map(|row| self.encode(CARD_DOMAIN, row))
+            .map(|row| self.encode(cache, CARD_DOMAIN, row))
             .fold(vec![0.0; self.width], |mut sum, value| {
                 sum.iter_mut()
                     .zip(value)
@@ -10560,10 +10638,10 @@ impl ValueModel {
         let potions = state_rows(POTION_DOMAIN)
             .into_iter()
             .filter(|row| row.u[0] == 0)
-            .map(|row| self.encode(POTION_DOMAIN, row))
+            .map(|row| self.encode(cache, POTION_DOMAIN, row))
             .collect();
         tokens.append(&mut self.collection(potions, 7, 6));
-        let continuations = self.continuation_items(observation);
+        let continuations = self.continuation_items(observation, cache);
         if self.pooling[10] == 3 {
             tokens.extend(
                 continuations
@@ -10580,40 +10658,41 @@ impl ValueModel {
         tokens.extend(
             state_rows(CRYSTAL_DOMAIN)
                 .into_iter()
-                .map(|row| self.tag(self.encode(CRYSTAL_DOMAIN, row), 12, None)),
+                .map(|row| self.tag(self.encode(cache, CRYSTAL_DOMAIN, row), 12, None)),
         );
         if !state_rows(ACTOR_DOMAIN).is_empty() {
-            let (actors, effects) = self.actors(observation);
+            let (actors, effects) = self.actors(observation, cache);
             tokens.extend(actors);
             for (zone, name, collection) in [(1, 5, 1), (2, 2, 2), (3, 4, 3), (4, 3, 4)] {
                 let values = cards
                     .iter()
                     .filter(|row| row.u[0] == zone)
-                    .map(|row| self.encode(CARD_DOMAIN, row))
+                    .map(|row| self.encode(cache, CARD_DOMAIN, row))
                     .collect();
                 tokens.append(&mut self.collection(values, name, collection));
             }
             let orbs = state_rows(ORB_DOMAIN)
                 .into_iter()
-                .map(|row| self.encode(ORB_DOMAIN, row))
+                .map(|row| self.encode(cache, ORB_DOMAIN, row))
                 .collect();
             tokens.append(&mut self.collection(orbs, 6, 7));
             tokens.extend(effects);
         }
         let mut actions = Vec::with_capacity(observation.candidates.len());
         for (index, candidate) in observation.candidates.iter().enumerate() {
-            let mut action = self.action_encoder.encode(
+            let mut action = self.encode_values(
+                cache,
+                DOMAIN_NAMES.len(),
                 &candidate.c,
                 &candidate.f,
-                &self.semantic_embedding,
-                self.width,
+                &self.action_encoder,
             );
             for domain in 0..DOMAIN_NAMES.len() {
                 for row in observation.domains[domain]
                     .iter()
                     .filter(|row| row.scope == index as i32)
                 {
-                    let value = self.encode(domain, row);
+                    let value = self.encode(cache, domain, row);
                     action
                         .iter_mut()
                         .zip(value)
@@ -10634,13 +10713,19 @@ impl ValueModel {
         let action_start = tokens.len() - actions.len() + 1;
         let mut sequence = vec![self.embedding(Semantic::TokenRole, 0)];
         sequence.extend(tokens);
-        for layer in &self.global_layers {
+        let (last, layers) = self.global_layers.split_last().unwrap();
+        for layer in layers {
             self.transform(&mut sequence, layer);
         }
+        sequence = self.transformed(
+            &sequence,
+            last,
+            std::iter::once(0).chain(action_start..sequence.len()),
+        );
         for value in &mut sequence {
             layer_norm(value, &self.global_norm_w, &self.global_norm_b);
         }
-        (sequence.remove(0), sequence[action_start - 1..].to_vec())
+        (sequence.remove(0), sequence)
     }
 
     #[cfg(feature = "python")]
@@ -10650,27 +10735,27 @@ impl ValueModel {
     ) -> Vec<(Vec<f32>, Vec<Vec<f32>>)> {
         observations
             .par_iter()
-            .map(|observation| self.state_actions_uncached(observation))
+            .map(|observation| {
+                let index = rayon::current_thread_index().unwrap_or(0) % self.encode_caches.len();
+                let mut cache = self.encode_caches[index].lock().unwrap();
+                if cache.rows.len() > 65_536 {
+                    cache.rows.clear();
+                }
+                self.state_actions(observation, &mut cache)
+            })
             .collect()
     }
 
-    fn state_actions(
-        &self,
-        observation: &ObservationV56,
-        _cache: &mut EncodingCache,
-    ) -> (Vec<f32>, Vec<Vec<f32>>) {
-        self.state_actions_uncached(observation)
-    }
-
     fn state(&self, observation: &ObservationV56) -> Vec<f32> {
-        self.state_actions_uncached(observation).0
+        self.state_actions(observation, &mut EncodingCache::default())
+            .0
     }
 
     fn evaluate(
         &self,
         observation: &ObservationV56,
         temperature: f32,
-        _cache: &mut EncodingCache,
+        cache: &mut EncodingCache,
     ) -> io::Result<(Vec<f32>, f32, f32, Vec<f32>)> {
         let policy = self
             .policy
@@ -10679,7 +10764,7 @@ impl ValueModel {
         if !temperature.is_finite() || temperature <= 0.0 {
             return Err(invalid("invalid policy temperature"));
         }
-        let (state, actions) = self.state_actions_uncached(observation);
+        let (state, actions) = self.state_actions(observation, cache);
         let raw = actions
             .iter()
             .map(|action| policy.apply(action)[0] / temperature)
@@ -17650,8 +17735,8 @@ mod python {
                         if cache.rows.len() > 65_536 {
                             cache.rows.clear();
                         }
-                        if cache.groups.len() > 65_536 {
-                            cache.groups.clear();
+                        if cache.maps.len() > 1_024 {
+                            cache.maps.clear();
                         }
                         model.state_actions(row, &mut cache)
                     })
