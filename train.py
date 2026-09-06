@@ -4205,6 +4205,10 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             if args.critic_only:
                 critic_only_step(model, optimizer); critic_only_updates += 1
                 accepted, proposals, post_log_ratio = True, [0.], log_ratio.detach()
+            elif args.target_kl >= 1:
+                nn.utils.clip_grad_norm_(model.parameters(), .5)
+                optimizer.step()
+                accepted, proposals, post_log_ratio = True, [], log_ratio.detach()
             else:
                 accepted, proposals, post_log_ratio = trust_region_step(
                     model, optimizer, inputs, action, old, fresh, denominator,
@@ -4217,8 +4221,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             post_kl_checks += len(proposals)
             post_kl_proposals += len(proposals)
             post_kl_rejected_proposals += rejected_proposals
-            post_kl_retries += len(proposals) - 1
-            post_kl_retry_depth = max(post_kl_retry_depth, len(proposals) - 1)
+            post_kl_retries += max(0, len(proposals) - 1)
+            post_kl_retry_depth = max(post_kl_retry_depth, max(0, len(proposals) - 1))
             if not accepted:
                 dataset.post_kl_dropped += fresh_rows
                 post_kl_discarded_updates += 1
@@ -4237,7 +4241,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 update_durations.append(update_elapsed)
                 backward_durations.append(time.monotonic() - backward_started)
                 continue
-            post_kl = proposals[-1]
+            post_kl = proposals[-1] if proposals else kl_value
             post_ratio = post_log_ratio.exp()
             observed_kl = post_kl
             observed_clip = float(
