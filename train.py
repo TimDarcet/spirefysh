@@ -1334,19 +1334,28 @@ class Agent(nn.Module):
         counts = torch.bincount(group, minlength=groups)
         if values.device.type == "mps" and self.width // self.heads in (16, 32):
             lengths = counts + 1
+            padded_groups = (groups // 256 + 1) * 256
+            lengths = nn.functional.pad(lengths, (0, padded_groups - groups), value=1)
+            total = len(values) + padded_groups
+            extra = (-total) % (65_536 if groups >= 4096 else 4096)
+            lengths[groups:] += extra // (padded_groups - groups)
+            lengths[groups:groups + extra % (padded_groups - groups)] += 1
+            total += extra
             offsets = torch.cat((counts.new_zeros(1), lengths.cumsum(0)))
-            starts = torch.repeat_interleave(offsets[:-1], counts)
+            starts = torch.repeat_interleave(offsets[:groups], counts)
             position = torch.arange(len(values), device=values.device) \
                 - torch.repeat_interleave(counts.cumsum(0) - counts, counts) + 1
             destination = starts + position
-            current = values.new_zeros((int(offsets[-1]), self.width))
-            current[offsets[:-1]] = seed.to(values.dtype)
+            current = values.new_zeros((total, self.width))
+            current[offsets[:groups]] = seed.to(values.dtype)
             current[destination] = values
-            sequence = torch.repeat_interleave(torch.arange(groups, device=values.device), lengths)
+            sequence = torch.repeat_interleave(
+                torch.arange(len(lengths), device=values.device), lengths,
+            )
             for layer_index, layer in enumerate(transformer.layers):
                 if selected is not None and layer_index == len(transformer.layers) - 1:
                     positions = torch.cat((offsets[:-1], destination[selected])).sort().values
-                    query_counts = torch.bincount(sequence[positions], minlength=groups)
+                    query_counts = torch.bincount(sequence[positions], minlength=len(lengths))
                     query_offsets = torch.cat((query_counts.new_zeros(1), query_counts.cumsum(0)))
                     query_position = torch.arange(len(positions), device=values.device) \
                         - torch.repeat_interleave(query_offsets[:-1], query_counts)
@@ -1361,7 +1370,7 @@ class Agent(nn.Module):
                     )
                     current = current[positions] + layer.self_attn.out_proj(attended)
                     current = current + layer.linear2(layer.activation(layer.linear1(layer.norm2(current))))
-                    state = current[query_offsets[:-1]]
+                    state = current[query_offsets[:groups]]
                     items = current[query_position > 0][torch.argsort(order[selected])]
                     return state, items
                 qkv = nn.functional.linear(
@@ -1376,7 +1385,7 @@ class Agent(nn.Module):
                 current = current + layer.self_attn.out_proj(attended)
                 current = current + layer.linear2(layer.activation(layer.linear1(layer.norm2(current))))
             items = current[destination][inverse] if len(values) else values
-            return current[offsets[:-1]], items
+            return current[offsets[:groups]], items
         maximum = int(counts.max().item()) if len(counts) else 0
         sequence = values.new_zeros((groups, maximum + 1, self.width))
         sequence[:, 0] = seed.to(values.dtype)
@@ -1507,7 +1516,7 @@ class Agent(nn.Module):
     def _actions(self, domains, encoded, values, index, nodes, concepts):
         semantic, numeric = values
         action_row, action_flat, _legal, policy_sequence, actions, path, action_count = index
-        action = self.action_encoder(semantic[:action_count], numeric[:action_count], concepts)
+        action = self.action_encoder(semantic, numeric, concepts)[:action_count]
         attached = action.new_zeros(action.shape)
         for domain in range(len(TOKEN_SPECS)):
             _semantic, _numeric, _count, _u, _row, scope, inverse = domains[domain]
@@ -1913,6 +1922,11 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
     globals_ = np.asarray(globals_, np.float32)
     if globals_.shape != (batch, model.layout["globals"]) or not np.isfinite(globals_).all():
         raise ValueError("invalid public globals")
+    pad = model.training and model.global_norm.weight.device.type == "mps"
+    bucket = lambda count: 0 if not count else min(
+        size for power in range(max(1, (count - 1).bit_length()), 64)
+        for size in (3 * (1 << power) // 4, 1 << power) if size >= count
+    )
     tensor = lambda value: torch.as_tensor(value, dtype=torch.long, device=target)
     domain_tensors = []
     inverse_rows = []
@@ -1925,9 +1939,15 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
             ))
         else:
             first = inverse = np.empty(0, np.intp)
+        count = len(first)
+        size = bucket(count) if pad else count
         domain_tensors.append((
-            torch.as_tensor(semantic[first].astype(np.int32), device=target),
-            torch.as_tensor(numeric[first], device=target), len(first),
+            torch.as_tensor(np.pad(
+                semantic[first], ((0, size - count), (0, 0)),
+            ).astype(np.int32), device=target),
+            torch.as_tensor(np.pad(
+                numeric[first], ((0, size - count), (0, 0)),
+            ), device=target), count,
             torch.as_tensor(u.astype(np.int64), device=target),
             torch.as_tensor(row.astype(np.int64), device=target),
             torch.as_tensor(scope.astype(np.int64), device=target),
@@ -1998,11 +2018,31 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
         if len(selected):
             parents, group = np.unique(edge_src[selected], return_inverse=True)
             levels.append((
-                tensor(parents), tensor(edge_dst[selected]), tensor(selected),
-                candidate_index(group, len(parents), target),
-                torch.as_tensor(node_u[node_source[parents], 9].astype(np.float32), device=target),
-                len(parents), len(selected),
+                parents, edge_dst[selected], selected, group,
+                node_u[node_source[parents], 9].astype(np.float32),
             ))
+    if pad:
+        padded = []
+        for parents, children, edges, group, degree in levels:
+            count, edge_count = len(parents), len(children)
+            edge_size = bucket(edge_count)
+            parent_size = bucket(count + (edge_size > edge_count))
+            extra = edge_size - edge_count
+            padded.append((
+                tensor(np.pad(parents, (0, parent_size - count))),
+                tensor(np.pad(children, (0, extra))), tensor(np.pad(edges, (0, extra))),
+                candidate_index(np.r_[group, np.full(extra, count, np.int32)],
+                                parent_size, target, True),
+                torch.as_tensor(np.pad(degree, (0, parent_size - count)), device=target),
+                count, edge_count,
+            ))
+        levels = padded
+    else:
+        levels = [(
+            tensor(parents), tensor(children), tensor(edges),
+            candidate_index(group, len(parents), target),
+            torch.as_tensor(degree, device=target), len(parents), len(children),
+        ) for parents, children, edges, group, degree in levels]
     run_u, _run_s, _run_c, _run_f, run_row, run_scope = domains[DOMAIN["run"]]
     run_source = np.flatnonzero(run_scope == -1)
     current_id = np.full(batch, np.iinfo(np.uint32).max, np.uint32)
@@ -2033,6 +2073,7 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
 
     action_u, _action_s, action_c, action_f = action
     action_count = len(action_u)
+    action_size = bucket(action_count) if pad else action_count
     if action_c.max(initial=0) >= model.concepts.num_embeddings:
         raise ValueError("invalid action semantic id")
     path = np.full(action_count, -1, np.int32)
@@ -2052,8 +2093,12 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
     return (
         torch.as_tensor(character, dtype=torch.long, device=target),
         torch.as_tensor(globals_, device=target), domain_tensors, map_index,
-        (torch.as_tensor(action_c.astype(np.int32), device=target),
-         torch.as_tensor(action_f.astype(np.float32), device=target)),
+        (torch.as_tensor(np.pad(
+            action_c, ((0, action_size - action_count), (0, 0)),
+        ).astype(np.int32), device=target),
+         torch.as_tensor(np.pad(
+             action_f, ((0, action_size - action_count), (0, 0)),
+         ).astype(np.float32), device=target)),
         action_index, torch.as_tensor(legal, device=target),
     )
 
