@@ -1109,7 +1109,8 @@ class TokenEncoder(nn.Module):
     def forward(self, categorical, numeric, embeddings):
         if not len(categorical):
             return self.norm.weight.new_empty((0, len(self.norm.weight)))
-        return self.norm(embeddings(categorical.long()).sum(1) + self.numeric(numeric))
+        return self.norm(nn.functional.embedding(categorical.long(), embeddings).sum(1)
+                         + self.numeric(numeric))
 
 
 class Agent(nn.Module):
@@ -1285,8 +1286,8 @@ class Agent(nn.Module):
         selected = selected + self.graph_ff(self.graph_ff_norm(selected))
         return selected[current_inverse], nodes
 
-    def encode_domains(self, domains):
-        return tuple(self.encoders[name](*values[:2], self.concepts)[:values[2]]
+    def encode_domains(self, domains, concepts):
+        return tuple(self.encoders[name](*values[:2], concepts)[:values[2]]
                      for (name, *_), values in zip(TOKEN_SPECS, domains))
 
     def _tag(self, values, role, collection=None):
@@ -1412,7 +1413,7 @@ class Agent(nn.Module):
                                   name, mode)
         return self._tag(summary[active], 14, collection), active
 
-    def _actors(self, domains, encoded, batch):
+    def _actors(self, domains, encoded, batch, concepts):
         actors, rows, u = self._domain_rows(domains, encoded, DOMAIN["actor"])
         if not len(actors):
             return actors, rows, u, [], []
@@ -1434,8 +1435,8 @@ class Agent(nn.Module):
                 history_semantic, _numeric, _count, _u, _row, _scope, history_inverse = \
                     domains[DOMAIN["history"]]
                 raw = (domains[DOMAIN["history"]][5] == -1).nonzero().squeeze(1)[moves]
-                move_values = self.concepts(
-                    history_semantic[history_inverse[raw], :1]
+                move_values = nn.functional.embedding(
+                    history_semantic[history_inverse[raw], :1].long(), concepts,
                 ).squeeze(1)
                 move_values, move_group = self._ordered(move_values, group[moves])
                 counts = torch.bincount(move_group, minlength=len(actors))
@@ -1489,10 +1490,10 @@ class Agent(nn.Module):
         actors = self.actor_norm(self._tag(actors, 8))
         return actors, rows, u, extra_values, extra_rows
 
-    def _actions(self, domains, encoded, values, index, nodes):
+    def _actions(self, domains, encoded, values, index, nodes, concepts):
         semantic, numeric = values
         action_row, action_flat, _legal, policy_sequence, actions, path, action_count = index
-        action = self.action_encoder(semantic[:action_count], numeric[:action_count], self.concepts)
+        action = self.action_encoder(semantic[:action_count], numeric[:action_count], concepts)
         attached = action.new_zeros(action.shape)
         for domain in range(len(TOKEN_SPECS)):
             _semantic, _numeric, _count, _u, _row, scope, inverse = domains[domain]
@@ -1519,11 +1520,11 @@ class Agent(nn.Module):
         items.index_add_(0, group, values)
         return items, rows[first]
 
-    def encode_state(self, domains, encoded, index, action_values, action_index):
+    def encode_state(self, domains, encoded, index, action_values, action_index, concepts):
         batch = int(domains[DOMAIN["run"]][4].max().item()) + 1
         current, nodes = self.encode_map(encoded, index)
         action, action_rows, action_flat, actions, policy_sequence = self._actions(
-            domains, encoded, action_values, action_index, nodes,
+            domains, encoded, action_values, action_index, nodes, concepts,
         )
         values, rows = [], []
         add = lambda value, row: (values.append(value), rows.append(row))
@@ -1558,7 +1559,9 @@ class Agent(nn.Module):
             role = ("card_pool", "relic_pool", "encounter_pool", "event_pool").index(name) + 4
             add(self._tag(summary, role), torch.arange(batch, device=summary.device))
 
-        actors, actor_rows, actor_u, effect_values, effect_rows = self._actors(domains, encoded, batch)
+        actors, actor_rows, actor_u, effect_values, effect_rows = self._actors(
+            domains, encoded, batch, concepts,
+        )
         combat_rows = actor_rows[actor_u[:, 1] == 0]
         for name, domain, predicate, active in (
             ("deck", DOMAIN["card"], lambda u: u[:, 0] == 0, torch.arange(batch, device=run.device)),
@@ -1611,9 +1614,10 @@ class Agent(nn.Module):
 
     def forward(self, _character, _globals, domains, state_index, action_values, action_index,
                 return_state=False, policy_only=False, flat_policy=False, temperature=1):
-        encoded = self.encode_domains(domains)
+        concepts = self.concepts.flattened()
+        encoded = self.encode_domains(domains, concepts)
         state, action, action_row, action_flat, actions, sequence = self.encode_state(
-            domains, encoded, state_index, action_values, action_index,
+            domains, encoded, state_index, action_values, action_index, concepts,
         )
         scores = self.policy(action).squeeze(-1) / temperature
         legal = torch.ones_like(scores, dtype=torch.bool)
