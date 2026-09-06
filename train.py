@@ -5,19 +5,18 @@ import ctypes
 import fcntl
 import hashlib
 import json
-import logging
 import math
 import multiprocessing
 import os
 import pickle
-import re
 import struct
 import sys
 import tempfile
 import threading
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from contextlib import nullcontext
 from pathlib import Path
 from queue import Empty, Full, Queue
 
@@ -59,145 +58,98 @@ STAGES = [(0, bonus) for bonus in (24, 20, 16, 12, 8, 4, 0)] + [
 ]
 
 
-_EVENT_STREAM = None
+_EVENT_FD = None
+_EVENT_ROLE = None
+_TRAINER_SESSION = None
+_EVENT_LOCK = threading.Lock()
 _ACCELERATOR_LOCK = None
-_GLOG = logging.getLogger()
-_GLOG_THREADS = []
-_GLOG_INFO_FD = None
-_GLOG_ACTIVE = False
-_GLOG_PATTERN = re.compile(
-    rb"^[DIWEF]\d{4} \d{2}:\d{2}:\d{2}\.\d{6} "
-)
+_LOG_CAPTURES = []
+_CONSOLE_FDS = {}
+_LOG_ACTIVE = False
 
 
-class GlogFormatter(logging.Formatter):
-    def __init__(self, role):
-        super().__init__()
-        self.role = role
-
-    def format(self, record):
-        severity = {logging.DEBUG: "D", logging.INFO: "I", logging.WARNING: "W",
-                    logging.ERROR: "E", logging.CRITICAL: "F"}.get(record.levelno, "I")
-        when = datetime.fromtimestamp(record.created)
-        source = Path(record.pathname).name
-        prefix = (
-            f"{severity}{when:%m%d %H:%M:%S}.{when.microsecond:06d} "
-            f"{record.process:06d} {getattr(record, 'native_tid', record.thread):08d} "
-            f"{self.role:<12} {record.threadName:<16} {source:>20}:{record.lineno:05d}] "
-        )
-        message = record.getMessage()
-        if record.exc_info:
-            message += "\n" + self.formatException(record.exc_info)
-        return "\n".join(prefix + line for line in message.splitlines() or [""])
-
-
-class BelowWarning(logging.Filter):
-    def filter(self, record):
-        return record.levelno < logging.WARNING
-
-
-def configure_logging(output, role, level="INFO"):
-    global _GLOG_ACTIVE, _GLOG_INFO_FD
-    if _GLOG_ACTIVE:
+def emit_event(value, level="INFO", console=True):
+    record = {
+        "schema": 1, "time": time.time(), "level": str(level).lower(),
+        "role": _EVENT_ROLE, "trainer_session": _TRAINER_SESSION,
+        "pid": os.getpid(), "thread": threading.get_native_id(),
+    } | value
+    line = (json.dumps(record, separators=(",", ":")) + "\n").encode()
+    if _EVENT_FD is None:
+        sys.__stdout__.write(line.decode()); sys.__stdout__.flush()
         return
-    logs = Path(output) / "logs"
-    logs.mkdir(parents=True, exist_ok=True)
-    info_fd = os.open(logs / f"{role}.INFO", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
-    _GLOG_INFO_FD = info_fd
-    lock = threading.Lock()
-    formatter = GlogFormatter(role)
+    with _EVENT_LOCK:
+        fcntl.flock(_EVENT_FD, fcntl.LOCK_EX)
+        try:
+            pending = memoryview(line)
+            while pending:
+                pending = pending[os.write(_EVENT_FD, pending):]
+        finally:
+            fcntl.flock(_EVENT_FD, fcntl.LOCK_UN)
+    if console and _CONSOLE_FDS:
+        fields = {key: item for key, item in value.items()
+                  if key not in ("event", "metrics", "pipeline", "result", "training", "time")}
+        fields.update({key: item for key, item in value.get("metrics", {}).items()
+                       if isinstance(item, (bool, int, float, str))})
+        message = value.get("event", "event") + " " + " ".join(
+            f"{key}={json.dumps(item, separators=(',', ':'))}" for key, item in fields.items()
+        ) + "\n"
+        fd = 2 if str(level).upper() in ("WARNING", "ERROR") else 1
+        os.write(_CONSOLE_FDS[fd], message.encode())
+
+
+def configure_logging(output, role, level="INFO", trainer_session=None):
+    global _EVENT_FD, _EVENT_ROLE, _TRAINER_SESSION, _LOG_ACTIVE
+    if _LOG_ACTIVE:
+        return
+    _EVENT_FD = os.open(Path(output) / "events.jsonl", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    _EVENT_ROLE = role
+    _TRAINER_SESSION = trainer_session
 
     def capture(fd, name, severity):
         saved = os.dup(fd)
         read_fd, write_fd = os.pipe()
         os.dup2(write_fd, fd); os.close(write_fd)
-        capture_fd = os.open(
-            logs / f"{role}.{name}", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644,
-        )
 
         def forward():
             with os.fdopen(read_fd, "rb", buffering=0) as source:
                 for raw in iter(source.readline, b""):
                     raw = raw.rstrip(b"\r\n")
-                    if _GLOG_PATTERN.match(raw):
-                        line = raw + b"\n"
-                    else:
-                        record = logging.LogRecord(
-                            "external", severity, f"<{name}>", 0,
-                            raw.decode(errors="replace"), (), None,
-                        )
-                        record.native_tid = threading.get_native_id()
-                        line = (formatter.format(record) + "\n").encode()
-                    os.write(saved, line)
-                    with lock:
-                        os.write(capture_fd, line)
-                        os.write(info_fd, line)
-            os.close(capture_fd); os.close(saved)
+                    os.write(saved, raw + b"\n")
+                    emit_event({"event": "log", "stream": name,
+                                "message": raw.decode(errors="replace")}, severity, False)
 
         thread = threading.Thread(target=forward, name=f"{name}-capture", daemon=True)
-        thread.start(); _GLOG_THREADS.append(thread)
+        thread.start(); _LOG_CAPTURES.append((fd, saved, thread)); _CONSOLE_FDS[fd] = saved
 
     sys.stdout.flush(); sys.stderr.flush()
-    capture(1, "stdout", logging.INFO)
-    capture(2, "stderr", logging.WARNING)
+    capture(1, "stdout", "INFO")
+    capture(2, "stderr", "WARNING")
     sys.stdout.reconfigure(line_buffering=True)
     sys.stderr.reconfigure(line_buffering=True)
-    factory = logging.getLogRecordFactory()
-
-    def record_factory(*args, **kwargs):
-        record = factory(*args, **kwargs)
-        record.native_tid = threading.get_native_id()
-        return record
-
-    logging.setLogRecordFactory(record_factory)
-    _GLOG.handlers.clear()
-    _GLOG.setLevel(getattr(logging, level.upper()))
-    stdout = logging.StreamHandler(sys.stdout); stdout.addFilter(BelowWarning())
-    stderr = logging.StreamHandler(sys.stderr); stderr.setLevel(logging.WARNING)
-    for handler in (stdout, stderr):
-        handler.setFormatter(formatter); _GLOG.addHandler(handler)
-    _GLOG.propagate = False
-    logging.captureWarnings(True)
     sts2_sim.configure_logging(role, level)
-    _GLOG_ACTIVE = True
-    _GLOG.info("logging_started info=%s stdout=%s stderr=%s",
-               logs / f"{role}.INFO", logs / f"{role}.stdout", logs / f"{role}.stderr")
+    _LOG_ACTIVE = True
+    emit_event({"event": "logging_started"})
 
 
 def shutdown_logging():
-    global _GLOG_ACTIVE
-    if not _GLOG_ACTIVE:
+    global _EVENT_FD, _EVENT_ROLE, _TRAINER_SESSION, _LOG_ACTIVE
+    if not _LOG_ACTIVE:
         return
-    sys.stdout.flush(); sys.stderr.flush(); logging.shutdown()
-    for fd in (1, 2):
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-    for thread in _GLOG_THREADS:
-        thread.join(2)
-    if _GLOG_INFO_FD is not None:
-        os.close(_GLOG_INFO_FD)
-    _GLOG_ACTIVE = False
+    sys.stdout.flush(); sys.stderr.flush()
+    for fd, saved, _ in _LOG_CAPTURES:
+        os.dup2(saved, fd)
+    for _, saved, thread in _LOG_CAPTURES:
+        thread.join()
+        os.close(saved)
+    _LOG_CAPTURES.clear()
+    _CONSOLE_FDS.clear()
+    os.close(_EVENT_FD)
+    _EVENT_FD = _EVENT_ROLE = _TRAINER_SESSION = None
+    _LOG_ACTIVE = False
 
 
 atexit.register(shutdown_logging)
-
-
-def emit_event(value, level=logging.INFO):
-    line = json.dumps(value, separators=(",", ":"))
-    if _EVENT_STREAM is None:
-        print(line, flush=True)
-    else:
-        print(line, file=_EVENT_STREAM, flush=True)
-    fields = {key: item for key, item in value.items()
-              if key not in ("event", "metrics", "pipeline", "result")}
-    if "metrics" in value:
-        fields.update({key: item for key, item in value["metrics"].items()
-                       if isinstance(item, (bool, int, float, str))})
-    _GLOG.log(level, "%s %s", value.get("event", "event"),
-              " ".join(f"{key}={json.dumps(item, separators=(',', ':'))}"
-                       for key, item in fields.items()), stacklevel=2)
 
 _TRAINING_METAL = r"""
 #include <metal_stdlib>
@@ -2604,20 +2556,18 @@ class RolloutCollector:
         self.native_started = np.full(args.envs, time.monotonic())
 
     def event(self, event, **values):
-        _GLOG.info("%s %s", event, " ".join(
-            f"{key}={json.dumps(value, separators=(',', ':'))}" for key, value in values.items()
-        ), stacklevel=2)
+        emit_event({"event": event, "role": f"sampler-{self.worker}", **values})
 
     def trace_empty(self, kind, indices, characters, stats):
         seeds = self.env.seeds()
-        with (Path(self.args.output) / "empty-actions.jsonl").open("a") as output:
-            for index in indices:
-                output.write(json.dumps({
-                    "kind": kind, "sampler_session": self.sampler_session, "worker": self.worker,
-                    "iteration": self.iteration, "env": index, "seed": seeds[index],
-                    "character": int(characters[index]), "stage": self.stage,
-                    "stats": list(stats[index]), "actions": self.action_history[index],
-                }) + "\n")
+        for index in indices:
+            emit_event({
+                "event": "empty_actions", "role": f"sampler-{self.worker}",
+                "kind": kind, "sampler_session": self.sampler_session, "worker": self.worker,
+                "iteration": self.iteration, "env": index, "seed": seeds[index],
+                "character": int(characters[index]), "stage": self.stage,
+                "stats": list(stats[index]), "actions": self.action_history[index],
+            }, "WARNING")
 
     def collect(self, model, target, precision, deadline, steps, version, stop=None,
                 heartbeat=None, progress=None):
@@ -2957,7 +2907,8 @@ def collect_worker(model, args, sampler_session, stage, capacity, pending_capaci
         _ACCELERATOR_LOCK.close()
         _ACCELERATOR_LOCK = None
     if args.sampler_backend == "process":
-        configure_logging(args.output, f"sampler-{worker}", getattr(args, "log_level", "INFO"))
+        configure_logging(args.output, f"sampler-{worker}", getattr(args, "log_level", "INFO"),
+                          args.trainer_session)
     qos = getattr(ctypes.CDLL(None), "pthread_set_qos_class_self_np", None)
     if qos is not None:
         qos(int(os.environ.get("ACTOR_QOS", "0x11"), 0), 0)
@@ -2996,9 +2947,8 @@ def collect_worker(model, args, sampler_session, stage, capacity, pending_capaci
             sampled=result[3]["sampled_steps"], discarded=result[3]["discarded_steps"],
         )
         results.put(result)
-    except BaseException:
-        collector.event("error", version=version)
-        _GLOG.exception("sampler_failed version=%d", version)
+    except BaseException as error:
+        collector.event("error", version=version, error=repr(error), traceback=traceback.format_exc())
         raise
     finally:
         if args.sampler_backend == "process":
@@ -3809,7 +3759,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 "time": time.time(), "event": "sampler_failure", "worker": worker,
                 "generation": sampler_generations[worker], "wedged": wedged,
                 "exitcode": exitcode, "dropped": dropped,
-            }, logging.WARNING)
+            }, "WARNING")
             if (sampler_restart_streaks[worker] >= args.sampler_restarts or stop.is_set()
                     or time.monotonic() >= deadline or decisions >= budget):
                 sampler_exhausted[worker] = True
@@ -3844,12 +3794,12 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     queue_size = samples.qsize()
                 except NotImplementedError:
                     queue_size = -1
-                _GLOG.info(
-                    "heartbeat decisions=%d sampled=%d updates=%d dataset=%d expert=%d "
-                    "queue=%d sampler_version=%d sampler_age_s=%.1f",
-                    decisions, sampled, updates, len(dataset), len(expert_dataset), queue_size,
-                    latest_sampler_version, max(now - value for value in heartbeat[:]),
-                )
+                emit_event({
+                    "event": "heartbeat", "decisions": decisions, "sampled": sampled,
+                    "updates": updates, "dataset": len(dataset), "expert": len(expert_dataset),
+                    "queue": queue_size, "sampler_version": latest_sampler_version,
+                    "sampler_age_seconds": max(now - value for value in heartbeat[:]),
+                })
                 next_heartbeat_log = now + 10
             sampler_done = (stop.is_set() or all(not worker.is_alive() for worker in workers)) and samples.empty()
             if not pending:
@@ -4300,25 +4250,23 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             update_elapsed = time.monotonic() - update_started
             update_seconds += update_elapsed
             update_durations.append(update_elapsed)
-            _GLOG.info(
-                "optimizer_update update=%d rows=%d expert_rows=%d replay=%d "
-                "policy_loss=%.6g expert_loss=%.6g ppo_head_grad=%.6g expert_head_grad=%.6g "
-                "expert_grad_cosine=%.6g critic_loss=%.6g search_consistency_loss=%.6g "
-                "critic_expected=%.6g "
-                "critic_win_probability=%.6g entropy=%.6g "
-                "pre_kl=%.6g post_kl=%.6g seconds=%.3f",
-                updates, fresh_rows, expert_count, len(replay), float(policy_loss.detach()),
-                float(expert_loss.detach()),
-                float(ppo_head_grad.detach()) if ppo_head_grad is not None else 0,
-                float(expert_head_grad.detach()) if expert_head_grad is not None else 0,
-                float(expert_ppo_grad_cosine.detach())
+            emit_event({
+                "event": "optimizer_update", "update": updates, "rows": fresh_rows,
+                "expert_rows": expert_count, "replay": len(replay),
+                "policy_loss": float(policy_loss.detach()),
+                "expert_loss": float(expert_loss.detach()),
+                "ppo_head_grad": float(ppo_head_grad.detach()) if ppo_head_grad is not None else 0,
+                "expert_head_grad": float(expert_head_grad.detach())
+                if expert_head_grad is not None else 0,
+                "expert_grad_cosine": float(expert_ppo_grad_cosine.detach())
                 if expert_ppo_grad_cosine is not None else 0,
-                float(value_loss.detach()), float(search_consistency_loss.detach()),
-                float(critic_expected(probabilities).mean()),
-                float(probabilities[:, -1].mean()),
-                float(entropy.detach()),
-                kl_value, post_kl, update_elapsed,
-            )
+                "critic_loss": float(value_loss.detach()),
+                "search_consistency_loss": float(search_consistency_loss.detach()),
+                "critic_expected": float(critic_expected(probabilities).mean()),
+                "critic_win_probability": float(probabilities[:, -1].mean()),
+                "entropy": float(entropy.detach()), "pre_kl": kl_value,
+                "post_kl": post_kl, "seconds": update_elapsed,
+            })
             if update_elapsed > 5:
                 packed = rows + expert_rows + [sample[0] for sample in replay]
                 represented_actions = max(packed_action_count(row) for row in packed)
@@ -4331,7 +4279,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     "legal_actions_max": max(packed_legal_count(row) for row in packed),
                     "unpack_seconds": unpack_seconds,
                     "forward_seconds": forward_seconds, "backward_seconds": backward_seconds,
-                }}, logging.WARNING)
+                }}, "WARNING")
             absolute = base_decisions + handled
             if absolute >= next_save:
                 save_step(absolute)
@@ -5016,7 +4964,49 @@ def repartition_optimizer(state, index_groups):
         for scale in [template.get("lr_scale", 1.)]
     ]
     return True
-
+def logged_history(run, manifest):
+    reports, promotions = {}, {}
+    sessions = manifest.get("sessions", [])
+    session = parent_step = None
+    starts = 0
+    saw_report = saw_promotion = False
+    try:
+        lines = (run / "events.jsonl").open()
+    except OSError:
+        lines = ()
+    with lines if lines else nullcontext(lines):
+        for line in lines:
+            try:
+                row = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            event = row.get("event")
+            if event == "start" and row.get("role") in (None, "learner"):
+                saved = sessions[starts] if starts < len(sessions) else {}
+                starts += 1
+                parent_step = row.get("parent_checkpoint_step", saved.get("step"))
+                session = row.get("trainer_session", saved.get("id", starts))
+                if (reports or promotions) and parent_step is not None:
+                    reports = {step: report for step, report in reports.items()
+                               if step <= int(parent_step)}
+                    promotions = {step: promotion for step, promotion in promotions.items()
+                                  if step <= int(parent_step)}
+            elif event == "report":
+                saw_report = True
+                try:
+                    row["_written"] = row.get("time")
+                    row["_trainer_session"] = row.get("trainer_session", session)
+                    reports[int(row["step"])] = row
+                except (KeyError, TypeError, ValueError):
+                    pass
+            elif event == "promotion":
+                saw_promotion = True
+                try:
+                    row["_written"] = row.get("time")
+                    promotions[int(row["step"])] = row
+                except (KeyError, TypeError, ValueError):
+                    pass
+    return reports, promotions, session, parent_step, saw_report, saw_promotion
 
 
 def dashboard(target):
@@ -5029,22 +5019,25 @@ def dashboard(target):
         except (OSError, json.JSONDecodeError):
             continue
         run = path.parent
-        reports = {}
-        for report in list((run / "reports").glob("*.json")) + [run / "live.json"]:
-            try:
-                row = json.loads(report.read_text())
-                row["_written"] = report.stat().st_mtime
-                reports[int(row["step"])] = row
-            except (OSError, json.JSONDecodeError, KeyError, ValueError):
-                pass
-        promotions = {}
-        for promotion in (run / "promotions").glob("*.json"):
-            try:
-                row = json.loads(promotion.read_text())
-                row["_written"] = promotion.stat().st_mtime
-                promotions[int(row["step"])] = row
-            except (OSError, json.JSONDecodeError, KeyError, ValueError):
-                pass
+        reports, promotions, trainer_session, parent_step, logged_reports, logged_promotions = \
+            logged_history(run, manifest)
+        if not logged_reports:
+            for report in list((run / "reports").glob("*.json")) + [run / "live.json"]:
+                try:
+                    row = json.loads(report.read_text())
+                    row["_written"] = report.stat().st_mtime
+                    row["_trainer_session"] = row.get("trainer_session")
+                    reports[int(row["step"])] = row
+                except (OSError, json.JSONDecodeError, KeyError, ValueError):
+                    pass
+        if not logged_promotions:
+            for promotion in (run / "promotions").glob("*.json"):
+                try:
+                    row = json.loads(promotion.read_text())
+                    row["_written"] = promotion.stat().st_mtime
+                    promotions[int(row["step"])] = row
+                except (OSError, json.JSONDecodeError, KeyError, ValueError):
+                    pass
         if not reports:
             archived = {}
             for suffix in ("live", "train"):
@@ -5092,7 +5085,9 @@ def dashboard(target):
              "step": reports[key]["step"], "stage": reports[key].get("stage", {}),
              "description": reports[key].get("description", ""),
              "pipeline": reports[key].get("pipeline", []),
-             "metrics": dict(reports[key]["metrics"]), "_written": reports[key].get("_written")}
+             "metrics": dict(reports[key]["metrics"]), "_written": reports[key].get("_written"),
+             "_session": f"{name}:{reports[key].get('_trainer_session')}:"
+                         f"{reports[key].get('sampler_session')}"}
             for index, key in enumerate(sorted(reports), 1)
         ]
         for row in report_rows:
@@ -5151,9 +5146,13 @@ def dashboard(target):
                 "reports": version_reports,
                 "promotions": [promotions[key] for key in sorted(promotions) if low <= key <= high],
                 "best": best if version == manifest.get("model_version") else None, "live": live,
+                "trainer_session": trainer_session, "parent_checkpoint_step": parent_step,
             }
             if live:
-                atomic_live(run / "live.js", {"version": version, "report": version_reports[-1]})
+                atomic_live(run / "live.js", {
+                    "version": version, "trainer_session": trainer_session,
+                    "parent_checkpoint_step": parent_step, "report": version_reports[-1],
+                })
     def history(name, seen=()):
         row = runs[name]
         source = Path(row["source"]).resolve() if row["source"] else None
@@ -5178,7 +5177,7 @@ def dashboard(target):
 body{font:14px system-ui;margin:24px;background:#101319;color:#e8ecf2}h1,h2{margin-bottom:6px}.controls{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:22px}select,input{padding:7px;background:#202938;color:#e8ecf2;border:1px solid #526176;border-radius:5px}.charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(440px,1fr));gap:14px}.panel{margin:22px 0;padding:16px;background:#171d28;border:1px solid #303a49;border-radius:10px}.charts .panel{margin:0}.plot{height:340px;min-width:0}table{border-collapse:collapse;width:100%}th,td{padding:7px;border-bottom:1px solid #303a49;text-align:left}.yes{color:#75db91}.no{color:#ee7b7b}
 </style><h1 id=title>Spirefysh dashboard</h1><div class=controls><label>Run <select id=version></select></label><label>X axis <select id=xaxis><option value=updates>Optimizer steps</option><option value=decisions selected># decisions</option><option value=time>Wall-clock time</option></select></label><label><input id=smooth type=checkbox checked> EMA</label><label>EMA α <input id=ema type=number min=.01 max=1 step=.01 value=.2></label><span>Auto-refresh 15s</span></div><div class=charts><section class=panel><h2>Mean advantage</h2><div id=advantage class=plot></div></section><section class=panel><h2>Decisions / second</h2><div id=throughput class=plot></div></section><section class=panel><h2>Terminal floor</h2><div id=floor class=plot></div></section><section class=panel><h2>Ascension</h2><div id=ascension class=plot></div></section><section class=panel><h2>Bonus strength</h2><div id=bonus class=plot></div></section><section class=panel><h2>Win proportion</h2><div id=wins class=plot></div></section><section class=panel><h2>Clip fraction</h2><div id=clip class=plot></div></section><section class=panel><h2>KL</h2><div id=kl class=plot></div></section><section class=panel><h2>Entropy</h2><div id=entropy class=plot></div></section></div><section class=panel><h2>Promotion</h2><div id=promotion></div></section><script>const versions=""" + data + r""",versionSelect=document.querySelector('#version'),xaxis=document.querySelector('#xaxis'),smooth=document.querySelector('#smooth'),ema=document.querySelector('#ema');
 const characterNames=['Ironclad','Defect','Silent','Regent','Necrobinder'],characterColors=['#ef4444','#38bdf8','#22c55e','#f59e0b','#a78bfa'],names=Object.keys(versions),config={responsive:true,displaylogo:false},refreshKey='spirefysh-dashboard',saved=(()=>{try{return JSON.parse(sessionStorage.getItem(refreshKey))}catch{return null}})();let timeOrigin=0;versionSelect.innerHTML=names.map(name=>`<option value="${name}">V${versions[name].version} · ${name}</option>`).join('');versionSelect.value=saved?.followLatest?names.at(-1):names.includes(saved?.version)?saved.version:names.at(-1)||'';if(saved?.xaxis)xaxis.value=saved.xaxis==='iteration'?'updates':saved.xaxis;if(typeof saved?.smooth==='boolean')smooth.checked=saved.smooth;if(saved?.ema)ema.value=saved.ema;
-function updateSteps(history,run){const starts=(run.manifest.sessions||[]).map(session=>Number(session.step)).sort((left,right)=>left-right);let offset=0,last=0,previous=-Infinity,index=0;for(const report of history){let boundary=false;while(starts[index]<report.step){boundary||=starts[index]>previous;index++}const updates=Number(report.metrics.updates)||0;if(boundary||updates<last){offset+=last;last=0}report._updates=offset+updates;last=Math.max(last,updates);previous=report.step}}function x(report){return xaxis.value==='time'?(Number.isFinite(Number(report._written))?(report._written-timeOrigin)/60:(report.metrics.seconds||0)/60):xaxis.value==='decisions'?report.step:report._updates}function series(history,key){return history.map(report=>({x:x(report),y:Number(report.metrics[key])})).filter(point=>Number.isFinite(point.y))}
+function updateSteps(history){let offset=0,last=0,session;for(const report of history){const updates=Number(report.metrics.updates)||0;if(session!==undefined&&(report._session!==session||updates<last)){offset+=last;last=0}report._updates=offset+updates;last=Math.max(last,updates);session=report._session}}function x(report){return xaxis.value==='time'?(Number.isFinite(Number(report._written))?(report._written-timeOrigin)/60:(report.metrics.seconds||0)/60):xaxis.value==='decisions'?report.step:report._updates}function series(history,key){return history.map(report=>({x:x(report),y:Number(report.metrics[key])})).filter(point=>Number.isFinite(point.y))}
 function emaLine(points){const alpha=Math.max(.01,Math.min(1,Number(ema.value)||.2));let value;return points.map((point,index)=>({x:point.x,y:value=index?alpha*point.y+(1-alpha)*value:point.y}))}
 function stageTransitions(history,run){const promotions=(run?.promotions||[]).filter(row=>row.promoted);if(promotions.length)return promotions.map(promotion=>{const report=history.find(row=>row.step===promotion.step)||history.filter(row=>row.step<=promotion.step).at(-1),after=history.find(row=>row.step>promotion.step),next=run.manifest.stages?.[(promotion.stage?.index??-1)+1]||after?.stage,position=xaxis.value==='decisions'?promotion.step:report&&xaxis.value==='updates'?report._updates:Number.isFinite(Number(promotion._written))?(promotion._written-timeOrigin)/60:Number.isFinite(Number(promotion.seconds))?promotion.seconds/60:report?x(report):NaN;return{x:position,stage:next}}).filter(point=>Number.isFinite(Number(point.x)));return history.slice(1).flatMap((row,index)=>Number.isFinite(Number(row.stage?.ascension))&&Number.isFinite(Number(history[index].stage?.ascension))&&(row.stage.ascension!==history[index].stage.ascension||row.stage.bonus!==history[index].stage.bonus)?[{x:x(row),stage:row.stage}]:[])}
 function stageLines(history,run){return stageTransitions(history,run).map(point=>({type:'line',xref:'x',yref:'paper',x0:point.x,x1:point.x,y0:0,y1:1,layer:'below',line:{color:'rgba(232,236,242,.38)',width:1,dash:'dash'}}))}
@@ -5189,8 +5188,8 @@ function stagePlot(id,history,key,color,run){const rows=history.filter(row=>Numb
 function promotionSummary(row){if(!row)return '<p>No promotion check yet.</p>';const characters=row.result?.characters||[],rows=characters.map(item=>`<tr><td>${characterNames[item.character]??`Character ${item.character}`}</td><td>${item.wins}/${item.runs}</td><td>${(100*item.wins/item.runs).toFixed(1)}%</td><td>${Number(item.floor_mean).toFixed(2)}</td><td>${item.caps}</td></tr>`).join('');return `<p class="${row.promoted?'yes':'no'}">${row.promoted?'Promoted':'Stayed at current stage'} · threshold ${(100*row.threshold).toFixed(0)}% per character · seed ${row.seed}</p><table><thead><tr><th>Character</th><th>Wins</th><th>Rate</th><th>Mean floor</th><th>Caps</th></tr></thead><tbody>${rows}</tbody></table>`}
 function saveDashboardState(){const views={};document.querySelectorAll('.plot').forEach(node=>{const view={};if(node._fullLayout?.xaxis?.autorange===false)view.x=[...node._fullLayout.xaxis.range];if(node._fullLayout?.yaxis?.autorange===false)view.y=[...node._fullLayout.yaxis.range];if(view.x||view.y)views[node.id]=view});try{sessionStorage.setItem(refreshKey,JSON.stringify({version:versionSelect.value,followLatest:versionSelect.value===names.at(-1),xaxis:xaxis.value,smooth:smooth.checked,ema:ema.value,scroll:[scrollX,scrollY],views}))}catch{}}
 function restoreDashboardState(){if(saved?.version===versionSelect.value&&saved.xaxis===xaxis.value)for(const [id,view] of Object.entries(saved.views||{})){const update={};if(view.x)update['xaxis.range']=view.x;if(view.y)update['yaxis.range']=view.y;if(Object.keys(update).length)Plotly.relayout(id,update)}if(saved?.scroll)scrollTo(...saved.scroll)}
-function showVersion(){const run=versions[versionSelect.value],reports=run.reports;updateSteps(reports,run);const timed=reports.find(row=>Number.isFinite(Number(row._written))&&Number.isFinite(Number(row.metrics.seconds)));timeOrigin=timed?timed._written-timed.metrics.seconds:0;document.querySelector('#title').textContent=`Spirefysh V${run.version} · ${run.run}`;plot('advantage',series(reports,'mean_advantage'),{history:reports,run});plot('throughput',series(reports,'decisions_per_second'),{tozero:true,history:reports,run});floorPlot(reports,run);stagePlot('ascension',reports,'ascension','#fb7185',run);stagePlot('bonus',reports,'bonus','#f59e0b',run);plot('wins',reports.map(row=>({x:x(row),y:row.metrics.wins/Math.max(1,row.metrics.episodes)})),{range:[0,1],percent:true,history:reports,run});plot('clip',series(reports,'clip_fraction'),{range:[0,1],percent:true,history:reports,run});plot('kl',series(reports,'kl'),{tozero:true,history:reports,run});plot('entropy',series(reports,'entropy'),{tozero:true,history:reports,run});document.querySelector('#promotion').innerHTML=promotionSummary(run.promotions.at(-1))}
-function refreshLive(){const selected=versionSelect.value,run=versions[selected];if(!run?.live)return;const script=document.createElement('script');script.src=encodeURI(run.live)+`?${Date.now()}`;script.onload=()=>{script.remove();const live=window.spirefyshLive;if(versionSelect.value!==selected||live?.version!==run.version)return;const report=live.report,last=run.reports.at(-1);if(!last||report.step>last.step||report._written>last._written){run.reports=[...run.reports.filter(row=>row.step!==report.step),report].sort((a,b)=>a.step-b.step);showVersion()}};script.onerror=()=>script.remove();document.head.append(script)}
+function showVersion(){const run=versions[versionSelect.value],reports=run.reports;updateSteps(reports);const timed=reports.find(row=>Number.isFinite(Number(row._written))&&Number.isFinite(Number(row.metrics.seconds)));timeOrigin=timed?timed._written-timed.metrics.seconds:0;document.querySelector('#title').textContent=`Spirefysh V${run.version} · ${run.run}`;plot('advantage',series(reports,'mean_advantage'),{history:reports,run});plot('throughput',series(reports,'decisions_per_second'),{tozero:true,history:reports,run});floorPlot(reports,run);stagePlot('ascension',reports,'ascension','#fb7185',run);stagePlot('bonus',reports,'bonus','#f59e0b',run);plot('wins',reports.map(row=>({x:x(row),y:row.metrics.wins/Math.max(1,row.metrics.episodes)})),{range:[0,1],percent:true,history:reports,run});plot('clip',series(reports,'clip_fraction'),{range:[0,1],percent:true,history:reports,run});plot('kl',series(reports,'kl'),{tozero:true,history:reports,run});plot('entropy',series(reports,'entropy'),{tozero:true,history:reports,run});document.querySelector('#promotion').innerHTML=promotionSummary(run.promotions.at(-1))}
+function refreshLive(){const selected=versionSelect.value,run=versions[selected];if(!run?.live)return;const script=document.createElement('script');script.src=encodeURI(run.live)+`?${Date.now()}`;script.onload=()=>{script.remove();const live=window.spirefyshLive;if(versionSelect.value!==selected||live?.version!==run.version)return;let changed=false;if(live.trainer_session!==run.trainer_session){run.reports=run.reports.filter(row=>row.step<=live.parent_checkpoint_step);run.trainer_session=live.trainer_session;changed=true}const report=live.report;report._session=`${selected}:${live.trainer_session}:${report.sampler_session}`;const last=run.reports.at(-1);if(!last||report.step>last.step||report._written>last._written){run.reports=[...run.reports.filter(row=>row.step!==report.step),report].sort((a,b)=>a.step-b.step);changed=true}if(changed)showVersion()};script.onerror=()=>script.remove();document.head.append(script)}
 versionSelect.onchange=showVersion;xaxis.onchange=showVersion;smooth.onchange=showVersion;ema.oninput=showVersion;showVersion();setTimeout(restoreDashboardState,100);window.addEventListener('beforeunload',saveDashboardState);setInterval(refreshLive,15000)</script>"""
     content = content.replace(
         "<section class=panel><h2>Entropy</h2><div id=entropy class=plot></div></section></div><section class=panel><h2>Promotion</h2>",
@@ -5211,7 +5210,7 @@ versionSelect.onchange=showVersion;xaxis.onchange=showVersion;smooth.onchange=sh
     )
     floor_start = content.index("function floorPlot(")
     floor_end = content.index("function stagePlot(", floor_start)
-    content = content[:floor_start] + r"""function floorPlot(history,run){const completed=history.filter(report=>Number(report.metrics.episodes)>0||(report.metrics.trajectory_floors?.length??0)>0),points=[],traces=[],bands=[['min','max','min–max','.04'],['p01','p99','p1–p99','.06'],['p05','p95','p5–p95','.09'],['p10','p90','p10–p90','.13'],['p25','p75','p25–p75','.20']];for(const [low,high,name,alpha] of bands){const rows=completed.map(report=>({x:x(report),low:report.metrics.floor_bands?.[low],high:report.metrics.floor_bands?.[high]})).filter(row=>Number.isFinite(row.low)&&Number.isFinite(row.high));traces.push({x:rows.map(row=>row.x),y:rows.map(row=>row.low),mode:'lines',showlegend:false,hoverinfo:'skip',line:{width:0}},{x:rows.map(row=>row.x),y:rows.map(row=>row.high),mode:'lines',name,line:{width:0},fill:'tonexty',fillcolor:`rgba(111,177,255,${alpha})`,hovertemplate:`${name}<br>upper %{y:.2f}<extra></extra>`})}for(const report of completed){let inferred=0,last=-Infinity;for(const row of report.metrics.trajectory_floors||[]){const [iteration,floor,stored]=row;if(stored===undefined&&iteration<last)inferred++;const character=stored??Math.min(inferred,4);points.push({x:xaxis.value==='updates'?report._updates:xaxis.value==='decisions'?report.step:(report.metrics.seconds||0)/60,y:floor,character,updates:report._updates,step:report.step});last=iteration}}for(let i=points.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[points[i],points[j]]=[points[j],points[i]]}traces.push({x:points.map(point=>point.x),y:points.map(point=>point.y),customdata:points.map(point=>[characterNames[point.character],point.updates,point.step]),mode:'markers',name:'trajectories',marker:{color:points.map(point=>characterColors[point.character]),size:5,opacity:.28},hovertemplate:'%{customdata[0]}<br>floor %{y}<br>optimizer steps %{customdata[1]:,}<br>report decisions %{customdata[2]:,}<extra></extra>'});const means=completed.map(report=>({x:x(report),y:report.metrics.floor_bands?.mean??report.metrics.floor_mean})).filter(point=>Number.isFinite(point.y));traces.push({x:means.map(point=>point.x),y:means.map(point=>point.y),mode:'lines+markers',name:'mean',line:{color:'#ffb454',width:3},marker:{size:5},hovertemplate:'mean %{y:.2f}<extra></extra>'});if(smooth.checked&&means.length>1){const line=emaLine(means);traces.push({x:line.map(point=>point.x),y:line.map(point=>point.y),mode:'lines',name:`mean EMA α=${Number(ema.value)||.2}`,line:{color:'#f97316',width:2,dash:'dot'},hovertemplate:'mean EMA %{y:.2f}<extra></extra>'})}for(const [character,name] of characterNames.entries())traces.push({x:[null],y:[null],mode:'markers',name,hoverinfo:'skip',marker:{color:characterColors[character],size:7,opacity:.6}});const options=layout(false,[0,52],history,run);options.yaxis.title='Terminal floor';Plotly.react('floor',traces,options,config)}
+    content = content[:floor_start] + r"""function floorPlot(history,run){const completed=history.filter(report=>Number(report.metrics.episodes)>0||(report.metrics.trajectory_floors?.length??0)>0),points=[],traces=[],bands=[['min','max','min–max','.04'],['p01','p99','p1–p99','.06'],['p05','p95','p5–p95','.09'],['p10','p90','p10–p90','.13'],['p25','p75','p25–p75','.20']];for(const [low,high,name,alpha] of bands){const rows=completed.map(report=>({x:x(report),low:report.metrics.floor_bands?.[low],high:report.metrics.floor_bands?.[high]})).filter(row=>Number.isFinite(row.low)&&Number.isFinite(row.high));traces.push({x:rows.map(row=>row.x),y:rows.map(row=>row.low),mode:'lines',showlegend:false,hoverinfo:'skip',line:{width:0}},{x:rows.map(row=>row.x),y:rows.map(row=>row.high),mode:'lines',name,line:{width:0},fill:'tonexty',fillcolor:`rgba(111,177,255,${alpha})`,hovertemplate:`${name}<br>upper %{y:.2f}<extra></extra>`})}for(const report of completed){let inferred=0,last=-Infinity;for(const row of report.metrics.trajectory_floors||[]){const [iteration,floor,stored]=row;if(stored===undefined&&iteration<last)inferred++;const character=stored??Math.min(inferred,4);points.push({x:x(report),y:floor,character,updates:report._updates,step:report.step});last=iteration}}for(let i=points.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[points[i],points[j]]=[points[j],points[i]]}traces.push({x:points.map(point=>point.x),y:points.map(point=>point.y),customdata:points.map(point=>[characterNames[point.character],point.updates,point.step]),mode:'markers',name:'trajectories',marker:{color:points.map(point=>characterColors[point.character]),size:5,opacity:.28},hovertemplate:'%{customdata[0]}<br>floor %{y}<br>optimizer steps %{customdata[1]:,}<br>report decisions %{customdata[2]:,}<extra></extra>'});const means=completed.map(report=>({x:x(report),y:report.metrics.floor_bands?.mean??report.metrics.floor_mean})).filter(point=>Number.isFinite(point.y));traces.push({x:means.map(point=>point.x),y:means.map(point=>point.y),mode:'lines+markers',name:'mean',line:{color:'#ffb454',width:3},marker:{size:5},hovertemplate:'mean %{y:.2f}<extra></extra>'});if(smooth.checked&&means.length>1){const line=emaLine(means);traces.push({x:line.map(point=>point.x),y:line.map(point=>point.y),mode:'lines',name:`mean EMA α=${Number(ema.value)||.2}`,line:{color:'#f97316',width:2,dash:'dot'},hovertemplate:'mean EMA %{y:.2f}<extra></extra>'})}for(const [character,name] of characterNames.entries())traces.push({x:[null],y:[null],mode:'markers',name,hoverinfo:'skip',marker:{color:characterColors[character],size:7,opacity:.6}});const options=layout(false,[0,52],history,run);options.yaxis.title='Terminal floor';Plotly.react('floor',traces,options,config)}
 """ + content[floor_end:]
     target.mkdir(parents=True, exist_ok=True)
     temporary = target / "dashboard.html.tmp"
@@ -5220,7 +5219,6 @@ versionSelect.onchange=showVersion;xaxis.onchange=showVersion;smooth.onchange=sh
 
 
 def train(args):
-    global _EVENT_STREAM
     if args.expert_batch is None:
         args.expert_batch = args.batch
     qos = getattr(ctypes.CDLL(None), "pthread_set_qos_class_self_np", None)
@@ -5337,13 +5335,8 @@ def train(args):
     except BlockingIOError as error:
         raise RuntimeError(f"trainer already running for {output}") from error
     training_lock.seek(0); training_lock.truncate(); training_lock.write(str(os.getpid())); training_lock.flush()
-    configure_logging(output, "learner", args.log_level)
-    _EVENT_STREAM = (output / "events.jsonl").open("a", buffering=1)
     training = {key: value for key, value in vars(args).items() if key != "command"}
-    emit_event({
-        "time": time.time(), "event": "start", "pid": os.getpid(),
-        "model_version": MODEL_VERSION, "checkpoint": args.checkpoint, "training": training,
-    })
+    parent_checkpoint_sha256 = sha256_file(Path(args.checkpoint)) if source else None
     manifest = json.loads((output / "run.json").read_text()) if continuing else {
         "schema": 1, "model_version": MODEL_VERSION, "feature_version": FEATURE_VERSION,
         "fingerprint": probe_env.fingerprint(), "layout": layout, "precision": args.precision,
@@ -5381,14 +5374,24 @@ def train(args):
         "entropy": f"fixed {args.entropy_weight}" if args.entropy_weight is not None
                    else "(start -> end) * max(0.35, 0.8^stage)",
     }
-    manifest.setdefault("sessions", []).append({"step": source["decisions"] if source else 0, "training": training})
+    sessions = manifest.setdefault("sessions", [])
+    args.trainer_session = len(sessions) + 1
+    sessions.append({
+        "id": args.trainer_session, "step": source["decisions"] if source else 0,
+        "training": training,
+    })
     atomic_json(output / "run.json", manifest)
-    reports_dir = output / "reports"; reports_dir.mkdir(exist_ok=continuing)
+    configure_logging(output, "learner", args.log_level, args.trainer_session)
+    emit_event({
+        "event": "start", "pid": os.getpid(), "model_version": MODEL_VERSION,
+        "checkpoint": args.checkpoint,
+        "parent_checkpoint_step": source["decisions"] if source else None,
+        "parent_checkpoint_sha256": parent_checkpoint_sha256, "training": training,
+    })
     checkpoints_dir = output / "checkpoints"; checkpoints_dir.mkdir(exist_ok=continuing)
     development_dir = output / "development"; development_dir.mkdir(exist_ok=continuing)
     champions_dir = output / "stage-champions"; champions_dir.mkdir(exist_ok=continuing)
     entries_dir = output / "stage-entries"; entries_dir.mkdir(exist_ok=continuing)
-    promotions_dir = output / "promotions"; promotions_dir.mkdir(exist_ok=continuing)
     stage = source["stage"] if source else args.start_stage
     reservoir = WinningReservoir(args.winning_capacity, args.envs)
     if source and source.get("_source_model_version") == MODEL_VERSION and source.get("winning_reservoir"):
@@ -5454,8 +5457,10 @@ def train(args):
     })
     dashboard(output.parent)
     started = time.monotonic()
-    elapsed_offset = max((json.loads(path.read_text())["metrics"].get("seconds", 0)
-                          for path in reports_dir.glob("*.json")), default=0) if continuing else 0
+    previous_reports = logged_history(output, manifest)[0]
+    elapsed_offset = max((row["metrics"].get("seconds", 0)
+                          for row in previous_reports.values()), default=0)
+    dashboard_ready = bool(previous_reports)
     run_started = started - elapsed_offset
     deadline = started + args.hours * 3600 if args.hours else math.inf
     training_seconds = promotion_seconds = 0.0
@@ -5472,8 +5477,7 @@ def train(args):
         atomic_json(best_path, best)
     def promote(result=None):
         nonlocal stage, stage_decisions, promotion_index, progress_active, promotion_seconds
-        path = promotions_dir / f"{decisions:012}.json"
-        if path.exists() or stage + 1 >= len(STAGES):
+        if decisions in logged_history(output, manifest)[1] or stage + 1 >= len(STAGES):
             raise ValueError("promotion is not available at this checkpoint")
         promotion_started = time.monotonic()
         manual = result is None
@@ -5495,7 +5499,6 @@ def train(args):
             },
             "threshold": args.promote_win_rate, "promoted": True, "result": result,
         }
-        immutable_json(path, promotion)
         progress_active &= stage != 6
         stage += 1
         stage_decisions = 0
@@ -5514,8 +5517,8 @@ def train(args):
             "step": decisions, "stage": stage, "sampler_session": sampler_session,
             "checkpoint": latest.name, "sha256": digest,
         })
-        dashboard(output.parent)
         emit_event({"time": time.time(), "event": "promotion", **promotion})
+        dashboard(output.parent)
 
     if args.promote_now:
         promote()
@@ -5542,6 +5545,8 @@ def train(args):
                 "stage": stage, "path": str(checkpoint), "sha256": immutable_digest,
             })
         def save_report(point, pipeline, window):
+            nonlocal dashboard_ready
+            written = time.time()
             row = {
                 "schema": 1, "step": point["steps"], "window": window,
                 "sampler_session": sampler_session,
@@ -5549,10 +5554,14 @@ def train(args):
                 "description": f"Continuous V{MODEL_VERSION} training at A{STAGES[stage][0]}/+{STAGES[stage][1]}.",
                 "pipeline": pipeline, "metrics": point,
             }
-            immutable_json(reports_dir / f"{point['steps']:012}.json", row)
-            atomic_json(output / "live.json", row)
-            live = row | {"_written": (output / "live.json").stat().st_mtime}
-            atomic_live(output / "live.js", {"version": MODEL_VERSION, "report": live})
+            emit_event({"time": written, "event": "report", **row})
+            atomic_live(output / "live.js", {
+                "version": MODEL_VERSION, "trainer_session": args.trainer_session,
+                "parent_checkpoint_step": source["decisions"] if source else None,
+                "report": row | {"_written": written},
+            })
+            if not dashboard_ready:
+                dashboard(output.parent); dashboard_ready = True
             keep = {last_checkpoint[1]} if last_checkpoint else set()
             keep.update(output / row["checkpoint"] for row in stage_bests.values())
             if best.get("checkpoint"):
@@ -5560,7 +5569,6 @@ def train(args):
             for checkpoint in checkpoints_dir.glob("*.pt"):
                 if checkpoint not in keep:
                     checkpoint.unlink()
-            emit_event({"time": time.time(), "event": "report", **row})
         model.train()
         training = train_stream(
             model, optimizer, args, sampler_session, stage, target, deadline, budget,
@@ -5581,19 +5589,14 @@ def train(args):
         "step": decisions, "stage": stage, "sampler_session": sampler_session,
         "checkpoint": latest.name, "sha256": digest,
     })
-    atomic_json(output / "timing.json", {
-        "elapsed_seconds": elapsed_offset + time.monotonic() - started,
-        "training_seconds": training_seconds, "promotion_seconds": promotion_seconds,
-        "training_fraction": training_seconds / max(1e-9, training_seconds + promotion_seconds),
-        "decisions": decisions, "stage": stage,
-    })
     emit_event({
         "time": time.time(), "event": "complete", "decisions": decisions,
         "stage": stage, "training_seconds": training_seconds,
         "promotion_seconds": promotion_seconds,
+        "training_fraction": training_seconds / max(1e-9, training_seconds + promotion_seconds),
+        "elapsed_seconds": elapsed_offset + time.monotonic() - started,
     })
     dashboard(output.parent)
-    _EVENT_STREAM.close(); _EVENT_STREAM = None
     shutdown_logging()
 
 
