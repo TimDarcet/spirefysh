@@ -213,16 +213,19 @@ inline float head_sum(float value, uint dimension, uint lane) {
 
 kernel void attention_forward(
     device const float *qkv, device const int *offsets, device const int *sequence,
+    device const int *selected,
     device float *output, device float *lse, constant uint& heads, constant uint& dimension,
+    constant bool& sparse,
     uint tid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
     uint group = tid / SIMD_WIDTH, heads_per_group = SIMD_WIDTH / dimension;
-    uint groups = heads / heads_per_group, token = group / groups;
+    uint groups = heads / heads_per_group, query_index = group / groups;
+    uint token = sparse ? selected[query_index] : query_index;
     uint head = group % groups * heads_per_group + lane / dimension, column = lane % dimension;
     int row = sequence[token], begin = offsets[row], end = offsets[row + 1];
     uint width = heads * dimension, query = token * 3 * width + head * dimension + column;
     if (end == begin + 1) {
-        output[token * width + head * dimension + column] = qkv[query + 2 * width];
-        if (column == 0) lse[token * heads + head] = 0.0f;
+        output[query_index * width + head * dimension + column] = qkv[query + 2 * width];
+        if (column == 0) lse[query_index * heads + head] = 0.0f;
         return;
     }
     float q = qkv[query];
@@ -235,24 +238,27 @@ kernel void attention_forward(
         value = value * old + weight * qkv[k + width + column];
         maximum = next;
     }
-    output[token * width + head * dimension + column] = value / sum;
-    if (column == 0) lse[token * heads + head] = maximum + log(sum);
+    output[query_index * width + head * dimension + column] = value / sum;
+    if (column == 0) lse[query_index * heads + head] = maximum + log(sum);
 }
 
 kernel void backward_query(
     device const float *qkv, device const int *offsets, device const int *sequence,
+    device const int *selected,
     device const float *output, device const float *lse, device const float *grad_output,
     device float *grad_qkv, device float *delta, constant uint& heads, constant uint& dimension,
+    constant bool& sparse,
     uint tid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
     uint group = tid / SIMD_WIDTH, heads_per_group = SIMD_WIDTH / dimension;
-    uint groups = heads / heads_per_group, token = group / groups;
+    uint groups = heads / heads_per_group, query_index = group / groups;
+    uint token = sparse ? selected[query_index] : query_index;
     uint head = group % groups * heads_per_group + lane / dimension, column = lane % dimension;
     int row = sequence[token], begin = offsets[row], end = offsets[row + 1];
     uint width = heads * dimension, query = token * 3 * width + head * dimension + column;
-    uint out = token * width + head * dimension + column;
+    uint out = query_index * width + head * dimension + column;
     if (end == begin + 1) {
         grad_qkv[query] = 0.0f;
-        if (column == 0) delta[token * heads + head] = 0.0f;
+        if (column == 0) delta[query_index * heads + head] = 0.0f;
         return;
     }
     float q = qkv[query], grad = grad_output[out];
@@ -260,37 +266,41 @@ kernel void backward_query(
     for (int key = begin; key < end; ++key) {
         uint k = key * 3 * width + width + head * dimension;
         float key_value = qkv[k + column];
-        float probability = exp(head_sum(q * key_value, dimension, lane) * rsqrt(float(dimension)) - lse[token * heads + head]);
+        float probability = exp(head_sum(q * key_value, dimension, lane) * rsqrt(float(dimension)) - lse[query_index * heads + head]);
         float dp = head_sum(grad * qkv[k + width + column], dimension, lane);
         dq += probability * (dp - correction) * key_value * rsqrt(float(dimension));
     }
     grad_qkv[query] = dq;
-    if (column == 0) delta[token * heads + head] = correction;
+    if (column == 0) delta[query_index * heads + head] = correction;
 }
 
 kernel void backward_key_value(
     device const float *qkv, device const int *offsets, device const int *sequence,
+    device const int *selected, device const int *query_offsets,
     device const float *output, device const float *lse, device const float *grad_output,
     device const float *delta, device float *grad_qkv, constant uint& heads, constant uint& dimension,
+    constant bool& sparse,
     uint tid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
     uint group = tid / SIMD_WIDTH, heads_per_group = SIMD_WIDTH / dimension;
     uint groups = heads / heads_per_group, key = group / groups;
     uint head = group % groups * heads_per_group + lane / dimension, column = lane % dimension;
-    int row = sequence[key], begin = offsets[row], end = offsets[row + 1];
+    int row = sequence[key], begin = sparse ? query_offsets[row] : offsets[row];
+    int end = sparse ? query_offsets[row + 1] : offsets[row + 1];
     uint width = heads * dimension, k = key * 3 * width + width + head * dimension;
-    if (end == begin + 1) {
+    if (offsets[row + 1] == offsets[row] + 1) {
         grad_qkv[k + column] = 0.0f;
-        grad_qkv[k + width + column] = grad_output[key * width + head * dimension + column];
+        grad_qkv[k + width + column] = grad_output[begin * width + head * dimension + column];
         return;
     }
     float value = qkv[k + width + column];
     float dk = 0.0f, dv = 0.0f;
-    for (int token = begin; token < end; ++token) {
+    for (int query_index = begin; query_index < end; ++query_index) {
+        uint token = sparse ? selected[query_index] : query_index;
         uint query = token * 3 * width + head * dimension + column;
-        uint out = token * width + head * dimension + column;
+        uint out = query_index * width + head * dimension + column;
         float q = qkv[query], key_value = qkv[k + column], grad = grad_output[out];
-        float probability = exp(head_sum(q * key_value, dimension, lane) * rsqrt(float(dimension)) - lse[token * heads + head]);
-        float ds = probability * (head_sum(grad * value, dimension, lane) - delta[token * heads + head]);
+        float probability = exp(head_sum(q * key_value, dimension, lane) * rsqrt(float(dimension)) - lse[query_index * heads + head]);
+        float ds = probability * (head_sum(grad * value, dimension, lane) - delta[query_index * heads + head]);
         dk += ds * q * rsqrt(float(dimension));
         dv += probability * grad;
     }
@@ -300,16 +310,19 @@ kernel void backward_key_value(
 
 kernel void attention_forward_bfloat(
     device const bfloat *qkv, device const int *offsets, device const int *sequence,
+    device const int *selected,
     device bfloat *output, device float *lse, constant uint& heads, constant uint& dimension,
+    constant bool& sparse,
     uint tid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
     uint group = tid / SIMD_WIDTH, heads_per_group = SIMD_WIDTH / dimension;
-    uint groups = heads / heads_per_group, token = group / groups;
+    uint groups = heads / heads_per_group, query_index = group / groups;
+    uint token = sparse ? selected[query_index] : query_index;
     uint head = group % groups * heads_per_group + lane / dimension, column = lane % dimension;
     int row = sequence[token], begin = offsets[row], end = offsets[row + 1];
     uint width = heads * dimension, query = token * 3 * width + head * dimension + column;
     if (end == begin + 1) {
-        output[token * width + head * dimension + column] = qkv[query + 2 * width];
-        if (column == 0) lse[token * heads + head] = 0.0f;
+        output[query_index * width + head * dimension + column] = qkv[query + 2 * width];
+        if (column == 0) lse[query_index * heads + head] = 0.0f;
         return;
     }
     float q = float(qkv[query]);
@@ -322,24 +335,27 @@ kernel void attention_forward_bfloat(
         value = value * old + weight * float(qkv[k + width + column]);
         maximum = next;
     }
-    output[token * width + head * dimension + column] = bfloat(value / sum);
-    if (column == 0) lse[token * heads + head] = maximum + log(sum);
+    output[query_index * width + head * dimension + column] = bfloat(value / sum);
+    if (column == 0) lse[query_index * heads + head] = maximum + log(sum);
 }
 
 kernel void attention_backward_query_bfloat(
     device const bfloat *qkv, device const int *offsets, device const int *sequence,
+    device const int *selected,
     device const bfloat *output, device const float *lse, device const bfloat *grad_output,
     device bfloat *grad_qkv, device float *delta, constant uint& heads, constant uint& dimension,
+    constant bool& sparse,
     uint tid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
     uint group = tid / SIMD_WIDTH, heads_per_group = SIMD_WIDTH / dimension;
-    uint groups = heads / heads_per_group, token = group / groups;
+    uint groups = heads / heads_per_group, query_index = group / groups;
+    uint token = sparse ? selected[query_index] : query_index;
     uint head = group % groups * heads_per_group + lane / dimension, column = lane % dimension;
     int row = sequence[token], begin = offsets[row], end = offsets[row + 1];
     uint width = heads * dimension, query = token * 3 * width + head * dimension + column;
-    uint out = token * width + head * dimension + column;
+    uint out = query_index * width + head * dimension + column;
     if (end == begin + 1) {
         grad_qkv[query] = bfloat(0.0f);
-        if (column == 0) delta[token * heads + head] = 0.0f;
+        if (column == 0) delta[query_index * heads + head] = 0.0f;
         return;
     }
     float q = float(qkv[query]), grad = float(grad_output[out]);
@@ -347,37 +363,41 @@ kernel void attention_backward_query_bfloat(
     for (int key = begin; key < end; ++key) {
         uint k = key * 3 * width + width + head * dimension;
         float key_value = float(qkv[k + column]);
-        float probability = exp(head_sum(q * key_value, dimension, lane) * rsqrt(float(dimension)) - lse[token * heads + head]);
+        float probability = exp(head_sum(q * key_value, dimension, lane) * rsqrt(float(dimension)) - lse[query_index * heads + head]);
         float dp = head_sum(grad * float(qkv[k + width + column]), dimension, lane);
         dq += probability * (dp - correction) * key_value * rsqrt(float(dimension));
     }
     grad_qkv[query] = bfloat(dq);
-    if (column == 0) delta[token * heads + head] = correction;
+    if (column == 0) delta[query_index * heads + head] = correction;
 }
 
 kernel void attention_backward_key_value_bfloat(
     device const bfloat *qkv, device const int *offsets, device const int *sequence,
+    device const int *selected, device const int *query_offsets,
     device const bfloat *output, device const float *lse, device const bfloat *grad_output,
     device const float *delta, device bfloat *grad_qkv, constant uint& heads, constant uint& dimension,
+    constant bool& sparse,
     uint tid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
     uint group = tid / SIMD_WIDTH, heads_per_group = SIMD_WIDTH / dimension;
     uint groups = heads / heads_per_group, key = group / groups;
     uint head = group % groups * heads_per_group + lane / dimension, column = lane % dimension;
-    int row = sequence[key], begin = offsets[row], end = offsets[row + 1];
+    int row = sequence[key], begin = sparse ? query_offsets[row] : offsets[row];
+    int end = sparse ? query_offsets[row + 1] : offsets[row + 1];
     uint width = heads * dimension, k = key * 3 * width + width + head * dimension;
-    if (end == begin + 1) {
+    if (offsets[row + 1] == offsets[row] + 1) {
         grad_qkv[k + column] = bfloat(0.0f);
-        grad_qkv[k + width + column] = grad_output[key * width + head * dimension + column];
+        grad_qkv[k + width + column] = grad_output[begin * width + head * dimension + column];
         return;
     }
     float value = float(qkv[k + width + column]);
     float dk = 0.0f, dv = 0.0f;
-    for (int token = begin; token < end; ++token) {
+    for (int query_index = begin; query_index < end; ++query_index) {
+        uint token = sparse ? selected[query_index] : query_index;
         uint query = token * 3 * width + head * dimension + column;
-        uint out = token * width + head * dimension + column;
+        uint out = query_index * width + head * dimension + column;
         float q = float(qkv[query]), key_value = float(qkv[k + column]), grad = float(grad_output[out]);
-        float probability = exp(head_sum(q * key_value, dimension, lane) * rsqrt(float(dimension)) - lse[token * heads + head]);
-        float ds = probability * (head_sum(grad * value, dimension, lane) - delta[token * heads + head]);
+        float probability = exp(head_sum(q * key_value, dimension, lane) * rsqrt(float(dimension)) - lse[query_index * heads + head]);
+        float ds = probability * (head_sum(grad * value, dimension, lane) - delta[query_index * heads + head]);
         dk += ds * q * rsqrt(float(dimension));
         dv += probability * grad;
     }
@@ -805,7 +825,7 @@ class _RaggedAttention(torch.autograd.Function):
     half_library = None
 
     @staticmethod
-    def forward(ctx, qkv, offsets, sequence, heads):
+    def forward(ctx, qkv, offsets, sequence, heads, selected, query_offsets, sparse):
         if _RaggedAttention.library is None:
             _RaggedAttention.library = torch.mps.compile_shader(_TRAINING_METAL)
         if qkv.dtype == torch.float16 and _RaggedAttention.half_library is None:
@@ -813,38 +833,43 @@ class _RaggedAttention(torch.autograd.Function):
                 _TRAINING_METAL.replace("bfloat", "half")
             )
         library = _RaggedAttention.half_library if qkv.dtype == torch.float16 else _RaggedAttention.library
-        output = qkv.new_empty((len(qkv), qkv.shape[1] // 3))
-        lse = torch.empty((len(qkv), heads), dtype=torch.float32, device=qkv.device)
+        queries = len(selected) if sparse else len(qkv)
+        output = qkv.new_empty((queries, qkv.shape[1] // 3))
+        lse = torch.empty((queries, heads), dtype=torch.float32, device=qkv.device)
         dimension = output.shape[1] // heads
-        threads = len(qkv) * heads * dimension
+        threads = queries * heads * dimension
         suffix = "_half" if qkv.dtype == torch.float16 else "_bfloat" if qkv.dtype == torch.bfloat16 else ""
         kernel = getattr(library, f"attention_forward{suffix}")
         kernel(
-            qkv, offsets, sequence, output, lse, heads, dimension,
+            qkv, offsets, sequence, selected, output, lse, heads, dimension, sparse,
             threads=threads, group_size=32,
         )
-        ctx.save_for_backward(qkv, offsets, sequence, output, lse)
+        ctx.save_for_backward(qkv, offsets, sequence, selected, query_offsets, output, lse)
         ctx.heads = heads
         ctx.dimension = dimension
-        ctx.library, ctx.suffix = library, suffix
+        ctx.library, ctx.suffix, ctx.sparse = library, suffix, sparse
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        qkv, offsets, sequence, output, lse = ctx.saved_tensors
-        grad_qkv = torch.empty_like(qkv)
+        qkv, offsets, sequence, selected, query_offsets, output, lse = ctx.saved_tensors
+        grad_qkv = torch.zeros_like(qkv) if ctx.sparse else torch.empty_like(qkv)
         delta = torch.empty_like(lse)
-        threads = len(qkv) * ctx.heads * ctx.dimension
-        args = qkv, offsets, sequence, output, lse, grad_output.contiguous()
+        query_threads = len(output) * ctx.heads * ctx.dimension
+        key_threads = len(qkv) * ctx.heads * ctx.dimension
+        args = qkv, offsets, sequence, selected, output, lse, grad_output.contiguous()
         query = getattr(ctx.library, f"attention_backward_query{ctx.suffix}") if ctx.suffix else ctx.library.backward_query
         key_value = getattr(ctx.library, f"attention_backward_key_value{ctx.suffix}") if ctx.suffix else ctx.library.backward_key_value
         query(
-            *args, grad_qkv, delta, ctx.heads, ctx.dimension, threads=threads, group_size=32
+            *args, grad_qkv, delta, ctx.heads, ctx.dimension, ctx.sparse,
+            threads=query_threads, group_size=32,
         )
         key_value(
-            *args, delta, grad_qkv, ctx.heads, ctx.dimension, threads=threads, group_size=32
+            qkv, offsets, sequence, selected, query_offsets, output, lse,
+            grad_output.contiguous(), delta, grad_qkv, ctx.heads, ctx.dimension, ctx.sparse,
+            threads=key_threads, group_size=32,
         )
-        return grad_qkv, None, None, None
+        return grad_qkv, None, None, None, None, None, None
 
 
 class _RaggedSummaryAttention(torch.autograd.Function):
@@ -1284,11 +1309,12 @@ class Agent(nn.Module):
         order = torch.argsort(group, stable=True)
         return values[order], group[order]
 
-    def _sequence(self, values, group, groups, seed, transformer):
+    def _sequence(self, values, group, groups, seed, transformer, selected=None):
         order = torch.argsort(group, stable=True)
         inverse = torch.empty_like(order)
         inverse[order] = torch.arange(len(order), device=order.device)
         values, group = values[order], group[order]
+        selected = selected[order] if selected is not None else None
         counts = torch.bincount(group, minlength=groups)
         if values.device.type == "mps" and self.width // self.heads in (16, 32):
             lengths = counts + 1
@@ -1301,14 +1327,35 @@ class Agent(nn.Module):
             current[offsets[:-1]] = seed.to(values.dtype)
             current[destination] = values
             sequence = torch.repeat_interleave(torch.arange(groups, device=values.device), lengths)
-            for layer in transformer.layers:
+            for layer_index, layer in enumerate(transformer.layers):
+                if selected is not None and layer_index == len(transformer.layers) - 1:
+                    positions = torch.cat((offsets[:-1], destination[selected])).sort().values
+                    query_counts = torch.bincount(sequence[positions], minlength=groups)
+                    query_offsets = torch.cat((query_counts.new_zeros(1), query_counts.cumsum(0)))
+                    query_position = torch.arange(len(positions), device=values.device) \
+                        - torch.repeat_interleave(query_offsets[:-1], query_counts)
+                    qkv = nn.functional.linear(
+                        layer.norm1(current), layer.self_attn.in_proj_weight,
+                        layer.self_attn.in_proj_bias,
+                    )
+                    attended = _RaggedAttention.apply(
+                        qkv, offsets.to(torch.int32), sequence.to(torch.int32),
+                        layer.self_attn.num_heads, positions.to(torch.int32),
+                        query_offsets.to(torch.int32), True,
+                    )
+                    current = current[positions] + layer.self_attn.out_proj(attended)
+                    current = current + layer.linear2(layer.activation(layer.linear1(layer.norm2(current))))
+                    state = current[query_offsets[:-1]]
+                    items = current[query_position > 0][torch.argsort(order[selected])]
+                    return state, items
                 qkv = nn.functional.linear(
                     layer.norm1(current), layer.self_attn.in_proj_weight,
                     layer.self_attn.in_proj_bias,
                 )
                 attended = _RaggedAttention.apply(
                     qkv, offsets.to(torch.int32), sequence.to(torch.int32),
-                    layer.self_attn.num_heads,
+                    layer.self_attn.num_heads, sequence.to(torch.int32), offsets.to(torch.int32),
+                    False,
                 )
                 current = current + layer.self_attn.out_proj(attended)
                 current = current + layer.linear2(layer.activation(layer.linear1(layer.norm2(current))))
@@ -1324,6 +1371,8 @@ class Agent(nn.Module):
         valid = torch.arange(maximum + 1, device=values.device)[None] <= counts[:, None]
         sequence = transformer(sequence, src_key_padding_mask=~valid)
         items = sequence[group, position][inverse] if len(values) else values
+        if selected is not None:
+            items = items[selected[inverse]]
         return sequence[:, 0], items
 
     def _summarize(self, values, group, groups, name, mode, transformer_name=None):
@@ -1550,11 +1599,13 @@ class Agent(nn.Module):
         values = torch.cat(values)
         rows = torch.cat(rows)
         self._sequence_lengths = torch.bincount(rows, minlength=batch) + 1
+        selected = torch.arange(len(values), device=values.device) >= len(values) - len(action)
         state, transformed = self._sequence(
             values, rows, batch, self.concepts.local("token_role", 0), self.global_transformer,
+            selected,
         )
         transformed = self.global_norm(transformed)
-        action = transformed[-len(action):] if len(action) else action
+        action = transformed if len(action) else action
         return self.global_norm(state), action, action_rows, action_flat, actions, policy_sequence
 
     def forward(self, _character, _globals, domains, state_index, action_values, action_index,
