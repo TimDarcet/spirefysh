@@ -2965,7 +2965,7 @@ def collect_worker(model, args, sampler_session, stage, capacity, pending_capaci
                           args.trainer_session)
     qos = getattr(ctypes.CDLL(None), "pthread_set_qos_class_self_np", None)
     if qos is not None:
-        qos(int(os.environ.get("ACTOR_QOS", "0x11"), 0), 0)
+        qos(int(os.environ.get("ACTOR_QOS", "0x21"), 0), 0)
     if args.sampler_backend == "process":
         os.environ["RAYON_NUM_THREADS"] = str(args.sampler_threads)
         torch.set_num_threads(args.torch_threads)
