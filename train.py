@@ -2694,6 +2694,7 @@ class RolloutCollector:
             if native:
                 result = self.env.policy(
                     args.policy_temperature,
+                    advance=True,
                     mcts_fraction=args.mcts_fraction,
                     mcts_simulations=args.mcts_simulations,
                     mcts_boss_simulations=args.mcts_boss_simulations,
@@ -2712,6 +2713,7 @@ class RolloutCollector:
                 )
                 characters, choice, log_probability, critic_probability, step_rows, \
                     step_experts, step_search_stats, *cached = result
+                raw_reward, done, stats, next_legal, in_combat, *cached = cached
                 step_features = cached[0] if cached else None
                 if heartbeat is not None:
                     heartbeat[self.worker] = time.monotonic()
@@ -2740,9 +2742,12 @@ class RolloutCollector:
             self.reservoir.record(
                 step_rows, choice, log_probability, policy, critic_probability[:, -1], self.rng,
             )
-            in_combat = np.asarray([row[4] == 1 for row in self.env.stats()])
+            in_combat = np.asarray(in_combat, bool) if native else np.asarray([
+                row[4] == 1 for row in self.env.stats()
+            ])
             self.combat_steps = np.where(in_combat, self.combat_steps + 1, 0)
-            raw_reward, done, _ = self.env.step(choice.tolist())
+            if not native:
+                raw_reward, done, _ = self.env.step(choice.tolist())
             raw_reward = np.array(raw_reward, np.float32, copy=True)
             done = np.asarray(done, bool)
             sampled_steps += args.envs
@@ -2750,11 +2755,11 @@ class RolloutCollector:
                 progress[self.worker] += args.envs
             self.episode_steps += 1
             next_observation = None if native else self.env.observe_tokens((~done).tolist(), True)
-            stats = self.env.stats()
+            stats = stats if native else self.env.stats()
             still_combat = np.asarray([row[4] == 1 for row in stats])
             truncated, step_truncated, combat_truncated, empty_actions = cuts(
                 done, self.episode_steps, self.combat_steps, still_combat,
-                np.asarray(self.env.has_legal_actions((~done).tolist()))[:, None]
+                np.asarray(next_legal)[:, None]
                 if native else observation_legal(next_observation),
                 args.max_steps, args.max_combat_steps,
             )
