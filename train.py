@@ -3124,12 +3124,20 @@ class ExperienceDataset:
     def discard(self, indices):
         if not len(indices):
             return
-        keep = np.ones(len(self), bool); keep[indices] = False
-        self.rows = [row for row, selected in zip(self.rows, keep) if selected]
+        indices = np.unique(indices)
+        end = len(self) - len(indices)
+        holes = indices[indices < end]
+        sources = np.setdiff1d(np.arange(end, len(self)), indices, assume_unique=True)
+        for target, source in zip(holes, sources):
+            self.rows[target] = self.rows[source]
+        del self.rows[end:]
         if self.features:
-            self.features = [row for row, selected in zip(self.features, keep) if selected]
-        for key in self.data:
-            self.data[key] = self.data[key][keep]
+            for target, source in zip(holes, sources):
+                self.features[target] = self.features[source]
+            del self.features[end:]
+        for key, values in self.data.items():
+            values[holes] = values[sources]
+            self.data[key] = values[:end]
 
     def discard_ids(self, ids):
         indices = np.flatnonzero(np.isin(self.data["id"], ids))
@@ -3542,8 +3550,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         return cached_tensors(features, model.width), time.monotonic() - prepared
 
     def reserve_batch(size):
-        order = dataset.sample(len(dataset), rng, args.character_balanced)
-        selected = order[:size]
+        selected = dataset.sample(size, rng, args.character_balanced)
         rows = [dataset.rows[index] for index in selected]
         expert_selected = expert_dataset.sample(args.expert_batch, rng) \
             if args.expert_weight or args.search_consistency_weight else np.empty(0, np.int64)
