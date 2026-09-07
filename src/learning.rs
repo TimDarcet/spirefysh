@@ -11513,6 +11513,22 @@ mod python {
         compact_packed_observation_known(row, None)
     }
 
+    fn cached_packed_metadata(row: &ObservationV56) -> Vec<u8> {
+        let mut output = vec![0; 32 + 4 * DOMAIN_WIDTHS.len()];
+        output[..4].copy_from_slice(b"SP68");
+        output[4] = row.character;
+        output[16..20].copy_from_slice(&(row.candidates.len() as u32).to_le_bytes());
+        output[20..24].copy_from_slice(
+            &(row
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.legal)
+                .count() as u32)
+                .to_le_bytes(),
+        );
+        output
+    }
+
     fn compact_packed_observation_known(row: &ObservationV56, digest: Option<u64>) -> Vec<u8> {
         compact_packed_observation_and_digest(row, digest).0
     }
@@ -17966,7 +17982,11 @@ mod python {
             let features = py.allow_threads(|| model.state_actions_batch(&evaluated_rows));
             let packed = py.allow_threads(|| {
                 rows.par_iter()
-                    .map(compact_packed_observation)
+                    .map(if cache_features {
+                        cached_packed_metadata
+                    } else {
+                        compact_packed_observation
+                    })
                     .collect::<Vec<_>>()
             });
             let outputs = model
@@ -18107,9 +18127,14 @@ mod python {
                 if cache_features {
                     let mut bytes = Vec::with_capacity((actions.len() + 1) * state.len() * 4);
                     for value in std::iter::once(&state).chain(&actions) {
-                        for &number in value {
-                            bytes.extend_from_slice(&number.to_le_bytes());
-                        }
+                        #[cfg(target_endian = "little")]
+                        bytes.extend_from_slice(unsafe {
+                            std::slice::from_raw_parts(value.as_ptr().cast(), value.len() * 4)
+                        });
+                        #[cfg(target_endian = "big")]
+                        value
+                            .iter()
+                            .for_each(|number| bytes.extend_from_slice(&number.to_le_bytes()));
                     }
                     cached_features.push(PyBytes::new(py, &bytes));
                 }
