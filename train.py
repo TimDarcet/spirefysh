@@ -3271,6 +3271,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         "Critic loss balanced by EMA character/phase/canonical-floor frequency",
         "Turn-start native MCTS → expectimax-Q targets and policy-expectation critic transitions",
         ("Frozen encoder and policy; critic head only" if args.critic_only else
+         "Asynchronous clipped PPO; policy and value heads updated every iteration"
+         if args.freeze_backbone else
          "Asynchronous clipped PPO; full model updated every iteration") + "; "
         f"policy-head LR ×{args.head_learning_rate_multiplier:g}; "
         f"critic LR ×{args.critic_learning_rate_multiplier:g}; "
@@ -5257,6 +5259,7 @@ def train(args):
         pooling = {name: getattr(args, name + "_pooling") or default
                    for name, default in POOLING_DEFAULTS.items()}
         model = Agent(layout, *config, pooling=pooling).to(target)
+    args.freeze_backbone |= bool(source and source["stage"] >= 5 and args.target_kl >= 1)
     if args.freeze_backbone:
         model.requires_grad_(False)
         model.global_norm.requires_grad_(True)
