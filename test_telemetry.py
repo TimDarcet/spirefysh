@@ -35,7 +35,8 @@ class TelemetryTest(unittest.TestCase):
                  "training_elapsed_seconds": 0},
                 {"event": "sample_packet", "time": 2, "step": 40, "stage": 0,
                  "packet_sampled_decisions": 80, "admitted_rows": 30,
-                 "discarded_decisions": 5, "collect_seconds": 2,
+                 "discarded_decisions": 5, "forced_rows": 3,
+                 "budget_excess_rows": 2, "collect_seconds": 2,
                  "episodes": [{"character": 2, "floor": 12, "won": True,
                                "step_cap": False, "combat_cap": False,
                                "empty_actions": False, "length": 20,
@@ -44,6 +45,8 @@ class TelemetryTest(unittest.TestCase):
                  "weights_revision": 1, "policy_revision": 1,
                  "attempted_rows": 20, "fresh_rows": 20,
                  "policy_trained_rows": 20, "critic_trained_rows": 20,
+                 "policy_outcome": "accepted", "commit_kind": "full",
+                 "retired_rows": 4,
                  "policy_loss": 2, "critic_loss": 3, "total_seconds": 1,
                  "training_elapsed_seconds": 3},
             ])
@@ -63,6 +66,31 @@ class TelemetryTest(unittest.TestCase):
             self.assertEqual(metrics["characters"][2]["wins"], 1)
             self.assertEqual(metrics["policy_loss"], 2)
             self.assertEqual(metrics["dataset_rows"], 7)
+            self.assertEqual(metrics["optimizer_steps_per_second"], 1)
+            self.assertEqual(metrics["used_rows_per_second"], 20)
+            self.assertEqual(metrics["dataset_rollout_dropped"], 3)
+            self.assertEqual(metrics["dataset_budget_dropped"], 2)
+            self.assertEqual(metrics["dataset_forced_dropped"], 3)
+            self.assertEqual(metrics["dataset_retired"], 4)
+
+    def test_projector_tracks_policy_rejections(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); run = root / "run"; (run / "events").mkdir(parents=True)
+            manifest = self.manifest("run", 1)
+            (run / "run.json").write_text(json.dumps(manifest))
+            write_events(run / "events/000001.jsonl", [
+                {"event": "training_batch", "time": 1, "step": 40, "stage": 0,
+                 "policy_outcome": "pre_kl_rejected", "commit_kind": "critic_only",
+                 "fresh_rows": 5, "critic_trained_rows": 5, "total_seconds": 2},
+                {"event": "training_batch", "time": 2, "step": 40, "stage": 0,
+                 "policy_outcome": "post_kl_rejected", "commit_kind": "critic_only",
+                 "fresh_rows": 7, "critic_trained_rows": 7, "total_seconds": 2},
+            ])
+            metrics = train.MetricsProjector(root, run, manifest, 1).value()["reports"][-1]["metrics"]
+            self.assertEqual(metrics["optimizer_steps_per_second"], .5)
+            self.assertEqual(metrics["used_rows_per_second"], 3)
+            self.assertEqual(metrics["dataset_kl_dropped"], 5)
+            self.assertEqual(metrics["dataset_post_kl_dropped"], 7)
 
     def test_branch_reads_parent_only_to_checkpoint(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -127,6 +155,7 @@ class TelemetryTest(unittest.TestCase):
             self.assertEqual(live["reports"][0]["step"], 0)
             self.assertTrue(all(label in html for label in (
                 "Lineage", "Branch", "Weights revision", "Policy loss", "Gradient norm",
+                "Optimizer steps / second", "Used rows / second", "Row outcomes",
             )))
             self.assertIn("weights_revision??report.metrics.updates", html)
             self.assertIn("row.step>step", html)
