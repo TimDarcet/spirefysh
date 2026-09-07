@@ -15,6 +15,7 @@ import tempfile
 import threading
 import time
 import traceback
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from pathlib import Path
@@ -63,32 +64,43 @@ STAGES = [(0, bonus) for bonus in (24, 20, 16, 12, 8, 4, 0)] + [
 _EVENT_FD = None
 _EVENT_ROLE = None
 _TRAINER_SESSION = None
+_RUN_ID = None
+_EVENT_PATH = None
 _EVENT_LOCK = threading.Lock()
 _ACCELERATOR_LOCK = None
+_LIVE_PROJECTOR = None
 _LOG_CAPTURES = []
 _CONSOLE_FDS = {}
 _LOG_ACTIVE = False
+_LOG_STOP = b"\0spirefysh-log-stop\0"
 
 
-def emit_event(value, level="INFO", console=True):
+def emit_event(value, level="INFO", console=True, role=None, event_time=None):
+    reserved = {"event_schema", "time", "level", "run_id", "session_id", "role", "pid", "thread"}
+    overlap = reserved & value.keys()
+    if overlap:
+        raise ValueError(f"reserved event fields: {', '.join(sorted(overlap))}")
     record = {
-        "schema": 1, "time": time.time(), "level": str(level).lower(),
-        "role": _EVENT_ROLE, "trainer_session": _TRAINER_SESSION,
+        "event_schema": 2, "time": time.time() if event_time is None else event_time,
+        "level": str(level).lower(),
+        "run_id": _RUN_ID, "session_id": _TRAINER_SESSION,
+        "role": role or _EVENT_ROLE,
         "pid": os.getpid(), "thread": threading.get_native_id(),
     } | value
     line = (json.dumps(record, separators=(",", ":")) + "\n").encode()
     if _EVENT_FD is None:
         sys.__stdout__.write(line.decode()); sys.__stdout__.flush()
-        return
+        return None
     with _EVENT_LOCK:
         fcntl.flock(_EVENT_FD, fcntl.LOCK_EX)
         try:
             pending = memoryview(line)
             while pending:
                 pending = pending[os.write(_EVENT_FD, pending):]
+            end = os.lseek(_EVENT_FD, 0, os.SEEK_END)
         finally:
             fcntl.flock(_EVENT_FD, fcntl.LOCK_UN)
-    if console and _CONSOLE_FDS:
+    if console and _CONSOLE_FDS and not record["role"].startswith("sampler-"):
         fields = {key: item for key, item in value.items()
                   if key not in ("event", "metrics", "pipeline", "result", "training", "time")}
         fields.update({key: item for key, item in value.get("metrics", {}).items()
@@ -98,15 +110,25 @@ def emit_event(value, level="INFO", console=True):
         ) + "\n"
         fd = 2 if str(level).upper() in ("WARNING", "ERROR") else 1
         os.write(_CONSOLE_FDS[fd], message.encode())
+    if _LIVE_PROJECTOR is not None:
+        _LIVE_PROJECTOR.wake.set()
+    return end
 
 
-def configure_logging(output, role, level="INFO", trainer_session=None):
-    global _EVENT_FD, _EVENT_ROLE, _TRAINER_SESSION, _LOG_ACTIVE
+def configure_logging(output, role, level="INFO", trainer_session=None, run_id=None,
+                      event_log=None, first_event=None):
+    global _EVENT_FD, _EVENT_ROLE, _TRAINER_SESSION, _RUN_ID, _EVENT_PATH, _LOG_ACTIVE
     if _LOG_ACTIVE:
         return
-    _EVENT_FD = os.open(Path(output) / "events.jsonl", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    _EVENT_PATH = Path(event_log) if event_log else Path(output) / "events.jsonl"
+    _EVENT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _EVENT_FD = os.open(_EVENT_PATH, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
     _EVENT_ROLE = role
     _TRAINER_SESSION = trainer_session
+    _RUN_ID = run_id
+    _LOG_ACTIVE = True
+    if first_event:
+        emit_event(first_event, console=False)
 
     def capture(fd, name, severity):
         saved = os.dup(fd)
@@ -117,6 +139,8 @@ def configure_logging(output, role, level="INFO", trainer_session=None):
             with os.fdopen(read_fd, "rb", buffering=0) as source:
                 for raw in iter(source.readline, b""):
                     raw = raw.rstrip(b"\r\n")
+                    if raw == _LOG_STOP:
+                        break
                     os.write(saved, raw + b"\n")
                     emit_event({"event": "log", "stream": name,
                                 "message": raw.decode(errors="replace")}, severity, False)
@@ -130,16 +154,16 @@ def configure_logging(output, role, level="INFO", trainer_session=None):
     sys.stdout.reconfigure(line_buffering=True)
     sys.stderr.reconfigure(line_buffering=True)
     sts2_sim.configure_logging(role, level)
-    _LOG_ACTIVE = True
     emit_event({"event": "logging_started"})
 
 
 def shutdown_logging():
-    global _EVENT_FD, _EVENT_ROLE, _TRAINER_SESSION, _LOG_ACTIVE
+    global _EVENT_FD, _EVENT_ROLE, _TRAINER_SESSION, _RUN_ID, _EVENT_PATH, _LOG_ACTIVE
     if not _LOG_ACTIVE:
         return
     sys.stdout.flush(); sys.stderr.flush()
     for fd, saved, _ in _LOG_CAPTURES:
+        os.write(fd, _LOG_STOP + b"\n")
         os.dup2(saved, fd)
     for _, saved, thread in _LOG_CAPTURES:
         thread.join()
@@ -147,7 +171,7 @@ def shutdown_logging():
     _LOG_CAPTURES.clear()
     _CONSOLE_FDS.clear()
     os.close(_EVENT_FD)
-    _EVENT_FD = _EVENT_ROLE = _TRAINER_SESSION = None
+    _EVENT_FD = _EVENT_ROLE = _TRAINER_SESSION = _RUN_ID = _EVENT_PATH = None
     _LOG_ACTIVE = False
 
 
@@ -1760,7 +1784,7 @@ def upload(value, target):
 def trust_region_step(model, optimizer, inputs, action, old, fresh, denominator, precision, limit,
                       temperature=1, attempts=3, choice_index=None):
     parameters = [parameter for parameter in model.parameters() if parameter.grad is not None]
-    nn.utils.clip_grad_norm_(parameters, .5)
+    gradient_norm = float(nn.utils.clip_grad_norm_(parameters, .5))
     optimizer_state = copy.deepcopy(optimizer.state_dict()) if any(
         parameter.grad is not None and parameter not in optimizer.state for parameter in parameters
     ) else None
@@ -1812,9 +1836,9 @@ def trust_region_step(model, optimizer, inputs, action, old, fresh, denominator,
                 post_kl = (((log_ratio.exp() - 1 - log_ratio) * fresh).sum() / denominator).float()
             proposals.append(float(post_kl))
             if torch.isfinite(post_kl) and proposals[-1] <= limit:
-                return True, proposals, log_ratio
+                return True, proposals, log_ratio, gradient_norm
         restore()
-        return False, proposals, None
+        return False, proposals, None, gradient_norm
     except Exception:
         restore()
         raise
@@ -1826,8 +1850,9 @@ def critic_only_step(model, optimizer, parameters=None):
     for parameter in model.parameters():
         if id(parameter) not in selected:
             parameter.grad = None
-    nn.utils.clip_grad_norm_(parameters, .5)
+    gradient_norm = float(nn.utils.clip_grad_norm_(parameters, .5))
     optimizer.step()
+    return gradient_norm
 
 
 def sequence_index(row, batch, target, pad=False, items=None):
@@ -2604,34 +2629,37 @@ class RolloutCollector:
         self.native_started = np.full(args.envs, time.monotonic())
 
     def event(self, event, **values):
-        emit_event({"event": event, "role": f"sampler-{self.worker}", **values})
+        emit_event({"event": event, **values}, role=f"sampler-{self.worker}")
 
     def trace_empty(self, kind, indices, characters, stats):
         seeds = self.env.seeds()
         for index in indices:
             emit_event({
-                "event": "empty_actions", "role": f"sampler-{self.worker}",
+                "event": "empty_actions",
                 "kind": kind, "sampler_session": self.sampler_session, "worker": self.worker,
                 "iteration": self.iteration, "env": index, "seed": seeds[index],
                 "character": int(characters[index]), "stage": self.stage,
                 "stats": list(stats[index]), "actions": self.action_history[index],
-            }, "WARNING")
+            }, "WARNING", role=f"sampler-{self.worker}")
 
-    def collect(self, model, target, precision, deadline, steps, version, stop=None,
+    def collect(self, model, target, precision, deadline, steps, version, actor_revision,
+                stop=None,
                 heartbeat=None, progress=None):
         args = self.args
         native = model is None
         cache_start = dict.fromkeys(("card_hit", "card_miss", "graph_hit", "graph_miss"), 0) \
             if native else model.cache_stats.copy()
         finished = []
+        completions = []
         episodes = [[] for _ in range(5)]
         sample_keys = (
             "rows", "choices", "old_log", "critic_probabilities", "canonical_progress",
-            "phases", "win_rewards", "terminals", "characters", "versions",
+            "phases", "win_rewards", "terminals", "characters", "versions", "actor_versions",
         ) + (("features",) if native and args.cache_features else ())
         def materialize(trajectory):
             samples = trajectory.pop("samples")
             trajectory.update(zip(sample_keys, map(list, zip(*samples))))
+            trajectory.pop("actor_versions")
             return trajectory
         discarded_steps = orphan_empty_actions = sampled_steps = 0
         search_stats = np.zeros(17, np.int64)
@@ -2737,7 +2765,7 @@ class RolloutCollector:
             if native:
                 self.native_steps.append((
                     step_rows, choice, log_probability, critic_probability, canonical, phases,
-                    raw_reward, done, characters, version,
+                    raw_reward, done, characters, version, actor_revision,
                 ) + ((step_features,) if args.cache_features else ()))
             else:
                 for index, row in enumerate(step_rows):
@@ -2748,13 +2776,33 @@ class RolloutCollector:
                     trajectory["samples"].append((
                         row, choice[index], log_probability[index], critic_probability[index],
                         canonical[index], phases[index], raw_reward[index], done[index],
-                        characters[index], version,
+                        characters[index], version, actor_revision,
                     ))
             if boundary.any():
                 reset = np.flatnonzero(boundary).tolist()
                 wins = [bool(done[index] and stats[index][4] == 12) for index in reset]
                 self.reservoir.finish(reset, wins, self.rng)
-                for index in reset:
+                for index, won in zip(reset, wins):
+                    history = (self.native_steps[self.native_starts[index]:] if native
+                               else self.trajectories[index]["samples"])
+                    completion_seconds = (time.monotonic() - self.native_started[index] if native
+                                          else time.monotonic() - self.trajectories[index]["started"])
+                    policy_versions = [row[9] for row in history]
+                    actor_versions = [row[10] for row in history]
+                    completions.append({
+                        "character": int(characters[index]),
+                        "floor": int((stats[index][0] - 1) * 17 + stats[index][1]),
+                        "terminal": bool(done[index]), "won": won,
+                        "step_cap": bool(step_truncated[index] and truncated[index]),
+                        "combat_cap": bool(combat_truncated[index] and truncated[index]),
+                        "empty_actions": bool(empty_actions[index]),
+                        "length": len(history), "completion_seconds": completion_seconds,
+                        "iteration": self.iteration,
+                        "policy_revision_min": min(policy_versions, default=version),
+                        "policy_revision_max": max(policy_versions, default=version),
+                        "actor_revision_min": min(actor_versions, default=actor_revision),
+                        "actor_revision_max": max(actor_versions, default=actor_revision),
+                    })
                     episodes[characters[index]].append((
                         int(done[index] and stats[index][4] == 12),
                         (stats[index][0] - 1) * 17 + stats[index][1],
@@ -2764,19 +2812,20 @@ class RolloutCollector:
                         self.iteration,
                     ))
                     if native and done[index]:
-                        history = self.native_steps[self.native_starts[index]:]
                         trajectory = {
-                            key: [step[column] if column == 9 else step[column][index]
+                            key: [step[column] if column in (9, 10) else step[column][index]
                                   for step in history]
                             for column, key in enumerate(sample_keys)
                         }
-                        trajectory["completion_seconds"] = time.monotonic() - self.native_started[index]
+                        trajectory.pop("actor_versions")
+                        trajectory["completion_seconds"] = completion_seconds
                         finished.append(trajectory)
                     elif native:
                         discarded_steps += len(self.native_steps) - int(self.native_starts[index])
                     elif done[index]:
                         trajectory = self.trajectories[index]
-                        trajectory["completion_seconds"] = time.monotonic() - trajectory.pop("started")
+                        trajectory["completion_seconds"] = completion_seconds
+                        trajectory.pop("started")
                         finished.append(materialize(trajectory))
                     else:
                         discarded_steps += len(self.trajectories[index]["samples"])
@@ -2806,6 +2855,7 @@ class RolloutCollector:
                 break
         return {
             "trajectories": finished,
+            "completions": completions,
             "episodes": episodes,
             "iteration": self.iteration,
             "orphan_empty_actions": orphan_empty_actions,
@@ -2832,12 +2882,13 @@ class RolloutCollector:
         }
 
     def run(self, model, models, samples, stop, deadline, budget, worker=0,
-            heartbeat=None, progress=None, version=0, target=None, precision="fp32"):
+            heartbeat=None, progress=None, version=0, actor_revision=0, target=None,
+            precision="fp32"):
         target = target or torch.device("cpu")
         produced = 0
         def empty():
             return {
-                "trajectories": [], "episodes": [[] for _ in range(5)],
+                "trajectories": [], "completions": [], "episodes": [[] for _ in range(5)],
                 "iteration": self.iteration, "orphan_empty_actions": 0,
                 "collect_seconds": 0.0, "queue_full_waits": 0,
                 "queue_put_seconds": 0.0,
@@ -2864,18 +2915,19 @@ class RolloutCollector:
                 except (Empty, EOFError, OSError):
                     break
             if latest:
-                version, state = latest
+                actor_revision, version, state = latest
                 if model is None:
                     self.env.load_policy(state)
                 else:
                     model.load_state_dict(state)
                 if self.args.log_level == "DEBUG":
-                    self.event("model", version=version)
+                    self.event("actor_loaded", actor_revision=actor_revision,
+                               policy_revision=version)
             steps = sampling_steps(produced, budget, self.args.envs, self.args.sampler_steps)
             if not steps:
                 break
             result = self.collect(
-                model, target, precision, deadline, steps, version, stop,
+                model, target, precision, deadline, steps, version, actor_revision, stop,
                 heartbeat, progress,
             )
             if self.args.log_level == "DEBUG":
@@ -2888,6 +2940,7 @@ class RolloutCollector:
                     mcts_targets=result["mcts_targets"], mcts_seconds=round(result["mcts_seconds"], 3),
                 )
             pending["trajectories"].extend(result["trajectories"])
+            pending["completions"].extend(result["completions"])
             pending["expert_rows"].extend(result["expert_rows"])
             for target_episodes, rows in zip(pending["episodes"], result["episodes"]):
                 target_episodes.extend(rows)
@@ -2904,12 +2957,11 @@ class RolloutCollector:
             ):
                 pending[key] += result[key]
             pending["iteration"] = result["iteration"]
-            if not pending["trajectories"]:
-                continue
             added = sum(len(trajectory["rows"]) for trajectory in result["trajectories"])
             pending_rows += added
             produced += added
-            if pending_rows < self.args.envs * 4 and produced < budget \
+            if max(pending_rows, len(pending["completions"])) < self.args.envs * 4 \
+                    and produced < budget \
                     and time.monotonic() < deadline and not stop.is_set():
                 continue
             pending["reservoir"] = self.reservoir.drain_candidates()
@@ -2954,15 +3006,15 @@ class RolloutCollector:
 
 
 def collect_worker(model, args, sampler_session, stage, capacity, pending_capacity, iteration,
-                   worker, generation, version, models, samples, stop, deadline, budget, results,
-                   heartbeat, progress):
+                   worker, generation, actor_revision, policy_revision, models, samples, stop,
+                   deadline, budget, results, heartbeat, progress):
     global _ACCELERATOR_LOCK
     if args.sampler_backend == "process" and _ACCELERATOR_LOCK is not None:
         _ACCELERATOR_LOCK.close()
         _ACCELERATOR_LOCK = None
     if args.sampler_backend == "process":
         configure_logging(args.output, f"sampler-{worker}", getattr(args, "log_level", "INFO"),
-                          args.trainer_session)
+                          args.trainer_session, args.run_id, args.event_log)
     qos = getattr(ctypes.CDLL(None), "pthread_set_qos_class_self_np", None)
     if qos is not None:
         qos(int(os.environ.get("ACTOR_QOS", "0x21"), 0), 0)
@@ -2976,8 +3028,10 @@ def collect_worker(model, args, sampler_session, stage, capacity, pending_capaci
         args, sampler_session, stage, reservoir, iteration, worker, generation,
     )
     collector.event(
-        "start", pid=os.getpid(), worker=worker, generation=generation,
-        session=sampler_session, stage=stage, envs=args.envs, threads=args.sampler_threads,
+        "sampler_start", worker=worker, generation=generation,
+        sampler_session=sampler_session, stage=stage, envs=args.envs,
+        threads=args.sampler_threads, actor_revision=actor_revision,
+        policy_revision=policy_revision,
     )
     target = torch.device("mps") if os.environ.get("ACTOR_MPS") else torch.device("cpu")
     precision = "bf16" if target.type == "mps" else "fp32"
@@ -2993,16 +3047,17 @@ def collect_worker(model, args, sampler_session, stage, capacity, pending_capaci
     heartbeat[worker] = time.monotonic()
     try:
         result = collector.run(
-            model, models, samples, stop, deadline, budget, worker, heartbeat, progress, version,
-            target, precision,
+            model, models, samples, stop, deadline, budget, worker, heartbeat, progress,
+            policy_revision, actor_revision, target, precision,
         )
         collector.event(
-            "stop", version=result[2], iteration=result[3]["iteration"],
+            "sampler_stop", policy_revision=result[2], iteration=result[3]["iteration"],
             sampled=result[3]["sampled_steps"], discarded=result[3]["discarded_steps"],
         )
         results.put(result)
     except BaseException as error:
-        collector.event("error", version=version, error=repr(error), traceback=traceback.format_exc())
+        collector.event("sampler_error", policy_revision=policy_revision,
+                        error=repr(error), traceback=traceback.format_exc())
         raise
     finally:
         if args.sampler_backend == "process":
@@ -3295,7 +3350,7 @@ class ExpertDataset:
 
 def train_stream(model, optimizer, args, sampler_session, stage, target, deadline, budget,
                  base_decisions, auxiliary_decisions, stage_decisions, run_started, reservoir, progress_active,
-                 save_report, save_step, fingerprint, critic_balance):
+                 save_report, save_step, fingerprint, critic_balance, revisions):
     ascension, bonus = STAGES[stage]
     collector_args = copy.copy(args)
     collector_args.cache_features = (
@@ -3376,8 +3431,9 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
     queue_packets = queue_peak = 0
     cache_stats = dict.fromkeys(("card_hit", "card_miss", "graph_hit", "graph_miss"), 0)
     observed_kl = observed_clip = 0.0
-    latest_sampler_version = dataset_peak = 0
-    sampler_versions = [0] * args.samplers
+    latest_sampler_version = revisions["policy_revision"]
+    dataset_peak = 0
+    sampler_versions = [revisions["policy_revision"]] * args.samplers
     sampler_iterations = [base_decisions // args.envs] * args.samplers
     latest_sampler_iteration = base_decisions // args.envs
     policy_lags = []
@@ -3406,7 +3462,16 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
     watchdog_pending = [False] * args.samplers
     watchdog_failures = Queue()
     actor = export_value_model(None, model, fingerprint, 1, 0, True)
-    actor_version = updates
+    revisions["actor_revision"] += 1
+    actor_revision = revisions["actor_revision"]
+    policy_version = revisions["policy_revision"]
+    emit_event({
+        "event": "actor_published", "actor_revision": actor_revision,
+        "weights_revision": revisions["weights_revision"],
+        "policy_revision": policy_version, "step": base_decisions,
+        "resolved_decisions_total": base_decisions, "stage": stage,
+        "training_elapsed_seconds": time.monotonic() - run_started,
+    })
 
     def start_worker(worker):
         heartbeat[worker] = time.monotonic()
@@ -3416,8 +3481,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         process = worker_type(target=collect_worker, args=(
             actor, collector_args, sampler_session, stage,
             reservoir.capacity, pending_capacity, sampler_iterations[worker], worker,
-            sampler_generations[worker], actor_version, models[worker], samples, stop, deadline, budget,
-            results, heartbeat, progress,
+            sampler_generations[worker], actor_revision, policy_version, models[worker], samples,
+            stop, deadline, budget, results, heartbeat, progress,
         ), name=f"sampler-{worker}")
         workers[worker] = process
         process.start()
@@ -3426,18 +3491,27 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         start_worker(worker)
 
     def publish():
-        nonlocal actor, actor_version
+        nonlocal actor, actor_revision, policy_version
         if stop.is_set():
             return
         actor = export_value_model(None, model, fingerprint, 1, 0, True)
-        actor_version = updates
+        revisions["actor_revision"] += 1
+        actor_revision = revisions["actor_revision"]
+        policy_version = revisions["policy_revision"]
+        emit_event({
+            "event": "actor_published", "actor_revision": actor_revision,
+            "weights_revision": revisions["weights_revision"],
+            "policy_revision": policy_version, "step": base_decisions + handled,
+            "resolved_decisions_total": base_decisions + handled, "stage": stage,
+            "training_elapsed_seconds": time.monotonic() - run_started,
+        })
         for queue in models:
             try:
-                queue.put_nowait((actor_version, actor))
+                queue.put_nowait((actor_revision, policy_version, actor))
             except Full:
                 try:
                     queue.get(timeout=.1)
-                    queue.put((actor_version, actor), timeout=.1)
+                    queue.put((actor_revision, policy_version, actor), timeout=.1)
                 except (Empty, Full, EOFError, OSError):
                     pass
 
@@ -3512,9 +3586,10 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 update["rows"][index] = (*row[:4], np.asarray(
                     policy[:packed_action_count(row[0])], np.float16,
                 ))
-        winning_added += reservoir.admit(
+        packet_winning_added = reservoir.admit(
             update["rows"], update["wins"], update["skipped"], update["forced"], rng,
         )
+        winning_added += packet_winning_added
         for target_episodes, collected in zip(episodes, result["episodes"]):
             target_episodes.extend(collected)
         for character, collected in enumerate(result["episodes"]):
@@ -3526,13 +3601,54 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         orphan_empty_actions += result["orphan_empty_actions"]
         queue_full_waits += result.get("queue_full_waits", 0)
         queue_put_seconds += result.get("queue_put_seconds", 0)
+        queue_delay = None
         if "queued_at" in result:
-            queue_delay_sum += time.monotonic() - result["queued_at"]
+            queue_delay = time.monotonic() - result["queued_at"]
+            queue_delay_sum += queue_delay
             queue_packets += 1
         try:
             queue_peak = max(queue_peak, samples.qsize())
         except NotImplementedError:
             pass
+        emit_event({
+            "event": "sample_packet", "step": base_decisions + handled,
+            "resolved_decisions_total": base_decisions + handled,
+            "sampled_decisions_total": base_decisions + sampled,
+            "training_elapsed_seconds": time.monotonic() - run_started,
+            "stage": stage, "worker": worker, "generation": generation,
+            "weights_revision": revisions["weights_revision"],
+            "policy_revision": revisions["policy_revision"],
+            "packet_policy_revision": version,
+            "packet_sampled_decisions": result["sampled_steps"],
+            "trajectory_rows": sum(len(row["rows"]) for row in result["trajectories"]),
+            "accepted_rows": added, "admitted_rows": added - excluded,
+            "forced_rows": excluded, "budget_excess_rows": excess,
+            "discarded_decisions": result["discarded_steps"] + excess,
+            "expert_rows": len(result.get("expert_rows", ())),
+            "winning_candidates": len(update["rows"]),
+            "winning_admitted": packet_winning_added,
+            "queue_delay_seconds": queue_delay,
+            "queue_put_seconds": result.get("queue_put_seconds", 0.0),
+            "collect_seconds": result.get("collect_seconds", 0.0),
+            "cache": {
+                "card_hits": result.get("card_hit", 0),
+                "card_misses": result.get("card_miss", 0),
+                "graph_hits": result.get("graph_hit", 0),
+                "graph_misses": result.get("graph_miss", 0),
+            },
+            "mcts": {
+                key.removeprefix("mcts_"): result.get(key, 0)
+                for key in (
+                    "mcts_roots", "mcts_simulations", "mcts_leaves", "mcts_nodes",
+                    "mcts_batches", "mcts_targets", "mcts_turn_starts", "mcts_seconds",
+                    "mcts_simulate_seconds", "mcts_encode_seconds",
+                    "mcts_inference_seconds", "mcts_backup_seconds",
+                    "mcts_rollout_steps", "mcts_rollout_completed",
+                    "mcts_rollout_invalid", "mcts_rollout_seconds", "mcts_timeouts",
+                )
+            },
+            "episodes": result.get("completions", ()),
+        }, console=False)
 
     def drain_samples():
         for _ in range(sample_capacity):
@@ -3729,7 +3845,10 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             "trajectory_stale_step_fraction": sum(recent_stale_steps) / max(1, sum(recent_lengths)),
             "trajectory_completion_seconds_mean": float(np.mean(recent_seconds)) if recent_seconds else 0,
             "trajectory_completion_seconds_max": max(recent_seconds, default=0),
-            "policy_version": updates, "sampler_version": latest_sampler_version,
+            "policy_version": revisions["policy_revision"],
+            "weights_revision": revisions["weights_revision"],
+            "actor_revision": revisions["actor_revision"],
+            "sampler_version": latest_sampler_version,
             "policy_lag_mean": float(np.mean(policy_lags)) if policy_lags else 0,
             "sampler_heartbeats": [time.monotonic() - value for value in heartbeat[:]],
             "sampler_restarts": sampler_restarts, "sampler_wedges": sampler_wedges,
@@ -3778,6 +3897,19 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 ingest(results.get_nowait(), False)
             except (Empty, EOFError, OSError):
                 return
+
+    def training_batch_event(policy_outcome, commit_kind, **values):
+        emit_event({
+            "event": "training_batch", "policy_outcome": policy_outcome,
+            "commit_kind": commit_kind, "step": base_decisions + handled,
+            "sampled_decisions_total": base_decisions + sampled,
+            "update_attempt": revisions["update_attempt"],
+            "weights_revision": revisions["weights_revision"],
+            "policy_revision": revisions["policy_revision"], "stage": stage,
+            "resolved_decisions_total": base_decisions + handled,
+            "training_elapsed_seconds": time.monotonic() - run_started,
+            **values,
+        })
 
     def watch_samplers():
         while not stop.wait(min(1., args.sampler_timeout / 10)):
@@ -3838,7 +3970,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             watchdog_dropped += dropped
             worker_accounted[worker] = worker_resolved[worker] = 0
             emit_event({
-                "time": time.time(), "event": "sampler_failure", "worker": worker,
+                "event": "sampler_failure", "worker": worker,
                 "generation": sampler_generations[worker], "wedged": wedged,
                 "exitcode": exitcode, "dropped": dropped,
             }, "WARNING")
@@ -3858,7 +3990,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             start_worker(worker)
             watchdog_pending[worker] = False
             emit_event({
-                "time": time.time(), "event": "sampler_restart", "worker": worker,
+                "event": "sampler_restart", "worker": worker,
                 "generation": sampler_generations[worker],
                 "restarts": sampler_restarts[worker], "streak": sampler_restart_streaks[worker],
             })
@@ -3877,10 +4009,32 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 except NotImplementedError:
                     queue_size = -1
                 emit_event({
-                    "event": "heartbeat", "decisions": decisions, "sampled": sampled,
-                    "updates": updates, "dataset": len(dataset), "expert": len(expert_dataset),
-                    "queue": queue_size, "sampler_version": latest_sampler_version,
-                    "sampler_age_seconds": max(now - value for value in heartbeat[:]),
+                    "event": "heartbeat", "step": base_decisions + handled,
+                    "resolved_decisions_total": base_decisions + handled,
+                    "sampled_decisions_total": base_decisions + sampled,
+                    "accepted_decisions_total": base_decisions + decisions,
+                    "policy_trained_rows_total": trained,
+                    "discarded_decisions_total": discarded_steps,
+                    "update_attempt": revisions["update_attempt"],
+                    "weights_revision": revisions["weights_revision"],
+                    "policy_revision": revisions["policy_revision"],
+                    "actor_revision": revisions["actor_revision"],
+                    "stage": stage, "dataset_rows": len(dataset),
+                    "dataset_peak_rows": dataset_peak, "expert_rows": len(expert_dataset),
+                    "winning_rows": len(reservoir.rows), "queue_depth": queue_size,
+                    "queue_capacity": sample_capacity,
+                    "sampler_policy_revision": latest_sampler_version,
+                    "sampler_age_seconds": [now - value for value in heartbeat[:]],
+                    "sampler_generations": sampler_generations,
+                    "sampler_restarts": sampler_restarts,
+                    "sampler_wedges": sampler_wedges,
+                    "accelerator_allocated_bytes": (
+                        torch.mps.current_allocated_memory() if target.type == "mps" else 0
+                    ),
+                    "accelerator_driver_allocated_bytes": (
+                        torch.mps.driver_allocated_memory() if target.type == "mps" else 0
+                    ),
+                    "training_elapsed_seconds": time.monotonic() - run_started,
                 })
                 next_heartbeat_log = now + 10
             sampler_done = (stop.is_set() or all(not worker.is_alive() for worker in workers)) and samples.empty()
@@ -3895,9 +4049,18 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     sampler_done = (stop.is_set() or all(not worker.is_alive() for worker in workers)) and samples.empty()
                 absolute = base_decisions + handled
                 boundary = min(next_report, next_save) - absolute
-                stale = dataset.prune(updates, args.max_policy_lag, boundary)
-                expert_dataset.prune(updates, args.expert_max_lag)
+                stale = dataset.prune(revisions["policy_revision"], args.max_policy_lag, boundary)
+                expert_stale = len(expert_dataset)
+                expert_dataset.prune(revisions["policy_revision"], args.expert_max_lag)
+                expert_stale -= len(expert_dataset)
                 handled += stale
+                if stale or expert_stale:
+                    emit_event({
+                        "event": "dataset_pruned", "step": base_decisions + handled,
+                        "resolved_decisions_total": base_decisions + handled,
+                        "stage": stage, "stale_rows": stale,
+                        "expert_stale_rows": expert_stale,
+                    })
                 absolute = base_decisions + handled
                 if absolute >= next_save:
                     save_step(absolute)
@@ -3942,6 +4105,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
              cached, packed) = pending.pop(0)
             if not rows:
                 continue
+            revisions["update_attempt"] += 1
             screen_started = time.monotonic()
             unpack_started = time.monotonic()
             cpu_inputs, unpack_elapsed = packed.result()
@@ -3992,13 +4156,18 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             if len(removed):
                 dataset.discard(np.unique(removed))
             handled += len(removed)
-            policy_lags.extend((updates - values["version"][~invalid]).tolist())
+            batch_policy_lags = (
+                revisions["policy_revision"] - values["version"][~invalid]
+            ).tolist()
+            policy_lags.extend(batch_policy_lags)
             mask = fresh.to(log_ratio.dtype)
             fresh_count = mask.sum()
             denominator = fresh_count.clamp_min(1)
             safe_log_ratio = torch.where(fresh, log_ratio, torch.zeros_like(log_ratio))
             ratio = safe_log_ratio.exp()
             kl = ((ratio - 1 - safe_log_ratio) * mask).sum().div(denominator).detach()
+            clip_fraction = (((ratio - 1).abs() > args.clip).to(mask.dtype) * mask).sum() \
+                .div(denominator).detach()
             fresh_cpu = fresh.detach().cpu().numpy()
             fresh_rows = int(fresh_count)
             attempted += len(rows)
@@ -4011,6 +4180,14 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 update_seconds += update_elapsed
                 update_durations.append(update_elapsed)
                 backward_durations.append(0.)
+                training_batch_event(
+                    "no_fresh_rows", "none", attempted_rows=len(rows), fresh_rows=0,
+                    policy_trained_rows=0, critic_trained_rows=0,
+                    ratio_rejected_rows=len(rejected), retired_rows=len(expired),
+                    pre_kl=kl_value, unpack_seconds=unpack_seconds,
+                    forward_seconds=forward_seconds, backward_seconds=0.,
+                    total_seconds=update_elapsed,
+                )
                 continue
             batch_target = torch.as_tensor(values["critic_target"][fresh_cpu], device=target)
             critic_weights = critic_balance.weights(
@@ -4032,13 +4209,30 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 pre_kl_rejected_updates += 1
                 backward_started = time.monotonic()
                 optimizer.zero_grad(set_to_none=True); critic_loss.backward(inputs=critic_parameters)
-                critic_only_step(model, optimizer, critic_parameters); publish()
+                gradient_norm = critic_only_step(model, optimizer, critic_parameters)
+                revisions["weights_revision"] += 1
                 critic_only_updates += 1
                 backward_seconds = time.monotonic() - backward_started
                 backward_durations.append(backward_seconds)
                 update_elapsed = time.monotonic() - update_started
                 update_seconds += update_elapsed
                 update_durations.append(update_elapsed)
+                training_batch_event(
+                    "pre_kl_rejected", "critic_only", attempted_rows=len(rows),
+                    fresh_rows=fresh_rows, policy_trained_rows=0,
+                    critic_trained_rows=fresh_rows, ratio_rejected_rows=len(rejected),
+                    retired_rows=len(expired), critic_loss=float(value_loss.detach()),
+                    advantage_mean=float(np.mean(values["advantage"][fresh_cpu])),
+                    advantage_stddev=float(np.std(values["advantage"][fresh_cpu])),
+                    policy_lag_mean=float(np.mean(batch_policy_lags)),
+                    policy_lag_p95=float(np.quantile(batch_policy_lags, .95)),
+                    policy_lag_max=max(batch_policy_lags), pre_kl=kl_value,
+                    gradient_norm=gradient_norm,
+                    gradient_clipped=gradient_norm > .5, unpack_seconds=unpack_seconds,
+                    forward_seconds=forward_seconds, backward_seconds=backward_seconds,
+                    total_seconds=update_elapsed,
+                )
+                publish()
                 continue
             advantages = torch.as_tensor(values["advantage"], device=target)
             characters = torch.as_tensor(values["character"], device=target)
@@ -4166,14 +4360,14 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             backward_started = time.monotonic()
             optimizer.zero_grad(set_to_none=True); loss.backward()
             if args.critic_only:
-                critic_only_step(model, optimizer); critic_only_updates += 1
+                gradient_norm = critic_only_step(model, optimizer); critic_only_updates += 1
                 accepted, proposals, post_log_ratio = True, [0.], log_ratio.detach()
             elif args.target_kl >= 1:
-                nn.utils.clip_grad_norm_(model.parameters(), .5)
+                gradient_norm = float(nn.utils.clip_grad_norm_(model.parameters(), .5))
                 optimizer.step()
                 accepted, proposals, post_log_ratio = True, [], log_ratio.detach()
             else:
-                accepted, proposals, post_log_ratio = trust_region_step(
+                accepted, proposals, post_log_ratio, gradient_norm = trust_region_step(
                     model, optimizer, inputs, action, old, fresh, denominator,
                     args.precision, args.target_kl, args.policy_temperature,
                     choice_index=choice_index if flat_policy else None,
@@ -4193,16 +4387,37 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 retry_logits = predict(
                     model, inputs, args.precision, args.policy_temperature,
                 )[1][:len(rows)][fresh]
-                retry_critic_loss = args.value_weight * (
+                retry_value_loss = (
                     -batch_target * retry_logits.log_softmax(-1)
                 ).sum(1).mul(critic_weights).mean()
+                retry_critic_loss = args.value_weight * retry_value_loss
                 retry_critic_loss.backward(inputs=critic_parameters)
-                critic_only_step(model, optimizer, critic_parameters); publish()
+                gradient_norm = critic_only_step(model, optimizer, critic_parameters)
+                revisions["weights_revision"] += 1
                 critic_only_updates += 1
                 update_elapsed = time.monotonic() - update_started
                 update_seconds += update_elapsed
                 update_durations.append(update_elapsed)
-                backward_durations.append(time.monotonic() - backward_started)
+                backward_seconds = time.monotonic() - backward_started
+                backward_durations.append(backward_seconds)
+                training_batch_event(
+                    "post_kl_rejected", "critic_only", attempted_rows=len(rows),
+                    fresh_rows=fresh_rows, policy_trained_rows=0,
+                    critic_trained_rows=fresh_rows, ratio_rejected_rows=len(rejected),
+                    retired_rows=len(expired), critic_loss=float(retry_value_loss.detach()),
+                    advantage_mean=float(np.mean(values["advantage"][fresh_cpu])),
+                    advantage_stddev=float(np.std(values["advantage"][fresh_cpu])),
+                    policy_lag_mean=float(np.mean(batch_policy_lags)),
+                    policy_lag_p95=float(np.quantile(batch_policy_lags, .95)),
+                    policy_lag_max=max(batch_policy_lags),
+                    entropy=float(entropy.detach()), entropy_weight=entropy_weight,
+                    pre_kl=kl_value, post_kl_proposals=proposals,
+                    clip_fraction=float(clip_fraction), gradient_norm=gradient_norm,
+                    gradient_clipped=gradient_norm > .5, unpack_seconds=unpack_seconds,
+                    forward_seconds=forward_seconds, backward_seconds=backward_seconds,
+                    total_seconds=update_elapsed,
+                )
+                publish()
                 continue
             post_kl = proposals[-1] if proposals else kl_value
             post_ratio = post_log_ratio.exp()
@@ -4213,7 +4428,6 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             losses["post_kl"].append(post_kl)
             accepted_pre_kl_sum += kl_value
             accepted_post_kl_sum += post_kl
-            clip_fraction = (((ratio - 1).abs() > args.clip).to(mask.dtype) * mask).sum().div(denominator).detach()
             losses["mean_advantage"].append(float(np.mean(values["advantage"][fresh_cpu])))
             losses["policy_loss"].append(policy_loss.detach())
             if expert_count and args.expert_weight:
@@ -4237,6 +4451,9 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             losses["entropy_weight"].append(entropy_weight)
             losses["kl"].append(kl); losses["clip_fraction"].append(clip_fraction)
             trained += fresh_rows; updates += 1
+            revisions["weights_revision"] += 1
+            if not args.critic_only:
+                revisions["policy_revision"] += 1
             if expert_count:
                 expert_visits += int(expert_visits_batch.sum())
                 expert_depth += int(expert_depths_batch.sum())
@@ -4258,8 +4475,6 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     losses["winning_loss"].append(winning_loss.detach())
                     losses["winning_kl"].append(replay_kl_mean.detach())
                     winning_replayed += replay_count
-            if updates % args.publish_updates == 0:
-                publish()
             if target.type == "mps":
                 torch.mps.empty_cache()
             backward_seconds = time.monotonic() - backward_started
@@ -4267,27 +4482,44 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             update_elapsed = time.monotonic() - update_started
             update_seconds += update_elapsed
             update_durations.append(update_elapsed)
-            emit_event({
-                "event": "optimizer_update", "update": updates, "rows": fresh_rows,
-                "expert_rows": expert_count, "replay": len(replay),
-                "policy_loss": float(policy_loss.detach()),
-                "expert_loss": float(expert_loss.detach()),
-                "ppo_head_grad": float(ppo_head_grad.detach()) if ppo_head_grad is not None else 0,
-                "expert_head_grad": float(expert_head_grad.detach())
+            training_batch_event(
+                "disabled" if args.critic_only else "accepted",
+                "critic_only" if args.critic_only else "full",
+                attempted_rows=len(rows), fresh_rows=fresh_rows,
+                policy_trained_rows=0 if args.critic_only else fresh_rows,
+                critic_trained_rows=fresh_rows, ratio_rejected_rows=len(rejected),
+                retired_rows=len(expired), local_policy_updates=updates,
+                expert_rows=expert_count, replay_rows=len(replay),
+                policy_loss=float(policy_loss.detach()),
+                expert_loss=float(expert_loss.detach()),
+                ppo_head_grad=float(ppo_head_grad.detach()) if ppo_head_grad is not None else 0,
+                expert_head_grad=float(expert_head_grad.detach())
                 if expert_head_grad is not None else 0,
-                "expert_grad_cosine": float(expert_ppo_grad_cosine.detach())
+                expert_grad_cosine=float(expert_ppo_grad_cosine.detach())
                 if expert_ppo_grad_cosine is not None else 0,
-                "critic_loss": float(value_loss.detach()),
-                "search_consistency_loss": float(search_consistency_loss.detach()),
-                "critic_expected": float(critic_expected(probabilities).mean()),
-                "critic_win_probability": float(probabilities[:, -1].mean()),
-                "entropy": float(entropy.detach()), "pre_kl": kl_value,
-                "post_kl": post_kl, "seconds": update_elapsed,
-            })
+                critic_loss=float(value_loss.detach()),
+                search_consistency_loss=float(search_consistency_loss.detach()),
+                critic_expected=float(critic_expected(probabilities).mean()),
+                critic_win_probability=float(probabilities[:, -1].mean()),
+                advantage_mean=float(np.mean(values["advantage"][fresh_cpu])),
+                advantage_stddev=float(np.std(values["advantage"][fresh_cpu])),
+                policy_lag_mean=float(np.mean(batch_policy_lags)),
+                policy_lag_p95=float(np.quantile(batch_policy_lags, .95)),
+                policy_lag_max=max(batch_policy_lags),
+                entropy=float(entropy.detach()), entropy_weight=entropy_weight,
+                pre_kl=kl_value, post_kl=post_kl,
+                post_kl_proposals=proposals, clip_fraction=float(clip_fraction),
+                gradient_norm=gradient_norm, gradient_clipped=gradient_norm > .5,
+                learning_rates=[group["lr"] for group in optimizer.param_groups],
+                unpack_seconds=unpack_seconds, forward_seconds=forward_seconds,
+                backward_seconds=backward_seconds, total_seconds=update_elapsed,
+            )
+            if updates % args.publish_updates == 0:
+                publish()
             if update_elapsed > 5:
                 packed = rows + expert_rows + [sample[0] for sample in replay]
                 represented_actions = max(packed_action_count(row) for row in packed)
-                emit_event({"time": time.time(), "event": "slow_update", "metrics": {
+                emit_event({"event": "slow_update", "metrics": {
                     "seconds": update_elapsed,
                     "fresh": fresh_rows, "replay": len(replay),
                     "state_tokens_max": max(packed_state_count(row) for row in packed),
@@ -4433,7 +4665,10 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         "trajectory_stale_step_fraction": sum(trajectory_stale_steps) / max(1, sum(trajectory_lengths)),
         "trajectory_completion_seconds_mean": float(np.mean(trajectory_seconds)) if trajectory_seconds else 0,
         "trajectory_completion_seconds_max": max(trajectory_seconds, default=0),
-        "policy_version": updates, "sampler_version": latest_sampler_version,
+        "policy_version": revisions["policy_revision"],
+        "weights_revision": revisions["weights_revision"],
+        "actor_revision": revisions["actor_revision"],
+        "sampler_version": latest_sampler_version,
         "policy_lag_mean": float(np.mean(policy_lags)) if policy_lags else 0,
         "sampler_heartbeats": [time.monotonic() - value for value in heartbeat[:]],
         "sampler_restarts": sampler_restarts, "sampler_wedges": sampler_wedges,
@@ -4855,6 +5090,14 @@ def atomic_live(path, value):
     temporary.replace(path)
 
 
+def read_live(path):
+    try:
+        source = path.read_text()
+        return json.loads(source.removeprefix("window.spirefyshLive=").removesuffix(";"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
 def evaluation_score(result):
     characters = result["characters"]
     return (
@@ -4883,13 +5126,407 @@ def sha256_file(path):
         return hashlib.file_digest(source, "sha256").hexdigest()
 
 
+def event_logs(run):
+    legacy = run / "events.jsonl"
+    return ([legacy] if legacy.exists() else []) + sorted((run / "events").glob("*.jsonl"))
+
+
+def checkpoint_origin(path, digest):
+    run = path.parent
+    while run != run.parent and not (run / "run.json").exists():
+        run = run.parent
+    if not (run / "run.json").exists():
+        return None
+    for metadata_path in (run / "latest.json", run / "initial.json"):
+        try:
+            metadata = json.loads(metadata_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        aliases = [metadata.get("checkpoint"), metadata.get("alias")]
+        if metadata_path.name == "initial.json":
+            aliases.append("initial.pt")
+        matches_path = any(
+            value and (run / value).resolve() == path.resolve() for value in aliases
+        )
+        if matches_path and metadata.get("sha256") == digest and all(
+            metadata.get(key) is not None for key in ("run_id", "session_id", "event_end")
+        ):
+            return {
+                "run_id": metadata["run_id"], "session_id": metadata["session_id"],
+                "event_end": metadata["event_end"], "checkpoint_sha256": digest,
+                "checkpoint_step": metadata.get("step"),
+                "checkpoint_weights_revision": metadata.get("revisions", {}).get(
+                    "weights_revision"
+                ),
+                "log": metadata.get("event_log"),
+            }
+    matches = []
+    for log in event_logs(run):
+        with log.open("rb") as source:
+            while line := source.readline():
+                try:
+                    row = json.loads(line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if row.get("event") == "checkpoint" and row.get("sha256") == digest:
+                    matches.append((log, source.tell(), row))
+    if len(matches) != 1:
+        return None
+    log, end, row = matches[0]
+    manifest = json.loads((run / "run.json").read_text())
+    return {
+        "run_id": manifest.get("run_id"),
+        "session_id": row.get("session_id", row.get("trainer_session")),
+        "event_end": end, "checkpoint_sha256": digest,
+        "checkpoint_step": row.get("step"),
+        "checkpoint_weights_revision": row.get("weights_revision"),
+        "log": str(log.relative_to(run)),
+    }
+
+
+def lineage_segments(root, run_id, session_id, end=None, seen=()):
+    if (run_id, session_id) in seen:
+        raise ValueError("cyclic training lineage")
+    for manifest_path in root.rglob("run.json"):
+        try:
+            manifest = json.loads(manifest_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if manifest.get("run_id") != run_id:
+            continue
+        session = next((row for row in manifest.get("sessions", [])
+                        if row.get("id") == session_id), None)
+        if session is None:
+            break
+        parent = session.get("parent")
+        prefix = lineage_segments(
+            root, parent["run_id"], parent["session_id"], parent["event_end"],
+            seen + ((run_id, session_id),),
+        ) if parent and parent.get("run_id") and parent.get("session_id") else []
+        log = manifest_path.parent / session.get("log", "events.jsonl")
+        legacy = manifest_path.parent / "events.jsonl"
+        if not prefix and log != legacy and legacy.exists():
+            prefix = [(legacy, None)]
+        return prefix + [(log, end)]
+    return []
+
+
+def floor_bands(histogram):
+    count = sum(histogram)
+    if not count:
+        return dict.fromkeys((
+            "min", "p01", "p05", "p10", "p25", "median", "p75", "p90", "p95",
+            "p99", "max", "mean",
+        ))
+    values = np.repeat(np.arange(len(histogram)), histogram)
+    return bands(values.tolist())
+
+
+class MetricsProjector:
+    means = {
+        "advantage_mean": "fresh_rows", "advantage_stddev": "fresh_rows",
+        "policy_loss": "policy_trained_rows", "critic_loss": "critic_trained_rows",
+        "entropy": "policy_trained_rows", "entropy_weight": "policy_trained_rows",
+        "pre_kl": "fresh_rows", "post_kl": "policy_trained_rows",
+        "clip_fraction": "policy_trained_rows", "gradient_norm": None,
+        "policy_lag_mean": "fresh_rows", "policy_lag_p95": "fresh_rows",
+        "policy_lag_max": None,
+        "unpack_seconds": None, "forward_seconds": None, "backward_seconds": None,
+        "total_seconds": None,
+    }
+
+    def __init__(self, root, run, manifest, session_id):
+        self.root, self.run, self.manifest, self.session_id = root, run, manifest, session_id
+        self.width = manifest.get("telemetry_window_decisions", 32_768)
+        self.closed, self.current, self.promotions = [], None, []
+        self.status, self.last_time, self.invalid = "running", None, 0
+        self.cursor = 0
+        segments = lineage_segments(root, manifest["run_id"], session_id)
+        if not segments:
+            segments = [(run / manifest["sessions"][-1]["log"], None)]
+        for index, (path, end) in enumerate(segments):
+            self.read(path, end)
+            if index + 1 == len(segments):
+                self.path, self.cursor = path, min(path.stat().st_size, end or path.stat().st_size)
+
+    def window(self, event):
+        step, stage = int(event.get("step", 0)), int(event.get("stage", 0))
+        key = step // self.width, stage
+        if self.current and self.current["_key"] != key:
+            self.closed.append(self.render(self.current))
+            del self.closed[:-4096]
+            self.current = None
+        if self.current is None:
+            self.current = {
+                "_key": key, "_start_step": step,
+                "_start_seconds": event.get("training_elapsed_seconds"),
+                "step": step, "stage": stage, "_written": event.get("time"),
+                "weights_revision": event.get("weights_revision", 0),
+                "policy_revision": event.get("policy_revision", 0),
+                "_sum": {}, "_weight": {}, "_floors": [0] * 53,
+                "_characters": [[0, 0] for _ in range(5)],
+                "_character_floors": [[0] * 53 for _ in range(5)],
+                "_character_caps": [[0, 0, 0] for _ in range(5)],
+                "_caps": [0, 0, 0], "_outcomes": {}, "_commits": {},
+                "_samples": [[] for _ in range(5)], "_sampled": 0,
+                "_trained": 0, "_critic_trained": 0, "_discarded": 0, "_batches": 0,
+                "_collect_seconds": 0., "_update_seconds": 0.,
+                "_episode_length": 0, "_episode_seconds": 0.,
+                "_attempted": 0, "_admitted": 0, "_forced": 0,
+                "_ratio_rejected": 0, "_stale": 0,
+            }
+        self.current["step"] = max(self.current["step"], step)
+        self.current["_written"] = event.get("time", self.current["_written"])
+        self.current["weights_revision"] = event.get(
+            "weights_revision", self.current["weights_revision"]
+        )
+        self.current["policy_revision"] = event.get(
+            "policy_revision", self.current["policy_revision"]
+        )
+        if event.get("training_elapsed_seconds") is not None:
+            self.current["_last_seconds"] = event["training_elapsed_seconds"]
+        return self.current
+
+    def fold(self, event, event_end=0):
+        self.last_time = event.get("time", self.last_time)
+        kind = event.get("event")
+        if kind == "session_start" or kind == "start" and event.get("role") in (None, "learner"):
+            self.status = "running"
+            parent_step = event.get("parent_checkpoint_step")
+            if parent_step is not None:
+                self.closed = [row for row in self.closed if row["step"] <= parent_step]
+                if self.current and self.current["step"] > parent_step:
+                    self.current = None
+            if kind == "session_start":
+                self.window(event)
+        elif kind == "training_batch":
+            window = self.window(event); window["_batches"] += 1
+            window["_trained"] += event.get("policy_trained_rows", 0)
+            window["_critic_trained"] += event.get("critic_trained_rows", 0)
+            window["_attempted"] += event.get("attempted_rows", 0)
+            window["_ratio_rejected"] += event.get("ratio_rejected_rows", 0)
+            window["_update_seconds"] += event.get("total_seconds", 0.)
+            outcome, commit = event.get("policy_outcome"), event.get("commit_kind")
+            if outcome:
+                window["_outcomes"][outcome] = window["_outcomes"].get(outcome, 0) + 1
+            if commit:
+                window["_commits"][commit] = window["_commits"].get(commit, 0) + 1
+            for metric, denominator in self.means.items():
+                value = event.get(metric)
+                weight = event.get(denominator, 1) if denominator else 1
+                if value is None or not weight:
+                    continue
+                window["_sum"][metric] = window["_sum"].get(metric, 0.) + value * weight
+                window["_weight"][metric] = window["_weight"].get(metric, 0) + weight
+        elif kind == "sample_packet":
+            window = self.window(event)
+            window["_sampled"] += event.get("packet_sampled_decisions", 0)
+            window["_discarded"] += event.get("discarded_decisions", 0)
+            window["_admitted"] += event.get("admitted_rows", 0)
+            window["_forced"] += event.get("forced_rows", 0)
+            window["_collect_seconds"] += event.get("collect_seconds", 0.)
+            for index, episode in enumerate(event.get("episodes", ())):
+                character = int(episode["character"]); floor = max(0, min(52, int(episode["floor"])))
+                window["_floors"][floor] += 1
+                window["_characters"][character][0] += 1
+                window["_characters"][character][1] += int(episode["won"])
+                window["_character_floors"][character][floor] += 1
+                window["_caps"][0] += int(episode.get("step_cap", False))
+                window["_caps"][1] += int(episode.get("combat_cap", False))
+                window["_caps"][2] += int(episode.get("empty_actions", False))
+                for target, key in enumerate(("step_cap", "combat_cap", "empty_actions")):
+                    window["_character_caps"][character][target] += int(episode.get(key, False))
+                window["_episode_length"] += episode.get("length", 0)
+                window["_episode_seconds"] += episode.get("completion_seconds", 0.)
+                priority = hashlib.sha256(
+                    f"{event.get('run_id')}:{event.get('session_id')}:{event_end}:{index}".encode()
+                ).digest()[:8]
+                samples = window["_samples"][character]
+                samples.append((priority, episode.get("iteration", 0), floor, character))
+                samples.sort()
+                del samples[8:]
+        elif kind == "dataset_pruned":
+            self.window(event)["_stale"] += event.get("stale_rows", 0)
+        elif kind == "heartbeat":
+            window = self.window(event)
+            for source, target in (
+                ("dataset_rows", "dataset_rows"), ("queue_depth", "sample_queue_depth"),
+                ("expert_rows", "expert_buffer_rows"),
+                ("winning_rows", "winning_reservoir"),
+                ("accelerator_allocated_bytes", "accelerator_allocated_bytes"),
+                ("accelerator_driver_allocated_bytes", "accelerator_driver_allocated_bytes"),
+            ):
+                if source in event:
+                    window[target] = event[source]
+        elif kind == "checkpoint":
+            self.window(event)
+        elif kind == "promotion":
+            self.promotions.append(event | {"_written": event.get("time")})
+        elif kind == "report" and event.get("event_schema") != 2:
+            row = dict(event); row["_written"] = event.get("time")
+            row["_session"] = f"{event.get('run_id', 'legacy')}:" \
+                f"{event.get('trainer_session', 0)}:{event.get('sampler_session', 0)}"
+            self.closed = [saved for saved in self.closed if saved["step"] != row.get("step")]
+            self.closed.append(row)
+        elif kind == "session_complete":
+            self.status = "completed"
+        elif kind in ("session_error", "error") and event.get("role") == "learner":
+            self.status = "failed"
+
+    def render(self, window):
+        metrics = {
+            key: window["_sum"][key] / window["_weight"][key]
+            for key in window["_sum"]
+        }
+        episodes = sum(row[0] for row in window["_characters"])
+        wins = sum(row[1] for row in window["_characters"])
+        elapsed = next((value for value in (
+            window.get("training_elapsed_seconds"), window.get("_last_seconds")
+        ) if value is not None), 0)
+        start_seconds = window.get("_start_seconds")
+        metrics |= {
+            "steps": window["step"], "updates": window["weights_revision"],
+            "weights_revision": window["weights_revision"],
+            "policy_version": window["policy_revision"], "episodes": episodes,
+            "wins": wins, "win_rate": wins / max(1, episodes),
+            "step_caps": window["_caps"][0], "combat_caps": window["_caps"][1],
+            "empty_actions": window["_caps"][2], "floor_bands": floor_bands(window["_floors"]),
+            "trajectory_floors": [list(sample[1:]) for rows in window["_samples"] for sample in rows],
+            "sampled_decisions": window["_sampled"], "dataset_trained": window["_trained"],
+            "policy_trained_rows": window["_trained"],
+            "critic_trained_rows": window["_critic_trained"],
+            "discarded_steps": window["_discarded"], "seconds": elapsed,
+            "actor_decisions_per_second": window["_sampled"]
+            / max(1e-9, window["_collect_seconds"]),
+            "learner_decisions_per_second": window["_trained"]
+            / max(1e-9, window["_update_seconds"]),
+            "trajectory_length_mean": window["_episode_length"] / max(1, episodes),
+            "trajectory_completion_seconds_mean": window["_episode_seconds"] / max(1, episodes),
+            "dataset_attempted": window["_attempted"],
+            "dataset_admitted": window["_admitted"],
+            "dataset_forced_dropped": window["_forced"],
+            "dataset_ratio_dropped": window["_ratio_rejected"],
+            "dataset_stale_dropped": window["_stale"],
+            "row_utilization": max(window["_trained"], window["_critic_trained"])
+            / max(1, window["_attempted"]),
+            "policy_row_utilization": window["_trained"] / max(1, window["_attempted"]),
+            "update_attempts": window["_batches"],
+            "weight_commits": sum(value for key, value in window["_commits"].items()
+                                  if key != "none"),
+            "policy_commits": window["_commits"].get("full", 0),
+            **{f"{key}_updates": value for key, value in window["_outcomes"].items()},
+            "decisions_per_second": (
+                (window["step"] - window["_start_step"]) / max(1e-9, elapsed - start_seconds)
+                if start_seconds is not None and elapsed >= start_seconds else 0
+            ),
+        }
+        for key in ("dataset_rows", "sample_queue_depth", "expert_buffer_rows",
+                    "winning_reservoir", "accelerator_allocated_bytes",
+                    "accelerator_driver_allocated_bytes"):
+            if key in window:
+                metrics[key] = window[key]
+        metrics["characters"] = [
+            {
+                "character": character, "episodes": count, "wins": wins,
+                "win_rate": wins / max(1, count),
+                "floor_bands": floor_bands(window["_character_floors"][character]),
+                "step_caps": window["_character_caps"][character][0],
+                "combat_caps": window["_character_caps"][character][1],
+                "empty_actions": window["_character_caps"][character][2],
+            }
+            for character, (count, wins) in enumerate(window["_characters"])
+        ]
+        stages = self.manifest.get("stages", ())
+        stage = stages[window["stage"]] if 0 <= window["stage"] < len(stages) else {}
+        return {
+            "step": window["step"], "stage": {"index": window["stage"], **stage},
+            "metrics": metrics, "_written": window["_written"],
+            "_session": f"{self.manifest['run_id']}:{self.session_id}",
+        }
+
+    def read(self, path, end=None, start=0):
+        try:
+            source = path.open("rb")
+        except OSError:
+            return start
+        with source:
+            source.seek(start)
+            position = start
+            while end is None or source.tell() < end:
+                line = source.readline()
+                if not line or not line.endswith(b"\n"):
+                    break
+                position = source.tell()
+                if end is not None and position > end:
+                    break
+                try:
+                    event = json.loads(line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    self.invalid += 1
+                    continue
+                self.fold(event, position)
+            return position
+
+    def value(self):
+        reports = self.closed + ([self.render(self.current)] if self.current else [])
+        reports = reports[-4096:]
+        return {
+            "schema": 2, "version": self.manifest["model_version"],
+            "run_id": self.manifest["run_id"], "lineage_id": self.manifest["lineage_id"],
+            "leaf_session_id": self.session_id, "revision": self.cursor,
+            "status": self.status, "last_event_time": self.last_time,
+            "first_retained_step": reports[0]["step"] if reports else None,
+            "invalid_events": self.invalid, "reports": reports,
+            "promotions": self.promotions, "cursor": self.cursor,
+        }
+
+
+class LiveProjector:
+    def __init__(self, root, run, manifest, session_id):
+        self.projector = MetricsProjector(root, run, manifest, session_id)
+        self.wake, self.stop = threading.Event(), threading.Event()
+        self.error = None
+        self.refresh()
+        self.thread = threading.Thread(target=self.run, name="live-metrics", daemon=True)
+        self.thread.start()
+
+    def refresh(self):
+        self.projector.cursor = self.projector.read(
+            self.projector.path, start=self.projector.cursor
+        )
+        value = self.projector.value()
+        while len(json.dumps(value, separators=(",", ":"))) > 4 * 1024 * 1024 \
+                and len(self.projector.closed) > 1:
+            self.projector.closed.pop(0)
+            value = self.projector.value()
+        atomic_live(self.projector.run / "live.js", value)
+
+    def run(self):
+        try:
+            while not self.stop.wait(2):
+                if self.wake.is_set():
+                    self.wake.clear(); self.refresh()
+            self.refresh()
+        except BaseException as error:
+            self.error = error
+
+    def close(self):
+        self.stop.set(); self.wake.set(); self.thread.join()
+        if self.error:
+            raise RuntimeError("live metrics projector failed") from self.error
+
+
 def load_stage_bests(output, development, checkpoints, best):
     stages = {
         key: row for key, row in best.get("stages", {}).items()
         if (output / row["checkpoint"]).exists()
     }
     for checkpoint in checkpoints.glob("*.pt"):
-        development_path = development / f"{int(checkpoint.stem):012}.json"
+        try:
+            step = int(checkpoint.stem.split("-w", 1)[0])
+        except ValueError:
+            continue
+        development_path = development / f"{step:012}.json"
         if not development_path.exists():
             continue
         evaluation = json.loads(development_path.read_text())
@@ -4909,7 +5546,8 @@ def load_stage_bests(output, development, checkpoints, best):
 
 def save_checkpoint(path, model, optimizer, manifest, stage, decisions, sampler_session,
                     promotion_index, progress_active, reservoir, auxiliary_decisions,
-                    stage_decisions, critic_balance=None, replace=False):
+                    stage_decisions, critic_balance=None, replace=False, revisions=None,
+                    training_elapsed_seconds=0, checkpoint_id=None):
     if path.exists() and not replace:
         raise FileExistsError(path)
     target = path.with_suffix(path.suffix + ".tmp") if replace else path
@@ -4917,6 +5555,9 @@ def save_checkpoint(path, model, optimizer, manifest, stage, decisions, sampler_
         torch.save({
             "schema": 1, "model_version": model.model_version, "feature_version": FEATURE_VERSION,
             "fingerprint": manifest["fingerprint"], "precision": manifest["precision"],
+            "run_id": manifest.get("run_id"), "lineage_id": manifest.get("lineage_id"),
+            "session_id": manifest.get("sessions", [{}])[-1].get("id"),
+            "checkpoint_id": checkpoint_id,
             "layout": model.layout, "architecture": manifest["architecture"],
             "stage": stage, "decisions": decisions, "sampler_session": sampler_session,
             "promotion_index": promotion_index,
@@ -4924,10 +5565,13 @@ def save_checkpoint(path, model, optimizer, manifest, stage, decisions, sampler_
             "auxiliary_decisions": auxiliary_decisions,
             "stage_decisions": stage_decisions,
             "critic_balance": critic_balance.state_dict() if critic_balance else None,
+            "revisions": dict(revisions or {}),
+            "training_elapsed_seconds": training_elapsed_seconds,
             "winning_reservoir": reservoir.state_dict() if reservoir else None,
             "model": model.state_dict(), "optimizer": optimizer.state_dict(),
             "torch_rng": torch.get_rng_state(),
         }, output)
+        output.flush(); os.fsync(output.fileno())
     if replace:
         target.replace(path)
     return sha256_file(path)
@@ -4993,42 +5637,47 @@ def logged_history(run, manifest):
     session = parent_step = None
     starts = 0
     saw_report = saw_promotion = False
-    try:
-        lines = (run / "events.jsonl").open()
-    except OSError:
-        lines = ()
-    with lines if lines else nullcontext(lines):
-        for line in lines:
-            try:
-                row = json.loads(line)
-            except (json.JSONDecodeError, TypeError):
-                continue
-            event = row.get("event")
-            if event == "start" and row.get("role") in (None, "learner"):
-                saved = sessions[starts] if starts < len(sessions) else {}
-                starts += 1
-                parent_step = row.get("parent_checkpoint_step", saved.get("step"))
-                session = row.get("trainer_session", saved.get("id", starts))
-                if (reports or promotions) and parent_step is not None:
-                    reports = {step: report for step, report in reports.items()
-                               if step <= int(parent_step)}
-                    promotions = {step: promotion for step, promotion in promotions.items()
-                                  if step <= int(parent_step)}
-            elif event == "report":
-                saw_report = True
+    for path in event_logs(run):
+        try:
+            lines = path.open()
+        except OSError:
+            continue
+        with lines:
+            for line in lines:
                 try:
-                    row["_written"] = row.get("time")
-                    row["_trainer_session"] = row.get("trainer_session", session)
-                    reports[int(row["step"])] = row
-                except (KeyError, TypeError, ValueError):
-                    pass
-            elif event == "promotion":
-                saw_promotion = True
-                try:
-                    row["_written"] = row.get("time")
-                    promotions[int(row["step"])] = row
-                except (KeyError, TypeError, ValueError):
-                    pass
+                    row = json.loads(line)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                event = row.get("event")
+                if event in ("start", "session_start") and row.get("role") in (None, "learner"):
+                    saved = sessions[starts] if starts < len(sessions) else {}
+                    starts += 1
+                    parent_step = row.get("parent_checkpoint_step", saved.get("step"))
+                    session = row.get(
+                        "session_id", row.get("trainer_session", saved.get("id", starts))
+                    )
+                    if (reports or promotions) and parent_step is not None:
+                        reports = {step: report for step, report in reports.items()
+                                   if step <= int(parent_step)}
+                        promotions = {step: promotion for step, promotion in promotions.items()
+                                      if step <= int(parent_step)}
+                elif event == "report":
+                    saw_report = True
+                    try:
+                        row["_written"] = row.get("time")
+                        row["_trainer_session"] = row.get(
+                            "session_id", row.get("trainer_session", session)
+                        )
+                        reports[int(row["step"])] = row
+                    except (KeyError, TypeError, ValueError):
+                        pass
+                elif event == "promotion":
+                    saw_promotion = True
+                    try:
+                        row["_written"] = row.get("time")
+                        promotions[int(row["step"])] = row
+                    except (KeyError, TypeError, ValueError):
+                        pass
     return reports, promotions, session, parent_step, saw_report, saw_promotion
 
 
@@ -5042,8 +5691,36 @@ def dashboard(target):
         except (OSError, json.JSONDecodeError):
             continue
         run = path.parent
-        reports, promotions, trainer_session, parent_step, logged_reports, logged_promotions = \
-            logged_history(run, manifest)
+        live_data = read_live(run / "live.js") if manifest.get("schema", 1) >= 2 else None
+        sessions = manifest.get("sessions", [])
+        if sessions and manifest.get("schema", 1) >= 2:
+            session_id = sessions[-1]["id"]
+            log = run / sessions[-1].get("log", "events.jsonl")
+            try:
+                stale = not live_data or live_data.get("leaf_session_id") != session_id \
+                    or live_data.get("cursor", 0) < log.stat().st_size
+                if stale:
+                    projected = MetricsProjector(target, run, manifest, session_id).value()
+                    atomic_live(run / "live.js", projected); live_data = projected
+            except (OSError, ValueError):
+                pass
+        if live_data and live_data.get("schema") == 2:
+            reports, promotions = {}, {}
+            trainer_session = live_data.get("leaf_session_id")
+            parent_step = sessions[-1].get("step") if sessions else None
+            logged_reports = logged_promotions = False
+        else:
+            reports, promotions, trainer_session, parent_step, logged_reports, logged_promotions = \
+                logged_history(run, manifest)
+        if live_data and live_data.get("schema") == 2:
+            reports = {f"{row['step']}:{index}": row
+                       for index, row in enumerate(live_data.get("reports", ())) }
+            promotions = {index: row for index, row in enumerate(
+                live_data.get("promotions", ())
+            )}
+            trainer_session = live_data.get("leaf_session_id")
+            logged_reports = bool(reports)
+            logged_promotions = bool(promotions)
         if not logged_reports:
             for report in list((run / "reports").glob("*.json")) + [run / "live.json"]:
                 try:
@@ -5109,9 +5786,12 @@ def dashboard(target):
              "description": reports[key].get("description", ""),
              "pipeline": reports[key].get("pipeline", []),
              "metrics": dict(reports[key]["metrics"]), "_written": reports[key].get("_written"),
-             "_session": f"{name}:{reports[key].get('_trainer_session')}:"
+             "_session": reports[key].get("_session") or
+                         f"{name}:{reports[key].get('_trainer_session')}:"
                          f"{reports[key].get('sampler_session')}"}
-            for index, key in enumerate(sorted(reports), 1)
+            for index, key in enumerate(sorted(
+                reports, key=lambda value: (reports[value]["step"], reports[value].get("_written", 0))
+            ), 1)
         ]
         for row in report_rows:
             floors = row["metrics"].get("trajectory_floors", [])
@@ -5167,13 +5847,20 @@ def dashboard(target):
                 if version == manifest.get("model_version") else None
             runs[key] = {
                 "version": version, "manifest": version_manifest,
-                "source": manifest.get("source") if len(version_groups) == 1 else None,
+                "source": (None if live_data and live_data.get("schema") == 2 else
+                           manifest.get("source") if len(version_groups) == 1 else None),
                 "reports": version_reports,
-                "promotions": [promotions[key] for key in sorted(promotions) if low <= key <= high],
+                "promotions": [row for row in promotions.values()
+                               if low <= row.get("step", low) <= high],
                 "best": best if version == manifest.get("model_version") else None, "live": live,
                 "trainer_session": trainer_session, "parent_checkpoint_step": parent_step,
+                "run_id": manifest.get("run_id"),
+                "lineage_id": manifest.get("lineage_id", manifest.get("run_id", name)),
+                "live_revision": live_data.get("revision", 0) if live_data else 0,
+                "status": live_data.get("status") if live_data else None,
+                "last_event_time": live_data.get("last_event_time") if live_data else None,
             }
-            if live:
+            if live and manifest.get("schema", 1) < 2:
                 atomic_live(run / "live.js", {
                     "version": version, "trainer_session": trainer_session,
                     "parent_checkpoint_step": parent_step, "report": version_reports[-1],
@@ -5187,8 +5874,10 @@ def dashboard(target):
         parents = [candidate for candidate in parents if compatible(candidate)]
         start = min((int(session["step"]) for session in row["manifest"].get("sessions", []) if "step" in session), default=None)
         if not parents and source and start is not None:
-            checkpoint = f"{start:012}.pt"
-            parents = [candidate for candidate in runs if candidate not in seen + (name,) and compatible(candidate) and (target / candidate / "checkpoints" / checkpoint).exists()]
+            parents = [candidate for candidate in runs if candidate not in seen + (name,)
+                       and compatible(candidate) and any(
+                           (target / candidate / "checkpoints").glob(f"{start:012}*.pt")
+                       )]
         parent = max(parents, key=lambda candidate: runs[candidate]["reports"][-1]["step"], default=None)
         inherited = [report for report in history(parent, seen + (name,)) if start is None or report["step"] <= start] if parent else []
         return list({report["step"]: report for report in inherited + row["reports"]}.values())
@@ -5200,9 +5889,9 @@ def dashboard(target):
     data = json.dumps({name: run | {"run": name} for name, run in runs.items()}, separators=(",", ":")).replace("</", "<\\/")
     content = """<!doctype html><meta charset=utf-8><title>Spirefysh dashboard</title><script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script><style>
 body{font:14px system-ui;margin:24px;background:#101319;color:#e8ecf2}h1,h2{margin-bottom:6px}.controls{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:22px}select,input{padding:7px;background:#202938;color:#e8ecf2;border:1px solid #526176;border-radius:5px}.charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(440px,1fr));gap:14px}.panel{margin:22px 0;padding:16px;background:#171d28;border:1px solid #303a49;border-radius:10px}.charts .panel{margin:0}.plot{height:340px;min-width:0}table{border-collapse:collapse;width:100%}th,td{padding:7px;border-bottom:1px solid #303a49;text-align:left}.yes{color:#75db91}.no{color:#ee7b7b}
-</style><h1 id=title>Spirefysh dashboard</h1><div class=controls><label>Run <select id=version></select></label><label>X axis <select id=xaxis><option value=updates>Optimizer steps</option><option value=decisions selected># decisions</option><option value=time>Wall-clock time</option></select></label><label><input id=smooth type=checkbox checked> EMA</label><label>EMA α <input id=ema type=number min=.01 max=1 step=.01 value=.2></label><span>Auto-refresh 15s</span></div><div class=charts><section class=panel><h2>Mean advantage</h2><div id=advantage class=plot></div></section><section class=panel><h2>Decisions / second</h2><div id=throughput class=plot></div></section><section class=panel><h2>Terminal floor</h2><div id=floor class=plot></div></section><section class=panel><h2>Ascension</h2><div id=ascension class=plot></div></section><section class=panel><h2>Bonus strength</h2><div id=bonus class=plot></div></section><section class=panel><h2>Win proportion</h2><div id=wins class=plot></div></section><section class=panel><h2>Clip fraction</h2><div id=clip class=plot></div></section><section class=panel><h2>KL</h2><div id=kl class=plot></div></section><section class=panel><h2>Entropy</h2><div id=entropy class=plot></div></section></div><section class=panel><h2>Promotion</h2><div id=promotion></div></section><script>const versions=""" + data + r""",versionSelect=document.querySelector('#version'),xaxis=document.querySelector('#xaxis'),smooth=document.querySelector('#smooth'),ema=document.querySelector('#ema');
-const characterNames=['Ironclad','Defect','Silent','Regent','Necrobinder'],characterColors=['#ef4444','#38bdf8','#22c55e','#f59e0b','#a78bfa'],names=Object.keys(versions),config={responsive:true,displaylogo:false},refreshKey='spirefysh-dashboard',saved=(()=>{try{return JSON.parse(sessionStorage.getItem(refreshKey))}catch{return null}})();let timeOrigin=0;versionSelect.innerHTML=names.map(name=>`<option value="${name}">V${versions[name].version} · ${name}</option>`).join('');versionSelect.value=saved?.followLatest?names.at(-1):names.includes(saved?.version)?saved.version:names.at(-1)||'';if(saved?.xaxis)xaxis.value=saved.xaxis==='iteration'?'updates':saved.xaxis;if(typeof saved?.smooth==='boolean')smooth.checked=saved.smooth;if(saved?.ema)ema.value=saved.ema;
-function updateSteps(history){let offset=0,last=0,session;for(const report of history){const updates=Number(report.metrics.updates)||0;if(session!==undefined&&(report._session!==session||updates<last)){offset+=last;last=0}report._updates=offset+updates;last=Math.max(last,updates);session=report._session}}function x(report){return xaxis.value==='time'?(Number.isFinite(Number(report._written))?(report._written-timeOrigin)/60:(report.metrics.seconds||0)/60):xaxis.value==='decisions'?report.step:report._updates}function series(history,key){return history.map(report=>({x:x(report),y:Number(report.metrics[key])})).filter(point=>Number.isFinite(point.y))}
+</style><h1 id=title>Spirefysh dashboard</h1><div class=controls><label>Lineage <select id=lineage></select></label><label>Branch <select id=version></select></label><label>X axis <select id=xaxis><option value=updates>Weights revision</option><option value=decisions selected># decisions</option><option value=time>Active training time</option></select></label><label><input id=smooth type=checkbox checked> EMA</label><label>EMA α <input id=ema type=number min=.01 max=1 step=.01 value=.2></label><span>Auto-refresh 2s</span><span id=status></span></div><div class=charts><section class=panel><h2>Mean advantage</h2><div id=advantage class=plot></div></section><section class=panel><h2>Decisions / second</h2><div id=throughput class=plot></div></section><section class=panel><h2>Terminal floor</h2><div id=floor class=plot></div></section><section class=panel><h2>Ascension</h2><div id=ascension class=plot></div></section><section class=panel><h2>Bonus strength</h2><div id=bonus class=plot></div></section><section class=panel><h2>Win proportion</h2><div id=wins class=plot></div></section><section class=panel><h2>Clip fraction</h2><div id=clip class=plot></div></section><section class=panel><h2>KL</h2><div id=kl class=plot></div></section><section class=panel><h2>Entropy</h2><div id=entropy class=plot></div></section></div><section class=panel><h2>Promotion</h2><div id=promotion></div></section><script>const versions=""" + data + r""",lineageSelect=document.querySelector('#lineage'),versionSelect=document.querySelector('#version'),xaxis=document.querySelector('#xaxis'),smooth=document.querySelector('#smooth'),ema=document.querySelector('#ema');
+const characterNames=['Ironclad','Defect','Silent','Regent','Necrobinder'],characterColors=['#ef4444','#38bdf8','#22c55e','#f59e0b','#a78bfa'],names=Object.keys(versions),lineages=[...new Set(names.map(name=>versions[name].lineage_id||name))],config={responsive:true,displaylogo:false},refreshKey='spirefysh-dashboard',saved=(()=>{try{return JSON.parse(sessionStorage.getItem(refreshKey))}catch{return null}})();let timeOrigin=0;const initial=saved?.followLatest?names.at(-1):names.includes(saved?.version)?saved.version:names.at(-1)||'';lineageSelect.innerHTML=lineages.map(id=>`<option value="${id}">${names.find(name=>(versions[name].lineage_id||name)===id)||id}</option>`).join('');lineageSelect.value=versions[initial]?.lineage_id||initial;function showBranches(preferred){const branches=names.filter(name=>(versions[name].lineage_id||name)===lineageSelect.value);versionSelect.innerHTML=branches.map(name=>`<option value="${name}">V${versions[name].version} · ${name}</option>`).join('');versionSelect.value=branches.includes(preferred)?preferred:branches.at(-1)||''}showBranches(initial);if(saved?.xaxis)xaxis.value=saved.xaxis==='iteration'?'updates':saved.xaxis;if(typeof saved?.smooth==='boolean')smooth.checked=saved.smooth;if(saved?.ema)ema.value=saved.ema;
+function updateSteps(history){let offset=0,last=0,session;for(const report of history){if(Number.isFinite(Number(report.metrics.weights_revision))){report._updates=Number(report.metrics.weights_revision);continue}const updates=Number(report.metrics.updates)||0;if(session!==undefined&&(report._session!==session||updates<last)){offset+=last;last=0}report._updates=offset+updates;last=Math.max(last,updates);session=report._session}}function x(report){return xaxis.value==='time'?(Number.isFinite(Number(report.metrics.seconds))?report.metrics.seconds/60:Number.isFinite(Number(report._written))?(report._written-timeOrigin)/60:0):xaxis.value==='decisions'?report.step:report._updates}function series(history,key){return history.map(report=>({x:x(report),y:Number(report.metrics[key])})).filter(point=>Number.isFinite(point.y))}
 function emaLine(points){const alpha=Math.max(.01,Math.min(1,Number(ema.value)||.2));let value;return points.map((point,index)=>({x:point.x,y:value=index?alpha*point.y+(1-alpha)*value:point.y}))}
 function stageTransitions(history,run){const promotions=(run?.promotions||[]).filter(row=>row.promoted);if(promotions.length)return promotions.map(promotion=>{const report=history.find(row=>row.step===promotion.step)||history.filter(row=>row.step<=promotion.step).at(-1),after=history.find(row=>row.step>promotion.step),next=run.manifest.stages?.[(promotion.stage?.index??-1)+1]||after?.stage,position=xaxis.value==='decisions'?promotion.step:report&&xaxis.value==='updates'?report._updates:Number.isFinite(Number(promotion._written))?(promotion._written-timeOrigin)/60:Number.isFinite(Number(promotion.seconds))?promotion.seconds/60:report?x(report):NaN;return{x:position,stage:next}}).filter(point=>Number.isFinite(Number(point.x)));return history.slice(1).flatMap((row,index)=>Number.isFinite(Number(row.stage?.ascension))&&Number.isFinite(Number(history[index].stage?.ascension))&&(row.stage.ascension!==history[index].stage.ascension||row.stage.bonus!==history[index].stage.bonus)?[{x:x(row),stage:row.stage}]:[])}
 function stageLines(history,run){return stageTransitions(history,run).map(point=>({type:'line',xref:'x',yref:'paper',x0:point.x,x1:point.x,y0:0,y1:1,layer:'below',line:{color:'rgba(232,236,242,.38)',width:1,dash:'dash'}}))}
@@ -5213,15 +5902,15 @@ function stagePlot(id,history,key,color,run){const rows=history.filter(row=>Numb
 function promotionSummary(row){if(!row)return '<p>No promotion check yet.</p>';const characters=row.result?.characters||[],rows=characters.map(item=>`<tr><td>${characterNames[item.character]??`Character ${item.character}`}</td><td>${item.wins}/${item.runs}</td><td>${(100*item.wins/item.runs).toFixed(1)}%</td><td>${Number(item.floor_mean).toFixed(2)}</td><td>${item.caps}</td></tr>`).join('');return `<p class="${row.promoted?'yes':'no'}">${row.promoted?'Promoted':'Stayed at current stage'} · threshold ${(100*row.threshold).toFixed(0)}% per character · seed ${row.seed}</p><table><thead><tr><th>Character</th><th>Wins</th><th>Rate</th><th>Mean floor</th><th>Caps</th></tr></thead><tbody>${rows}</tbody></table>`}
 function saveDashboardState(){const views={};document.querySelectorAll('.plot').forEach(node=>{const view={};if(node._fullLayout?.xaxis?.autorange===false)view.x=[...node._fullLayout.xaxis.range];if(node._fullLayout?.yaxis?.autorange===false)view.y=[...node._fullLayout.yaxis.range];if(view.x||view.y)views[node.id]=view});try{sessionStorage.setItem(refreshKey,JSON.stringify({version:versionSelect.value,followLatest:versionSelect.value===names.at(-1),xaxis:xaxis.value,smooth:smooth.checked,ema:ema.value,scroll:[scrollX,scrollY],views}))}catch{}}
 function restoreDashboardState(){if(saved?.version===versionSelect.value&&saved.xaxis===xaxis.value)for(const [id,view] of Object.entries(saved.views||{})){const update={};if(view.x)update['xaxis.range']=view.x;if(view.y)update['yaxis.range']=view.y;if(Object.keys(update).length)Plotly.relayout(id,update)}if(saved?.scroll)scrollTo(...saved.scroll)}
-function showVersion(){const run=versions[versionSelect.value],reports=run.reports;updateSteps(reports);const timed=reports.find(row=>Number.isFinite(Number(row._written))&&Number.isFinite(Number(row.metrics.seconds)));timeOrigin=timed?timed._written-timed.metrics.seconds:0;document.querySelector('#title').textContent=`Spirefysh V${run.version} · ${run.run}`;plot('advantage',series(reports,'mean_advantage'),{history:reports,run});plot('throughput',series(reports,'decisions_per_second'),{tozero:true,history:reports,run});floorPlot(reports,run);stagePlot('ascension',reports,'ascension','#fb7185',run);stagePlot('bonus',reports,'bonus','#f59e0b',run);plot('wins',reports.map(row=>({x:x(row),y:row.metrics.wins/Math.max(1,row.metrics.episodes)})),{range:[0,1],percent:true,history:reports,run});plot('clip',series(reports,'clip_fraction'),{range:[0,1],percent:true,history:reports,run});plot('kl',series(reports,'kl'),{tozero:true,history:reports,run});plot('entropy',series(reports,'entropy'),{tozero:true,history:reports,run});document.querySelector('#promotion').innerHTML=promotionSummary(run.promotions.at(-1))}
-function refreshLive(){const selected=versionSelect.value,run=versions[selected];if(!run?.live)return;const script=document.createElement('script');script.src=encodeURI(run.live)+`?${Date.now()}`;script.onload=()=>{script.remove();const live=window.spirefyshLive;if(versionSelect.value!==selected||live?.version!==run.version)return;let changed=false;if(live.trainer_session!==run.trainer_session){run.reports=run.reports.filter(row=>row.step<=live.parent_checkpoint_step);run.trainer_session=live.trainer_session;changed=true}const report=live.report;report._session=`${selected}:${live.trainer_session}:${report.sampler_session}`;const last=run.reports.at(-1);if(!last||report.step>last.step||report._written>last._written){run.reports=[...run.reports.filter(row=>row.step!==report.step),report].sort((a,b)=>a.step-b.step);changed=true}if(changed)showVersion()};script.onerror=()=>script.remove();document.head.append(script)}
-versionSelect.onchange=showVersion;xaxis.onchange=showVersion;smooth.onchange=showVersion;ema.oninput=showVersion;showVersion();setTimeout(restoreDashboardState,100);window.addEventListener('beforeunload',saveDashboardState);setInterval(refreshLive,15000)</script>"""
+function showStatus(run){const age=Date.now()/1000-(run.last_event_time||0),timeout=run.manifest.sessions?.at(-1)?.training?.sampler_timeout||120;document.querySelector('#status').textContent=run.status==='running'&&age>timeout?'stalled':run.status||''}function showVersion(){const run=versions[versionSelect.value],reports=run.reports;updateSteps(reports);const timed=reports.find(row=>Number.isFinite(Number(row._written))&&Number.isFinite(Number(row.metrics.seconds)));timeOrigin=timed?timed._written-timed.metrics.seconds:0;document.querySelector('#title').textContent=`Spirefysh V${run.version} · ${run.run}`;showStatus(run);plot('advantage',series(reports,'mean_advantage'),{history:reports,run});plot('throughput',series(reports,'decisions_per_second'),{tozero:true,history:reports,run});floorPlot(reports,run);stagePlot('ascension',reports,'ascension','#fb7185',run);stagePlot('bonus',reports,'bonus','#f59e0b',run);plot('wins',reports.map(row=>({x:x(row),y:row.metrics.wins/Math.max(1,row.metrics.episodes)})),{range:[0,1],percent:true,history:reports,run});plot('clip',series(reports,'clip_fraction'),{range:[0,1],percent:true,history:reports,run});plot('kl',series(reports,'kl'),{tozero:true,history:reports,run});plot('entropy',series(reports,'entropy'),{tozero:true,history:reports,run});document.querySelector('#promotion').innerHTML=promotionSummary(run.promotions.at(-1))}
+function refreshLive(){const selected=versionSelect.value,run=versions[selected];if(!run?.live)return;const script=document.createElement('script');script.src=encodeURI(run.live)+`?${Date.now()}`;script.onload=()=>{script.remove();const live=window.spirefyshLive;if(versionSelect.value!==selected||live?.version!==run.version)return;if(live.schema===2){if(live.run_id!==run.run_id||live.leaf_session_id<run.trainer_session)return;if(live.leaf_session_id===run.trainer_session&&live.revision<=run.live_revision){showStatus(run);return}run.reports=live.reports;run.promotions=live.promotions||[];run.trainer_session=live.leaf_session_id;run.live_revision=live.revision;run.status=live.status;run.last_event_time=live.last_event_time;showVersion();return}let changed=false;if(live.trainer_session!==run.trainer_session){run.reports=run.reports.filter(row=>row.step<=live.parent_checkpoint_step);run.trainer_session=live.trainer_session;changed=true}const report=live.report;report._session=`${selected}:${live.trainer_session}:${report.sampler_session}`;const last=run.reports.at(-1);if(!last||report.step>last.step||report._written>last._written){run.reports=[...run.reports.filter(row=>row.step!==report.step),report].sort((a,b)=>a.step-b.step);changed=true}if(changed)showVersion()};script.onerror=()=>script.remove();document.head.append(script)}
+lineageSelect.onchange=()=>{showBranches();showVersion()};versionSelect.onchange=showVersion;xaxis.onchange=showVersion;smooth.onchange=showVersion;ema.oninput=showVersion;showVersion();setTimeout(restoreDashboardState,100);window.addEventListener('beforeunload',saveDashboardState);setInterval(refreshLive,2000)</script>"""
     content = content.replace(
         "<section class=panel><h2>Entropy</h2><div id=entropy class=plot></div></section></div><section class=panel><h2>Promotion</h2>",
-        "<section class=panel><h2>Entropy</h2><div id=entropy class=plot></div></section><section class=panel><h2>Dataset size</h2><div id=dataset class=plot></div></section></div><section class=panel><h2>Promotion</h2>",
+        "<section class=panel><h2>Entropy</h2><div id=entropy class=plot></div></section><section class=panel><h2>Policy loss</h2><div id=policy class=plot></div></section><section class=panel><h2>Critic loss</h2><div id=critic class=plot></div></section><section class=panel><h2>Update duration</h2><div id=duration class=plot></div></section><section class=panel><h2>Policy lag</h2><div id=lag class=plot></div></section><section class=panel><h2>Gradient norm</h2><div id=gradient class=plot></div></section><section class=panel><h2>Dataset size</h2><div id=dataset class=plot></div></section></div><section class=panel><h2>Promotion</h2>",
     ).replace(
         "plot('entropy',series(reports,'entropy'),{tozero:true,history:reports,run});document.querySelector('#promotion')",
-        "plot('entropy',series(reports,'entropy'),{tozero:true,history:reports,run});plot('dataset',series(reports,'dataset_rows'),{tozero:true,history:reports,run});document.querySelector('#promotion')",
+        "plot('entropy',series(reports,'entropy'),{tozero:true,history:reports,run});plot('policy',series(reports,'policy_loss'),{history:reports,run});plot('critic',series(reports,'critic_loss'),{tozero:true,history:reports,run});plot('duration',series(reports,'total_seconds'),{tozero:true,history:reports,run});plot('lag',series(reports,'policy_lag_p95'),{tozero:true,history:reports,run});plot('gradient',series(reports,'gradient_norm'),{tozero:true,history:reports,run});plot('dataset',series(reports,'dataset_rows'),{tozero:true,history:reports,run});document.querySelector('#promotion')",
     )
     content = content.replace(
         "['Priority',`1+|Awin|+|Aprogress|+terminal/win bonuses`,`Each row gets priority 1 + |policy advantage| + |progress advantage| + 4×terminal + 4×winning-return. Sampling uses the square root of priority.",
@@ -5244,6 +5933,7 @@ versionSelect.onchange=showVersion;xaxis.onchange=showVersion;smooth.onchange=sh
 
 
 def train(args):
+    global _LIVE_PROJECTOR
     if args.expert_batch is None:
         args.expert_batch = args.batch
     qos = getattr(ctypes.CDLL(None), "pthread_set_qos_class_self_np", None)
@@ -5376,8 +6066,12 @@ def train(args):
     training_lock.seek(0); training_lock.truncate(); training_lock.write(str(os.getpid())); training_lock.flush()
     training = {key: value for key, value in vars(args).items() if key != "command"}
     parent_checkpoint_sha256 = sha256_file(Path(args.checkpoint)) if source else None
+    parent = checkpoint_origin(Path(args.checkpoint), parent_checkpoint_sha256) if source else None
+    run_id = uuid.uuid4().hex
     manifest = json.loads((output / "run.json").read_text()) if continuing else {
-        "schema": 1, "model_version": model.model_version, "feature_version": FEATURE_VERSION,
+        "schema": 2, "run_id": run_id,
+        "lineage_id": source.get("lineage_id") if source and source.get("lineage_id") else run_id,
+        "model_version": model.model_version, "feature_version": FEATURE_VERSION,
         "fingerprint": probe_env.fingerprint(), "layout": layout, "precision": args.precision,
         "change": CHANGE, "parameters": sum(parameter.numel() for parameter in model.parameters()),
         "architecture": architecture(model),
@@ -5389,8 +6083,14 @@ def train(args):
                    "warm continuation; learner and reservoir restored; optimizer reset")
                   if source else None,
     }
+    manifest.setdefault("run_id", run_id)
+    manifest.setdefault("lineage_id", manifest["run_id"])
+    manifest.setdefault("telemetry_window_decisions", 32_768)
+    if parent and not parent.get("run_id") and continuing:
+        parent["run_id"] = manifest["run_id"]
     if continuing and manifest.get("model_version") != model.model_version:
         raise ValueError("new model versions require a new output directory")
+    manifest["schema"] = 2
     manifest["model_version"] = model.model_version
     manifest["precision"] = args.precision
     manifest["parameters"] = sum(parameter.numel() for parameter in model.parameters())
@@ -5416,20 +6116,40 @@ def train(args):
                    else "(start -> end) * max(0.35, 0.8^stage)",
     }
     sessions = manifest.setdefault("sessions", [])
-    args.trainer_session = len(sessions) + 1
+    event_dir = output / "events"; event_dir.mkdir(exist_ok=True)
+    saved_ids = [int(row["id"]) for row in sessions if str(row.get("id", "")).isdigit()]
+    file_ids = [int(path.stem) for path in event_dir.glob("*.jsonl") if path.stem.isdigit()]
+    args.trainer_session = max(saved_ids + file_ids, default=0) + 1
+    event_log = event_dir / f"{args.trainer_session:06}.jsonl"
+    descriptor = os.open(event_log, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    os.close(descriptor)
     sessions.append({
         "id": args.trainer_session, "step": source["decisions"] if source else 0,
-        "training": training, "optimizer_restored": optimizer_restored,
+        "log": str(event_log.relative_to(output)), "started_at": time.time(),
+        "parent": parent, "training": training, "optimizer_restored": optimizer_restored,
     })
     atomic_json(output / "run.json", manifest)
-    configure_logging(output, "learner", args.log_level, args.trainer_session)
-    emit_event({
-        "event": "start", "pid": os.getpid(), "model_version": model.model_version,
+    args.run_id = manifest["run_id"]
+    args.event_log = str(event_log)
+    revisions = {
+        key: int((source or {}).get("revisions", {}).get(key, 0))
+        for key in ("update_attempt", "weights_revision", "policy_revision", "actor_revision")
+    }
+    configure_logging(
+        output, "learner", args.log_level, args.trainer_session, manifest["run_id"], event_log,
+        {
+        "event": "session_start", "model_version": model.model_version,
+        "step": source["decisions"] if source else 0,
+        "resolved_decisions_total": source["decisions"] if source else 0,
+        "stage": source["stage"] if source else args.start_stage,
+        "training_elapsed_seconds": float((source or {}).get("training_elapsed_seconds", 0)),
         "checkpoint": args.checkpoint,
         "optimizer_restored": optimizer_restored,
         "parent_checkpoint_step": source["decisions"] if source else None,
-        "parent_checkpoint_sha256": parent_checkpoint_sha256, "training": training,
-    })
+        "parent_checkpoint_sha256": parent_checkpoint_sha256, "parent": parent,
+        "revisions": revisions, "training": training,
+        },
+    )
     checkpoints_dir = output / "checkpoints"; checkpoints_dir.mkdir(exist_ok=continuing)
     development_dir = output / "development"; development_dir.mkdir(exist_ok=continuing)
     champions_dir = output / "stage-champions"; champions_dir.mkdir(exist_ok=continuing)
@@ -5467,39 +6187,70 @@ def train(args):
         raise ValueError("--decisions precedes the checkpoint")
     if args.promote_now and (not source or args.decisions != decisions):
         raise ValueError("--promote-now requires an unchanged checkpoint decision target")
-    initial = None
-    initial_digest = None
-    if not source and not continuing:
-        initial = output / "initial.pt"
-        initial_digest = save_checkpoint(
-            initial, model, optimizer, manifest, stage, 0, sampler_session,
-            promotion_index, progress_active, reservoir, auxiliary_decisions, stage_decisions,
-            critic_balance,
-        )
-        atomic_json(output / "initial.json", {
-            "step": 0, "checkpoint": initial.name, "sha256": initial_digest,
-        })
+    elapsed_offset = float((source or {}).get("training_elapsed_seconds", 0))
     latest = output / "latest.pt"
-    def save(path, step, replace):
-        return save_checkpoint(
+    training_started = [None]
+    def write_checkpoint(path, step, kind):
+        checkpoint_id = uuid.uuid4().hex
+        elapsed = elapsed_offset + (
+            time.monotonic() - training_started[0] if training_started[0] else 0
+        )
+        digest = save_checkpoint(
             path, model, optimizer, manifest, stage, step, sampler_session,
             promotion_index, progress_active, reservoir, auxiliary_decisions + step - decisions,
-            stage_decisions + step - decisions, critic_balance, replace,
+            stage_decisions + step - decisions, critic_balance, False,
+            revisions, elapsed, checkpoint_id,
         )
-    if initial is not None and decisions == 0:
-        link_checkpoint(initial, latest)
-        digest = initial_digest
+        event_end = emit_event({
+            "event": "checkpoint", "checkpoint_id": checkpoint_id, "kind": kind,
+            "step": step, "resolved_decisions_total": step, "stage": stage,
+            "update_attempt": revisions["update_attempt"],
+            "weights_revision": revisions["weights_revision"],
+            "policy_revision": revisions["policy_revision"],
+            "actor_revision": revisions["actor_revision"],
+            "training_elapsed_seconds": elapsed,
+            "path": str(path.relative_to(output)), "sha256": digest,
+        })
+        os.fsync(_EVENT_FD)
+        return {
+            "step": step, "stage": stage, "sampler_session": sampler_session,
+            "checkpoint": str(path.relative_to(output)), "sha256": digest,
+            "checkpoint_id": checkpoint_id, "run_id": manifest["run_id"],
+            "session_id": args.trainer_session,
+            "event_log": str(event_log.relative_to(output)), "event_end": event_end,
+            "revisions": dict(revisions), "training_elapsed_seconds": elapsed,
+        }
+
+    def activate_checkpoint(record):
+        atomic_json(output / "latest.json", record | {"alias": latest.name})
+        link_checkpoint(output / record["checkpoint"], latest)
+
+    if not continuing:
+        initial_checkpoint = checkpoints_dir / (
+            f"{decisions:012}-w{revisions['weights_revision']:012}.pt"
+        )
+        initial_record = write_checkpoint(initial_checkpoint, decisions, "initial")
+        atomic_json(output / "initial.json", initial_record)
+        link_checkpoint(initial_checkpoint, output / "initial.pt")
+        activate_checkpoint(initial_record)
+        active_checkpoint = initial_record
+    elif (output / "latest.json").exists():
+        active_checkpoint = json.loads((output / "latest.json").read_text())
     else:
-        digest = save(latest, decisions, True)
-    atomic_json(output / "latest.json", {
-        "step": decisions, "stage": stage, "sampler_session": sampler_session,
-        "checkpoint": latest.name, "sha256": digest,
-    })
+        migrated = checkpoints_dir / (
+            f"{decisions:012}-w{revisions['weights_revision']:012}.pt"
+        )
+        active_checkpoint = write_checkpoint(migrated, decisions, "migration")
+        activate_checkpoint(active_checkpoint)
+    _LIVE_PROJECTOR = LiveProjector(
+        output.parent, output, manifest, args.trainer_session,
+    )
     dashboard(output.parent)
     started = time.monotonic()
+    training_started[0] = started
     previous_reports = logged_history(output, manifest)[0]
-    elapsed_offset = max((row["metrics"].get("seconds", 0)
-                          for row in previous_reports.values()), default=0)
+    elapsed_offset = max(elapsed_offset, max((row["metrics"].get("seconds", 0)
+                         for row in previous_reports.values()), default=0))
     dashboard_ready = bool(previous_reports)
     run_started = started - elapsed_offset
     deadline = started + args.hours * 3600 if args.hours else math.inf
@@ -5517,6 +6268,7 @@ def train(args):
         atomic_json(best_path, best)
     def promote(result=None):
         nonlocal stage, stage_decisions, promotion_index, progress_active, promotion_seconds
+        nonlocal active_checkpoint
         if decisions in logged_history(output, manifest)[1] or stage + 1 >= len(STAGES):
             raise ValueError("promotion is not available at this checkpoint")
         promotion_started = time.monotonic()
@@ -5547,21 +6299,23 @@ def train(args):
                 args.samplers, args.sampler_threads = 2, min(args.sampler_threads, 4)
             args.save_decisions = max(args.save_decisions, 262_144)
         reservoir.clear()
-        entry = entries_dir / f"{stage:02}-{decisions:012}.pt"
-        entry_digest = save(entry, decisions, False)
+        promotion["next_stage"] = {
+            "index": stage, "ascension": STAGES[stage][0], "bonus": STAGES[stage][1],
+        }
+        emit_event({"event": "promotion", "resolved_decisions_total": decisions, **promotion})
+        entry = entries_dir / (
+            f"{stage:02}-{decisions:012}-w{revisions['weights_revision']:012}.pt"
+        )
+        active_checkpoint = write_checkpoint(entry, decisions, "stage_entry")
         best.setdefault("entries", {})[str(stage)] = {
             "step": decisions,
             "stage": {"index": stage, "ascension": STAGES[stage][0], "bonus": STAGES[stage][1]},
-            "checkpoint": str(entry.relative_to(output)), "sha256": entry_digest,
+            "checkpoint": str(entry.relative_to(output)),
+            "sha256": active_checkpoint["sha256"],
         }
         atomic_json(best_path, best)
         promotion_seconds += time.monotonic() - promotion_started
-        digest = save(latest, decisions, True)
-        atomic_json(output / "latest.json", {
-            "step": decisions, "stage": stage, "sampler_session": sampler_session,
-            "checkpoint": latest.name, "sha256": digest,
-        })
-        emit_event({"time": time.time(), "event": "promotion", **promotion})
+        activate_checkpoint(active_checkpoint)
         dashboard(output.parent)
 
     if args.promote_now:
@@ -5572,22 +6326,13 @@ def train(args):
         budget = args.decisions - decisions if args.decisions else (1 << 62) // args.envs * args.envs
         last_checkpoint = None
         def save_step(step):
-            nonlocal last_checkpoint
-            checkpoint = checkpoints_dir / f"{step:012}.pt"
-            immutable_digest = save(checkpoint, step, False)
-            link_checkpoint(checkpoint, latest)
-            digest = immutable_digest
-            last_checkpoint = step, checkpoint, immutable_digest
-            atomic_json(output / "latest.json", {
-                "step": step, "stage": stage, "sampler_session": sampler_session,
-                "checkpoint": latest.name,
-                "immutable": str(checkpoint.relative_to(output)),
-                "immutable_sha256": immutable_digest, "sha256": digest,
-            })
-            emit_event({
-                "time": time.time(), "event": "checkpoint", "step": step,
-                "stage": stage, "path": str(checkpoint), "sha256": immutable_digest,
-            })
+            nonlocal last_checkpoint, active_checkpoint
+            checkpoint = checkpoints_dir / (
+                f"{step:012}-w{revisions['weights_revision']:012}.pt"
+            )
+            active_checkpoint = write_checkpoint(checkpoint, step, "periodic")
+            activate_checkpoint(active_checkpoint)
+            last_checkpoint = active_checkpoint
         def save_report(point, pipeline, window):
             nonlocal dashboard_ready
             written = time.time()
@@ -5598,15 +6343,12 @@ def train(args):
                 "description": f"Continuous V{model.model_version} training at A{STAGES[stage][0]}/+{STAGES[stage][1]}.",
                 "pipeline": pipeline, "metrics": point,
             }
-            emit_event({"time": written, "event": "report", **row})
-            atomic_live(output / "live.js", {
-                "version": model.model_version, "trainer_session": args.trainer_session,
-                "parent_checkpoint_step": source["decisions"] if source else None,
-                "report": row | {"_written": written},
-            })
+            emit_event({"event": "report", **row}, event_time=written)
             if not dashboard_ready:
                 dashboard(output.parent); dashboard_ready = True
-            keep = {last_checkpoint[1]} if last_checkpoint else set()
+            keep = {output / active_checkpoint["checkpoint"]}
+            initial = json.loads((output / "initial.json").read_text())
+            keep.add(output / initial["checkpoint"])
             keep.update(output / row["checkpoint"] for row in stage_bests.values())
             if best.get("checkpoint"):
                 keep.add(output / best["checkpoint"])
@@ -5617,7 +6359,7 @@ def train(args):
         training = train_stream(
             model, optimizer, args, sampler_session, stage, target, deadline, budget,
             base, auxiliary_decisions, stage_decisions, run_started, reservoir, progress_active,
-            save_report, save_step, manifest["fingerprint"], critic_balance,
+            save_report, save_step, manifest["fingerprint"], critic_balance, revisions,
         )
         if not training["decisions"]:
             break
@@ -5628,23 +6370,44 @@ def train(args):
         if not training["promotion_ready"] or time.monotonic() >= deadline:
             break
         promote(training["promotion_result"])
-    digest = save(latest, decisions, True)
-    atomic_json(output / "latest.json", {
-        "step": decisions, "stage": stage, "sampler_session": sampler_session,
-        "checkpoint": latest.name, "sha256": digest,
-    })
+    current = (decisions, stage, revisions["weights_revision"])
+    saved = (
+        active_checkpoint.get("step"), active_checkpoint.get("stage"),
+        active_checkpoint.get("revisions", {}).get("weights_revision"),
+    )
+    if current != saved:
+        final_path = checkpoints_dir / (
+            f"{decisions:012}-w{revisions['weights_revision']:012}.pt"
+        )
+        active_checkpoint = write_checkpoint(final_path, decisions, "final")
+    activate_checkpoint(active_checkpoint)
     emit_event({
-        "time": time.time(), "event": "complete", "decisions": decisions,
+        "event": "session_complete", "decisions": decisions,
+        "resolved_decisions_total": decisions,
         "stage": stage, "training_seconds": training_seconds,
         "promotion_seconds": promotion_seconds,
         "training_fraction": training_seconds / max(1e-9, training_seconds + promotion_seconds),
-        "elapsed_seconds": elapsed_offset + time.monotonic() - started,
+        "training_elapsed_seconds": elapsed_offset + time.monotonic() - started,
+        **revisions,
     })
+    projector, _LIVE_PROJECTOR = _LIVE_PROJECTOR, None
+    projector.close()
     dashboard(output.parent)
     shutdown_logging()
 
 
 def load(path, target):
+    path = Path(path)
+    metadata_path = path.parent / "latest.json"
+    if path.name == "latest.pt" and metadata_path.exists():
+        metadata = json.loads(metadata_path.read_text())
+        committed = path.parent / metadata.get("checkpoint", path.name)
+        if not committed.exists() or sha256_file(committed) != metadata.get("sha256"):
+            raise ValueError("committed checkpoint is missing or corrupt")
+        if committed != path:
+            if not path.exists() or sha256_file(path) != metadata["sha256"]:
+                link_checkpoint(committed, path)
+            path = committed
     checkpoint = torch.load(path, map_location=target, weights_only=False)
     version = checkpoint.get("model_version")
     if checkpoint.get("schema") != 1 or version not in COMPATIBLE_MODEL_VERSIONS:
@@ -6631,7 +7394,22 @@ def parser():
 if __name__ == "__main__":
     args = parser().parse_args()
     if args.command == "train":
-        train(args)
+        try:
+            train(args)
+        except BaseException as error:
+            if _LOG_ACTIVE:
+                emit_event({
+                    "event": "session_error", "error": repr(error),
+                    "traceback": traceback.format_exc(),
+                }, "ERROR")
+            if _LIVE_PROJECTOR is not None:
+                projector, _LIVE_PROJECTOR = _LIVE_PROJECTOR, None
+                try:
+                    projector.close()
+                except BaseException:
+                    pass
+            shutdown_logging()
+            raise
     elif args.command == "finalize":
         finalize(args)
     elif args.command == "evaluate":
