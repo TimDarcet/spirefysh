@@ -2869,7 +2869,8 @@ class RolloutCollector:
                     self.env.load_policy(state)
                 else:
                     model.load_state_dict(state)
-                self.event("model", version=version)
+                if self.args.log_level == "DEBUG":
+                    self.event("model", version=version)
             steps = sampling_steps(produced, budget, self.args.envs, self.args.sampler_steps)
             if not steps:
                 break
@@ -2877,14 +2878,15 @@ class RolloutCollector:
                 model, target, precision, deadline, steps, version, stop,
                 heartbeat, progress,
             )
-            self.event(
-                "collect", version=version, iteration=result["iteration"],
-                sampled=result["sampled_steps"], trajectories=len(result["trajectories"]),
-                rows=sum(len(row["rows"]) for row in result["trajectories"]),
-                seconds=round(result["collect_seconds"], 3),
-                mcts_roots=result["mcts_roots"], mcts_simulations=result["mcts_simulations"],
-                mcts_targets=result["mcts_targets"], mcts_seconds=round(result["mcts_seconds"], 3),
-            )
+            if self.args.log_level == "DEBUG":
+                self.event(
+                    "collect", version=version, iteration=result["iteration"],
+                    sampled=result["sampled_steps"], trajectories=len(result["trajectories"]),
+                    rows=sum(len(row["rows"]) for row in result["trajectories"]),
+                    seconds=round(result["collect_seconds"], 3),
+                    mcts_roots=result["mcts_roots"], mcts_simulations=result["mcts_simulations"],
+                    mcts_targets=result["mcts_targets"], mcts_seconds=round(result["mcts_seconds"], 3),
+                )
             pending["trajectories"].extend(result["trajectories"])
             pending["expert_rows"].extend(result["expert_rows"])
             for target_episodes, rows in zip(pending["episodes"], result["episodes"]):
@@ -2917,11 +2919,12 @@ class RolloutCollector:
                 try:
                     pending["queue_put_seconds"] = time.monotonic() - put_started
                     samples.put_nowait((worker, self.generation, version, pending))
-                    self.event(
-                        "packet", version=version, iteration=pending["iteration"],
-                        trajectories=len(pending["trajectories"]), rows=pending_rows,
-                        sampled=pending["sampled_steps"], discarded=pending["discarded_steps"],
-                    )
+                    if self.args.log_level == "DEBUG":
+                        self.event(
+                            "packet", version=version, iteration=pending["iteration"],
+                            trajectories=len(pending["trajectories"]), rows=pending_rows,
+                            sampled=pending["sampled_steps"], discarded=pending["discarded_steps"],
+                        )
                     pending = empty()
                     pending_rows = 0
                     break
