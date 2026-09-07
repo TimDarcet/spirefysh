@@ -16,6 +16,7 @@ use std::{
 const MAGIC: &[u8; 8] = b"STSVALUE";
 const VERSION: u32 = 56;
 const VALUE_MODEL_VERSION: u32 = 72;
+const MIN_VALUE_MODEL_VERSION: u32 = 71;
 const VALUE_CATEGORIES: usize = 83;
 const TOKEN_CATEGORICAL: usize = 10;
 const TOKEN_NUMERIC: usize = 24;
@@ -79,10 +80,10 @@ const PHASES: usize = 14;
 const ENCHANTMENTS: usize = 22;
 const MAP_FLOORS: usize = 18;
 const PUBLIC_GLOBALS: usize = 0;
-const MODEL_WIDTH: usize = 128;
-const MODEL_LAYERS: usize = 4;
-const MODEL_HEADS: usize = 8;
-const MODEL_FEEDFORWARD: usize = 384;
+const DEFAULT_MODEL_WIDTH: usize = 128;
+const DEFAULT_MODEL_LAYERS: usize = 4;
+const DEFAULT_MODEL_HEADS: usize = 8;
+const DEFAULT_MODEL_FEEDFORWARD: usize = 384;
 const POSITION_CAPS: [u32; 14] = [32, 64, 16, 64, 256, 256, 256, 256, 256, 256, 11, 11, 4, 4];
 #[cfg(test)]
 const ENEMY_SLOTS: usize = 8;
@@ -9985,8 +9986,10 @@ impl ValueModel {
 
     fn from_bytes(bytes: &[u8], content: &Content) -> io::Result<Self> {
         let mut input = bytes;
-        if take_bytes(&mut input, 8)? != MAGIC
-            || read_u32(&mut input)? != VALUE_MODEL_VERSION
+        let magic = take_bytes(&mut input, 8)?;
+        let model_version = read_u32(&mut input)?;
+        if magic != MAGIC
+            || !(MIN_VALUE_MODEL_VERSION..=VALUE_MODEL_VERSION).contains(&model_version)
             || read_u32(&mut input)? != VERSION
             || read_u64(&mut input)? != content_fingerprint(content)
         {
@@ -10026,7 +10029,13 @@ impl ValueModel {
         let pooling = <[u8; 13]>::try_from(take_bytes(&mut input, 13)?).unwrap();
         let actor = take_bytes(&mut input, 1)?[0] != 0;
         let layout = Layout::new(content);
-        if (width, layers, heads, feedforward) != (128, 4, 8, 384)
+        let (width, layers, heads, feedforward) = (
+            width as usize,
+            layers as usize,
+            heads as usize,
+            feedforward as usize,
+        );
+        if !valid_model_shape(width, layers, heads, feedforward)
             || domains as usize != DOMAIN_NAMES.len()
             || concepts as usize != Semantic::Count as usize
             || concept_vocab as usize != layout.concept_vocab()
@@ -10045,7 +10054,6 @@ impl ValueModel {
         if !temperature.is_finite() || temperature <= 0.0 || !bias.is_finite() {
             return Err(invalid("invalid value calibration"));
         }
-        let width = width as usize;
         let semantic_embedding = read_f32s(&mut input, concept_vocab as usize * width)?;
         let encoders = DOMAIN_WIDTHS
             .iter()
@@ -10060,7 +10068,7 @@ impl ValueModel {
         let mut pool_layers = Vec::with_capacity(13);
         for (index, &mode) in pooling.iter().enumerate() {
             pool_layers.push(if transformer_pool(index, mode) {
-                Some(read_transformer_layers(&mut input, 1, width, feedforward as usize)?.remove(0))
+                Some(read_transformer_layers(&mut input, 1, width, feedforward)?.remove(0))
             } else {
                 None
             });
@@ -10073,8 +10081,7 @@ impl ValueModel {
         let actor_norm_b = read_f32s(&mut input, width)?;
         let action_norm_w = read_f32s(&mut input, width)?;
         let action_norm_b = read_f32s(&mut input, width)?;
-        let global_layers =
-            read_transformer_layers(&mut input, layers as usize, width, feedforward as usize)?;
+        let global_layers = read_transformer_layers(&mut input, layers, width, feedforward)?;
         let global_norm_w = read_f32s(&mut input, width)?;
         let global_norm_b = read_f32s(&mut input, width)?;
         let graph_norm_w = read_f32s(&mut input, width)?;
@@ -11240,6 +11247,10 @@ fn read_f32(input: &mut &[u8]) -> io::Result<f32> {
 
 fn read_f32s(input: &mut &[u8], len: usize) -> io::Result<Vec<f32>> {
     (0..len).map(|_| read_f32(input)).collect()
+}
+
+fn valid_model_shape(width: usize, layers: usize, heads: usize, feedforward: usize) -> bool {
+    width > 0 && layers > 0 && heads > 0 && feedforward > 0 && width % heads == 0
 }
 
 #[cfg(feature = "python")]
@@ -16234,20 +16245,30 @@ mod python {
             Ok(batch)
         }
 
-        fn token_layout(&self) -> std::collections::BTreeMap<String, usize> {
+        #[pyo3(signature = (width=DEFAULT_MODEL_WIDTH, layers=DEFAULT_MODEL_LAYERS, heads=DEFAULT_MODEL_HEADS, feedforward=DEFAULT_MODEL_FEEDFORWARD))]
+        fn token_layout(
+            &self,
+            width: usize,
+            layers: usize,
+            heads: usize,
+            feedforward: usize,
+        ) -> PyResult<std::collections::BTreeMap<String, usize>> {
+            if !valid_model_shape(width, layers, heads, feedforward) {
+                return Err(PyValueError::new_err("invalid model shape"));
+            }
             let mut out = std::collections::BTreeMap::from([
                 ("version".into(), VERSION as usize),
                 ("characters".into(), self.layout.characters),
                 ("globals".into(), globals_len(self.layout)),
-                ("model_width".into(), MODEL_WIDTH),
-                ("model_layers".into(), MODEL_LAYERS),
-                ("model_heads".into(), MODEL_HEADS),
-                ("model_feedforward".into(), MODEL_FEEDFORWARD),
+                ("model_width".into(), width),
+                ("model_layers".into(), layers),
+                ("model_heads".into(), heads),
+                ("model_feedforward".into(), feedforward),
                 ("entity_summaries".into(), 0),
-                ("base_state_width".into(), MODEL_WIDTH),
-                ("state_width".into(), MODEL_WIDTH),
-                ("action_width".into(), MODEL_WIDTH),
-                ("head_width".into(), MODEL_WIDTH),
+                ("base_state_width".into(), width),
+                ("state_width".into(), width),
+                ("action_width".into(), width),
+                ("head_width".into(), width),
                 ("domain_count".into(), DOMAIN_NAMES.len()),
                 ("action_u".into(), ACTION_U),
                 ("action_s".into(), ACTION_S),
@@ -16308,7 +16329,7 @@ mod python {
                     self.layout.semantic_sizes[index] as usize,
                 );
             }
-            out
+            Ok(out)
         }
 
         fn fingerprint(&self) -> u64 {
@@ -26322,9 +26343,16 @@ mod tests {
         let layout = Layout::new(&foundation_content());
         assert_eq!((VERSION, VALUE_MODEL_VERSION), (56, 72));
         assert_eq!(
-            (MODEL_WIDTH, MODEL_LAYERS, MODEL_HEADS, MODEL_FEEDFORWARD),
+            (
+                DEFAULT_MODEL_WIDTH,
+                DEFAULT_MODEL_LAYERS,
+                DEFAULT_MODEL_HEADS,
+                DEFAULT_MODEL_FEEDFORWARD,
+            ),
             (128, 4, 8, 384)
         );
+        assert!(valid_model_shape(64, 2, 4, 128));
+        assert!(!valid_model_shape(65, 2, 4, 128));
         for (semantic, size) in [
             (Semantic::EnemyPosition, 33),
             (Semantic::PowerPosition, 65),

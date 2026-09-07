@@ -29,11 +29,13 @@ import sts2_sim
 
 FEATURE_VERSION = 56
 MODEL_VERSION = 72
+COMPATIBLE_MODEL_VERSIONS = (71, 72)
+DEFAULT_ARCHITECTURE = (128, 4, 8, 384)
 CATEGORIES = 83
 MAX_PROGRESS = 72
 PRECISIONS = ("fp32", "bf16")
 WINNING_CAPACITY = 0
-CHANGE = "V72: 128-D tokens and a four-layer global transformer."
+CHANGE = "Configurable explicit tokens in one global transformer."
 COLLECTION_POOLING = ("sum", "transformer", "global_tokens")
 EFFECT_POOLING = (
     "sum_into_actor", "transformer_into_actor", "sum_token", "transformer_token",
@@ -1088,7 +1090,7 @@ class TokenEncoder(nn.Module):
 
 class Agent(nn.Module):
     def __init__(self, layout, width=128, layers=4, heads=8, feedforward=384, head_width=None,
-                 pooling=None):
+                 pooling=None, model_version=MODEL_VERSION):
         nn.Module.__init__(self)
         self.layout = dict(layout)
         if self.layout["version"] != FEATURE_VERSION:
@@ -1098,14 +1100,16 @@ class Agent(nn.Module):
                                           ("_c", semantic), ("_f", numeric))}
         expected |= {"domain_count": len(TOKEN_SPECS), "action_u": ACTION_FIELDS[0],
                      "action_s": ACTION_FIELDS[1], "action_c": ACTION_FIELDS[2],
-                     "action_f": ACTION_FIELDS[3], "globals": 0, "model_width": 128,
-                     "model_layers": 4, "model_heads": 8, "model_feedforward": 384,
-                     "action_width": 128}
+                     "action_f": ACTION_FIELDS[3], "globals": 0, "model_width": width,
+                     "model_layers": layers, "model_heads": heads,
+                     "model_feedforward": feedforward, "action_width": width}
         if any(self.layout.get(key) != value for key, value in expected.items()):
             raise ValueError("incompatible observation schema")
-        if (width, layers, heads, feedforward) != (128, 4, 8, 384) \
-                or head_width not in (None, 128):
+        if min(width, layers, heads, feedforward) <= 0 or width % heads \
+                or head_width not in (None, width) \
+                or model_version not in COMPATIBLE_MODEL_VERSIONS:
             raise ValueError("invalid architecture")
+        self.model_version = model_version
         self.width, self.layers, self.heads, self.feedforward = width, layers, heads, feedforward
         self.head_width = width
         self.state_width = width
@@ -4391,7 +4395,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         "stage": {"index": stage, "ascension": ascension, "bonus": bonus},
         "characters": summaries(episodes),
         "terminals": terminal_summary,
-        "description": f"Continuously trained V{MODEL_VERSION} on A{ascension}/+{bonus} trajectories.",
+        "description": f"Continuously trained V{model.model_version} on A{ascension}/+{bonus} trajectories.",
         "pipeline": pipeline, "promotion_ready": promotion_ready,
         "promotion_result": promotion_result,
         "dataset_rows": len(dataset), "dataset_peak": dataset_peak,
@@ -4901,7 +4905,7 @@ def save_checkpoint(path, model, optimizer, manifest, stage, decisions, sampler_
     target = path.with_suffix(path.suffix + ".tmp") if replace else path
     with target.open("wb" if replace else "xb") as output:
         torch.save({
-            "schema": 1, "model_version": MODEL_VERSION, "feature_version": FEATURE_VERSION,
+            "schema": 1, "model_version": model.model_version, "feature_version": FEATURE_VERSION,
             "fingerprint": manifest["fingerprint"], "precision": manifest["precision"],
             "layout": model.layout, "architecture": manifest["architecture"],
             "stage": stage, "decisions": decisions, "sampler_session": sampler_session,
@@ -5127,21 +5131,23 @@ def dashboard(target):
                 row.pop("description", None); row.pop("pipeline", None)
             version_manifest = manifest | manifest.get("version_history", {}).get(str(version), {})
             version_manifest["model_version"] = version
-            if version == MODEL_VERSION:
+            if version in COMPATIBLE_MODEL_VERSIONS:
                 saved = version_manifest.get("architecture", {})
                 current = Agent(
                     version_manifest["layout"],
                     *(saved.get(key, default) for key, default in zip(
                         ("width", "layers", "heads", "feedforward", "head_width"),
-                        (128, 4, 8, 384, 128),
+                        (*DEFAULT_ARCHITECTURE, DEFAULT_ARCHITECTURE[0]),
                     )),
-                    pooling=saved.get("pooling"),
+                    pooling=saved.get("pooling"), model_version=version,
                 )
                 version_manifest |= {
-                    "architecture": architecture(current), "change": CHANGE,
+                    "architecture": architecture(current),
                     "feature_version": FEATURE_VERSION,
                     "parameters": sum(parameter.numel() for parameter in current.parameters()),
                 }
+                if version == MODEL_VERSION:
+                    version_manifest["change"] = CHANGE
             if len(version_groups) > 1:
                 sessions = [row for row in manifest.get("sessions", []) if row["step"] <= version_reports[-1]["step"]]
                 version_manifest["sessions"] = sessions[-1:] or manifest.get("sessions", [])[:1]
@@ -5285,10 +5291,10 @@ def train(args):
     if seed_panel(args.development_seed, args.development_runs)[1] > args.promotion_seed:
         raise ValueError("development and promotion seed panels overlap")
     probe_env = sts2_sim.Batch(1, args.training_seed, None, ascension=STAGES[0][0])
-    layout = dict(probe_env.token_layout())
     source = None
     if args.checkpoint:
         model, source = load(args.checkpoint, target)
+        layout = model.layout
         requested = (args.width, args.layers, args.heads, args.feedforward)
         loaded = (model.width, model.layers, model.heads, model.feedforward)
         if any(value is not None and value != saved for value, saved in zip(requested, loaded)):
@@ -5302,9 +5308,10 @@ def train(args):
         args.width, args.layers, args.heads, args.feedforward = loaded
     else:
         config = tuple(value if value is not None else default for value, default in zip(
-            (args.width, args.layers, args.heads, args.feedforward), (128, 4, 8, 384)
+            (args.width, args.layers, args.heads, args.feedforward), DEFAULT_ARCHITECTURE
         ))
         args.width, args.layers, args.heads, args.feedforward = config
+        layout = dict(probe_env.token_layout(*config))
         pooling = {name: getattr(args, name + "_pooling") or default
                    for name, default in POOLING_DEFAULTS.items()}
         model = Agent(layout, *config, pooling=pooling).to(target)
@@ -5357,7 +5364,7 @@ def train(args):
     training = {key: value for key, value in vars(args).items() if key != "command"}
     parent_checkpoint_sha256 = sha256_file(Path(args.checkpoint)) if source else None
     manifest = json.loads((output / "run.json").read_text()) if continuing else {
-        "schema": 1, "model_version": MODEL_VERSION, "feature_version": FEATURE_VERSION,
+        "schema": 1, "model_version": model.model_version, "feature_version": FEATURE_VERSION,
         "fingerprint": probe_env.fingerprint(), "layout": layout, "precision": args.precision,
         "change": CHANGE, "parameters": sum(parameter.numel() for parameter in model.parameters()),
         "architecture": architecture(model),
@@ -5369,10 +5376,9 @@ def train(args):
                    "warm continuation; learner and reservoir restored; optimizer reset")
                   if source else None,
     }
-    if continuing and manifest.get("model_version") != MODEL_VERSION:
+    if continuing and manifest.get("model_version") != model.model_version:
         raise ValueError("new model versions require a new output directory")
-    manifest["model_version"] = MODEL_VERSION
-    manifest["change"] = CHANGE
+    manifest["model_version"] = model.model_version
     manifest["precision"] = args.precision
     manifest["parameters"] = sum(parameter.numel() for parameter in model.parameters())
     manifest["architecture"] = architecture(model)
@@ -5405,7 +5411,7 @@ def train(args):
     atomic_json(output / "run.json", manifest)
     configure_logging(output, "learner", args.log_level, args.trainer_session)
     emit_event({
-        "event": "start", "pid": os.getpid(), "model_version": MODEL_VERSION,
+        "event": "start", "pid": os.getpid(), "model_version": model.model_version,
         "checkpoint": args.checkpoint,
         "optimizer_restored": optimizer_restored,
         "parent_checkpoint_step": source["decisions"] if source else None,
@@ -5417,7 +5423,7 @@ def train(args):
     entries_dir = output / "stage-entries"; entries_dir.mkdir(exist_ok=continuing)
     stage = source["stage"] if source else args.start_stage
     reservoir = WinningReservoir(args.winning_capacity, args.envs)
-    if source and source.get("_source_model_version") == MODEL_VERSION and source.get("winning_reservoir"):
+    if source and source.get("winning_reservoir"):
         reservoir.load_state_dict(source["winning_reservoir"])
         missing = [index for index, row in enumerate(reservoir.rows) if row[4] is None]
         for start in range(0, len(missing), 128):
@@ -5438,8 +5444,7 @@ def train(args):
     stage_decisions, progress_active = resume_curriculum(source, stage)
     critic_balance = CriticBalance(
         args.critic_balance_decay,
-        source.get("critic_balance")
-        if source and source.get("_source_model_version") == MODEL_VERSION else None,
+        source.get("critic_balance") if source else None,
     )
     sampler_session = source.get("sampler_session", source.get("sampler_index", 0)) if source else 0
     promotion_index = source.get("promotion_index", 0) if source else 0
@@ -5573,12 +5578,12 @@ def train(args):
                 "schema": 1, "step": point["steps"], "window": window,
                 "sampler_session": sampler_session,
                 "stage": {"index": stage, "ascension": STAGES[stage][0], "bonus": STAGES[stage][1]},
-                "description": f"Continuous V{MODEL_VERSION} training at A{STAGES[stage][0]}/+{STAGES[stage][1]}.",
+                "description": f"Continuous V{model.model_version} training at A{STAGES[stage][0]}/+{STAGES[stage][1]}.",
                 "pipeline": pipeline, "metrics": point,
             }
             emit_event({"time": written, "event": "report", **row})
             atomic_live(output / "live.js", {
-                "version": MODEL_VERSION, "trainer_session": args.trainer_session,
+                "version": model.model_version, "trainer_session": args.trainer_session,
                 "parent_checkpoint_step": source["decisions"] if source else None,
                 "report": row | {"_written": written},
             })
@@ -5624,20 +5629,24 @@ def train(args):
 
 def load(path, target):
     checkpoint = torch.load(path, map_location=target, weights_only=False)
-    live = sts2_sim.Batch(1, 0, None, ascension=0)
-    layout = dict(live.token_layout())
     version = checkpoint.get("model_version")
-    if checkpoint.get("schema") != 1 or version != MODEL_VERSION:
+    if checkpoint.get("schema") != 1 or version not in COMPATIBLE_MODEL_VERSIONS:
         raise ValueError("incompatible checkpoint")
+    config = checkpoint.get("architecture", {})
+    try:
+        dimensions = tuple(config[key] for key in ("width", "layers", "heads", "feedforward"))
+        live = sts2_sim.Batch(1, 0, None, ascension=0)
+        layout = dict(live.token_layout(*dimensions))
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("invalid checkpoint architecture") from error
     if checkpoint.get("feature_version") != FEATURE_VERSION or layout["version"] != FEATURE_VERSION:
         raise ValueError("incompatible feature version")
     if checkpoint["fingerprint"] != live.fingerprint() or checkpoint["layout"] != layout:
         raise ValueError("checkpoint does not match simulator content")
-    config = checkpoint.get("architecture", {})
     try:
         model = Agent(layout, *(config[key] for key in (
             "width", "layers", "heads", "feedforward", "head_width"
-        )), pooling=config["pooling"]).to(target)
+        )), pooling=config["pooling"], model_version=version).to(target)
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError("invalid checkpoint architecture") from error
     if config != architecture(model):
@@ -5649,8 +5658,6 @@ def load(path, target):
     checkpoint["_optimizer_compatible"] = optimizer_compatible(
         checkpoint["optimizer"], len(tuple(model.parameters()))
     )
-    checkpoint["_source_model_version"] = version
-    checkpoint["model_version"] = MODEL_VERSION
     checkpoint["architecture"] = architecture(model)
     return model, checkpoint
 
@@ -5959,7 +5966,7 @@ def export_value_model(path, model, fingerprint, temperature, bias, actor=False)
     if path is not None:
         path.parent.mkdir(parents=True, exist_ok=True)
     parts = [
-        b"STSVALUE", struct.pack("<IIQ", MODEL_VERSION, FEATURE_VERSION, fingerprint),
+        b"STSVALUE", struct.pack("<IIQ", model.model_version, FEATURE_VERSION, fingerprint),
         struct.pack("<10I", model.width, model.layers, model.heads, model.feedforward,
                     len(TOKEN_SPECS), len(SEMANTIC_NAMES), model.concepts.num_embeddings,
                     ACTION_FIELDS[2], ACTION_FIELDS[3], CATEGORIES),
@@ -6135,7 +6142,7 @@ def finalize(args):
     final_checkpoint.pop("_optimizer_compatible", None)
     torch.save(final_checkpoint, output.with_suffix(".pt"))
     report = {
-        "schema": 1, "model_version": MODEL_VERSION, "feature_version": FEATURE_VERSION,
+        "schema": 1, "model_version": model.model_version, "feature_version": FEATURE_VERSION,
         "source": args.checkpoint, "output": str(output), "sha256": digest,
         "policy": "frozen greedy A10/+0", "temperature": temperature, "bias": bias,
         "rust_pytorch_max_abs": parity_error,
@@ -6166,6 +6173,11 @@ def probe():
     assert (layout["version"], layout["model_width"], layout["model_layers"],
             layout["model_heads"], layout["model_feedforward"], layout["state_width"],
             layout["action_width"], layout["entity_summaries"]) == (56, 128, 4, 8, 384, 128, 128, 0)
+    compact_layout = dict(env.token_layout(64, 2, 4, 128))
+    assert tuple(compact_layout[key] for key in (
+        "model_width", "model_layers", "model_heads", "model_feedforward",
+        "state_width", "action_width", "head_width",
+    )) == (64, 2, 4, 128, 64, 64, 64)
     for name, size in {
         "enemy_position": 33, "power_position": 65, "orb_position": 17,
         "map_floor_position": 65, "deck_origin": 257, "draw_top_position": 257,
@@ -6353,9 +6365,31 @@ def probe():
             raise AssertionError("accepted incompatible checkpoint architecture")
         except ValueError:
             pass
+        compact = Agent(compact_layout, 64, 2, 4, 128, model_version=71).eval()
+        compact.critic.weight.data.normal_(std=.1)
+        compact_path = Path(directory) / "compact.bin"
+        export_value_model(compact_path, compact, env.fingerprint(), 1, 0)
+        with torch.no_grad():
+            compact_python = critic_win_logit(predict(
+                compact, tensors(combat, target, compact), "fp32",
+            )[1]).sigmoid().numpy()
+        compact_rust = np.asarray(env.rust_values(str(compact_path)))
+        assert np.max(np.abs(compact_python - compact_rust)) < 1e-5
+        compact_checkpoint = Path(directory) / "compact.pt"
+        compact_optimizer = torch.optim.Adam(compact.parameters())
+        torch.save({
+            "schema": 1, "model_version": 71, "feature_version": FEATURE_VERSION,
+            "fingerprint": env.fingerprint(), "layout": compact_layout,
+            "architecture": architecture(compact), "model": compact.state_dict(),
+            "optimizer": compact_optimizer.state_dict(),
+        }, compact_checkpoint)
+        restored, loaded = load(compact_checkpoint, target)
+        assert (restored.model_version, restored.width, restored.layers,
+                restored.heads, restored.feedforward) == (71, 64, 2, 4, 128)
+        assert loaded["model_version"] == 71
         incompatible = torch.load(checkpoint, weights_only=False)
         incompatible["architecture"]["position_caps"]["enemy"] = 32
-        incompatible["model_version"] = 71
+        incompatible["model_version"] = 70
         torch.save(incompatible, checkpoint)
         try:
             load(checkpoint, target)
