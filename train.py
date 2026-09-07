@@ -7257,7 +7257,7 @@ def parser():
     run.add_argument("--publish-updates", type=int, default=4)
     run.add_argument("--report-decisions", type=int, default=32_768)
     run.add_argument("--save-decisions", type=int, default=262_144)
-    run.add_argument("--max-policy-lag", type=int, default=128)
+    run.add_argument("--max-policy-lag", type=int, default=16)
     run.add_argument("--max-log-ratio", type=float, default=.5)
     run.add_argument("--policy-temperature", type=float, default=.8)
     run.add_argument("--mcts-fraction", type=float, default=0)
