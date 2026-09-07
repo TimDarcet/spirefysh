@@ -17904,35 +17904,19 @@ mod python {
                     .map(|game| observation_v56(game, content, layout, bonuses))
                     .collect::<Vec<_>>()
             });
-            let features = py.allow_threads(|| {
-                rows.par_iter()
-                    .map(|row| {
-                        let index =
-                            rayon::current_thread_index().unwrap_or(0) % model.encode_caches.len();
-                        let mut cache = model.encode_caches[index].lock().unwrap();
-                        if cache.rows.len() > 65_536 {
-                            cache.rows.clear();
-                        }
-                        if cache.maps.len() > 1_024 {
-                            cache.maps.clear();
-                        }
-                        model.state_actions(row, &mut cache)
-                    })
-                    .collect::<Vec<_>>()
-            });
+            let skip_forced = cache_features && !search_enabled;
+            let evaluated_rows = rows
+                .iter()
+                .filter(|row| !skip_forced || row.candidates.len() > 1)
+                .collect::<Vec<_>>();
+            let features = py.allow_threads(|| model.state_actions_batch(&evaluated_rows));
             let packed = py.allow_threads(|| {
                 rows.par_iter()
                     .map(compact_packed_observation)
                     .collect::<Vec<_>>()
             });
             let outputs = model
-                .evaluate_batch(
-                    &rows.iter().collect::<Vec<_>>(),
-                    &features,
-                    temperature,
-                    None,
-                    true,
-                )
+                .evaluate_batch(&evaluated_rows, &features, temperature, None, true)
                 .map_err(|error| PyValueError::new_err(error.to_string()))?;
             let mut random = self.random;
             let mut search_random = random ^ 0x4d43_5453_524e_4701;
@@ -18021,11 +18005,26 @@ mod python {
             if advance {
                 self.actions.resize_with(rows.len(), Vec::new);
             }
-            for (
-                ((row, packed), (state, actions)),
-                (log_policy, _win, _expected, probabilities, _),
-            ) in rows.into_iter().zip(packed).zip(features).zip(outputs)
-            {
+            let mut evaluated = features.into_iter().zip(outputs);
+            for (row, packed) in rows.into_iter().zip(packed) {
+                if skip_forced && row.candidates.len() == 1 {
+                    characters.push(row.character);
+                    choices.push(0);
+                    log_probabilities.push(0.0);
+                    critic_probabilities.push(1.0);
+                    critic_probabilities
+                        .resize(critic_probabilities.len() + VALUE_CATEGORIES - 1, 0.0);
+                    if advance {
+                        selected_actions.push(row.candidates[0].action.clone());
+                    } else {
+                        self.actions.push(vec![row.candidates[0].action.clone()]);
+                    }
+                    cached_features.push(PyBytes::new(py, &[]));
+                    packed_rows.push(PyBytes::new(py, &packed));
+                    continue;
+                }
+                let ((state, actions), (log_policy, _win, _expected, probabilities, _)) =
+                    evaluated.next().unwrap();
                 let choice = if sample {
                     sample_policy(&log_policy, &mut random)
                 } else {
@@ -18062,6 +18061,7 @@ mod python {
                 }
                 packed_rows.push(PyBytes::new(py, &packed));
             }
+            debug_assert!(evaluated.next().is_none());
             self.random = random;
             let expert_targets = expert_targets
                 .into_iter()

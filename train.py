@@ -3283,7 +3283,10 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                  save_report, save_step, fingerprint, critic_balance):
     ascension, bonus = STAGES[stage]
     collector_args = copy.copy(args)
-    collector_args.cache_features = args.freeze_backbone and args.target_kl >= 1
+    collector_args.cache_features = (
+        args.freeze_backbone and args.target_kl >= 1 and args.critic_lambda == 1
+        and not args.winning_capacity
+    )
     pending_capacity = max(1, reservoir.capacity // args.envs)
     collector_args.envs //= args.samplers
     dataset = ExperienceDataset()
