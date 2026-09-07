@@ -18230,6 +18230,16 @@ mod python {
                 .into_any(),
             ];
             if advance {
+                let canonical = self
+                    .games
+                    .iter()
+                    .map(canonical_progress)
+                    .collect::<Vec<_>>();
+                let phases = self
+                    .games
+                    .iter()
+                    .map(|game| phase_index(&game.phase) as u8)
+                    .collect::<Vec<_>>();
                 let paths = selected_actions
                     .iter()
                     .map(|action| matches!(action, Action::Path(_)))
@@ -18296,6 +18306,12 @@ mod python {
                     stats.into_pyobject(py)?.into_any(),
                     ndarray::Array1::from_vec(legal).into_pyarray(py).into_any(),
                     ndarray::Array1::from_vec(in_combat)
+                        .into_pyarray(py)
+                        .into_any(),
+                    ndarray::Array1::from_vec(canonical)
+                        .into_pyarray(py)
+                        .into_any(),
+                    ndarray::Array1::from_vec(phases)
                         .into_pyarray(py)
                         .into_any(),
                 ]);

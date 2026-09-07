@@ -2688,9 +2688,6 @@ class RolloutCollector:
                 self.combat_steps[reset] = 0
                 self.observation = self.env.observe_tokens(flat=True)
             step_started = time.monotonic()
-            state_stats = self.env.stats()
-            canonical = np.asarray([row[9] for row in state_stats], np.uint8)
-            phases = np.asarray([row[4] for row in state_stats], np.uint8)
             if native:
                 result = self.env.policy(
                     args.policy_temperature,
@@ -2713,7 +2710,7 @@ class RolloutCollector:
                 )
                 characters, choice, log_probability, critic_probability, step_rows, \
                     step_experts, step_search_stats, *cached = result
-                raw_reward, done, stats, next_legal, in_combat, *cached = cached
+                raw_reward, done, stats, next_legal, in_combat, canonical, phases, *cached = cached
                 step_features = cached[0] if cached else None
                 if heartbeat is not None:
                     heartbeat[self.worker] = time.monotonic()
@@ -2730,6 +2727,9 @@ class RolloutCollector:
                                         visits, depth, consistency))
                 policy = None
             else:
+                state_stats = self.env.stats()
+                canonical = np.asarray([row[9] for row in state_stats], np.uint8)
+                phases = np.asarray([row[4] for row in state_stats], np.uint8)
                 characters = np.asarray(self.observation[0], np.uint8)
                 choice, log_probability, policy, critic_probability = act(
                     model, self.observation, target, True, precision, self.torch_rng,
