@@ -10951,7 +10951,7 @@ impl ValueModel {
 
     fn evaluate_batch(
         &self,
-        observations: &[&ObservationV56],
+        _observations: &[&ObservationV56],
         features: &[(Vec<f32>, Vec<Vec<f32>>)],
         temperature: f32,
         rollout_temperature: Option<f32>,
@@ -10964,38 +10964,39 @@ impl ValueModel {
         if !temperature.is_finite() || temperature <= 0.0 {
             return Err(invalid("invalid policy temperature"));
         }
-        Ok(observations
-            .iter()
-            .zip(features)
-            .map(|(_observation, (state, actions))| {
-                let scores = |temperature: f32| {
-                    let raw = actions
-                        .iter()
-                        .map(|action| policy.apply(action)[0] / temperature)
-                        .collect::<Vec<_>>();
-                    let normalizer = log_sum_exp(&raw);
-                    raw.into_iter()
-                        .map(|score| score - normalizer)
-                        .collect::<Vec<_>>()
-                };
-                let probabilities = values
-                    .then(|| softmax(&self.critic.apply(state)))
-                    .unwrap_or_default();
-                let expected = probabilities
+        let evaluate = |(state, actions): &(Vec<f32>, Vec<Vec<f32>>)| {
+            let scores = |temperature: f32| {
+                let raw = actions
                     .iter()
-                    .enumerate()
-                    .map(|(i, p)| i as f32 * p)
-                    .sum::<f32>()
-                    / (VALUE_CATEGORIES - 1) as f32;
-                (
-                    scores(temperature),
-                    probabilities.last().copied().unwrap_or_default(),
-                    expected,
-                    probabilities,
-                    rollout_temperature.map(scores),
-                )
-            })
-            .collect())
+                    .map(|action| policy.apply(action)[0] / temperature)
+                    .collect::<Vec<_>>();
+                let normalizer = log_sum_exp(&raw);
+                raw.into_iter()
+                    .map(|score| score - normalizer)
+                    .collect::<Vec<_>>()
+            };
+            let probabilities = values
+                .then(|| softmax(&self.critic.apply(state)))
+                .unwrap_or_default();
+            let expected = probabilities
+                .iter()
+                .enumerate()
+                .map(|(i, p)| i as f32 * p)
+                .sum::<f32>()
+                / (VALUE_CATEGORIES - 1) as f32;
+            (
+                scores(temperature),
+                probabilities.last().copied().unwrap_or_default(),
+                expected,
+                probabilities,
+                rollout_temperature.map(scores),
+            )
+        };
+        #[cfg(feature = "python")]
+        let output = features.par_iter().map(evaluate).collect();
+        #[cfg(not(feature = "python"))]
+        let output = features.iter().map(evaluate).collect();
+        Ok(output)
     }
 
     pub fn win_probability(&self, game: &Game, content: &Content) -> f32 {
