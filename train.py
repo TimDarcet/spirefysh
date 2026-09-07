@@ -3023,6 +3023,7 @@ class ExperienceDataset:
             "version": np.empty(0, np.int64), "id": np.empty(0, np.int64),
         }
         self.next_id = 0
+        self.capacity = 0
         self.seen = self.admitted = self.uses = self.retired = self.forced_dropped = 0
         self.stale_dropped = self.ratio_dropped = self.kl_dropped = self.post_kl_dropped = 0
 
@@ -3101,20 +3102,28 @@ class ExperienceDataset:
         }
         accepted = len(rows) if limit is None else max(0, min(len(rows), limit))
         rows, actionable = rows[:accepted], actionable[:accepted]
+        size = len(self)
+        required = size + int(actionable.sum())
+        if required > self.capacity:
+            self.capacity = max(required, max(1024, self.capacity * 2))
+            for key, value in self.data.items():
+                storage = np.empty((self.capacity, *value.shape[1:]), value.dtype)
+                storage[:size] = value[:size]
+                self.data[key] = storage
         self.next_id += accepted
         self.rows.extend(row for row, keep in zip(rows, actionable) if keep)
         if features:
             self.features.extend(row for row, keep in zip(features[:accepted], actionable) if keep)
         for key, value in data.items():
-            self.data[key] = np.concatenate((self.data[key], value[:accepted][actionable]))
+            self.data[key][size:required] = value[:accepted][actionable]
         self.seen += accepted
-        self.admitted += int(actionable.sum())
-        forced = accepted - int(actionable.sum())
+        self.admitted += required - size
+        forced = accepted - required + size
         self.forced_dropped += forced
         return accepted, forced, len(data["action"]) - accepted
 
     def prune(self, version, lag, limit=None):
-        stale = np.flatnonzero(self.data["version"] < version - lag)
+        stale = np.flatnonzero(self.data["version"][:len(self)] < version - lag)
         if limit is not None:
             stale = stale[:max(0, limit)]
         self.stale_dropped += len(stale)
@@ -3137,17 +3146,17 @@ class ExperienceDataset:
             del self.features[end:]
         for key, values in self.data.items():
             values[holes] = values[sources]
-            self.data[key] = values[:end]
 
     def discard_ids(self, ids):
-        indices = np.flatnonzero(np.isin(self.data["id"], ids))
+        indices = np.flatnonzero(np.isin(self.data["id"][:len(self)], ids))
         self.discard(indices)
         return len(indices)
 
     def sample(self, size, rng, balanced=False):
         size = min(size, len(self))
         if balanced:
-            pools = [list(rng.permutation(np.flatnonzero(self.data["character"] == character)))
+            pools = [list(rng.permutation(np.flatnonzero(
+                self.data["character"][:len(self)] == character)))
                      for character in range(5)]
             selected = []
             while len(selected) < size and any(pools):
@@ -3708,8 +3717,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             "dataset_seen": dataset.seen, "dataset_admitted": dataset.admitted,
             "dataset_uses": dataset.uses, "dataset_retired": dataset.retired,
             "dataset_forced_dropped": dataset.forced_dropped,
-            "dataset_priority_mean": float(dataset.data["priority"].mean()) if len(dataset) else 0,
-            "dataset_priority_max": float(dataset.data["priority"].max()) if len(dataset) else 0,
+            "dataset_priority_mean": float(dataset.data["priority"][:len(dataset)].mean()) if len(dataset) else 0,
+            "dataset_priority_max": float(dataset.data["priority"][:len(dataset)].max()) if len(dataset) else 0,
             "dataset_attempted": attempted, "dataset_trained": trained,
             "dataset_stale_dropped": dataset.stale_dropped,
             "dataset_ratio_dropped": dataset.ratio_dropped, "dataset_kl_dropped": dataset.kl_dropped,
@@ -4412,8 +4421,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         "dataset_seen": dataset.seen, "dataset_admitted": dataset.admitted,
         "dataset_uses": dataset.uses, "dataset_retired": dataset.retired,
         "dataset_forced_dropped": dataset.forced_dropped,
-        "dataset_priority_mean": float(dataset.data["priority"].mean()) if len(dataset) else 0,
-        "dataset_priority_max": float(dataset.data["priority"].max()) if len(dataset) else 0,
+        "dataset_priority_mean": float(dataset.data["priority"][:len(dataset)].mean()) if len(dataset) else 0,
+        "dataset_priority_max": float(dataset.data["priority"][:len(dataset)].max()) if len(dataset) else 0,
         "dataset_attempted": attempted, "dataset_trained": trained,
         "dataset_stale_dropped": dataset.stale_dropped,
         "dataset_ratio_dropped": dataset.ratio_dropped, "dataset_kl_dropped": dataset.kl_dropped,
