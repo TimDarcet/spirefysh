@@ -7282,7 +7282,7 @@ def parser():
     run.add_argument("--expert-max-lag", type=int, default=4)
     run.add_argument("--expert-batch", type=int)
     run.add_argument("--expert-capacity", type=int, default=131_072)
-    run.add_argument("--batch", type=int, default=1024)
+    run.add_argument("--batch", type=int, default=4096)
     run.add_argument("--learning-rate", type=float, default=3e-4)
     run.add_argument("--head-learning-rate-multiplier", type=float, default=1)
     run.add_argument("--critic-learning-rate-multiplier", type=float, default=1)
