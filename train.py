@@ -5257,6 +5257,12 @@ def train(args):
         pooling = {name: getattr(args, name + "_pooling") or default
                    for name, default in POOLING_DEFAULTS.items()}
         model = Agent(layout, *config, pooling=pooling).to(target)
+    if args.freeze_backbone:
+        model.requires_grad_(False)
+        model.global_transformer.layers[-1].requires_grad_(True)
+        model.global_norm.requires_grad_(True)
+        model.policy.requires_grad_(True)
+        model.critic.requires_grad_(True)
     fused_optimizer = target.type != "cpu"
     parameter_groups, group_indices = optimizer_groups(
         model, args.head_learning_rate_multiplier, args.critic_learning_rate_multiplier,
@@ -6380,6 +6386,7 @@ def parser():
     run.add_argument("--head-learning-rate-multiplier", type=float, default=1)
     run.add_argument("--critic-learning-rate-multiplier", type=float, default=1)
     run.add_argument("--critic-only", action="store_true")
+    run.add_argument("--freeze-backbone", action="store_true")
     run.add_argument("--gae-lambda", type=float, default=1.0)
     run.add_argument("--critic-lambda", type=float, default=1.0)
     run.add_argument("--critic-balance-decay", type=float, default=.99)
