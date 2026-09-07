@@ -7259,7 +7259,7 @@ def parser():
     run.add_argument("--sampler-timeout", type=float, default=120)
     run.add_argument("--sampler-restarts", type=int, default=3)
     run.add_argument("--segment-steps", type=int, default=0)
-    run.add_argument("--publish-updates", type=int, default=4)
+    run.add_argument("--publish-updates", type=int, default=8)
     run.add_argument("--report-decisions", type=int, default=32_768)
     run.add_argument("--save-decisions", type=int, default=262_144)
     run.add_argument("--max-policy-lag", type=int, default=16)
