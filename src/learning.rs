@@ -10372,7 +10372,7 @@ impl ValueModel {
             &layer.linear1_w,
             &layer.linear1_b,
         );
-        hidden.iter_mut().for_each(|value| *value = gelu(*value));
+        gelu_in_place(&mut hidden);
         let projected = linear_batch(&hidden, rows.len(), &layer.linear2_w, &layer.linear2_b);
         for (row, projected) in rows.iter_mut().zip(projected.chunks_exact(self.width)) {
             for (left, right) in row.iter_mut().zip(projected) {
@@ -10405,7 +10405,7 @@ impl ValueModel {
             &layer.linear1_w,
             &layer.linear1_b,
         );
-        hidden.iter_mut().for_each(|value| *value = gelu(*value));
+        gelu_in_place(&mut hidden);
         let projected = linear_batch(&hidden, sequence.len(), &layer.linear2_w, &layer.linear2_b);
         for (row, projected) in sequence.iter_mut().zip(projected.chunks_exact(self.width)) {
             row.iter_mut()
@@ -11143,21 +11143,44 @@ fn dense_relu(input: &[f32], weights: &[f32], bias: &[f32]) -> Vec<f32> {
 }
 
 fn dense_gelu(input: &[f32], weights: &[f32], bias: &[f32]) -> Vec<f32> {
-    linear(input, weights, bias).into_iter().map(gelu).collect()
+    let mut output = linear(input, weights, bias);
+    gelu_in_place(&mut output);
+    output
 }
 
-fn gelu(value: f32) -> f32 {
-    let x = value / 2.0f32.sqrt();
-    let sign = x.signum();
-    let x = x.abs();
-    let t = 1.0 / (1.0 + 0.3275911 * x);
-    let erf = sign
-        * (1.0
-            - (((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t
-                + 0.254829592)
-                * t
-                * (-x * x).exp()));
-    value * 0.5 * (1.0 + erf)
+fn gelu_in_place(values: &mut [f32]) {
+    let gelu = |value: f32, exponential: f32| {
+        let x = value.abs() * std::f32::consts::FRAC_1_SQRT_2;
+        let t = 1.0 / (1.0 + 0.3275911 * x);
+        let erf = value.signum()
+            * (1.0
+                - (((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t
+                    + 0.254829592)
+                    * t
+                    * exponential));
+        value * 0.5 * (1.0 + erf)
+    };
+    #[cfg(target_os = "macos")]
+    {
+        #[link(name = "Accelerate", kind = "framework")]
+        unsafe extern "C" {
+            fn vvexpf(output: *mut f32, input: *const f32, count: *const i32);
+        }
+        let mut exponential = values
+            .iter()
+            .map(|value| -0.5 * value * value)
+            .collect::<Vec<_>>();
+        let count = values.len() as i32;
+        unsafe { vvexpf(exponential.as_mut_ptr(), exponential.as_ptr(), &count) };
+        values
+            .iter_mut()
+            .zip(exponential)
+            .for_each(|(value, exponential)| *value = gelu(*value, exponential));
+    }
+    #[cfg(not(target_os = "macos"))]
+    values
+        .iter_mut()
+        .for_each(|value| *value = gelu(*value, (-0.5 * *value * *value).exp()));
 }
 
 fn normalized(input: &[f32], weight: &[f32], bias: &[f32]) -> Vec<f32> {
