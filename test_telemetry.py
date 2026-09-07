@@ -9,7 +9,7 @@ import train
 def write_events(path, rows):
     with path.open("ab") as output:
         for row in rows:
-            output.write((json.dumps(row) + "\n").encode())
+            output.write((json.dumps({"event_schema": 2} | row) + "\n").encode())
 
 
 class TelemetryTest(unittest.TestCase):
@@ -49,7 +49,7 @@ class TelemetryTest(unittest.TestCase):
             ])
             projector = train.MetricsProjector(root, run, manifest, 1)
             cursor = projector.cursor
-            event = json.dumps({"event": "heartbeat", "time": 4, "step": 41,
+            event = json.dumps({"event_schema": 2, "event": "heartbeat", "time": 4, "step": 41,
                                 "stage": 0, "dataset_rows": 7}).encode()
             with log.open("ab") as output:
                 output.write(event[:len(event) // 2])
@@ -128,6 +128,22 @@ class TelemetryTest(unittest.TestCase):
             self.assertTrue(all(label in html for label in (
                 "Lineage", "Branch", "Weights revision", "Policy loss", "Gradient norm",
             )))
+
+    def test_legacy_heartbeat_does_not_create_a_zero_step(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); run = root / "run"; (run / "events").mkdir(parents=True)
+            manifest = self.manifest("run", 1)
+            (run / "run.json").write_text(json.dumps(manifest))
+            write_events(run / "events/000001.jsonl", [
+                {"event_schema": 1, "event": "report", "time": 1, "step": 120,
+                 "metrics": {"seconds": 10, "decisions_per_second": 12}},
+                {"event_schema": 1, "event": "heartbeat", "time": 2,
+                 "decisions": 130, "updates": 2},
+                {"event": "session_start", "role": "learner", "time": 3,
+                 "step": 140, "stage": 0, "training_elapsed_seconds": 12},
+            ])
+            reports = train.MetricsProjector(root, run, manifest, 1).value()["reports"]
+            self.assertEqual([row["step"] for row in reports], [120, 140])
 
 
 if __name__ == "__main__":

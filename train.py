@@ -4069,6 +4069,9 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                         "resolved_decisions_total": base_decisions + handled,
                         "stage": stage, "stale_rows": stale,
                         "expert_stale_rows": expert_stale,
+                        "weights_revision": revisions["weights_revision"],
+                        "policy_revision": revisions["policy_revision"],
+                        "training_elapsed_seconds": time.monotonic() - run_started,
                     })
                 absolute = base_decisions + handled
                 if absolute >= next_save:
@@ -5292,13 +5295,17 @@ class MetricsProjector:
         self.current["policy_revision"] = event.get(
             "policy_revision", self.current["policy_revision"]
         )
-        if event.get("training_elapsed_seconds") is not None:
-            self.current["_last_seconds"] = event["training_elapsed_seconds"]
+        elapsed = event.get("training_elapsed_seconds")
+        if elapsed is not None:
+            if self.current["_start_seconds"] is None:
+                self.current["_start_seconds"] = elapsed
+            self.current["_last_seconds"] = elapsed
         return self.current
 
     def fold(self, event, event_end=0):
         self.last_time = event.get("time", self.last_time)
         kind = event.get("event")
+        fact = event.get("event_schema") == 2
         if kind == "session_start" or kind == "start" and event.get("role") in (None, "learner"):
             self.status = "running"
             parent_step = event.get("parent_checkpoint_step")
@@ -5308,7 +5315,12 @@ class MetricsProjector:
                     self.current = None
             if kind == "session_start":
                 self.window(event)
-        elif kind == "training_batch":
+        elif fact and kind == "actor_published":
+            window = self.window(event)
+            if window["_start_seconds"] == 0 and window["_start_step"] \
+                    == event.get("step", 0) != 0:
+                window["_start_seconds"] = event.get("training_elapsed_seconds", 0)
+        elif fact and kind == "training_batch":
             window = self.window(event); window["_batches"] += 1
             window["_trained"] += event.get("policy_trained_rows", 0)
             window["_critic_trained"] += event.get("critic_trained_rows", 0)
@@ -5327,7 +5339,7 @@ class MetricsProjector:
                     continue
                 window["_sum"][metric] = window["_sum"].get(metric, 0.) + value * weight
                 window["_weight"][metric] = window["_weight"].get(metric, 0) + weight
-        elif kind == "sample_packet":
+        elif fact and kind == "sample_packet":
             window = self.window(event)
             window["_sampled"] += event.get("packet_sampled_decisions", 0)
             window["_discarded"] += event.get("discarded_decisions", 0)
@@ -5354,9 +5366,12 @@ class MetricsProjector:
                 samples.append((priority, episode.get("iteration", 0), floor, character))
                 samples.sort()
                 del samples[8:]
-        elif kind == "dataset_pruned":
-            self.window(event)["_stale"] += event.get("stale_rows", 0)
-        elif kind == "heartbeat":
+        elif fact and kind == "dataset_pruned":
+            window = self.current if self.current and event.get(
+                "training_elapsed_seconds"
+            ) is None else self.window(event)
+            window["_stale"] += event.get("stale_rows", 0)
+        elif fact and kind == "heartbeat":
             window = self.window(event)
             for source, target in (
                 ("dataset_rows", "dataset_rows"), ("queue_depth", "sample_queue_depth"),
@@ -5367,7 +5382,7 @@ class MetricsProjector:
             ):
                 if source in event:
                     window[target] = event[source]
-        elif kind == "checkpoint":
+        elif fact and kind == "checkpoint":
             self.window(event)
         elif kind == "promotion":
             self.promotions.append(event | {"_written": event.get("time")})
@@ -5900,7 +5915,7 @@ def dashboard(target):
 body{font:14px system-ui;margin:24px;background:#101319;color:#e8ecf2}h1,h2{margin-bottom:6px}.controls{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:22px}select,input{padding:7px;background:#202938;color:#e8ecf2;border:1px solid #526176;border-radius:5px}.charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(440px,1fr));gap:14px}.panel{margin:22px 0;padding:16px;background:#171d28;border:1px solid #303a49;border-radius:10px}.charts .panel{margin:0}.plot{height:340px;min-width:0}table{border-collapse:collapse;width:100%}th,td{padding:7px;border-bottom:1px solid #303a49;text-align:left}.yes{color:#75db91}.no{color:#ee7b7b}
 </style><h1 id=title>Spirefysh dashboard</h1><div class=controls><label>Lineage <select id=lineage></select></label><label>Branch <select id=version></select></label><label>X axis <select id=xaxis><option value=updates>Weights revision</option><option value=decisions selected># decisions</option><option value=time>Active training time</option></select></label><label><input id=smooth type=checkbox checked> EMA</label><label>EMA α <input id=ema type=number min=.01 max=1 step=.01 value=.2></label><span>Auto-refresh 2s</span><span id=status></span></div><div class=charts><section class=panel><h2>Mean advantage</h2><div id=advantage class=plot></div></section><section class=panel><h2>Decisions / second</h2><div id=throughput class=plot></div></section><section class=panel><h2>Terminal floor</h2><div id=floor class=plot></div></section><section class=panel><h2>Ascension</h2><div id=ascension class=plot></div></section><section class=panel><h2>Bonus strength</h2><div id=bonus class=plot></div></section><section class=panel><h2>Win proportion</h2><div id=wins class=plot></div></section><section class=panel><h2>Clip fraction</h2><div id=clip class=plot></div></section><section class=panel><h2>KL</h2><div id=kl class=plot></div></section><section class=panel><h2>Entropy</h2><div id=entropy class=plot></div></section></div><section class=panel><h2>Promotion</h2><div id=promotion></div></section><script>const versions=""" + data + r""",lineageSelect=document.querySelector('#lineage'),versionSelect=document.querySelector('#version'),xaxis=document.querySelector('#xaxis'),smooth=document.querySelector('#smooth'),ema=document.querySelector('#ema');
 const characterNames=['Ironclad','Defect','Silent','Regent','Necrobinder'],characterColors=['#ef4444','#38bdf8','#22c55e','#f59e0b','#a78bfa'],names=Object.keys(versions),lineages=[...new Set(names.map(name=>versions[name].lineage_id||name))],config={responsive:true,displaylogo:false},refreshKey='spirefysh-dashboard',saved=(()=>{try{return JSON.parse(sessionStorage.getItem(refreshKey))}catch{return null}})();let timeOrigin=0;const initial=saved?.followLatest?names.at(-1):names.includes(saved?.version)?saved.version:names.at(-1)||'';lineageSelect.innerHTML=lineages.map(id=>`<option value="${id}">${names.find(name=>(versions[name].lineage_id||name)===id)||id}</option>`).join('');lineageSelect.value=versions[initial]?.lineage_id||initial;function showBranches(preferred){const branches=names.filter(name=>(versions[name].lineage_id||name)===lineageSelect.value);versionSelect.innerHTML=branches.map(name=>`<option value="${name}">V${versions[name].version} · ${name}</option>`).join('');versionSelect.value=branches.includes(preferred)?preferred:branches.at(-1)||''}showBranches(initial);if(saved?.xaxis)xaxis.value=saved.xaxis==='iteration'?'updates':saved.xaxis;if(typeof saved?.smooth==='boolean')smooth.checked=saved.smooth;if(saved?.ema)ema.value=saved.ema;
-function updateSteps(history){let offset=0,last=0,session;for(const report of history){if(Number.isFinite(Number(report.metrics.weights_revision))){report._updates=Number(report.metrics.weights_revision);continue}const updates=Number(report.metrics.updates)||0;if(session!==undefined&&(report._session!==session||updates<last)){offset+=last;last=0}report._updates=offset+updates;last=Math.max(last,updates);session=report._session}}function x(report){return xaxis.value==='time'?(Number.isFinite(Number(report.metrics.seconds))?report.metrics.seconds/60:Number.isFinite(Number(report._written))?(report._written-timeOrigin)/60:0):xaxis.value==='decisions'?report.step:report._updates}function series(history,key){return history.map(report=>({x:x(report),y:Number(report.metrics[key])})).filter(point=>Number.isFinite(point.y))}
+function monotonic(history){let step=-Infinity;return history.filter(row=>row.step>step&&(step=row.step,true))}function updateSteps(history){let offset=0,last=0,session;for(const report of history){if(Number.isFinite(Number(report.metrics.weights_revision))){report._updates=Number(report.metrics.weights_revision);continue}const updates=Number(report.metrics.updates)||0;if(session!==undefined&&(report._session!==session||updates<last)){offset+=last;last=0}report._updates=offset+updates;last=Math.max(last,updates);session=report._session}}function x(report){return xaxis.value==='time'?(Number.isFinite(Number(report.metrics.seconds))?report.metrics.seconds/60:Number.isFinite(Number(report._written))?(report._written-timeOrigin)/60:0):xaxis.value==='decisions'?report.step:report._updates}function series(history,key){return history.map(report=>({x:x(report),y:Number(report.metrics[key])})).filter(point=>Number.isFinite(point.y))}
 function emaLine(points){const alpha=Math.max(.01,Math.min(1,Number(ema.value)||.2));let value;return points.map((point,index)=>({x:point.x,y:value=index?alpha*point.y+(1-alpha)*value:point.y}))}
 function stageTransitions(history,run){const promotions=(run?.promotions||[]).filter(row=>row.promoted);if(promotions.length)return promotions.map(promotion=>{const report=history.find(row=>row.step===promotion.step)||history.filter(row=>row.step<=promotion.step).at(-1),after=history.find(row=>row.step>promotion.step),next=run.manifest.stages?.[(promotion.stage?.index??-1)+1]||after?.stage,position=xaxis.value==='decisions'?promotion.step:report&&xaxis.value==='updates'?report._updates:Number.isFinite(Number(promotion._written))?(promotion._written-timeOrigin)/60:Number.isFinite(Number(promotion.seconds))?promotion.seconds/60:report?x(report):NaN;return{x:position,stage:next}}).filter(point=>Number.isFinite(Number(point.x)));return history.slice(1).flatMap((row,index)=>Number.isFinite(Number(row.stage?.ascension))&&Number.isFinite(Number(history[index].stage?.ascension))&&(row.stage.ascension!==history[index].stage.ascension||row.stage.bonus!==history[index].stage.bonus)?[{x:x(row),stage:row.stage}]:[])}
 function stageLines(history,run){return stageTransitions(history,run).map(point=>({type:'line',xref:'x',yref:'paper',x0:point.x,x1:point.x,y0:0,y1:1,layer:'below',line:{color:'rgba(232,236,242,.38)',width:1,dash:'dash'}}))}
@@ -5911,7 +5926,7 @@ function stagePlot(id,history,key,color,run){const rows=history.filter(row=>Numb
 function promotionSummary(row){if(!row)return '<p>No promotion check yet.</p>';const characters=row.result?.characters||[],rows=characters.map(item=>`<tr><td>${characterNames[item.character]??`Character ${item.character}`}</td><td>${item.wins}/${item.runs}</td><td>${(100*item.wins/item.runs).toFixed(1)}%</td><td>${Number(item.floor_mean).toFixed(2)}</td><td>${item.caps}</td></tr>`).join('');return `<p class="${row.promoted?'yes':'no'}">${row.promoted?'Promoted':'Stayed at current stage'} · threshold ${(100*row.threshold).toFixed(0)}% per character · seed ${row.seed}</p><table><thead><tr><th>Character</th><th>Wins</th><th>Rate</th><th>Mean floor</th><th>Caps</th></tr></thead><tbody>${rows}</tbody></table>`}
 function saveDashboardState(){const views={};document.querySelectorAll('.plot').forEach(node=>{const view={};if(node._fullLayout?.xaxis?.autorange===false)view.x=[...node._fullLayout.xaxis.range];if(node._fullLayout?.yaxis?.autorange===false)view.y=[...node._fullLayout.yaxis.range];if(view.x||view.y)views[node.id]=view});try{sessionStorage.setItem(refreshKey,JSON.stringify({version:versionSelect.value,followLatest:versionSelect.value===names.at(-1),xaxis:xaxis.value,smooth:smooth.checked,ema:ema.value,scroll:[scrollX,scrollY],views}))}catch{}}
 function restoreDashboardState(){if(saved?.version===versionSelect.value&&saved.xaxis===xaxis.value)for(const [id,view] of Object.entries(saved.views||{})){const update={};if(view.x)update['xaxis.range']=view.x;if(view.y)update['yaxis.range']=view.y;if(Object.keys(update).length)Plotly.relayout(id,update)}if(saved?.scroll)scrollTo(...saved.scroll)}
-function showStatus(run){const age=Date.now()/1000-(run.last_event_time||0),timeout=run.manifest.sessions?.at(-1)?.training?.sampler_timeout||120;document.querySelector('#status').textContent=run.status==='running'&&age>timeout?'stalled':run.status||''}function showVersion(){const run=versions[versionSelect.value],reports=run.reports;updateSteps(reports);const timed=reports.find(row=>Number.isFinite(Number(row._written))&&Number.isFinite(Number(row.metrics.seconds)));timeOrigin=timed?timed._written-timed.metrics.seconds:0;document.querySelector('#title').textContent=`Spirefysh V${run.version} · ${run.run}`;showStatus(run);plot('advantage',series(reports,'mean_advantage'),{history:reports,run});plot('throughput',series(reports,'decisions_per_second'),{tozero:true,history:reports,run});floorPlot(reports,run);stagePlot('ascension',reports,'ascension','#fb7185',run);stagePlot('bonus',reports,'bonus','#f59e0b',run);plot('wins',reports.map(row=>({x:x(row),y:row.metrics.wins/Math.max(1,row.metrics.episodes)})),{range:[0,1],percent:true,history:reports,run});plot('clip',series(reports,'clip_fraction'),{range:[0,1],percent:true,history:reports,run});plot('kl',series(reports,'kl'),{tozero:true,history:reports,run});plot('entropy',series(reports,'entropy'),{tozero:true,history:reports,run});document.querySelector('#promotion').innerHTML=promotionSummary(run.promotions.at(-1))}
+function showStatus(run){const age=Date.now()/1000-(run.last_event_time||0),timeout=run.manifest.sessions?.at(-1)?.training?.sampler_timeout||120;document.querySelector('#status').textContent=run.status==='running'&&age>timeout?'stalled':run.status||''}function showVersion(){const run=versions[versionSelect.value],reports=monotonic(run.reports);updateSteps(reports);const timed=reports.find(row=>Number.isFinite(Number(row._written))&&Number.isFinite(Number(row.metrics.seconds)));timeOrigin=timed?timed._written-timed.metrics.seconds:0;document.querySelector('#title').textContent=`Spirefysh V${run.version} · ${run.run}`;showStatus(run);plot('advantage',series(reports,'mean_advantage'),{history:reports,run});plot('throughput',series(reports,'decisions_per_second').filter(point=>point.y>0),{tozero:true,history:reports,run});floorPlot(reports,run);stagePlot('ascension',reports,'ascension','#fb7185',run);stagePlot('bonus',reports,'bonus','#f59e0b',run);plot('wins',reports.map(row=>({x:x(row),y:row.metrics.wins/Math.max(1,row.metrics.episodes)})),{range:[0,1],percent:true,history:reports,run});plot('clip',series(reports,'clip_fraction'),{range:[0,1],percent:true,history:reports,run});plot('kl',series(reports,'kl'),{tozero:true,history:reports,run});plot('entropy',series(reports,'entropy'),{tozero:true,history:reports,run});document.querySelector('#promotion').innerHTML=promotionSummary(run.promotions.at(-1))}
 function refreshLive(){const selected=versionSelect.value,run=versions[selected];if(!run?.live)return;const script=document.createElement('script');script.src=encodeURI(run.live)+`?${Date.now()}`;script.onload=()=>{script.remove();const live=window.spirefyshLive;if(versionSelect.value!==selected||live?.version!==run.version)return;if(live.schema===2){if(live.run_id!==run.run_id||live.leaf_session_id<run.trainer_session)return;if(live.leaf_session_id===run.trainer_session&&live.revision<=run.live_revision){showStatus(run);return}run.reports=live.reports;run.promotions=live.promotions||[];run.trainer_session=live.leaf_session_id;run.live_revision=live.revision;run.status=live.status;run.last_event_time=live.last_event_time;showVersion();return}let changed=false;if(live.trainer_session!==run.trainer_session){run.reports=run.reports.filter(row=>row.step<=live.parent_checkpoint_step);run.trainer_session=live.trainer_session;changed=true}const report=live.report;report._session=`${selected}:${live.trainer_session}:${report.sampler_session}`;const last=run.reports.at(-1);if(!last||report.step>last.step||report._written>last._written){run.reports=[...run.reports.filter(row=>row.step!==report.step),report].sort((a,b)=>a.step-b.step);changed=true}if(changed)showVersion()};script.onerror=()=>script.remove();document.head.append(script)}
 lineageSelect.onchange=()=>{showBranches();showVersion()};versionSelect.onchange=showVersion;xaxis.onchange=showVersion;smooth.onchange=showVersion;ema.oninput=showVersion;showVersion();setTimeout(restoreDashboardState,100);window.addEventListener('beforeunload',saveDashboardState);setInterval(refreshLive,2000)</script>"""
     content = content.replace(
@@ -6125,6 +6140,10 @@ def train(args):
                    else "(start -> end) * max(0.35, 0.8^stage)",
     }
     sessions = manifest.setdefault("sessions", [])
+    previous_reports = logged_history(output, manifest)[0] if continuing else {}
+    elapsed_offset = float((source or {}).get("training_elapsed_seconds", max(
+        (row["metrics"].get("seconds", 0) for row in previous_reports.values()), default=0,
+    )))
     event_dir = output / "events"; event_dir.mkdir(exist_ok=True)
     saved_ids = [int(row["id"]) for row in sessions if str(row.get("id", "")).isdigit()]
     file_ids = [int(path.stem) for path in event_dir.glob("*.jsonl") if path.stem.isdigit()]
@@ -6151,7 +6170,7 @@ def train(args):
         "step": source["decisions"] if source else 0,
         "resolved_decisions_total": source["decisions"] if source else 0,
         "stage": source["stage"] if source else args.start_stage,
-        "training_elapsed_seconds": float((source or {}).get("training_elapsed_seconds", 0)),
+        "training_elapsed_seconds": elapsed_offset,
         "checkpoint": args.checkpoint,
         "optimizer_restored": optimizer_restored,
         "parent_checkpoint_step": source["decisions"] if source else None,
@@ -6196,7 +6215,6 @@ def train(args):
         raise ValueError("--decisions precedes the checkpoint")
     if args.promote_now and (not source or args.decisions != decisions):
         raise ValueError("--promote-now requires an unchanged checkpoint decision target")
-    elapsed_offset = float((source or {}).get("training_elapsed_seconds", 0))
     latest = output / "latest.pt"
     training_started = [None]
     def write_checkpoint(path, step, kind):
@@ -6257,9 +6275,6 @@ def train(args):
     dashboard(output.parent)
     started = time.monotonic()
     training_started[0] = started
-    previous_reports = logged_history(output, manifest)[0]
-    elapsed_offset = max(elapsed_offset, max((row["metrics"].get("seconds", 0)
-                         for row in previous_reports.values()), default=0))
     dashboard_ready = bool(previous_reports)
     run_started = started - elapsed_offset
     deadline = started + args.hours * 3600 if args.hours else math.inf
