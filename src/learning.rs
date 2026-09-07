@@ -17834,6 +17834,7 @@ mod python {
             mcts_value_consistency=false,
             mcts_heuristic=false,
             mcts_timeout=0.0,
+            cache_features=false,
         ))]
         fn policy<'py>(
             &mut self,
@@ -17855,6 +17856,7 @@ mod python {
             mcts_value_consistency: bool,
             mcts_heuristic: bool,
             mcts_timeout: f64,
+            cache_features: bool,
         ) -> PyResult<Bound<'py, PyTuple>> {
             if !(0.0..=1.0).contains(&mcts_fraction)
                 || mcts_max_depth == 0
@@ -18013,13 +18015,16 @@ mod python {
             let mut log_probabilities = Vec::with_capacity(rows.len());
             let mut critic_probabilities = Vec::with_capacity(rows.len() * VALUE_CATEGORIES);
             let mut packed_rows = Vec::with_capacity(rows.len());
+            let mut cached_features = Vec::with_capacity(rows.len());
             let mut selected_actions = Vec::with_capacity(rows.len());
             self.actions.clear();
             if advance {
                 self.actions.resize_with(rows.len(), Vec::new);
             }
-            for (((row, packed), _features), (log_policy, _win, _expected, probabilities, _)) in
-                rows.into_iter().zip(packed).zip(features).zip(outputs)
+            for (
+                ((row, packed), (state, actions)),
+                (log_policy, _win, _expected, probabilities, _),
+            ) in rows.into_iter().zip(packed).zip(features).zip(outputs)
             {
                 let choice = if sample {
                     sample_policy(&log_policy, &mut random)
@@ -18045,6 +18050,15 @@ mod python {
                             .map(|candidate| candidate.action.clone())
                             .collect(),
                     );
+                }
+                if cache_features {
+                    let mut bytes = Vec::with_capacity((actions.len() + 1) * state.len() * 4);
+                    for value in std::iter::once(&state).chain(&actions) {
+                        for &number in value {
+                            bytes.extend_from_slice(&number.to_le_bytes());
+                        }
+                    }
+                    cached_features.push(PyBytes::new(py, &bytes));
                 }
                 packed_rows.push(PyBytes::new(py, &packed));
             }
@@ -18207,6 +18221,9 @@ mod python {
                         .into_pyarray(py)
                         .into_any(),
                 ]);
+            }
+            if cache_features {
+                output.push(PyTuple::new(py, cached_features)?.into_any());
             }
             PyTuple::new(py, output)
         }
