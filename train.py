@@ -5322,6 +5322,7 @@ def train(args):
     if args.freeze_backbone and args.samplers == 1 and args.envs % 2 == 0:
         args.samplers, args.sampler_threads = 2, min(args.sampler_threads, 4)
     if args.freeze_backbone:
+        args.save_decisions = max(args.save_decisions, 262_144)
         model.requires_grad_(False)
         model.policy.requires_grad_(True)
         model.critic.requires_grad_(True)
