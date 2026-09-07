@@ -10221,10 +10221,15 @@ impl ValueModel {
         output
     }
 
-    fn attention_batch(&self, qkv: &[f32], selected: &[usize]) -> Vec<f32> {
+    fn attention_batch(
+        &self,
+        qkv: &[f32],
+        selected: impl Iterator<Item = usize> + Clone,
+    ) -> Vec<f32> {
         let rows = qkv.len() / (3 * self.width);
         let dimension = self.width / self.heads;
-        let mut output = vec![0.0; selected.len() * self.width];
+        let selected_len = selected.clone().count();
+        let mut output = vec![0.0; selected_len * self.width];
         #[cfg(target_os = "macos")]
         {
             #[link(name = "Accelerate", kind = "framework")]
@@ -10246,15 +10251,16 @@ impl ValueModel {
                     output_stride: i32,
                 );
             }
-            let dense = selected.len() == rows && selected.iter().copied().eq(0..rows);
-            let mut query = vec![0.0; selected.len() * dimension];
-            let mut scores = vec![0.0; selected.len() * rows];
+            let dense = selected_len == rows && selected.clone().eq(0..rows);
+            let mut query = vec![0.0; selected_len * dimension];
+            let mut scores = vec![0.0; selected_len * rows];
             for head in 0..self.heads {
                 let column = head * dimension;
                 let (query, stride) = if dense {
                     (&qkv[column..], 3 * self.width)
                 } else {
-                    for (target, &source) in query.chunks_exact_mut(dimension).zip(selected) {
+                    for (target, source) in query.chunks_exact_mut(dimension).zip(selected.clone())
+                    {
                         target
                             .copy_from_slice(&qkv[source * 3 * self.width + column..][..dimension]);
                     }
@@ -10265,7 +10271,7 @@ impl ValueModel {
                         101,
                         111,
                         112,
-                        selected.len() as i32,
+                        selected_len as i32,
                         rows as i32,
                         dimension as i32,
                         (dimension as f32).sqrt().recip(),
@@ -10291,7 +10297,7 @@ impl ValueModel {
                         101,
                         111,
                         111,
-                        selected.len() as i32,
+                        selected_len as i32,
                         dimension as i32,
                         rows as i32,
                         1.0,
@@ -10313,7 +10319,7 @@ impl ValueModel {
                 .chunks_exact(3 * self.width)
                 .map(<[f32]>::to_vec)
                 .collect::<Vec<_>>();
-            for (target, &source) in output.chunks_exact_mut(self.width).zip(selected) {
+            for (target, source) in output.chunks_exact_mut(self.width).zip(selected) {
                 target.copy_from_slice(&self.attention(
                     &qkv[source][..self.width],
                     &qkv,
@@ -10328,16 +10334,16 @@ impl ValueModel {
         &self,
         sequence: &[Vec<f32>],
         layer: &TransformerLayer,
-        selected: impl IntoIterator<Item = usize>,
+        selected: impl Iterator<Item = usize> + Clone,
     ) -> Vec<Vec<f32>> {
         let normalized_rows = sequence
             .iter()
             .flat_map(|row| normalized(row, &layer.norm1_w, &layer.norm1_b))
             .collect::<Vec<_>>();
         let qkv = linear_batch(&normalized_rows, sequence.len(), &layer.qkv_w, &layer.qkv_b);
-        let selected = selected.into_iter().collect::<Vec<_>>();
-        let attention = self.attention_batch(&qkv, &selected);
-        let projected = linear_batch(&attention, selected.len(), &layer.out_w, &layer.out_b);
+        let rows = selected.clone().count();
+        let attention = self.attention_batch(&qkv, selected.clone());
+        let projected = linear_batch(&attention, rows, &layer.out_w, &layer.out_b);
         let mut rows = selected
             .into_iter()
             .zip(projected.chunks_exact(self.width))
@@ -10370,8 +10376,35 @@ impl ValueModel {
     }
 
     fn transform(&self, sequence: &mut Vec<Vec<f32>>, layer: &TransformerLayer) {
-        let transformed = self.transformed(sequence, layer, 0..sequence.len());
-        *sequence = transformed;
+        let normalized_rows = sequence
+            .iter()
+            .flat_map(|row| normalized(row, &layer.norm1_w, &layer.norm1_b))
+            .collect::<Vec<_>>();
+        let qkv = linear_batch(&normalized_rows, sequence.len(), &layer.qkv_w, &layer.qkv_b);
+        let attention = self.attention_batch(&qkv, 0..sequence.len());
+        let projected = linear_batch(&attention, sequence.len(), &layer.out_w, &layer.out_b);
+        for (row, projected) in sequence.iter_mut().zip(projected.chunks_exact(self.width)) {
+            row.iter_mut()
+                .zip(projected)
+                .for_each(|(left, right)| *left += right);
+        }
+        let normalized_rows = sequence
+            .iter()
+            .flat_map(|row| normalized(row, &layer.norm2_w, &layer.norm2_b))
+            .collect::<Vec<_>>();
+        let mut hidden = linear_batch(
+            &normalized_rows,
+            sequence.len(),
+            &layer.linear1_w,
+            &layer.linear1_b,
+        );
+        hidden.iter_mut().for_each(|value| *value = gelu(*value));
+        let projected = linear_batch(&hidden, sequence.len(), &layer.linear2_w, &layer.linear2_b);
+        for (row, projected) in sequence.iter_mut().zip(projected.chunks_exact(self.width)) {
+            row.iter_mut()
+                .zip(projected)
+                .for_each(|(left, right)| *left += right);
+        }
     }
 
     fn summarize(&self, name: usize, mode: u8, values: Vec<Vec<f32>>) -> Vec<f32> {
