@@ -10293,9 +10293,10 @@ impl ValueModel {
                 }
                 for score in scores.chunks_exact_mut(rows) {
                     let peak = score.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                    score
-                        .iter_mut()
-                        .for_each(|value| *value = (*value - peak).exp());
+                    score.iter_mut().for_each(|value| *value -= peak);
+                }
+                exp_in_place(&mut scores);
+                for score in scores.chunks_exact_mut(rows) {
                     let total = score.iter().sum::<f32>();
                     score.iter_mut().for_each(|value| *value /= total);
                 }
@@ -11162,16 +11163,11 @@ fn gelu_in_place(values: &mut [f32]) {
     };
     #[cfg(target_os = "macos")]
     {
-        #[link(name = "Accelerate", kind = "framework")]
-        unsafe extern "C" {
-            fn vvexpf(output: *mut f32, input: *const f32, count: *const i32);
-        }
         let mut exponential = values
             .iter()
             .map(|value| -0.5 * value * value)
             .collect::<Vec<_>>();
-        let count = values.len() as i32;
-        unsafe { vvexpf(exponential.as_mut_ptr(), exponential.as_ptr(), &count) };
+        exp_in_place(&mut exponential);
         values
             .iter_mut()
             .zip(exponential)
@@ -11181,6 +11177,20 @@ fn gelu_in_place(values: &mut [f32]) {
     values
         .iter_mut()
         .for_each(|value| *value = gelu(*value, (-0.5 * *value * *value).exp()));
+}
+
+fn exp_in_place(values: &mut [f32]) {
+    #[cfg(target_os = "macos")]
+    {
+        #[link(name = "Accelerate", kind = "framework")]
+        unsafe extern "C" {
+            fn vvexpf(output: *mut f32, input: *const f32, count: *const i32);
+        }
+        let count = values.len() as i32;
+        unsafe { vvexpf(values.as_mut_ptr(), values.as_ptr(), &count) };
+    }
+    #[cfg(not(target_os = "macos"))]
+    values.iter_mut().for_each(|value| *value = value.exp());
 }
 
 fn normalized(input: &[f32], weight: &[f32], bias: &[f32]) -> Vec<f32> {
