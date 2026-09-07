@@ -128,6 +128,8 @@ class TelemetryTest(unittest.TestCase):
             self.assertTrue(all(label in html for label in (
                 "Lineage", "Branch", "Weights revision", "Policy loss", "Gradient norm",
             )))
+            self.assertIn("weights_revision??report.metrics.updates", html)
+            self.assertIn("row.step>step", html)
 
     def test_legacy_heartbeat_does_not_create_a_zero_step(self):
         with tempfile.TemporaryDirectory() as temporary:
