@@ -1679,6 +1679,32 @@ def predict(model, inputs, precision, temperature=1, policy_only=False, flat_pol
     return output.float() if policy_only else tuple(value.float() for value in output)
 
 
+def predict_cached(model, inputs, precision, temperature=1):
+    state, action, offsets, action_rows = inputs
+    kind = state.device.type
+    dtype = torch.bfloat16 if precision == "bf16" else torch.float16
+    with torch.autocast(kind, dtype=dtype, enabled=precision != "fp32"):
+        scores = model.policy(action).squeeze(-1) / temperature
+        policy = model.group_log_softmax(
+            scores, torch.ones_like(scores, dtype=torch.bool),
+            (offsets, action_rows, None, None),
+        )
+        critic = model.critic(state)
+    return policy.float(), critic.float()
+
+
+def cached_tensors(features, width):
+    rows = [np.frombuffer(row, "<f4").reshape(-1, width) for row in features]
+    lengths = np.asarray([len(row) - 1 for row in rows], np.int32)
+    offsets = np.r_[0, np.cumsum(lengths, dtype=np.int64)].astype(np.int32)
+    return (
+        torch.from_numpy(np.stack([row[0] for row in rows])),
+        torch.from_numpy(np.concatenate([row[1:] for row in rows])),
+        torch.from_numpy(offsets),
+        torch.from_numpy(np.repeat(np.arange(len(rows), dtype=np.int64), lengths)),
+    )
+
+
 def critic_probabilities(logits):
     return logits.softmax(-1)
 
@@ -2598,7 +2624,7 @@ class RolloutCollector:
         sample_keys = (
             "rows", "choices", "old_log", "critic_probabilities", "canonical_progress",
             "phases", "win_rewards", "terminals", "characters", "versions",
-        )
+        ) + (("features",) if native and args.cache_features else ())
         def materialize(trajectory):
             samples = trajectory.pop("samples")
             trajectory.update(zip(sample_keys, map(list, zip(*samples))))
@@ -2634,8 +2660,7 @@ class RolloutCollector:
             canonical = np.asarray([row[9] for row in state_stats], np.uint8)
             phases = np.asarray([row[4] for row in state_stats], np.uint8)
             if native:
-                (characters, choice, log_probability, critic_probability, step_rows,
-                 step_experts, step_search_stats) = self.env.policy(
+                result = self.env.policy(
                     args.policy_temperature,
                     mcts_fraction=args.mcts_fraction,
                     mcts_simulations=args.mcts_simulations,
@@ -2651,7 +2676,11 @@ class RolloutCollector:
                     mcts_value_consistency=getattr(args, "search_consistency_weight", 0) > 0,
                     mcts_heuristic=args.mcts_heuristic,
                     mcts_timeout=bounded_mcts_timeout(args.mcts_timeout, args.sampler_timeout),
+                    cache_features=args.cache_features,
                 )
+                characters, choice, log_probability, critic_probability, step_rows, \
+                    step_experts, step_search_stats, *cached = result
+                step_features = cached[0] if cached else None
                 if heartbeat is not None:
                     heartbeat[self.worker] = time.monotonic()
                 characters = np.asarray(characters, np.uint8)
@@ -2705,7 +2734,7 @@ class RolloutCollector:
                 self.native_steps.append((
                     step_rows, choice, log_probability, critic_probability, canonical, phases,
                     raw_reward, done, characters, version,
-                ))
+                ) + ((step_features,) if args.cache_features else ()))
             else:
                 for index, row in enumerate(step_rows):
                     trajectory = self.trajectories[index]
@@ -2976,6 +3005,7 @@ def collect_worker(model, args, sampler_session, stage, capacity, pending_capaci
 class ExperienceDataset:
     def __init__(self):
         self.rows = []
+        self.features = []
         self.data = {
             "action": np.empty(0, np.int64), "old": np.empty(0, np.float32),
             "advantage": np.empty(0, np.float32),
@@ -3001,6 +3031,9 @@ class ExperienceDataset:
             "phases", "win_rewards", "terminals", "characters", "versions",
         )
         rows = [item for trajectory in trajectories for item in trajectory["rows"]]
+        features = [item for trajectory in trajectories for item in trajectory.get("features", [])]
+        if features and len(features) != len(rows):
+            raise ValueError("invalid cached features")
         advantage = np.empty(len(rows), np.float32)
         targets = np.empty((len(rows), CATEGORIES), np.float16)
         values = np.empty(len(rows), np.float32)
@@ -3063,6 +3096,8 @@ class ExperienceDataset:
         rows, actionable = rows[:accepted], actionable[:accepted]
         self.next_id += accepted
         self.rows.extend(row for row, keep in zip(rows, actionable) if keep)
+        if features:
+            self.features.extend(row for row, keep in zip(features[:accepted], actionable) if keep)
         for key, value in data.items():
             self.data[key] = np.concatenate((self.data[key], value[:accepted][actionable]))
         self.seen += accepted
@@ -3084,6 +3119,8 @@ class ExperienceDataset:
             return
         keep = np.ones(len(self), bool); keep[indices] = False
         self.rows = [row for row, selected in zip(self.rows, keep) if selected]
+        if self.features:
+            self.features = [row for row, selected in zip(self.features, keep) if selected]
         for key in self.data:
             self.data[key] = self.data[key][keep]
 
@@ -3246,6 +3283,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                  save_report, save_step, fingerprint, critic_balance):
     ascension, bonus = STAGES[stage]
     collector_args = copy.copy(args)
+    collector_args.cache_features = args.freeze_backbone and args.target_kl >= 1
     pending_capacity = max(1, reservoir.capacity // args.envs)
     collector_args.envs //= args.samplers
     dataset = ExperienceDataset()
@@ -3489,6 +3527,10 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         prepared = time.monotonic()
         return unpack(rows, torch.device("cpu"), model, False), time.monotonic() - prepared
 
+    def prepare_cached(features):
+        prepared = time.monotonic()
+        return cached_tensors(features, model.width), time.monotonic() - prepared
+
     def reserve_batch(size):
         order = dataset.sample(len(dataset), rng, args.character_balanced)
         selected = order[:size]
@@ -3518,9 +3560,12 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             search_children.extend(children)
         values = {key: dataset.data[key][selected].copy() for key in dataset.data}
         replay = reservoir.sample(len(selected) // 9, rng)
+        cached = bool(dataset.features) and not expert_rows and not replay and not search_children
         return selected, rows, expert_ids, expert_rows, expert_targets, \
             expert_visits_batch, expert_depths_batch, values, replay, search_groups, \
-            search_children, packer.submit(
+            search_children, cached, packer.submit(
+            prepare_cached, [dataset.features[index] for index in selected]
+        ) if cached else packer.submit(
             prepare, rows + expert_rows + [sample[0] for sample in replay] + search_children
         )
 
@@ -3877,7 +3922,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             update_started = time.monotonic()
             (selected, rows, expert_ids, expert_rows, expert_targets,
              expert_visits_batch, expert_depths_batch, values, replay, search_groups, search_children,
-             packed) = pending.pop(0)
+             cached, packed) = pending.pop(0)
             if not rows:
                 continue
             screen_started = time.monotonic()
@@ -3898,8 +3943,9 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             )
             flat_policy = not replay
             forward_started = time.monotonic()
-            all_logits, all_critic_logits = predict(
-                model, inputs, args.precision, args.policy_temperature, flat_policy=flat_policy,
+            all_logits, all_critic_logits = (
+                predict_cached(model, inputs, args.precision, args.policy_temperature) if cached else
+                predict(model, inputs, args.precision, args.policy_temperature, flat_policy=flat_policy)
             )
             forward_seconds = time.monotonic() - forward_started
             screen_forward_seconds += forward_seconds
@@ -3907,7 +3953,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             forward_durations.append(forward_seconds)
             backward_seconds = 0.0
             critic_logits = all_critic_logits[:len(rows)]
-            legal = inputs[6][:len(rows)]
+            legal = None if cached else inputs[6][:len(rows)]
             policy_actions = int(lengths.sum())
             expert_actions = int(expert_lengths.sum())
             logits = all_logits[:policy_actions] if flat_policy else all_logits[:len(rows)]
@@ -3916,7 +3962,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                              all_logits[len(rows):len(rows) + len(expert_rows)])
             log_ratio = (logits[choice_index] if flat_policy else
                          logits.gather(1, action[:, None]).squeeze(1)) - old
-            if not args.critic_only and not (legal.sum(1) > 1).all():
+            if not cached and not args.critic_only and not (legal.sum(1) > 1).all():
                 raise RuntimeError("forced action entered the dataset")
             fresh = torch.ones_like(log_ratio, dtype=torch.bool) if args.critic_only \
                 else log_ratio.abs() <= args.max_log_ratio
@@ -3994,8 +4040,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 ratio.clamp(1 - args.clip, 1 + args.clip) * batch_advantage,
             ) * mask).sum() / denominator
             if flat_policy:
-                action_row = inputs[5][0][:len(logits)]
-                action_legal = inputs[5][2][:len(logits)]
+                action_row = inputs[3] if cached else inputs[5][0][:len(logits)]
+                action_legal = 1 if cached else inputs[5][2][:len(logits)]
                 entropy_by_row = logits.new_zeros(len(rows)).index_add(
                     0, action_row, -(logits.exp() * logits * action_legal),
                 )
@@ -5264,7 +5310,6 @@ def train(args):
         args.samplers, args.sampler_threads = 2, min(args.sampler_threads, 4)
     if args.freeze_backbone:
         model.requires_grad_(False)
-        model.global_norm.requires_grad_(True)
         model.policy.requires_grad_(True)
         model.critic.requires_grad_(True)
     fused_optimizer = target.type != "cpu"
@@ -6272,6 +6317,12 @@ def probe():
             pass
         env.load_policy(export_value_model(None, model, env.fingerprint(), 1, 0, actor=True))
         assert len(env.policy(sample=False, advance=False)[0]) == 2
+        cached = env.policy(sample=False, advance=False, cache_features=True)
+        cached_inputs = cached_tensors(cached[-1], model.width)
+        with torch.no_grad():
+            expected = predict(model, tensors(combat, target, model), "fp32", flat_policy=True)
+            actual = predict_cached(model, cached_inputs, "fp32")
+        assert all(torch.allclose(left, right, atol=1e-5) for left, right in zip(actual, expected))
         groups, group_indices = optimizer_groups(model, 1, 1)
         optimizer = torch.optim.Adam(groups)
         sum(parameter.sum() for parameter in model.critic.parameters()).backward()
