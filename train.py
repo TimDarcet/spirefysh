@@ -5259,7 +5259,6 @@ def train(args):
         model = Agent(layout, *config, pooling=pooling).to(target)
     if args.freeze_backbone:
         model.requires_grad_(False)
-        model.global_transformer.layers[-1].requires_grad_(True)
         model.global_norm.requires_grad_(True)
         model.policy.requires_grad_(True)
         model.critic.requires_grad_(True)
