@@ -10140,9 +10140,9 @@ impl ValueModel {
         })
     }
 
-    fn embedding(&self, semantic: Semantic, value: u32) -> Vec<f32> {
+    fn embedding(&self, semantic: Semantic, value: u32) -> &[f32] {
         let code = self.layout.semantic(semantic, value) as usize;
-        self.semantic_embedding[code * self.width..][..self.width].to_vec()
+        &self.semantic_embedding[code * self.width..][..self.width]
     }
 
     #[cfg(test)]
@@ -10841,7 +10841,7 @@ impl ValueModel {
             tokens.append(&mut self.collection(orbs, 6, 7));
             tokens.extend(effects);
         }
-        let mut actions = Vec::with_capacity(observation.candidates.len());
+        let action_count = observation.candidates.len();
         for (index, candidate) in observation.candidates.iter().enumerate() {
             let mut action = self.encode_values(
                 cache,
@@ -10870,11 +10870,10 @@ impl ValueModel {
             }
             action = self.tag(action, 13, None);
             layer_norm(&mut action, &self.action_norm_w, &self.action_norm_b);
-            actions.push(action.clone());
             tokens.push(action);
         }
-        let action_start = tokens.len() - actions.len() + 1;
-        let mut sequence = vec![self.embedding(Semantic::TokenRole, 0)];
+        let action_start = tokens.len() - action_count + 1;
+        let mut sequence = vec![self.embedding(Semantic::TokenRole, 0).to_vec()];
         sequence.extend(tokens);
         let (last, layers) = self.global_layers.split_last().unwrap();
         for layer in layers {
