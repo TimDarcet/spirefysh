@@ -5260,6 +5260,8 @@ def train(args):
                    for name, default in POOLING_DEFAULTS.items()}
         model = Agent(layout, *config, pooling=pooling).to(target)
     args.freeze_backbone |= bool(source and source["stage"] >= 5 and args.target_kl >= 1)
+    if args.freeze_backbone and args.samplers == 1 and args.envs % 2 == 0:
+        args.samplers, args.sampler_threads = 2, min(args.sampler_threads, 4)
     if args.freeze_backbone:
         model.requires_grad_(False)
         model.global_norm.requires_grad_(True)
