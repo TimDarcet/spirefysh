@@ -5285,8 +5285,8 @@ def train(args):
         raise ValueError("invalid MCTS settings")
     if args.envs % args.samplers:
         raise ValueError("environments must be divisible by samplers")
-    if args.hours <= 0 and args.decisions <= 0:
-        raise ValueError("set --hours or --decisions")
+    if not math.isfinite(args.hours) or args.hours < 0 or args.decisions < 0:
+        raise ValueError("invalid training limit")
     if args.critic_only and not args.checkpoint:
         raise ValueError("critic-only training requires --checkpoint")
     if not 0 <= args.promotion_trigger_rate <= args.promote_win_rate <= 1:
@@ -5318,12 +5318,13 @@ def train(args):
         pooling = {name: getattr(args, name + "_pooling") or default
                    for name, default in POOLING_DEFAULTS.items()}
         model = Agent(layout, *config, pooling=pooling).to(target)
-    args.freeze_backbone |= bool(source and source["stage"] >= 5 and args.target_kl >= 1)
-    if args.freeze_backbone and args.samplers == 1 and args.envs % 2 == 0:
+    late_stage = (source["stage"] if source else args.start_stage) >= 5
+    if (late_stage or args.freeze_backbone) and args.samplers == 1 and args.envs % 2 == 0:
         args.samplers, args.sampler_threads = 2, min(args.sampler_threads, 4)
+    if late_stage or args.freeze_backbone:
+        args.save_decisions = max(args.save_decisions, 262_144)
     if args.freeze_backbone:
         args.publish_updates = max(args.publish_updates, 16)
-        args.save_decisions = max(args.save_decisions, 262_144)
         model.requires_grad_(False)
         model.policy.requires_grad_(True)
         model.critic.requires_grad_(True)
@@ -5534,6 +5535,10 @@ def train(args):
         progress_active &= stage != 6
         stage += 1
         stage_decisions = 0
+        if stage == 5:
+            if args.samplers == 1 and args.envs % 2 == 0:
+                args.samplers, args.sampler_threads = 2, min(args.sampler_threads, 4)
+            args.save_decisions = max(args.save_decisions, 262_144)
         reservoir.clear()
         entry = entries_dir / f"{stage:02}-{decisions:012}.pt"
         entry_digest = save(entry, decisions, False)
@@ -6442,7 +6447,7 @@ def parser():
     run.add_argument("--generation-pool-pooling", choices=("sum", "transformer"),
                      default=None)
     run.add_argument("--precision", choices=PRECISIONS, default="bf16")
-    run.add_argument("--start-stage", type=int, default=0)
+    run.add_argument("--start-stage", type=int, default=6)
     run.add_argument("--hours", type=float, default=0)
     run.add_argument("--decisions", type=int, default=0)
     run.add_argument("--envs", type=int, default=512)
@@ -6505,7 +6510,7 @@ def parser():
     run.add_argument("--character-balanced", action="store_true")
     run.add_argument("--entropy-start", type=float, default=0.01)
     run.add_argument("--entropy-end", type=float, default=0.001)
-    run.add_argument("--entropy-weight", type=float)
+    run.add_argument("--entropy-weight", type=float, default=.1)
     run.add_argument("--target-kl", type=float, default=0.004)
     run.add_argument("--training-seed", type=int, default=1_900_000_000)
     run.add_argument("--development-seed", type=int, default=3_500_000_000)
