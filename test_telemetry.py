@@ -1,7 +1,10 @@
 import json
 import tempfile
 import unittest
+from argparse import Namespace
 from pathlib import Path
+
+import numpy as np
 
 import train
 
@@ -175,6 +178,39 @@ class TelemetryTest(unittest.TestCase):
             ])
             reports = train.MetricsProjector(root, run, manifest, 1).value()["reports"]
             self.assertEqual([row["step"] for row in reports], [120, 140])
+
+    def test_floor_delta_gae(self):
+        def advantages(canonical, expected, gamma=1, gae_lambda=1, won=False):
+            length = len(canonical)
+            trajectory = {
+                "rows": list(range(length)), "choices": [0] * length,
+                "old_log": [0] * length,
+                "critic_probabilities": np.column_stack((np.zeros(length), expected)),
+                "canonical_progress": canonical, "phases": [0] * length,
+                "win_rewards": [0] * (length - 1) + [won],
+                "terminals": [False] * (length - 1) + [True],
+                "characters": [0] * length, "versions": [0] * length,
+            }
+            dataset = train.ExperienceDataset()
+            dataset.add({"trajectories": [trajectory]}, Namespace(
+                critic_lambda=1, critic_only=True, gae_gamma=gamma,
+                gae_lambda=gae_lambda,
+            ))
+            return dataset.data["advantage"][:length]
+
+        maximum = train.CATEGORIES - 1
+        expected = np.array([.2, .4, .6])
+        np.testing.assert_allclose(
+            advantages([0, 1, 2], expected), 2 / maximum - expected, atol=1e-7,
+        )
+        np.testing.assert_allclose(
+            advantages([0, 1, 2], np.arange(3) / maximum, .5, .5),
+            np.array([1.25, 1, 0]) / maximum, atol=1e-7,
+        )
+        np.testing.assert_allclose(
+            advantages([0, 72], np.array([0, 72]) / maximum, won=True),
+            np.array([1, 10 / maximum]), atol=1e-7,
+        )
 
 
 if __name__ == "__main__":

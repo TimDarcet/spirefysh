@@ -2707,7 +2707,7 @@ class RolloutCollector:
                     mcts_heuristic=args.mcts_heuristic,
                     mcts_timeout=bounded_mcts_timeout(args.mcts_timeout, args.sampler_timeout),
                     cache_features=args.cache_features,
-                    skip_forced=args.critic_lambda == 1,
+                    skip_forced=args.critic_lambda == args.gae_lambda == 1,
                     compact_critic=args.critic_lambda == 1,
                 )
                 characters, choice, log_probability, critic_probability, step_rows, \
@@ -3145,7 +3145,15 @@ class ExperienceDataset:
                     np.arange(CATEGORIES, dtype=np.float32) / (CATEGORIES - 1)
                 )
             values[start:end] = expected
-            advantage[start:end] = category / (CATEGORIES - 1) - expected
+            floor_value = canonical.astype(np.float32) / (CATEGORIES - 1)
+            reward = np.diff(np.append(floor_value, category / (CATEGORIES - 1)))
+            remaining_value = expected - floor_value
+            gae = next_value = 0.
+            for index in range(length - 1, -1, -1):
+                delta = reward[index] + args.gae_gamma * next_value - remaining_value[index]
+                gae = delta + args.gae_gamma * args.gae_lambda * gae
+                advantage[start + index] = gae
+                next_value = remaining_value[index]
         terminal = np.asarray([
             item for trajectory in trajectories for item in trajectory["terminals"]
         ], bool)
@@ -3397,7 +3405,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         f"{'Character-balanced' if args.character_balanced else 'Uniform'} reusable rows; "
         f"prefilter forced/stale/ratio-invalid; priority −{args.priority_decay:g} per use",
         f"{model.layers}-layer global Transformer over state, entity, and action tokens → heads",
-        f"{CATEGORIES}-class terminal-progress critic; detached backward λ={args.critic_lambda:g} targets",
+        f"Canonical floor-delta rewards → GAE γ={args.gae_gamma:g}, λ={args.gae_lambda:g}; "
+        f"{CATEGORIES}-class terminal-progress critic with backward λ={args.critic_lambda:g} targets",
         "Critic loss balanced by EMA character/phase/canonical-floor frequency",
         "Turn-start native MCTS → expectimax-Q targets and policy-expectation critic transitions",
         ("Frozen encoder and policy; critic head only" if args.critic_only else
@@ -6040,7 +6049,8 @@ def train(args):
         raise ValueError("invalid replay setting")
     if min(args.head_learning_rate_multiplier, args.critic_learning_rate_multiplier) <= 0:
         raise ValueError("invalid head learning-rate multiplier")
-    if (args.gae_lambda != 1 or args.segment_steps or not 0 <= args.critic_lambda <= 1
+    if (args.segment_steps or not 0 <= args.gae_gamma <= 1
+            or not 0 <= args.gae_lambda <= 1 or not 0 <= args.critic_lambda <= 1
             or not 0 <= args.critic_balance_decay < 1
             or args.blended_critic or args.critic_consistency_weight
             or args.search_consistency_weight and not args.critic_only):
@@ -7335,10 +7345,10 @@ def parser():
     run.add_argument("--critic-learning-rate-multiplier", type=float, default=1)
     run.add_argument("--critic-only", action="store_true")
     run.add_argument("--freeze-backbone", action="store_true")
+    run.add_argument("--gae-gamma", type=float, default=1.0)
     run.add_argument("--gae-lambda", type=float, default=1.0)
     run.add_argument("--critic-lambda", type=float, default=1.0)
     run.add_argument("--critic-balance-decay", type=float, default=.99)
-    run.add_argument("--progress-gamma", type=float, default=1.0)
     run.add_argument("--critic-consistency-weight", type=float, default=0)
     run.add_argument("--critic-consistency-batch", type=int, default=1024)
     run.add_argument("--search-consistency-weight", type=float, default=0)
