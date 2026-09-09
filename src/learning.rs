@@ -17956,6 +17956,7 @@ mod python {
             mcts_timeout=0.0,
             cache_features=false,
             skip_forced=false,
+            compact_critic=false,
         ))]
         fn policy<'py>(
             &mut self,
@@ -17979,6 +17980,7 @@ mod python {
             mcts_timeout: f64,
             cache_features: bool,
             skip_forced: bool,
+            compact_critic: bool,
         ) -> PyResult<Bound<'py, PyTuple>> {
             if !(0.0..=1.0).contains(&mcts_fraction)
                 || mcts_max_depth == 0
@@ -18146,7 +18148,8 @@ mod python {
             let mut characters = Vec::with_capacity(rows.len());
             let mut choices = Vec::with_capacity(rows.len());
             let mut log_probabilities = Vec::with_capacity(rows.len());
-            let mut critic_probabilities = Vec::with_capacity(rows.len() * VALUE_CATEGORIES);
+            let critic_columns = if compact_critic { 2 } else { VALUE_CATEGORIES };
+            let mut critic_probabilities = Vec::with_capacity(rows.len() * critic_columns);
             let mut packed_rows = Vec::with_capacity(rows.len());
             let mut cached_features = Vec::with_capacity(rows.len());
             let mut selected_actions = Vec::with_capacity(rows.len());
@@ -18160,9 +18163,13 @@ mod python {
                     characters.push(row.character);
                     choices.push(0);
                     log_probabilities.push(0.0);
-                    critic_probabilities.push(1.0);
-                    critic_probabilities
-                        .resize(critic_probabilities.len() + VALUE_CATEGORIES - 1, 0.0);
+                    if compact_critic {
+                        critic_probabilities.extend([0.0, 0.0]);
+                    } else {
+                        critic_probabilities.push(1.0);
+                        critic_probabilities
+                            .resize(critic_probabilities.len() + VALUE_CATEGORIES - 1, 0.0);
+                    }
                     if advance {
                         selected_actions.push(row.candidates[0].action.clone());
                     } else {
@@ -18172,7 +18179,7 @@ mod python {
                     packed_rows.push(PyBytes::new(py, &packed));
                     continue;
                 }
-                let ((state, actions), (log_policy, _win, _expected, probabilities, _)) =
+                let ((state, actions), (log_policy, win, expected, probabilities, _)) =
                     evaluated.next().unwrap();
                 let choice = if sample {
                     sample_policy(&log_policy, &mut random)
@@ -18188,7 +18195,11 @@ mod python {
                 characters.push(row.character);
                 choices.push(choice as i64);
                 log_probabilities.push(log_policy[choice]);
-                critic_probabilities.extend(probabilities);
+                if compact_critic {
+                    critic_probabilities.extend([win, expected]);
+                } else {
+                    critic_probabilities.extend(probabilities);
+                }
                 if advance {
                     selected_actions.push(row.candidates[choice].action.clone());
                 } else {
@@ -18277,7 +18288,7 @@ mod python {
                 ndarray::Array1::from_vec(log_probabilities)
                     .into_pyarray(py)
                     .into_any(),
-                ndarray::Array2::from_shape_vec((batch, VALUE_CATEGORIES), critic_probabilities)
+                ndarray::Array2::from_shape_vec((batch, critic_columns), critic_probabilities)
                     .unwrap()
                     .into_pyarray(py)
                     .into_any(),

@@ -2708,6 +2708,7 @@ class RolloutCollector:
                     mcts_timeout=bounded_mcts_timeout(args.mcts_timeout, args.sampler_timeout),
                     cache_features=args.cache_features,
                     skip_forced=args.critic_lambda == 1,
+                    compact_critic=args.critic_lambda == 1,
                 )
                 characters, choice, log_probability, critic_probability, step_rows, \
                     step_experts, step_search_stats, *cached = result
@@ -2741,7 +2742,8 @@ class RolloutCollector:
                 for index, action in enumerate(choice):
                     self.action_history[index].append(int(action))
             self.reservoir.record(
-                step_rows, choice, log_probability, policy, critic_probability[:, -1], self.rng,
+                step_rows, choice, log_probability, policy,
+                critic_probability[:, 0 if args.critic_lambda == 1 else -1], self.rng,
             )
             in_combat = np.asarray(in_combat, bool) if native else np.asarray([
                 row[4] == 1 for row in self.env.stats()
@@ -2819,8 +2821,11 @@ class RolloutCollector:
                     ))
                     if native and done[index]:
                         trajectory = {
-                            key: [step[column] if column in (9, 10) else step[column][index]
-                                  for step in history]
+                            key: ([step[column][index] for step in history]
+                                  if column in (0, 11) else np.asarray([
+                                      step[column] if column in (9, 10) else step[column][index]
+                                      for step in history
+                                  ]))
                             for column, key in enumerate(sample_keys)
                         }
                         trajectory.pop("actor_versions")
@@ -3095,6 +3100,8 @@ class ExperienceDataset:
         trajectories = result["trajectories"]
         if not trajectories:
             return 0, 0, 0
+        def joined(key, dtype):
+            return np.concatenate([np.asarray(row[key], dtype) for row in trajectories])
         fields = (
             "rows", "choices", "old_log", "critic_probabilities", "canonical_progress",
             "phases", "win_rewards", "terminals", "characters", "versions",
@@ -3115,19 +3122,28 @@ class ExperienceDataset:
             terminal = np.asarray(trajectory["terminals"], bool)
             probabilities = np.asarray(trajectory["critic_probabilities"], np.float32)
             canonical = np.asarray(trajectory["canonical_progress"], np.int64)
-            if (terminal[:-1].any() or not terminal[-1] or probabilities.shape != (length, CATEGORIES)
+            compact = probabilities.shape == (length, 2) and args.critic_lambda == 1
+            if (terminal[:-1].any() or not terminal[-1]
+                    or not compact and probabilities.shape != (length, CATEGORIES)
                     or not np.isfinite(probabilities).all()
-                    or not np.allclose(probabilities.sum(1), 1, atol=2e-3)
+                    or (compact and ((probabilities < 0).any() or (probabilities > 1).any()))
+                    or (not compact and not np.allclose(probabilities.sum(1), 1, atol=2e-3))
                     or canonical.min() < 0 or canonical.max() > MAX_PROGRESS):
                 raise ValueError("invalid trajectory terminal")
             category = CATEGORIES - 1 if trajectory["win_rewards"][-1] > .5 else int(canonical.max())
             target = np.zeros(CATEGORIES, np.float32); target[category] = 1
-            targets[end - 1] = target
-            for index in range(length - 2, -1, -1):
-                target = (1 - args.critic_lambda) * probabilities[index + 1] \
-                    + args.critic_lambda * target
-                targets[start + index] = target
-            expected = probabilities @ (np.arange(CATEGORIES, dtype=np.float32) / (CATEGORIES - 1))
+            if compact:
+                targets[start:end] = target
+                expected = probabilities[:, 1]
+            else:
+                targets[end - 1] = target
+                for index in range(length - 2, -1, -1):
+                    target = (1 - args.critic_lambda) * probabilities[index + 1] \
+                        + args.critic_lambda * target
+                    targets[start + index] = target
+                expected = probabilities @ (
+                    np.arange(CATEGORIES, dtype=np.float32) / (CATEGORIES - 1)
+                )
             values[start:end] = expected
             advantage[start:end] = category / (CATEGORIES - 1) - expected
         terminal = np.asarray([
@@ -3139,26 +3155,14 @@ class ExperienceDataset:
             packed_legal_count(row) > 1 for row in rows
         ])
         data = {
-            "action": np.asarray([
-                item for trajectory in trajectories for item in trajectory["choices"]
-            ], np.int64),
-            "old": np.asarray([
-                item for trajectory in trajectories for item in trajectory["old_log"]
-            ], np.float32),
+            "action": joined("choices", np.int64),
+            "old": joined("old_log", np.float32),
             "advantage": advantage, "critic_target": targets, "value": values,
-            "canonical": np.asarray([
-                item for trajectory in trajectories for item in trajectory["canonical_progress"]
-            ], np.int8),
-            "phase": np.asarray([
-                item for trajectory in trajectories for item in trajectory["phases"]
-            ], np.int8),
-            "character": np.asarray([
-                item for trajectory in trajectories for item in trajectory["characters"]
-            ], np.int8),
+            "canonical": joined("canonical_progress", np.int8),
+            "phase": joined("phases", np.int8),
+            "character": joined("characters", np.int8),
             "priority": priority.astype(np.float32),
-            "version": np.asarray([
-                item for trajectory in trajectories for item in trajectory["versions"]
-            ], np.int64),
+            "version": joined("versions", np.int64),
             "id": np.arange(self.next_id, self.next_id + len(rows), dtype=np.int64),
         }
         accepted = len(rows) if limit is None else max(0, min(len(rows), limit))
@@ -3577,13 +3581,13 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         for trajectory in result["trajectories"]:
             segmented_trajectories += int(not trajectory["terminals"][-1])
             trajectory_lengths.append(len(trajectory["rows"]))
-            trajectory_policy_spans.append(
+            trajectory_policy_spans.append(int(
                 max(trajectory["versions"]) - min(trajectory["versions"])
-            )
-            trajectory_arrival_lags.append(max(0, updates - min(trajectory["versions"])))
-            trajectory_stale_steps.append(sum(
-                version < updates - args.max_policy_lag for version in trajectory["versions"]
             ))
+            trajectory_arrival_lags.append(int(max(0, updates - min(trajectory["versions"]))))
+            trajectory_stale_steps.append(int(sum(
+                version < updates - args.max_policy_lag for version in trajectory["versions"]
+            )))
             trajectory_seconds.append(trajectory["completion_seconds"])
         dataset_peak = max(dataset_peak, len(dataset))
         update = result["reservoir"]
