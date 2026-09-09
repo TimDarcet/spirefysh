@@ -9447,6 +9447,19 @@ fn observation_v56_with_map(
     bonuses: (i16, i16),
     map: Option<&CanonicalMap>,
 ) -> ObservationV56 {
+    let (actions, legal) = candidate_actions(game, content);
+    observation_v56_with_candidates(game, content, layout, bonuses, map, actions, legal)
+}
+
+fn observation_v56_with_candidates(
+    game: &Game,
+    content: &Content,
+    layout: Layout,
+    bonuses: (i16, i16),
+    map: Option<&CanonicalMap>,
+    actions: Vec<Action>,
+    legal: Vec<bool>,
+) -> ObservationV56 {
     let (nodes, edges, map_ids, current) = map
         .cloned()
         .unwrap_or_else(|| canonical_map(game, content, layout));
@@ -9459,7 +9472,6 @@ fn observation_v56_with_map(
     push_collection_domains(game, content, layout, &mut domains);
     domains[CONTINUATION_DOMAIN] = continuation_domains(game, content);
     domains[CONTINUATION_DOMAIN].extend(phase_continuation_domains(game, content));
-    let (actions, legal) = candidate_actions(game, content);
     assert!(!actions.is_empty() || matches!(game.phase, Phase::Won | Phase::Dead));
     let candidates = actions
         .iter()
@@ -18008,13 +18020,34 @@ mod python {
             let content = &self.content;
             let layout = self.layout;
             let bonuses = (self.training_strength, self.training_dexterity);
+            let skip_forced = (cache_features || skip_forced) && !search_enabled;
             let rows = py.allow_threads(|| {
                 self.games
                     .par_iter()
-                    .map(|game| observation_v56(game, content, layout, bonuses))
+                    .map(|game| {
+                        let (mut actions, legal) = candidate_actions(game, content);
+                        if !skip_forced || actions.len() != 1 {
+                            return observation_v56_with_candidates(
+                                game, content, layout, bonuses, None, actions, legal,
+                            );
+                        }
+                        ObservationV56 {
+                            character: game.run.character as u8,
+                            globals: Vec::new(),
+                            domains: std::array::from_fn(|_| DomainRows::Owned(Vec::new())),
+                            candidates: vec![CandidateRow {
+                                action: actions.pop().unwrap(),
+                                u: [0; ACTION_U],
+                                s: [0; ACTION_S],
+                                c: [0; ACTION_C],
+                                f: [0.0; ACTION_F],
+                                legal: true,
+                            }],
+                            potential: 0.0,
+                        }
+                    })
                     .collect::<Vec<_>>()
             });
-            let skip_forced = (cache_features || skip_forced) && !search_enabled;
             let evaluated_rows = rows
                 .iter()
                 .filter(|row| !skip_forced || row.candidates.len() > 1)
