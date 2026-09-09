@@ -17943,6 +17943,7 @@ mod python {
             mcts_heuristic=false,
             mcts_timeout=0.0,
             cache_features=false,
+            skip_forced=false,
         ))]
         fn policy<'py>(
             &mut self,
@@ -17965,6 +17966,7 @@ mod python {
             mcts_heuristic: bool,
             mcts_timeout: f64,
             cache_features: bool,
+            skip_forced: bool,
         ) -> PyResult<Bound<'py, PyTuple>> {
             if !(0.0..=1.0).contains(&mcts_fraction)
                 || mcts_max_depth == 0
@@ -18012,7 +18014,7 @@ mod python {
                     .map(|game| observation_v56(game, content, layout, bonuses))
                     .collect::<Vec<_>>()
             });
-            let skip_forced = cache_features && !search_enabled;
+            let skip_forced = (cache_features || skip_forced) && !search_enabled;
             let evaluated_rows = rows
                 .iter()
                 .filter(|row| !skip_forced || row.candidates.len() > 1)
@@ -18020,10 +18022,12 @@ mod python {
             let features = py.allow_threads(|| model.state_actions_batch(&evaluated_rows));
             let packed = py.allow_threads(|| {
                 rows.par_iter()
-                    .map(if cache_features {
-                        cached_packed_metadata
-                    } else {
-                        compact_packed_observation
+                    .map(|row| {
+                        if cache_features || skip_forced && row.candidates.len() == 1 {
+                            cached_packed_metadata(row)
+                        } else {
+                            compact_packed_observation(row)
+                        }
                     })
                     .collect::<Vec<_>>()
             });

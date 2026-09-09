@@ -2707,6 +2707,7 @@ class RolloutCollector:
                     mcts_heuristic=args.mcts_heuristic,
                     mcts_timeout=bounded_mcts_timeout(args.mcts_timeout, args.sampler_timeout),
                     cache_features=args.cache_features,
+                    skip_forced=args.critic_lambda == 1,
                 )
                 characters, choice, log_probability, critic_probability, step_rows, \
                     step_experts, step_search_stats, *cached = result
