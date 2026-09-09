@@ -3471,7 +3471,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         os.environ["RAYON_NUM_THREADS"] = str(args.samplers * args.sampler_threads)
     models = [queue_type(maxsize=1) for _ in range(args.samplers)]
     sample_capacity = max(8, args.samplers * 16)
-    samples = queue_type(maxsize=sample_capacity)
+    sample_source = queue_type(maxsize=sample_capacity)
+    samples = sample_source if threaded else Queue(maxsize=sample_capacity)
     results = queue_type(); stop = threading.Event() if threaded else context.Event()
     heartbeat = [started] * args.samplers if threaded else context.Array("d", [started] * args.samplers)
     progress = [0] * args.samplers if threaded else context.Array("q", [0] * args.samplers)
@@ -3492,6 +3493,25 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         "training_elapsed_seconds": time.monotonic() - run_started,
     })
 
+    def receive_samples():
+        while not stop.is_set():
+            try:
+                item = sample_source.get(timeout=.1)
+            except (Empty, EOFError, OSError):
+                continue
+            while not stop.is_set():
+                try:
+                    samples.put(item, timeout=.1)
+                    break
+                except Full:
+                    pass
+
+    receiver = None if threaded else threading.Thread(
+        target=receive_samples, name="sample-receiver", daemon=True,
+    )
+    if receiver:
+        receiver.start()
+
     def start_worker(worker):
         heartbeat[worker] = time.monotonic()
         progress[worker] = 0
@@ -3500,7 +3520,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         process = worker_type(target=collect_worker, args=(
             actor, collector_args, sampler_session, stage,
             reservoir.capacity, pending_capacity, sampler_iterations[worker], worker,
-            sampler_generations[worker], actor_revision, policy_version, models[worker], samples,
+            sampler_generations[worker], actor_revision, policy_version, models[worker], sample_source,
             stop, deadline, budget, results, heartbeat, progress,
         ), name=f"sampler-{worker}")
         workers[worker] = process
@@ -4565,6 +4585,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
     finally:
         stop.set()
         watchdog.join()
+        if receiver:
+            receiver.join()
         recover_workers()
         packer.shutdown(wait=True, cancel_futures=True)
         started_workers = [worker for worker in workers if worker is not None and (threaded or worker.pid is not None)]
@@ -4586,7 +4608,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             discarded_steps += dropped
             watchdog_dropped += dropped * (worker in terminated)
         if not threaded:
-            for queue in (*models, samples, results):
+            for queue in (*models, sample_source, results):
                 queue.cancel_join_thread()
                 queue.close()
     failed = [] if threaded else [worker.exitcode for worker in started_workers
