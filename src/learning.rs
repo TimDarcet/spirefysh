@@ -10966,9 +10966,10 @@ impl ValueModel {
         }
         let evaluate = |(state, actions): &(Vec<f32>, Vec<Vec<f32>>)| {
             let scores = |temperature: f32| {
-                let raw = actions
-                    .iter()
-                    .map(|action| policy.apply(action)[0] / temperature)
+                let input = actions.iter().flatten().copied().collect::<Vec<_>>();
+                let raw = linear_batch(&input, actions.len(), &policy.w, &policy.b)
+                    .into_iter()
+                    .map(|score| score / temperature)
                     .collect::<Vec<_>>();
                 let normalizer = log_sum_exp(&raw);
                 raw.into_iter()
@@ -11240,11 +11241,15 @@ fn log_sum_exp(values: &[f32]) -> f32 {
 }
 
 fn softmax(values: &[f32]) -> Vec<f32> {
-    let normalizer = log_sum_exp(values);
-    values
+    let maximum = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut output = values
         .iter()
-        .map(|value| (value - normalizer).exp())
-        .collect()
+        .map(|value| value - maximum)
+        .collect::<Vec<_>>();
+    exp_in_place(&mut output);
+    let total = output.iter().sum::<f32>();
+    output.iter_mut().for_each(|value| *value /= total);
+    output
 }
 
 fn invalid(message: &'static str) -> io::Error {
