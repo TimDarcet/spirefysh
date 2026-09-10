@@ -59,7 +59,7 @@ POOLING_DEFAULTS = {
     "enemy_effect": "global_tokens", "friendly_effect": "global_tokens",
     "continuation": "gru", "phase": "transformer", "generation_pool": "sum",
 }
-STAGES = [(0, bonus) for bonus in (24, 20, 16, 12, 8, 4, 0)] + [
+STAGES = [(0, bonus) for bonus in (24, 20, 16, 12, 8, 4, 3, 2, 1, 0)] + [
     (ascension, 0) for ascension in range(1, 11)
 ]
 POTENTIAL_TERMS = (
