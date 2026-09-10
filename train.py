@@ -4,11 +4,13 @@ import copy
 import ctypes
 import fcntl
 import hashlib
+import http.server
 import json
 import math
 import multiprocessing
 import os
 import pickle
+import re
 import struct
 import sys
 import tempfile
@@ -20,6 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from pathlib import Path
 from queue import Empty, Full, Queue
+from urllib.parse import parse_qs, quote, urlparse
 
 import numpy as np
 import torch
@@ -29,14 +32,14 @@ import sts2_sim
 
 
 FEATURE_VERSION = 56
-MODEL_VERSION = 72
-COMPATIBLE_MODEL_VERSIONS = (71, 72)
+MODEL_VERSION = 73
+COMPATIBLE_MODEL_VERSIONS = (73,)
 DEFAULT_ARCHITECTURE = (128, 4, 8, 384)
 CATEGORIES = 83
 MAX_PROGRESS = 72
 PRECISIONS = ("fp32", "bf16")
 WINNING_CAPACITY = 0
-CHANGE = "Configurable explicit tokens in one global transformer."
+CHANGE = "Discount-consistent scalar shaped progress critic."
 COLLECTION_POOLING = ("sum", "transformer", "global_tokens")
 EFFECT_POOLING = (
     "sum_into_actor", "transformer_into_actor", "sum_token", "transformer_token",
@@ -59,6 +62,11 @@ POOLING_DEFAULTS = {
 STAGES = [(0, bonus) for bonus in (24, 20, 16, 12, 8, 4, 0)] + [
     (ascension, 0) for ascension in range(1, 11)
 ]
+POTENTIAL_TERMS = (
+    "bias", "max_hp", "upgrades", "relics", "potions", "gold", "cards",
+    "uncommon_relics", "rare_relics", "uncommon_potions", "rare_potions",
+    "uncommon_cards", "rare_cards",
+)
 
 
 _EVENT_FD = None
@@ -68,7 +76,6 @@ _RUN_ID = None
 _EVENT_PATH = None
 _EVENT_LOCK = threading.Lock()
 _ACCELERATOR_LOCK = None
-_LIVE_PROJECTOR = None
 _LOG_CAPTURES = []
 _CONSOLE_FDS = {}
 _LOG_ACTIVE = False
@@ -110,8 +117,6 @@ def emit_event(value, level="INFO", console=True, role=None, event_time=None):
         ) + "\n"
         fd = 2 if str(level).upper() in ("WARNING", "ERROR") else 1
         os.write(_CONSOLE_FDS[fd], message.encode())
-    if _LIVE_PROJECTOR is not None:
-        _LIVE_PROJECTOR.wake.set()
     return end
 
 
@@ -1114,7 +1119,7 @@ class TokenEncoder(nn.Module):
 
 class Agent(nn.Module):
     def __init__(self, layout, width=128, layers=4, heads=8, feedforward=384, head_width=None,
-                 pooling=None, model_version=MODEL_VERSION):
+                 pooling=None, model_version=MODEL_VERSION, potential_weights=None):
         nn.Module.__init__(self)
         self.layout = dict(layout)
         if self.layout["version"] != FEATURE_VERSION:
@@ -1137,6 +1142,10 @@ class Agent(nn.Module):
         self.width, self.layers, self.heads, self.feedforward = width, layers, heads, feedforward
         self.head_width = width
         self.state_width = width
+        self.potential_weights = tuple(potential_weights or (0.,) * len(POTENTIAL_TERMS))
+        if len(self.potential_weights) != len(POTENTIAL_TERMS) \
+                or not all(map(math.isfinite, self.potential_weights)):
+            raise ValueError("invalid potential weights")
         self.card_zones = 5
         self.entity_collections = 0
         self.pooling = POOLING_DEFAULTS | (pooling or {})
@@ -1194,7 +1203,7 @@ class Agent(nn.Module):
             nn.Linear(width, feedforward), nn.GELU(), nn.Linear(feedforward, width),
         )
         self.policy = nn.Linear(width, 1)
-        self.critic = nn.Linear(width, CATEGORIES)
+        self.critic = nn.Linear(width, 1)
         self._graph_cache = {}
         self.cache_stats = {"graph_hit": 0, "graph_miss": 0}
         nn.init.normal_(self.policy.weight, std=.01)
@@ -1687,7 +1696,8 @@ def architecture(model):
         "position_caps": POSITION_CAPS,
         "pooling": model.pooling,
         "candidate_numeric": ACTION_FIELDS[3],
-        "value_heads": [f"terminal_progress_categorical_{CATEGORIES}"],
+        "value_heads": ["shaped_terminal_floor_scalar"],
+        "potential_weights": model.potential_weights,
         "winning_reservoir": WINNING_CAPACITY,
     }
 
@@ -1733,19 +1743,38 @@ def cached_tensors(features, width):
     )
 
 
-def critic_probabilities(logits):
-    return logits.softmax(-1)
+def critic_value(output):
+    return output.squeeze(-1)
 
 
-def critic_expected(probabilities):
-    categories = torch.arange(CATEGORIES, device=probabilities.device, dtype=probabilities.dtype)
-    return probabilities @ categories / (CATEGORIES - 1)
+def critic_win_probability(value):
+    floor = MAX_PROGRESS / (CATEGORIES - 1)
+    return ((value - floor) / (1 - floor)).clamp(0, 1)
 
 
-def critic_win_logit(logits):
-    return logits[..., -1] - logits[..., :-1].logsumexp(-1)
-
-
+def critic_explained_reward_variance(predictions, targets, floors=None):
+    prediction = predictions.float().detach().cpu().numpy()
+    target = targets.float().detach().cpu().numpy()
+    def explained(mask=slice(None)):
+        variance = target[mask].var()
+        value = float(1 - (target[mask] - prediction[mask]).var() / variance) \
+            if variance else 0.
+        return value, float(variance)
+    overall = explained()[0]
+    if floors is None:
+        return overall
+    floors = np.asarray(floors)
+    grouped = {}
+    for floor in np.unique(floors):
+        mask = floors == floor
+        value, variance = explained(mask)
+        grouped[str(int(floor))] = {
+            "value": value, "target_variance": variance, "rows": int(mask.sum()),
+        }
+    weight = sum(row["rows"] * row["target_variance"] for row in grouped.values())
+    conditioned = sum(row["value"] * row["rows"] * row["target_variance"]
+                      for row in grouped.values()) / weight if weight else 0.
+    return overall, conditioned, grouped
 def upload(value, target):
     marker = object()
     tensors = []
@@ -2461,7 +2490,7 @@ def act(model, observation, target, sample, precision, generator=None, temperatu
         assert len(choice) == len(observation[0]) and legal[selected].all()
     policy = None
     return (choice.cpu().numpy(), masked[selected].cpu().numpy(),
-            policy, critic_probabilities(critic_logits).cpu().numpy())
+            policy, critic_value(critic_logits).cpu().numpy())
 
 
 def bands(values):
@@ -2613,6 +2642,9 @@ class RolloutCollector:
             ascension=ascension,
         )
         self.env.set_training_bonus(bonus)
+        self.env.set_potential_weights([
+            getattr(args, f"potential_{term}_weight") for term in POTENTIAL_TERMS
+        ])
         self.observation = self.env.observe_tokens(flat=True)
         self.episode_steps = np.zeros(args.envs, np.int32)
         self.combat_steps = np.zeros(args.envs, np.int32)
@@ -2653,8 +2685,9 @@ class RolloutCollector:
         completions = []
         episodes = [[] for _ in range(5)]
         sample_keys = (
-            "rows", "choices", "old_log", "critic_probabilities", "canonical_progress",
+            "rows", "choices", "old_log", "critic_values", "canonical_progress",
             "phases", "win_rewards", "terminals", "characters", "versions", "actor_versions",
+            "potentials",
         ) + (("features",) if native and args.cache_features else ())
         def materialize(trajectory):
             samples = trajectory.pop("samples")
@@ -2707,17 +2740,18 @@ class RolloutCollector:
                     mcts_heuristic=args.mcts_heuristic,
                     mcts_timeout=bounded_mcts_timeout(args.mcts_timeout, args.sampler_timeout),
                     cache_features=args.cache_features,
-                    skip_forced=args.critic_lambda == args.gae_lambda == 1,
-                    compact_critic=args.critic_lambda == 1,
+                    skip_forced=args.gae_lambda == 1 and not args.critic_only,
                 )
-                characters, choice, log_probability, critic_probability, step_rows, \
+                characters, choice, log_probability, critic_value, step_rows, \
                     step_experts, step_search_stats, *cached = result
-                raw_reward, done, stats, next_legal, in_combat, canonical, phases, *cached = cached
+                raw_reward, done, stats, next_legal, in_combat, canonical, phases, potentials, \
+                    *cached = cached
                 step_features = cached[0] if cached else None
                 if heartbeat is not None:
                     heartbeat[self.worker] = time.monotonic()
                 characters = np.asarray(characters, np.uint8)
-                critic_probability = np.asarray(critic_probability, np.float16)
+                critic_value = np.asarray(critic_value, np.float32)
+                potentials = np.asarray(potentials, np.float32)
                 search_stats += np.asarray(step_search_stats, np.int64)
                 for expert in step_experts:
                     row, target, visits, depth, *consistency = expert
@@ -2733,7 +2767,8 @@ class RolloutCollector:
                 canonical = np.asarray([row[9] for row in state_stats], np.uint8)
                 phases = np.asarray([row[4] for row in state_stats], np.uint8)
                 characters = np.asarray(self.observation[0], np.uint8)
-                choice, log_probability, policy, critic_probability = act(
+                potentials = np.asarray(self.observation[4], np.float32)
+                choice, log_probability, policy, critic_value = act(
                     model, self.observation, target, True, precision, self.torch_rng,
                     args.policy_temperature,
                 )
@@ -2743,7 +2778,7 @@ class RolloutCollector:
                     self.action_history[index].append(int(action))
             self.reservoir.record(
                 step_rows, choice, log_probability, policy,
-                critic_probability[:, 0 if args.critic_lambda == 1 else -1], self.rng,
+                critic_value + potentials, self.rng,
             )
             in_combat = np.asarray(in_combat, bool) if native else np.asarray([
                 row[4] == 1 for row in self.env.stats()
@@ -2772,8 +2807,9 @@ class RolloutCollector:
                 self.trace_empty("post_step", reset, characters, stats)
             if native:
                 self.native_steps.append((
-                    step_rows, choice, log_probability, critic_probability, canonical, phases,
+                    step_rows, choice, log_probability, critic_value, canonical, phases,
                     raw_reward, done, characters, version, actor_revision,
+                    potentials,
                 ) + ((step_features,) if args.cache_features else ()))
             else:
                 for index, row in enumerate(step_rows):
@@ -2782,9 +2818,10 @@ class RolloutCollector:
                         trajectory = {"samples": [], "started": step_started}
                         self.trajectories[index] = trajectory
                     trajectory["samples"].append((
-                        row, choice[index], log_probability[index], critic_probability[index],
+                        row, choice[index], log_probability[index], critic_value[index],
                         canonical[index], phases[index], raw_reward[index], done[index],
                         characters[index], version, actor_revision,
+                        potentials[index],
                     ))
             if boundary.any():
                 reset = np.flatnonzero(boundary).tolist()
@@ -2822,7 +2859,7 @@ class RolloutCollector:
                     if native and done[index]:
                         trajectory = {
                             key: ([step[column][index] for step in history]
-                                  if column in (0, 11) else np.asarray([
+                                  if column in (0, 12) else np.asarray([
                                       step[column] if column in (9, 10) else step[column][index]
                                       for step in history
                                   ]))
@@ -2859,7 +2896,7 @@ class RolloutCollector:
                 and len(trajectory["samples"]) >= args.segment_steps
             ]
             if segment:
-                raise ValueError("categorical critic requires complete terminal trajectories")
+                raise ValueError("critic requires complete terminal trajectories")
             self.observation = next_observation
             collect_seconds += time.monotonic() - step_started
             if finished and not native:
@@ -3082,8 +3119,9 @@ class ExperienceDataset:
         self.data = {
             "action": np.empty(0, np.int64), "old": np.empty(0, np.float32),
             "advantage": np.empty(0, np.float32),
-            "critic_target": np.empty((0, CATEGORIES), np.float16),
+            "critic_target": np.empty(0, np.float32),
             "value": np.empty(0, np.float32), "canonical": np.empty(0, np.int8),
+            "terminal": np.empty(0, np.int8), "potential": np.empty(0, np.float32),
             "phase": np.empty(0, np.int8), "character": np.empty(0, np.int8),
             "priority": np.empty(0, np.float32),
             "version": np.empty(0, np.int64), "id": np.empty(0, np.int64),
@@ -3103,15 +3141,17 @@ class ExperienceDataset:
         def joined(key, dtype):
             return np.concatenate([np.asarray(row[key], dtype) for row in trajectories])
         fields = (
-            "rows", "choices", "old_log", "critic_probabilities", "canonical_progress",
-            "phases", "win_rewards", "terminals", "characters", "versions",
+            "rows", "choices", "old_log", "critic_values", "canonical_progress",
+            "phases", "win_rewards", "terminals", "characters", "versions", "potentials",
         )
         rows = [item for trajectory in trajectories for item in trajectory["rows"]]
         features = [item for trajectory in trajectories for item in trajectory.get("features", [])]
         if features and len(features) != len(rows):
             raise ValueError("invalid cached features")
         advantage = np.empty(len(rows), np.float32)
-        targets = np.empty((len(rows), CATEGORIES), np.float16)
+        targets = np.empty(len(rows), np.float32)
+        terminal_categories = np.empty(len(rows), np.int8)
+        wins = np.empty(len(rows), bool)
         values = np.empty(len(rows), np.float32)
         end = 0
         for trajectory in trajectories:
@@ -3120,44 +3160,34 @@ class ExperienceDataset:
                 raise ValueError("invalid trajectory fields")
             start, end = end, end + length
             terminal = np.asarray(trajectory["terminals"], bool)
-            probabilities = np.asarray(trajectory["critic_probabilities"], np.float32)
+            predicted = np.asarray(trajectory["critic_values"], np.float32)
             canonical = np.asarray(trajectory["canonical_progress"], np.int64)
-            compact = probabilities.shape == (length, 2) and args.critic_lambda == 1
+            potential = np.asarray(trajectory["potentials"], np.float32)
             if (terminal[:-1].any() or not terminal[-1]
-                    or not compact and probabilities.shape != (length, CATEGORIES)
-                    or not np.isfinite(probabilities).all()
-                    or (compact and ((probabilities < 0).any() or (probabilities > 1).any()))
-                    or (not compact and not np.allclose(probabilities.sum(1), 1, atol=2e-3))
-                    or canonical.min() < 0 or canonical.max() > MAX_PROGRESS):
+                    or predicted.shape != (length,) or not np.isfinite(predicted).all()
+                    or canonical.min() < 0 or canonical.max() > MAX_PROGRESS
+                    or not np.isfinite(potential).all()):
                 raise ValueError("invalid trajectory terminal")
             category = CATEGORIES - 1 if trajectory["win_rewards"][-1] > .5 else int(canonical.max())
-            target = np.zeros(CATEGORIES, np.float32); target[category] = 1
-            if compact:
-                targets[start:end] = target
-                expected = probabilities[:, 1]
-            else:
-                targets[end - 1] = target
-                for index in range(length - 2, -1, -1):
-                    target = (1 - args.critic_lambda) * probabilities[index + 1] \
-                        + args.critic_lambda * target
-                    targets[start + index] = target
-                expected = probabilities @ (
-                    np.arange(CATEGORIES, dtype=np.float32) / (CATEGORIES - 1)
-                )
-            values[start:end] = expected
+            terminal_value = category / (CATEGORIES - 1)
+            terminal_categories[start:end] = category
+            wins[start:end] = category == CATEGORIES - 1
+            values[start:end] = predicted
             floor_value = canonical.astype(np.float32) / (CATEGORIES - 1)
-            reward = np.diff(np.append(floor_value, category / (CATEGORIES - 1)))
-            remaining_value = expected - floor_value
-            gae = next_value = 0.
+            reward = np.diff(np.append(floor_value, terminal_value))
+            reward += args.gae_gamma * np.append(potential[1:], 0.) - potential
+            remaining_value = predicted - floor_value
+            gae = next_value = discounted_return = 0.
             for index in range(length - 1, -1, -1):
                 delta = reward[index] + args.gae_gamma * next_value - remaining_value[index]
                 gae = delta + args.gae_gamma * args.gae_lambda * gae
                 advantage[start + index] = gae
+                discounted_return = reward[index] + args.gae_gamma * discounted_return
+                targets[start + index] = floor_value[index] + discounted_return
                 next_value = remaining_value[index]
         terminal = np.asarray([
             item for trajectory in trajectories for item in trajectory["terminals"]
         ], bool)
-        wins = targets[:, -1] > .5
         priority = 1 + np.abs(advantage) + 4 * terminal + 4 * wins
         actionable = np.ones(len(rows), bool) if getattr(args, "critic_only", False) else np.asarray([
             packed_legal_count(row) > 1 for row in rows
@@ -3167,6 +3197,7 @@ class ExperienceDataset:
             "old": joined("old_log", np.float32),
             "advantage": advantage, "critic_target": targets, "value": values,
             "canonical": joined("canonical_progress", np.int8),
+            "terminal": terminal_categories, "potential": joined("potentials", np.float32),
             "phase": joined("phases", np.int8),
             "character": joined("characters", np.int8),
             "priority": priority.astype(np.float32),
@@ -3283,9 +3314,9 @@ class CriticBalance:
         self.rows += len(weight); self.batches += 1
         return weight.astype(np.float32)
 
-    def record_loss(self, target, weighted_category_loss):
-        self.target_counts += target.sum(0)
-        self.loss_mass += weighted_category_loss.sum(0)
+    def record_loss(self, target, weighted_loss):
+        self.target_counts += np.bincount(target, minlength=CATEGORIES)
+        np.add.at(self.loss_mass, target, weighted_loss)
 
     def reset_report(self):
         self.counts = [np.zeros(size, np.int64) for size in (5, 14, MAX_PROGRESS + 1)]
@@ -3334,8 +3365,7 @@ class ExpertDataset:
             if (len(children) != len(weights) or not np.isfinite(weights).all()
                     or (weights < 0).any() or not 0 <= self_weight <= 1
                     or not np.isfinite(terminal_value)
-                    or float(weights.sum()) + self_weight > 1.002
-                    or not 0 <= terminal_value <= 1 - self_weight - float(weights.sum()) + .002):
+                    or float(weights.sum()) + self_weight > 1.002):
                 raise ValueError("invalid search consistency target")
         self.rows.extend(row for row, *_ in rows)
         self.targets.extend(np.asarray(target, np.float16) for _, target, *_ in rows)
@@ -3381,7 +3411,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
     ascension, bonus = STAGES[stage]
     collector_args = copy.copy(args)
     collector_args.cache_features = (
-        args.freeze_backbone and args.target_kl >= 1 and args.critic_lambda == 1
+        args.freeze_backbone and args.target_kl >= 1
         and not args.winning_capacity
     )
     pending_capacity = max(1, reservoir.capacity // args.envs)
@@ -3394,9 +3424,20 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         "mean_advantage", "policy_loss", "expert_loss", "expert_entropy", "expert_kl",
         "expert_rows", "ppo_policy_head_grad_norm", "expert_policy_head_grad_norm",
         "expert_ppo_grad_ratio", "expert_ppo_grad_cosine", "critic_loss",
-        "search_consistency_loss", "critic_expected", "critic_win_probability", "entropy", "entropy_weight", "kl",
+        "critic_explained_reward_variance", "search_consistency_loss", "critic_expected",
+        "critic_win_probability", "entropy", "entropy_weight", "kl",
         "post_kl", "clip_fraction", "winning_loss", "winning_kl",
     )}
+    floor_explained_sum = np.zeros(MAX_PROGRESS + 1)
+    floor_explained_weight = np.zeros(MAX_PROGRESS + 1)
+    floor_explained_rows = np.zeros(MAX_PROGRESS + 1, np.int64)
+    def record_floor_explained(metrics):
+        for floor, metric in metrics.items():
+            index, rows = int(floor), metric["rows"]
+            weight = rows * metric["target_variance"]
+            floor_explained_sum[index] += metric["value"] * weight
+            floor_explained_weight[index] += weight
+            floor_explained_rows[index] += rows
     pipeline = [
         f"{args.samplers} continuous CPU actor{'s' if args.samplers > 1 else ''} → "
         + (f"{args.segment_steps}-decision bootstrapped segments" if args.segment_steps
@@ -3405,8 +3446,9 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         f"{'Character-balanced' if args.character_balanced else 'Uniform'} reusable rows; "
         f"prefilter forced/stale/ratio-invalid; priority −{args.priority_decay:g} per use",
         f"{model.layers}-layer global Transformer over state, entity, and action tokens → heads",
-        f"Canonical floor-delta rewards → GAE γ={args.gae_gamma:g}, λ={args.gae_lambda:g}; "
-        f"{CATEGORIES}-class terminal-progress critic with backward λ={args.critic_lambda:g} targets",
+        f"Canonical floor delta + potential shaping γΦ(next)−Φ(current) → "
+        f"GAE γ={args.gae_gamma:g}, λ={args.gae_lambda:g}; "
+        "scalar critic predicts current floor plus discounted shaped progress",
         "Critic loss balanced by EMA character/phase/canonical-floor frequency",
         "Turn-start native MCTS → expectimax-Q targets and policy-expectation critic transitions",
         ("Frozen encoder and policy; critic head only" if args.critic_only else
@@ -3920,6 +3962,18 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             "winning_collection_drift": float(winning_behavior_drift),
             "observed_kl": observed_kl, "observed_clip_fraction": observed_clip,
             "progress_active": progress_active, "curriculum": curriculum,
+            "critic_floor_conditioned_explained_reward_variance":
+                floor_explained_sum.sum() / floor_explained_weight.sum()
+                if floor_explained_weight.any() else 0.,
+            "critic_explained_reward_variance_by_floor": {
+                str(floor): {
+                    "value": floor_explained_sum[floor] / floor_explained_weight[floor]
+                    if floor_explained_weight[floor] else 0.,
+                    "target_variance": floor_explained_weight[floor] / rows,
+                    "rows": int(rows),
+                }
+                for floor, rows in enumerate(floor_explained_rows) if rows
+            },
             **critic_balance.report(),
             **recent_metrics,
         }
@@ -3927,6 +3981,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         reported_seconds = segment_elapsed
         point["characters"] = summaries([rows[-args.promotion_window:] for rows in episodes])
         save_report(point, pipeline, windows)
+        floor_explained_sum.fill(0); floor_explained_weight.fill(0); floor_explained_rows.fill(0)
     next_report = base_decisions + args.report_decisions
     next_save = base_decisions + args.save_decisions
     promotion_ready = False
@@ -4246,13 +4301,18 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 values["canonical"][fresh_cpu],
             )
             critic_weights = torch.as_tensor(critic_weights, device=target)
-            category_loss = -batch_target * critic_logits[fresh].log_softmax(-1)
-            value_loss = (category_loss.sum(1) * critic_weights).mean()
+            prediction = critic_value(critic_logits[fresh])
+            squared_error = (prediction - batch_target).square()
+            value_loss = (squared_error * critic_weights).mean()
             critic_loss = args.value_weight * value_loss
+            explained_reward_variance, floor_conditioned_explained_reward_variance, \
+                explained_reward_variance_by_floor = critic_explained_reward_variance(
+                    prediction.detach(), batch_target, values["canonical"][fresh_cpu]
+                )
             critic_parameters = tuple(model.critic.parameters())
             critic_balance.record_loss(
-                values["critic_target"][fresh_cpu].astype(np.float64),
-                (category_loss.detach() * critic_weights[:, None]).cpu().numpy(),
+                values["terminal"][fresh_cpu],
+                (squared_error.detach() * critic_weights).cpu().numpy(),
             )
             policy_update_attempts += int(not args.critic_only)
             if not args.critic_only and kl_value > args.target_kl:
@@ -4268,11 +4328,17 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 update_elapsed = time.monotonic() - update_started
                 update_seconds += update_elapsed
                 update_durations.append(update_elapsed)
+                losses["critic_explained_reward_variance"].append(explained_reward_variance)
+                record_floor_explained(explained_reward_variance_by_floor)
                 training_batch_event(
                     "pre_kl_rejected", "critic_only", attempted_rows=len(rows),
                     fresh_rows=fresh_rows, policy_trained_rows=0,
                     critic_trained_rows=fresh_rows, ratio_rejected_rows=len(rejected),
                     retired_rows=len(expired), critic_loss=float(value_loss.detach()),
+                    critic_explained_reward_variance=float(explained_reward_variance),
+                    critic_floor_conditioned_explained_reward_variance=
+                    floor_conditioned_explained_reward_variance,
+                    critic_explained_reward_variance_by_floor=explained_reward_variance_by_floor,
                     advantage_mean=float(np.mean(values["advantage"][fresh_cpu])),
                     advantage_stddev=float(np.std(values["advantage"][fresh_cpu])),
                     policy_lag_mean=float(np.mean(batch_policy_lags)),
@@ -4328,7 +4394,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     / expert_count
             search_consistency_loss = critic_logits.sum() * 0
             if search_groups:
-                critic_values = critic_expected(critic_probabilities(all_critic_logits))
+                critic_values = critic_value(all_critic_logits)
                 child_offset = len(rows) + len(expert_rows) + len(replay)
                 consistency_losses = []
                 for position, _group, count, weights, self_weight, terminal_value in search_groups:
@@ -4369,7 +4435,6 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             if replay:
                 replay_start = len(rows) + len(expert_rows)
                 replay_logits = all_logits[replay_start:]
-                replay_value = critic_probabilities(all_critic_logits[replay_start:])[:, -1]
                 replay_legal = inputs[6][replay_start:]
                 replay_masked = replay_logits.masked_fill(~replay_legal, -torch.inf)
                 replay_action = torch.as_tensor([sample[1] for sample in replay], device=target)
@@ -4401,7 +4466,9 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     torch.zeros_like(replay_log_probability),
                 )
                 replay_ratio = replay_log_ratio.exp()
-                replay_advantage = (1 - replay_value).detach()
+                replay_advantage = torch.as_tensor(
+                    [sample[3] for sample in replay], device=target
+                )
                 winning_loss = -args.winning_loss_weight * (torch.minimum(
                     replay_ratio * replay_advantage,
                     replay_ratio.clamp(1 - args.clip, 1 + args.clip) * replay_advantage,
@@ -4438,9 +4505,16 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 retry_logits = predict(
                     model, inputs, args.precision, args.policy_temperature,
                 )[1][:len(rows)][fresh]
-                retry_value_loss = (
-                    -batch_target * retry_logits.log_softmax(-1)
-                ).sum(1).mul(critic_weights).mean()
+                retry_prediction = critic_value(retry_logits)
+                retry_squared_error = (retry_prediction - batch_target).square()
+                retry_value_loss = (retry_squared_error * critic_weights).mean()
+                retry_explained_reward_variance, \
+                    retry_floor_conditioned_explained_reward_variance, \
+                    retry_explained_reward_variance_by_floor = \
+                    critic_explained_reward_variance(
+                        retry_prediction.detach(), batch_target,
+                        values["canonical"][fresh_cpu],
+                    )
                 retry_critic_loss = args.value_weight * retry_value_loss
                 retry_critic_loss.backward(inputs=critic_parameters)
                 gradient_norm = critic_only_step(model, optimizer, critic_parameters)
@@ -4451,11 +4525,20 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 update_durations.append(update_elapsed)
                 backward_seconds = time.monotonic() - backward_started
                 backward_durations.append(backward_seconds)
+                losses["critic_explained_reward_variance"].append(
+                    retry_explained_reward_variance
+                )
+                record_floor_explained(retry_explained_reward_variance_by_floor)
                 training_batch_event(
                     "post_kl_rejected", "critic_only", attempted_rows=len(rows),
                     fresh_rows=fresh_rows, policy_trained_rows=0,
                     critic_trained_rows=fresh_rows, ratio_rejected_rows=len(rejected),
                     retired_rows=len(expired), critic_loss=float(retry_value_loss.detach()),
+                    critic_explained_reward_variance=float(retry_explained_reward_variance),
+                    critic_floor_conditioned_explained_reward_variance=
+                    retry_floor_conditioned_explained_reward_variance,
+                    critic_explained_reward_variance_by_floor=
+                    retry_explained_reward_variance_by_floor,
                     advantage_mean=float(np.mean(values["advantage"][fresh_cpu])),
                     advantage_stddev=float(np.std(values["advantage"][fresh_cpu])),
                     policy_lag_mean=float(np.mean(batch_policy_lags)),
@@ -4492,12 +4575,18 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     (expert_head_grad / ppo_head_grad.clamp_min(1e-12)).detach()
                 )
                 losses["expert_ppo_grad_cosine"].append(expert_ppo_grad_cosine.detach())
-            probabilities = critic_probabilities(critic_logits[fresh].detach())
             losses["critic_loss"].append(value_loss.detach())
+            losses["critic_explained_reward_variance"].append(explained_reward_variance)
+            record_floor_explained(explained_reward_variance_by_floor)
             if search_groups:
                 losses["search_consistency_loss"].append(search_consistency_loss.detach())
-            losses["critic_expected"].append(critic_expected(probabilities).mean())
-            losses["critic_win_probability"].append(probabilities[:, -1].mean())
+            base_prediction = prediction.detach() + torch.as_tensor(
+                values["potential"][fresh_cpu], device=target
+            )
+            losses["critic_expected"].append(base_prediction.mean())
+            losses["critic_win_probability"].append(
+                critic_win_probability(base_prediction).mean()
+            )
             losses["entropy"].append(entropy.detach())
             losses["entropy_weight"].append(entropy_weight)
             losses["kl"].append(kl); losses["clip_fraction"].append(clip_fraction)
@@ -4549,9 +4638,13 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 expert_grad_cosine=float(expert_ppo_grad_cosine.detach())
                 if expert_ppo_grad_cosine is not None else 0,
                 critic_loss=float(value_loss.detach()),
+                critic_explained_reward_variance=float(explained_reward_variance),
+                critic_floor_conditioned_explained_reward_variance=
+                floor_conditioned_explained_reward_variance,
+                critic_explained_reward_variance_by_floor=explained_reward_variance_by_floor,
                 search_consistency_loss=float(search_consistency_loss.detach()),
-                critic_expected=float(critic_expected(probabilities).mean()),
-                critic_win_probability=float(probabilities[:, -1].mean()),
+                critic_expected=float(base_prediction.mean()),
+                critic_win_probability=float(critic_win_probability(base_prediction).mean()),
                 advantage_mean=float(np.mean(values["advantage"][fresh_cpu])),
                 advantage_stddev=float(np.std(values["advantage"][fresh_cpu])),
                 policy_lag_mean=float(np.mean(batch_policy_lags)),
@@ -4993,14 +5086,7 @@ def evaluate_search_policies(args):
 
 
 def critic_metrics(rows):
-    probability = np.asarray([row["critic_probability"] for row in rows], np.float32)
-    category = np.asarray([row["terminal_category"] for row in rows], np.int64)
-    selected = probability[np.arange(len(rows)), category]
-    result = {
-        "states": len(rows),
-        "categorical_nll": float(-np.log(selected.clip(1e-12)).mean()),
-        "categorical_brier": float(np.mean(np.square(probability).sum(1) + 1 - 2 * selected)),
-    }
+    result = {"states": len(rows)}
     for name, target_key, prediction_key, scale in (
         ("win", "win", "win_prediction", 1),
         ("floor", "terminal_floor", "floor_prediction", CATEGORIES - 1),
@@ -5034,7 +5120,9 @@ def critic_diagnostics(args):
                 count, args.seed + character * 1_000_000 + start,
                 character, ascension=ascension,
             )
-            env.set_training_bonus(bonus); env.load_policy(policy)
+            env.set_training_bonus(bonus)
+            env.set_potential_weights(model.potential_weights)
+            env.load_policy(policy)
             active = np.ones(count, bool)
             histories = [[] for _ in range(count)]
             steps = np.zeros(count, np.int32)
@@ -5044,9 +5132,9 @@ def critic_diagnostics(args):
                     break
                 stats = env.stats()
                 result = env.policy(args.policy_temperature, True, True)
-                critic_probability = np.asarray(result[3], np.float32)
-                win = critic_probability[:, -1]
-                floor = critic_probability @ np.arange(CATEGORIES) / (CATEGORIES - 1)
+                shaped = np.asarray(result[3], np.float32)
+                floor = shaped + np.asarray(result[14], np.float32)
+                win = critic_win_probability(torch.from_numpy(floor)).numpy()
                 for index in np.flatnonzero(active):
                     row = stats[index]
                     histories[index].append({
@@ -5055,7 +5143,7 @@ def critic_diagnostics(args):
                         "reward_screen": row[4] == 2,
                         "win_prediction": float(win[index]),
                         "floor_prediction": float(floor[index]),
-                        "critic_probability": critic_probability[index].tolist(),
+                        "critic_value": float(shaped[index]),
                     })
                 done = np.asarray(result[8], bool)
                 final = result[9]
@@ -5134,21 +5222,6 @@ def atomic_json(path, value):
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(value, indent=2, sort_keys=True))
     temporary.replace(path)
-
-
-def atomic_live(path, value):
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    data = json.dumps(value, separators=(",", ":")).replace("</", "<\\/")
-    temporary.write_text(f"window.spirefyshLive={data};")
-    temporary.replace(path)
-
-
-def read_live(path):
-    try:
-        source = path.read_text()
-        return json.loads(source.removeprefix("window.spirefyshLive=").removesuffix(";"))
-    except (OSError, json.JSONDecodeError):
-        return None
 
 
 def evaluation_score(result):
@@ -5276,9 +5349,15 @@ def floor_bands(histogram):
 
 
 class MetricsProjector:
+    event_metadata = {
+        "event_schema", "time", "level", "event", "run_id", "session_id",
+        "trainer_session", "sampler_session", "role", "pid", "thread",
+    }
     means = {
         "advantage_mean": "fresh_rows", "advantage_stddev": "fresh_rows",
         "policy_loss": "policy_trained_rows", "critic_loss": "critic_trained_rows",
+        "critic_explained_reward_variance": "critic_trained_rows",
+        "critic_floor_conditioned_explained_reward_variance": None,
         "entropy": "policy_trained_rows", "entropy_weight": "policy_trained_rows",
         "pre_kl": "fresh_rows", "post_kl": "policy_trained_rows",
         "clip_fraction": "policy_trained_rows", "gradient_norm": None,
@@ -5307,7 +5386,6 @@ class MetricsProjector:
         key = step // self.width, stage
         if self.current and self.current["_key"] != key:
             self.closed.append(self.render(self.current))
-            del self.closed[:-4096]
             self.current = None
         if self.current is None:
             self.current = {
@@ -5317,12 +5395,16 @@ class MetricsProjector:
                 "weights_revision": event.get("weights_revision", 0),
                 "policy_revision": event.get("policy_revision", 0),
                 "_sum": {}, "_weight": {}, "_floors": [0] * 53,
+                "_floor_explained_sum": [0.] * (MAX_PROGRESS + 1),
+                "_floor_explained_weight": [0.] * (MAX_PROGRESS + 1),
+                "_floor_explained_rows": [0] * (MAX_PROGRESS + 1),
                 "_characters": [[0, 0] for _ in range(5)],
                 "_character_floors": [[0] * 53 for _ in range(5)],
                 "_character_caps": [[0, 0, 0] for _ in range(5)],
                 "_caps": [0, 0, 0], "_outcomes": {}, "_commits": {},
                 "_samples": [[] for _ in range(5)], "_sampled": 0,
                 "_trained": 0, "_critic_trained": 0, "_discarded": 0, "_batches": 0,
+                "_optimizer_steps": [],
                 "_collect_seconds": 0., "_update_seconds": 0.,
                 "_episode_length": 0, "_episode_seconds": 0.,
                 "_attempted": 0, "_admitted": 0, "_forced": 0,
@@ -5371,6 +5453,16 @@ class MetricsProjector:
             window["_retired"] += event.get("retired_rows", 0)
             window["_update_seconds"] += event.get("total_seconds", 0.)
             outcome, commit = event.get("policy_outcome"), event.get("commit_kind")
+            duration = event.get("total_seconds", 0.)
+            if commit and commit != "none" and duration > 0:
+                window["_optimizer_steps"].append({
+                    "step": event.get("step", 0),
+                    "weights_revision": event.get("weights_revision", 0),
+                    "seconds": event.get("training_elapsed_seconds", 0),
+                    "optimizer_steps_per_second": 1 / duration,
+                    "used_rows_per_second": event.get("critic_trained_rows", 0) / duration,
+                    "total_seconds": duration,
+                })
             if outcome == "pre_kl_rejected":
                 window["_pre_kl_rejected"] += event.get("fresh_rows", 0)
             elif outcome == "post_kl_rejected":
@@ -5386,6 +5478,13 @@ class MetricsProjector:
                     continue
                 window["_sum"][metric] = window["_sum"].get(metric, 0.) + value * weight
                 window["_weight"][metric] = window["_weight"].get(metric, 0) + weight
+            for floor, metric in event.get(
+                    "critic_explained_reward_variance_by_floor", {}).items():
+                floor, rows = int(floor), metric["rows"]
+                weight = rows * metric.get("target_variance", 1)
+                window["_floor_explained_sum"][floor] += metric["value"] * weight
+                window["_floor_explained_weight"][floor] += weight
+                window["_floor_explained_rows"][floor] += rows
         elif fact and kind == "sample_packet":
             window = self.window(event)
             window["_sampled"] += event.get("packet_sampled_decisions", 0)
@@ -5444,6 +5543,13 @@ class MetricsProjector:
             self.status = "completed"
         elif kind in ("session_error", "error") and event.get("role") == "learner":
             self.status = "failed"
+        if fact and "window" in locals():
+            for metric, value in event.items():
+                if metric in self.event_metadata or metric in self.means \
+                        or not isinstance(value, (int, float)):
+                    continue
+                window["_sum"][metric] = window["_sum"].get(metric, 0.) + value
+                window["_weight"][metric] = window["_weight"].get(metric, 0) + 1
 
     def render(self, window):
         metrics = {
@@ -5478,6 +5584,22 @@ class MetricsProjector:
             / max(1e-9, window["_update_seconds"]),
             "used_rows_per_second": window["_critic_trained"]
             / max(1e-9, window["_update_seconds"]),
+            "critic_floor_conditioned_explained_reward_variance":
+                sum(window["_floor_explained_sum"])
+                / sum(window["_floor_explained_weight"])
+                if any(window["_floor_explained_weight"])
+                else metrics.get("critic_floor_conditioned_explained_reward_variance", 0),
+            "critic_explained_reward_variance_by_floor": {
+                str(floor): {
+                    "value": window["_floor_explained_sum"][floor]
+                    / window["_floor_explained_weight"][floor]
+                    if window["_floor_explained_weight"][floor] else 0.,
+                    "target_variance": window["_floor_explained_weight"][floor] / rows,
+                    "rows": rows,
+                }
+                for floor, rows in enumerate(window["_floor_explained_rows"]) if rows
+            },
+            "optimizer_steps": window["_optimizer_steps"],
             "trajectory_length_mean": window["_episode_length"] / max(1, episodes),
             "trajectory_completion_seconds_mean": window["_episode_seconds"] / max(1, episodes),
             "dataset_attempted": window["_attempted"],
@@ -5552,8 +5674,9 @@ class MetricsProjector:
             return position
 
     def value(self):
-        reports = self.closed + ([self.render(self.current)] if self.current else [])
-        reports = reports[-4096:]
+        current = self.render(self.current) | {"_open": self.status == "running"} \
+            if self.current else None
+        reports = self.closed + ([current] if current else [])
         return {
             "schema": 2, "version": self.manifest["model_version"],
             "run_id": self.manifest["run_id"], "lineage_id": self.manifest["lineage_id"],
@@ -5563,41 +5686,6 @@ class MetricsProjector:
             "invalid_events": self.invalid, "reports": reports,
             "promotions": self.promotions, "cursor": self.cursor,
         }
-
-
-class LiveProjector:
-    def __init__(self, root, run, manifest, session_id):
-        self.projector = MetricsProjector(root, run, manifest, session_id)
-        self.wake, self.stop = threading.Event(), threading.Event()
-        self.error = None
-        self.refresh()
-        self.thread = threading.Thread(target=self.run, name="live-metrics", daemon=True)
-        self.thread.start()
-
-    def refresh(self):
-        self.projector.cursor = self.projector.read(
-            self.projector.path, start=self.projector.cursor
-        )
-        value = self.projector.value()
-        while len(json.dumps(value, separators=(",", ":"))) > 4 * 1024 * 1024 \
-                and len(self.projector.closed) > 1:
-            self.projector.closed.pop(0)
-            value = self.projector.value()
-        atomic_live(self.projector.run / "live.js", value)
-
-    def run(self):
-        try:
-            while not self.stop.wait(2):
-                if self.wake.is_set():
-                    self.wake.clear(); self.refresh()
-            self.refresh()
-        except BaseException as error:
-            self.error = error
-
-    def close(self):
-        self.stop.set(); self.wake.set(); self.thread.join()
-        if self.error:
-            raise RuntimeError("live metrics projector failed") from self.error
 
 
 def load_stage_bests(output, development, checkpoints, best):
@@ -5765,6 +5853,13 @@ def logged_history(run, manifest):
     return reports, promotions, session, parent_step, saw_report, saw_promotion
 
 
+def report_version(report, manifest):
+    marker = report.get("description", "").partition("Continuous V")[2].partition(" ")[0]
+    return int(marker) if marker.isdigit() else manifest.get(
+        "model_version", manifest.get("version", 0)
+    )
+
+
 def dashboard(target):
     if (target / "run.json").exists():
         target = target.parent
@@ -5775,36 +5870,24 @@ def dashboard(target):
         except (OSError, json.JSONDecodeError):
             continue
         run = path.parent
-        live_data = read_live(run / "live.js") if manifest.get("schema", 1) >= 2 else None
         sessions = manifest.get("sessions", [])
+        projected = None
         if sessions and manifest.get("schema", 1) >= 2:
             session_id = sessions[-1]["id"]
-            log = run / sessions[-1].get("log", "events.jsonl")
             try:
-                stale = not live_data or live_data.get("leaf_session_id") != session_id \
-                    or live_data.get("cursor", 0) < log.stat().st_size
-                if stale:
-                    projected = MetricsProjector(target, run, manifest, session_id).value()
-                    atomic_live(run / "live.js", projected); live_data = projected
+                projected = MetricsProjector(target, run, manifest, session_id).value()
             except (OSError, ValueError):
                 pass
-        if live_data and live_data.get("schema") == 2:
-            reports, promotions = {}, {}
-            trainer_session = live_data.get("leaf_session_id")
-            parent_step = sessions[-1].get("step") if sessions else None
-            logged_reports = logged_promotions = False
+        if projected:
+            reports = {f"{row['step']}:{index}": row
+                       for index, row in enumerate(projected["reports"])}
+            promotions = dict(enumerate(projected["promotions"]))
+            trainer_session = projected["leaf_session_id"]
+            parent_step = sessions[-1].get("step")
+            logged_reports, logged_promotions = bool(reports), bool(promotions)
         else:
             reports, promotions, trainer_session, parent_step, logged_reports, logged_promotions = \
                 logged_history(run, manifest)
-        if live_data and live_data.get("schema") == 2:
-            reports = {f"{row['step']}:{index}": row
-                       for index, row in enumerate(live_data.get("reports", ())) }
-            promotions = {index: row for index, row in enumerate(
-                live_data.get("promotions", ())
-            )}
-            trainer_session = live_data.get("leaf_session_id")
-            logged_reports = bool(reports)
-            logged_promotions = bool(promotions)
         if not logged_reports:
             for report in list((run / "reports").glob("*.json")) + [run / "live.json"]:
                 try:
@@ -5870,6 +5953,7 @@ def dashboard(target):
              "description": reports[key].get("description", ""),
              "pipeline": reports[key].get("pipeline", []),
              "metrics": dict(reports[key]["metrics"]), "_written": reports[key].get("_written"),
+             "_open": reports[key].get("_open", False),
              "_session": reports[key].get("_session") or
                          f"{name}:{reports[key].get('_trainer_session')}:"
                          f"{reports[key].get('sampler_session')}"}
@@ -5890,15 +5974,10 @@ def dashboard(target):
                 floor for group in floor_groups
                 for floor in group[::max(1, math.ceil(len(group) / 8))]
             ]
-            for key in tuple(row["metrics"]):
-                if key.startswith("critic_preweight_") or key in (
-                    "characters", "critic_postweight_loss_mass",
-                ):
-                    row["metrics"].pop(key)
+            row["metrics"].pop("characters", None)
         version_groups = {}
         for row in report_rows:
-            marker = row["description"].partition("Continuous V")[2].partition(" ")[0]
-            version = int(marker) if marker.isdigit() else manifest.get("model_version", manifest.get("version", 0))
+            version = report_version(row, manifest)
             version_groups.setdefault(version, []).append(row)
         for version, version_reports in version_groups.items():
             for row in version_reports[1:]:
@@ -5927,28 +6006,30 @@ def dashboard(target):
                 version_manifest["sessions"] = sessions[-1:] or manifest.get("sessions", [])[:1]
             low, high = version_reports[0]["step"], version_reports[-1]["step"]
             key = name if len(version_groups) == 1 else f"{name}/V{version}"
-            live = str((run / "live.js").relative_to(target)) \
-                if version == manifest.get("model_version") else None
+            live = f"/api?run={quote(name, safe='')}&version={version}" \
+                if projected and version == manifest.get("model_version") else None
+            stable = [row for row in version_reports if not row["_open"]]
+            version_promotions = [row for row in promotions.values()
+                                  if low <= row.get("step", low) <= high]
             runs[key] = {
                 "version": version, "manifest": version_manifest,
-                "source": (None if live_data and live_data.get("schema") == 2 else
+                "source": (None if projected else
                            manifest.get("source") if len(version_groups) == 1 else None),
                 "reports": version_reports,
-                "promotions": [row for row in promotions.values()
-                               if low <= row.get("step", low) <= high],
+                "promotions": version_promotions,
                 "best": best if version == manifest.get("model_version") else None, "live": live,
                 "trainer_session": trainer_session, "parent_checkpoint_step": parent_step,
                 "run_id": manifest.get("run_id"),
                 "lineage_id": manifest.get("lineage_id", manifest.get("run_id", name)),
-                "live_revision": live_data.get("revision", 0) if live_data else 0,
-                "status": live_data.get("status") if live_data else None,
-                "last_event_time": live_data.get("last_event_time") if live_data else None,
+                "live_revision": projected.get("revision", 0) if projected else 0,
+                "report_count": len(stable),
+                "optimizer_step_count": sum(len(row["metrics"].get("optimizer_steps", ()))
+                                            for row in version_reports),
+                "promotion_count": len(version_promotions),
+                "live_token": f"{manifest.get('run_id')}:{trainer_session}:{version}",
+                "status": projected.get("status") if projected else None,
+                "last_event_time": projected.get("last_event_time") if projected else None,
             }
-            if live and manifest.get("schema", 1) < 2:
-                atomic_live(run / "live.js", {
-                    "version": version, "trainer_session": trainer_session,
-                    "parent_checkpoint_step": parent_step, "report": version_reports[-1],
-                })
     def history(name, seen=()):
         row = runs[name]
         source = Path(row["source"]).resolve() if row["source"] else None
@@ -5972,31 +6053,26 @@ def dashboard(target):
     runs = dict(sorted(runs.items(), key=lambda item: (item[1]["version"], item[1]["reports"][-1]["step"], item[0])))
     data = json.dumps({name: run | {"run": name} for name, run in runs.items()}, separators=(",", ":")).replace("</", "<\\/")
     content = """<!doctype html><meta charset=utf-8><title>Spirefysh dashboard</title><script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script><style>
-body{font:14px system-ui;margin:24px;background:#101319;color:#e8ecf2}h1,h2{margin-bottom:6px}.controls{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:22px}select,input{padding:7px;background:#202938;color:#e8ecf2;border:1px solid #526176;border-radius:5px}.charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(440px,1fr));gap:14px}.panel{margin:22px 0;padding:16px;background:#171d28;border:1px solid #303a49;border-radius:10px}.charts .panel{margin:0}.plot{height:340px;min-width:0}.note{color:#9aa8bb;margin:0}table{border-collapse:collapse;width:100%}th,td{padding:7px;border-bottom:1px solid #303a49;text-align:left}.yes{color:#75db91}.no{color:#ee7b7b}
-</style><h1 id=title>Spirefysh dashboard</h1><div class=controls><label>Lineage <select id=lineage></select></label><label>Branch <select id=version></select></label><label>X axis <select id=xaxis><option value=updates>Weights revision</option><option value=decisions selected># decisions</option><option value=time>Active training time</option></select></label><label><input id=smooth type=checkbox checked> EMA</label><label>EMA α <input id=ema type=number min=.01 max=1 step=.01 value=.2></label><span>Auto-refresh 2s</span><span id=status></span></div><div class=charts><section class=panel><h2>Mean advantage</h2><div id=advantage class=plot></div></section><section class=panel><h2>Optimizer steps / second</h2><p class=note>During learner updates</p><div id=optimizer-rate class=plot></div></section><section class=panel><h2>Used rows / second</h2><p class=note>Critic-consumed rows during learner updates</p><div id=row-rate class=plot></div></section><section class=panel><h2>Terminal floor</h2><div id=floor class=plot></div></section><section class=panel><h2>Ascension</h2><div id=ascension class=plot></div></section><section class=panel><h2>Bonus strength</h2><div id=bonus class=plot></div></section><section class=panel><h2>Win proportion</h2><div id=wins class=plot></div></section><section class=panel><h2>Clip fraction</h2><div id=clip class=plot></div></section><section class=panel><h2>KL</h2><div id=kl class=plot></div></section><section class=panel><h2>Entropy</h2><div id=entropy class=plot></div></section></div><section class=panel><h2>Promotion</h2><div id=promotion></div></section><script>const versions=""" + data + r""",lineageSelect=document.querySelector('#lineage'),versionSelect=document.querySelector('#version'),xaxis=document.querySelector('#xaxis'),smooth=document.querySelector('#smooth'),ema=document.querySelector('#ema');
-const characterNames=['Ironclad','Defect','Silent','Regent','Necrobinder'],characterColors=['#ef4444','#38bdf8','#22c55e','#f59e0b','#a78bfa'],names=Object.keys(versions),lineages=[...new Set(names.map(name=>versions[name].lineage_id||name))],config={responsive:true,displaylogo:false},refreshKey='spirefysh-dashboard',saved=(()=>{try{return JSON.parse(sessionStorage.getItem(refreshKey))}catch{return null}})();let timeOrigin=0;const initial=saved?.followLatest?names.at(-1):names.includes(saved?.version)?saved.version:names.at(-1)||'';lineageSelect.innerHTML=lineages.map(id=>`<option value="${id}">${names.find(name=>(versions[name].lineage_id||name)===id)||id}</option>`).join('');lineageSelect.value=versions[initial]?.lineage_id||initial;function showBranches(preferred){const branches=names.filter(name=>(versions[name].lineage_id||name)===lineageSelect.value);versionSelect.innerHTML=branches.map(name=>`<option value="${name}">V${versions[name].version} · ${name}</option>`).join('');versionSelect.value=branches.includes(preferred)?preferred:branches.at(-1)||''}showBranches(initial);if(saved?.xaxis)xaxis.value=saved.xaxis==='iteration'?'updates':saved.xaxis;if(typeof saved?.smooth==='boolean')smooth.checked=saved.smooth;if(saved?.ema)ema.value=saved.ema;
-function monotonic(history){let step=-Infinity;return history.filter(row=>row.step>step&&(step=row.step,true))}function updateSteps(history){let offset=0,last=0,session;for(const report of history){const updates=Number(report.metrics.weights_revision??report.metrics.updates)||0;if(session!==undefined&&(report._session!==session||updates<last)){offset+=last;last=0}report._updates=offset+updates;last=Math.max(last,updates);session=report._session}}function x(report){return xaxis.value==='time'?(Number.isFinite(Number(report.metrics.seconds))?report.metrics.seconds/60:Number.isFinite(Number(report._written))?(report._written-timeOrigin)/60:0):xaxis.value==='decisions'?report.step:report._updates}function series(history,key){return history.map(report=>({x:x(report),y:Number(report.metrics[key])})).filter(point=>Number.isFinite(point.y))}function speedMetrics(history){for(const report of history){const metrics=report.metrics,seconds=Number(metrics.total_seconds)*Number(metrics.update_attempts);if(!Number.isFinite(Number(metrics.optimizer_steps_per_second))&&seconds>0)metrics.optimizer_steps_per_second=Number(metrics.weight_commits)/seconds;if(!Number.isFinite(Number(metrics.used_rows_per_second)))metrics.used_rows_per_second=seconds>0?Number(metrics.critic_trained_rows)/seconds:Number(metrics.learner_decisions_per_second)}}
-function emaLine(points){const alpha=Math.max(.01,Math.min(1,Number(ema.value)||.2));let value;return points.map((point,index)=>({x:point.x,y:value=index?alpha*point.y+(1-alpha)*value:point.y}))}
+body{font:14px system-ui;margin:24px;background:#101319;color:#e8ecf2}h1,h2{margin-bottom:6px}.controls,.legend{display:flex;align-items:center;gap:12px;flex-wrap:wrap}.controls{margin-bottom:12px}.legend{margin-bottom:22px}.legend-item{display:flex;align-items:center;gap:6px}.legend-line{width:24px;border-top:3px solid}.legend-dot{width:9px;height:9px;border-radius:50%}.metric-picker{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));margin-top:12px}.metric-picker label{padding:3px}summary{cursor:pointer;font-size:18px;font-weight:600}select,input{padding:7px;background:#202938;color:#e8ecf2;border:1px solid #526176;border-radius:5px}.charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(440px,1fr));gap:14px}.panel{margin:22px 0;padding:16px;background:#171d28;border:1px solid #303a49;border-radius:10px}.charts .panel{margin:0}.plot{height:340px;min-width:0}.note{color:#9aa8bb;margin:0}table{border-collapse:collapse;width:100%}th,td{padding:7px;border-bottom:1px solid #303a49;text-align:left}.yes{color:#75db91}.no{color:#ee7b7b}
+</style><h1 id=title>Spirefysh dashboard</h1><div class=controls><label>Lineage <select id=lineage></select></label><label>Branch <select id=version></select></label><label>Compare <select id=compare></select></label><label>X axis <select id=xaxis><option value=updates>Weights revision</option><option value=decisions selected># decisions</option><option value=time>Active training time</option></select></label><label><input id=smooth type=checkbox checked> EMA</label><label>EMA α <input id=ema type=number min=.01 max=1 step=.01 value=.2></label><label>Subsample <input id=subsample type=number min=1 step=1 value=3></label><span>Auto-refresh 2s</span><span id=status></span></div><div id=legend class=legend></div><div class=charts><section class=panel><h2>Mean advantage</h2><div id=advantage class=plot></div></section><section class=panel><h2>Optimizer steps / second</h2><p class=note>One point per committed step</p><div id=optimizer-rate class=plot></div></section><section class=panel><h2>Used rows / second</h2><p class=note>Critic-consumed rows per committed step</p><div id=row-rate class=plot></div></section><section class=panel><h2>Terminal floor</h2><div id=floor class=plot></div></section><section class=panel><h2>Ascension</h2><div id=ascension class=plot></div></section><section class=panel><h2>Bonus strength</h2><div id=bonus class=plot></div></section><section class=panel><h2>Win proportion</h2><div id=wins class=plot></div></section><section class=panel><h2>Clip fraction</h2><div id=clip class=plot></div></section><section class=panel><h2>KL</h2><div id=kl class=plot></div></section><section class=panel><h2>Entropy</h2><div id=entropy class=plot></div></section><section class=panel><h2>Policy loss</h2><div id=policy class=plot></div></section><section class=panel><h2>Critic loss</h2><div id=critic class=plot></div></section><section class=panel><h2>Optimizer step time</h2><p class=note>Seconds per committed step</p><div id=duration class=plot></div></section><section class=panel><h2>Policy lag (p95)</h2><div id=lag class=plot></div></section><section class=panel><h2>Gradient norm</h2><div id=gradient class=plot></div></section><section class=panel><h2>Dataset size</h2><div id=dataset class=plot></div></section></div><details class=panel open><summary>Metrics</summary><div id=metrics class=metric-picker></div></details><section class=panel><h2>Row outcomes</h2><div id=rows></div></section><section class=panel><h2>Promotion</h2><div id=promotion></div></section><script>const versions=""" + data + r""",lineageSelect=document.querySelector('#lineage'),versionSelect=document.querySelector('#version'),compareSelect=document.querySelector('#compare'),xaxis=document.querySelector('#xaxis'),smooth=document.querySelector('#smooth'),ema=document.querySelector('#ema'),subsample=document.querySelector('#subsample'),metricPicker=document.querySelector('#metrics'),charts=document.querySelector('.charts');
+const characterNames=['Ironclad','Defect','Silent','Regent','Necrobinder'],characterColors=['#ef4444','#38bdf8','#22c55e','#f59e0b','#a78bfa'],runColors=['#6fb1ff','#f472b6'],names=Object.keys(versions),lineages=[...new Set(names.map(name=>versions[name].lineage_id||name))],config={responsive:true,displaylogo:false},refreshKey='spirefysh-dashboard',saved=(()=>{try{return JSON.parse(sessionStorage.getItem(refreshKey))}catch{return null}})();let timeOrigin=0,sharedRange,syncingAxes=false,uiRevision='';const initial=saved?.followLatest?names.at(-1):names.includes(saved?.version)?saved.version:names.at(-1)||'';lineageSelect.innerHTML=lineages.map(id=>`<option value="${id}">${names.find(name=>(versions[name].lineage_id||name)===id)||id}</option>`).join('');lineageSelect.value=versions[initial]?.lineage_id||initial;function showBranches(preferred){const branches=names.filter(name=>(versions[name].lineage_id||name)===lineageSelect.value);versionSelect.innerHTML=branches.map(name=>`<option value="${name}">V${versions[name].version} · ${name}</option>`).join('');versionSelect.value=branches.includes(preferred)?preferred:branches.at(-1)||''}showBranches(initial);compareSelect.innerHTML='<option value="">None</option>'+names.map(name=>`<option value="${name}">V${versions[name].version} · ${name}</option>`).join('');compareSelect.value=names.includes(saved?.compare)?saved.compare:'';if(saved?.xaxis)xaxis.value=saved.xaxis==='iteration'?'updates':saved.xaxis;if(typeof saved?.smooth==='boolean')smooth.checked=saved.smooth;if(saved?.ema)ema.value=saved.ema;if(saved?.subsample)subsample.value=saved.subsample;
+const staticMetrics={advantage_mean:'advantage',optimizer_steps_per_second:'optimizer-rate',used_rows_per_second:'row-rate',floor_bands:'floor',ascension:'ascension',bonus:'bonus',win_rate:'wins',clip_fraction:'clip',post_kl:'kl',entropy:'entropy',policy_loss:'policy',critic_loss:'critic',total_seconds:'duration',policy_lag_p95:'lag',gradient_norm:'gradient',dataset_rows:'dataset'},metricTitles={advantage_mean:'Mean advantage',optimizer_steps_per_second:'Optimizer steps / second',used_rows_per_second:'Used rows / second',floor_bands:'Terminal floor',ascension:'Ascension',bonus:'Bonus strength',win_rate:'Win proportion',clip_fraction:'Clip fraction',post_kl:'KL',entropy:'Entropy',policy_loss:'Policy loss',critic_loss:'Critic loss',total_seconds:'Optimizer step time',policy_lag_p95:'Policy lag (p95)',gradient_norm:'Gradient norm',dataset_rows:'Dataset size',critic_explained_reward_variance:'Critic explained variance'},defaults=[...Object.keys(staticMetrics),'critic_explained_reward_variance'],metricKeys=[...new Set(defaults.concat(Object.values(versions).flatMap(run=>run.reports).flatMap(report=>Object.entries(report.metrics).filter(([,value])=>typeof value==='number'&&Number.isFinite(value)).map(([key])=>key))))].sort(),metricIds=Object.fromEntries(metricKeys.filter(key=>!staticMetrics[key]).map((key,index)=>[key,`metric-${index}`]));let selectedMetrics=new Set(saved?.metrics?.filter(key=>metricKeys.includes(key))??defaults);function metricLabel(key){return metricTitles[key]||key.replaceAll('_',' ')}metricPicker.innerHTML=metricKeys.map(key=>`<label><input type=checkbox value="${key}"${selectedMetrics.has(key)?' checked':''}> ${metricLabel(key)}</label>`).join('');function updateMetricPanels(){for(const [key,id] of Object.entries(staticMetrics))document.querySelector(`#${id}`).parentElement.hidden=!selectedMetrics.has(key);for(const [key,id] of Object.entries(metricIds)){let node=document.querySelector(`#${id}`);if(selectedMetrics.has(key)&&!node){charts.insertAdjacentHTML('beforeend',`<section class=panel><h2>${metricLabel(key)}</h2><div id="${id}" class=plot></div></section>`);node=document.querySelector(`#${id}`)}if(node)node.parentElement.hidden=!selectedMetrics.has(key)}}metricPicker.onchange=()=>{selectedMetrics=new Set([...metricPicker.querySelectorAll('input:checked')].map(input=>input.value));showVersion(false)};
+function monotonic(history){let step=-Infinity;return history.filter(row=>row.step>step&&(step=row.step,true))}function updateSteps(history){let offset=0,last=0,session;for(const report of history){const updates=Number(report.metrics.weights_revision??report.metrics.updates)||0;if(session!==undefined&&(report._session!==session||updates<last)){offset+=last;last=0}report._updates=offset+updates;last=Math.max(last,updates);session=report._session}}function x(report){return xaxis.value==='time'?(Number.isFinite(Number(report.metrics.seconds))?report.metrics.seconds/60:Number.isFinite(Number(report._written))?(report._written-timeOrigin)/60:0):xaxis.value==='decisions'?report.step:report._updates}function optimizerX(step){return xaxis.value==='time'?step.seconds/60:xaxis.value==='decisions'?step.step:step._updates}function series(history,key,fallback){return history.map(report=>({x:x(report),y:Number(report.metrics[key]??report.metrics[fallback])})).filter(point=>Number.isFinite(point.y))}function optimizerSeries(steps,history,key){return steps.length?steps.map(step=>({x:optimizerX(step),y:Number(step[key])})):series(history.filter(report=>(report.metrics.update_attempts??1)>0),key)}function optimizerSteps(run,reports){if(!run.optimizer_steps)run.optimizer_steps=reports.flatMap(report=>{const offset=report._updates-Number(report.metrics.weights_revision??report.metrics.updates);return(report.metrics.optimizer_steps||[]).map(step=>({...step,_updates:offset+step.weights_revision}))});return run.optimizer_steps}function speedMetrics(history){for(const report of history){const metrics=report.metrics,seconds=Number(metrics.total_seconds)*Number(metrics.update_attempts);if(!Number.isFinite(Number(metrics.optimizer_steps_per_second))&&seconds>0)metrics.optimizer_steps_per_second=Number(metrics.weight_commits)/seconds;if(!Number.isFinite(Number(metrics.used_rows_per_second)))metrics.used_rows_per_second=seconds>0?Number(metrics.critic_trained_rows)/seconds:Number(metrics.learner_decisions_per_second)}}function prepareRun(run){const all=monotonic(run.reports);updateSteps(all);const reports=all.filter(row=>!row._open),steps=optimizerSteps(run,all),last=all.at(-1),revision=Number(last?.metrics.weights_revision??last?.metrics.updates)||0,timed=all.find(row=>Number.isFinite(Number(row._written))&&Number.isFinite(Number(row.metrics.seconds)));run._updateOffset=(last?last._updates:0)-revision;run._timeOrigin=timed?timed._written-timed.metrics.seconds:0;speedMetrics(reports);return{run,reports,steps}}function rangeOf(values){let low=Infinity,high=-Infinity;for(const value of values)if(Number.isFinite(value)){low=Math.min(low,value);high=Math.max(high,value)}if(low===Infinity)return;const padding=(high-low||Math.abs(high)*.02||1)*.02;return[low-padding,high+padding]}function setFullRange(data){sharedRange=rangeOf(data.flatMap(({run,reports,steps})=>{timeOrigin=run._timeOrigin;return reports.map(x).concat(steps.map(optimizerX))}))}function clipComparison(comparison,primary){timeOrigin=primary.run._timeOrigin;const end=Math.max(...primary.reports.map(x).concat(primary.steps.map(optimizerX)).filter(Number.isFinite));timeOrigin=comparison.run._timeOrigin;return{...comparison,end,reports:comparison.reports.filter(report=>x(report)<=end),steps:comparison.steps.filter(step=>optimizerX(step)<=end)}}
+function emaLine(points){const alpha=Math.max(.01,Math.min(1,Number(ema.value)||.2));let value;return points.map((point,index)=>({x:point.x,y:value=index?alpha*point.y+(1-alpha)*value:point.y}))}function sampled(points,offset=0){const factor=Math.max(1,Math.floor(Number(subsample.value)||3));return factor===1?points:points.filter((_,index)=>(offset+index)%factor===0)}
 function stageTransitions(history,run){const promotions=(run?.promotions||[]).filter(row=>row.promoted);if(promotions.length)return promotions.map(promotion=>{const report=history.find(row=>row.step===promotion.step)||history.filter(row=>row.step<=promotion.step).at(-1),after=history.find(row=>row.step>promotion.step),next=run.manifest.stages?.[(promotion.stage?.index??-1)+1]||after?.stage,position=xaxis.value==='decisions'?promotion.step:report&&xaxis.value==='updates'?report._updates:Number.isFinite(Number(promotion._written))?(promotion._written-timeOrigin)/60:Number.isFinite(Number(promotion.seconds))?promotion.seconds/60:report?x(report):NaN;return{x:position,stage:next}}).filter(point=>Number.isFinite(Number(point.x)));return history.slice(1).flatMap((row,index)=>Number.isFinite(Number(row.stage?.ascension))&&Number.isFinite(Number(history[index].stage?.ascension))&&(row.stage.ascension!==history[index].stage.ascension||row.stage.bonus!==history[index].stage.bonus)?[{x:x(row),stage:row.stage}]:[])}
 function stageLines(history,run){return stageTransitions(history,run).map(point=>({type:'line',xref:'x',yref:'paper',x0:point.x,x1:point.x,y0:0,y1:1,layer:'below',line:{color:'rgba(232,236,242,.38)',width:1,dash:'dash'}}))}
-function layout(percent=false,range,history=[],run){const title=xaxis.value==='time'?'Wall-clock time (minutes)':xaxis.value==='decisions'?'# decisions':'Optimizer steps';return{template:'plotly_dark',paper_bgcolor:'rgba(0,0,0,0)',plot_bgcolor:'rgba(0,0,0,0)',margin:{l:62,r:18,t:12,b:52},hovermode:'closest',showlegend:true,uirevision:`${versionSelect.value}:${xaxis.value}`,shapes:stageLines(history,run),xaxis:{title,gridcolor:'#303a49'},yaxis:{gridcolor:'#303a49',tickformat:percent?'.0%':undefined,range,zerolinecolor:'#8794a8'}}}
-function plot(id,points,{range,percent=false,tozero=false,history=[],run}={}){const traces=[{x:points.map(point=>point.x),y:points.map(point=>point.y),mode:'lines+markers',name:'raw',line:{color:'#6fb1ff',width:2},marker:{color:'#6fb1ff',size:6,opacity:.8},hovertemplate:'x %{x}<br>y %{y:.5g}<extra></extra>'}];if(smooth.checked&&points.length>1){const line=emaLine(points);traces.push({x:line.map(point=>point.x),y:line.map(point=>point.y),mode:'lines',name:`EMA α=${Number(ema.value)||.2}`,line:{color:'#ffb454',width:4},hovertemplate:'EMA %{y:.5g}<extra></extra>'})}const options=layout(percent,range,history,run);if(tozero)options.yaxis.rangemode='tozero';Plotly.react(id,traces,options,config)}
-function floorPlot(history,run){const training=run.manifest.sessions?.at(-1)?.training||run.manifest.training||{},envs=training.envs||1,points=[];for(const report of history){let inferred=0,last=-Infinity;for(const row of report.metrics.trajectory_floors||[]){const [iteration,floor,stored]=row;if(stored===undefined&&iteration<last)inferred++;const character=stored??Math.min(inferred,4);points.push({x:xaxis.value==='updates'?report._updates:xaxis.value==='decisions'?iteration*envs:(report.metrics.seconds||0)/60,y:floor,character,updates:report._updates,step:report.step});last=iteration}}for(let i=points.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[points[i],points[j]]=[points[j],points[i]]}const trajectory={x:points.map(point=>point.x),y:points.map(point=>point.y),customdata:points.map(point=>[characterNames[point.character],point.updates,point.step]),mode:'markers',showlegend:false,marker:{color:points.map(point=>characterColors[point.character]),size:6,opacity:.5},hovertemplate:'%{customdata[0]}<br>floor %{y}<br>optimizer steps %{customdata[1]:,}<br>report decisions %{customdata[2]:,}<extra></extra>'},legend=characterNames.map((name,character)=>({x:[null],y:[null],mode:'markers',name,hoverinfo:'skip',marker:{color:characterColors[character],size:7,opacity:.5}})),options=layout(false,[0,52],history,run);options.yaxis.title='Terminal floor';Plotly.react('floor',[trajectory,...legend],options,config)}
-function stagePlot(id,history,key,color,run){const rows=history.filter(row=>Number.isFinite(Number(row.stage?.[key]))).map(row=>({x:x(row),y:row.stage[key]}));for(const transition of stageTransitions(history,run))if(Number.isFinite(Number(transition.stage?.[key])))rows.push({x:transition.x,y:transition.stage[key]});rows.sort((left,right)=>left.x-right.x);const options=layout(false,undefined,history,run);options.yaxis={...options.yaxis,title:key==='ascension'?'Ascension':'Bonus strength',rangemode:'tozero',dtick:key==='ascension'?1:4};Plotly.react(id,[{x:rows.map(row=>row.x),y:rows.map(row=>row.y),mode:'lines+markers',name:key==='ascension'?'Ascension':'Bonus strength',line:{color,width:3,shape:'hv'},marker:{color,size:6},hovertemplate:`${key==='ascension'?'ascension':'bonus'} %{y}<extra></extra>`}],options,config)}
+function layout(percent=false,range,history=[],run){const title=xaxis.value==='time'?'Wall-clock time (minutes)':xaxis.value==='decisions'?'# decisions':'Optimizer steps';return{template:'plotly_dark',uirevision:uiRevision,paper_bgcolor:'rgba(0,0,0,0)',plot_bgcolor:'rgba(0,0,0,0)',margin:{l:62,r:18,t:12,b:52},hovermode:'closest',showlegend:false,shapes:stageLines(history,run),xaxis:{title,gridcolor:'#303a49',autorange:!sharedRange,range:sharedRange},yaxis:{gridcolor:'#303a49',tickformat:percent?'.0%':undefined,range,zerolinecolor:'#8794a8'}}}function visiblePlots(){return[...document.querySelectorAll('.plot')].filter(node=>!node.parentElement.hidden)}function bindAxes(){for(const plot of visiblePlots())if(!plot._xSync&&plot.on){plot._xSync=true;plot.on('plotly_relayout',event=>{if(syncingAxes)return;const indexed=Number.isFinite(event['xaxis.range[0]'])&&Number.isFinite(event['xaxis.range[1]']),range=event['xaxis.range']||(indexed?[event['xaxis.range[0]'],event['xaxis.range[1]']]:event['xaxis.autorange']?rangeOf(visiblePlots().flatMap(node=>node.data.flatMap(trace=>trace.x||[]))):null);if(!range)return;sharedRange=range;syncingAxes=true;Promise.all(visiblePlots().filter(node=>node!==plot).map(node=>Plotly.relayout(node,{'xaxis.range':range,'xaxis.autorange':false}))).finally(()=>syncingAxes=false)})}}
+function lineTraces(points,label,color){const prefix=label?`${label} · `:'',shown=sampled(points),line=emaLine(points),traces=[{x:shown.map(point=>point.x),y:shown.map(point=>point.y),mode:'lines',name:`${prefix}raw`,line:{color,width:1},opacity:.45,hovertemplate:'x %{x}<br>y %{y:.5g}<extra></extra>'}];if(smooth.checked){const visible=sampled(line);traces.push({x:visible.map(point=>point.x),y:visible.map(point=>point.y),mode:'lines',name:`${prefix}EMA α=${Number(ema.value)||.2}`,line:{color,width:3},hovertemplate:'EMA %{y:.5g}<extra></extra>'})}return{traces,seen:points.length,ema:line.at(-1)?.y}}function plot(id,points,{range,percent=false,tozero=false,history=[],run,label=''}={}){const node=document.querySelector(`#${id}`);if(node.parentElement.hidden)return;const built=lineTraces(points,label,runColors[0]);node._series=[{seen:built.seen,ema:built.ema,raw:0,smooth:smooth.checked?1:null}];const options=layout(percent,range,history,run);if(tozero)options.yaxis.rangemode='tozero';Plotly.react(node,built.traces,options,config)}function addPlot(id,points,label){const node=document.querySelector(`#${id}`);if(!node?._series||node.parentElement.hidden)return;const built=lineTraces(points,label,runColors[1]),start=node.data.length;node._series[1]={seen:built.seen,ema:built.ema,raw:start,smooth:smooth.checked?start+1:null};Plotly.addTraces(node,built.traces)}function extendPlot(id,points,index=0){if(!points.length)return;const node=document.querySelector(`#${id}`);if(!node||node.parentElement.hidden)return;const state=node._series?.[index];if(!state)return;const offset=state.seen,shown=sampled(points,offset);state.seen+=points.length;const update={x:[shown.map(point=>point.x)],y:[shown.map(point=>point.y)]},traces=[state.raw];if(state.smooth!==null){const alpha=Math.max(.01,Math.min(1,Number(ema.value)||.2)),line=points.map(point=>({x:point.x,y:state.ema=state.ema===undefined?point.y:alpha*point.y+(1-alpha)*state.ema})),visible=sampled(line,offset);update.x.push(visible.map(point=>point.x));update.y.push(visible.map(point=>point.y));traces.push(state.smooth)}if(update.x.some(values=>values.length))Plotly.extendTraces(node,update,traces)}
+function trajectoryPoints(history){const points=[];for(const report of history){let inferred=0,last=-Infinity;for(const row of report.metrics.trajectory_floors||[]){const [iteration,floor,stored]=row;if(stored===undefined&&iteration<last)inferred++;const character=stored??Math.min(inferred,4);points.push({x:x(report),y:floor,character,updates:report._updates,step:report.step});last=iteration}}return points}function floorTraces(history,label='',secondary=false){const completed=history.filter(report=>Number(report.metrics.episodes)>0||(report.metrics.trajectory_floors?.length??0)>0),prefix=label?`${label} · `:'',rgb=secondary?'244,114,182':'111,177,255',traces=[],seen={bands:[],points:0,means:0},bands=[['min','max','min–max','.04'],['p01','p99','p1–p99','.06'],['p05','p95','p5–p95','.09'],['p10','p90','p10–p90','.13'],['p25','p75','p25–p75','.20']];for(const [low,high,name,alpha] of bands){let rows=completed.map(report=>({x:x(report),low:report.metrics.floor_bands?.[low],high:report.metrics.floor_bands?.[high]})).filter(row=>Number.isFinite(row.low)&&Number.isFinite(row.high));seen.bands.push(rows.length);rows=sampled(rows);traces.push({x:rows.map(row=>row.x),y:rows.map(row=>row.low),mode:'lines',showlegend:false,hoverinfo:'skip',line:{width:0}},{x:rows.map(row=>row.x),y:rows.map(row=>row.high),mode:'lines',name:`${prefix}${name}`,line:{width:0},fill:'tonexty',fillcolor:`rgba(${rgb},${alpha})`,hovertemplate:`${name}<br>upper %{y:.2f}<extra></extra>`})}let points=trajectoryPoints(completed);seen.points=points.length;points=sampled(points);for(let i=points.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[points[i],points[j]]=[points[j],points[i]]}traces.push({x:points.map(point=>point.x),y:points.map(point=>point.y),customdata:points.map(point=>[characterNames[point.character],point.updates,point.step]),mode:'markers',name:`${prefix}trajectories`,marker:{color:points.map(point=>characterColors[point.character]),symbol:secondary?'x':'circle',size:5,opacity:.28},hovertemplate:'%{customdata[0]}<br>floor %{y}<br>optimizer steps %{customdata[1]:,}<br>report decisions %{customdata[2]:,}<extra></extra>'});let means=completed.map(report=>({x:x(report),y:report.metrics.floor_bands?.mean??report.metrics.floor_mean})).filter(point=>Number.isFinite(point.y));seen.means=means.length;const line=emaLine(means);means=sampled(means);traces.push({x:means.map(point=>point.x),y:means.map(point=>point.y),mode:'lines',name:`${prefix}mean`,line:{color:runColors[secondary?1:0],width:3},hovertemplate:'mean %{y:.2f}<extra></extra>'});if(smooth.checked){const visible=sampled(line);traces.push({x:visible.map(point=>point.x),y:visible.map(point=>point.y),mode:'lines',name:`${prefix}mean EMA α=${Number(ema.value)||.2}`,line:{color:runColors[secondary?1:0],width:2,dash:'dot'},hovertemplate:'mean EMA %{y:.2f}<extra></extra>'})}return{traces,seen,ema:line.at(-1)?.y}}function rememberFloor(node,index,start,built){node._floor??=[];node._floor[index]={...built.seen,ema:built.ema,start,smooth:smooth.checked?start+12:null}}function floorPlot(history,run,label){const node=document.querySelector('#floor');if(node.parentElement.hidden)return;const built=floorTraces(history,label);rememberFloor(node,0,0,built);const options=layout(false,[0,52],history,run);options.yaxis.title='Terminal floor';Plotly.react(node,built.traces,options,config)}function addFloor(history,label){const node=document.querySelector('#floor');if(!node._floor)return;const built=floorTraces(history,label,true),start=node.data.length;rememberFloor(node,1,start,built);Plotly.addTraces(node,built.traces)}
+function stageTrace(history,key,color,run,label='',end=Infinity){let rows=history.filter(row=>Number.isFinite(Number(row.stage?.[key]))).map(row=>({x:x(row),y:row.stage[key]}));for(const transition of stageTransitions(history,run))if(Number.isFinite(Number(transition.stage?.[key])))rows.push({x:transition.x,y:transition.stage[key]});rows=rows.filter(row=>row.x<=end).sort((left,right)=>left.x-right.x);const seen=rows.length,name=key==='ascension'?'Ascension':'Bonus strength';rows=sampled(rows);return{seen,trace:{x:rows.map(row=>row.x),y:rows.map(row=>row.y),mode:'lines',name:label?`${label} · ${name}`:name,line:{color,width:3,shape:'hv'},hovertemplate:`${key==='ascension'?'ascension':'bonus'} %{y}<extra></extra>`}}}function stagePlot(id,history,key,color,run,label){const node=document.querySelector(`#${id}`);if(node.parentElement.hidden)return;const built=stageTrace(history,key,color,run,label);node._stage=[{seen:built.seen,trace:0}];const options=layout(false,undefined,history,run);options.yaxis={...options.yaxis,title:key==='ascension'?'Ascension':'Bonus strength',rangemode:'tozero',dtick:key==='ascension'?1:4};Plotly.react(node,[built.trace],options,config)}function addStage(id,history,key,run,label,end){const node=document.querySelector(`#${id}`);if(!node._stage)return;const built=stageTrace(history,key,runColors[1],run,label,end),trace=node.data.length;node._stage[1]={seen:built.seen,trace};Plotly.addTraces(node,[built.trace])}
 function promotionSummary(row){if(!row)return '<p>No promotion check yet.</p>';const characters=row.result?.characters||[],rows=characters.map(item=>`<tr><td>${characterNames[item.character]??`Character ${item.character}`}</td><td>${item.wins}/${item.runs}</td><td>${(100*item.wins/item.runs).toFixed(1)}%</td><td>${Number(item.floor_mean).toFixed(2)}</td><td>${item.caps}</td></tr>`).join('');return `<p class="${row.promoted?'yes':'no'}">${row.promoted?'Promoted':'Stayed at current stage'} · threshold ${(100*row.threshold).toFixed(0)}% per character · seed ${row.seed}</p><table><thead><tr><th>Character</th><th>Wins</th><th>Rate</th><th>Mean floor</th><th>Caps</th></tr></thead><tbody>${rows}</tbody></table>`}
 function rowSummary(history){const items=[['critic_trained_rows','Used by optimizer'],['discarded_steps','Sampler-discarded total'],['dataset_rollout_dropped','Rollout discard'],['dataset_budget_dropped','Over decision budget'],['dataset_forced_dropped','Forced-action excluded'],['dataset_stale_dropped','Stale'],['dataset_ratio_dropped','Behavior-ratio rejected'],['dataset_kl_dropped','Policy rejected before update (critic used)'],['dataset_post_kl_dropped','Policy rejected after trial (critic used)'],['dataset_retired','Used, then retired']],projected=history.filter(row=>'update_attempts'in row.metrics),rows=projected.length?projected:history.slice(-1),latest=rows.at(-1)?.metrics||{},number=value=>Number.isFinite(value)?value.toLocaleString():'—',body=items.map(([key,label])=>{const values=rows.map(row=>Number(row.metrics[key])).filter(Number.isFinite);return `<tr><td>${label}</td><td>${number(Number(latest[key]))}</td><td>${number(values.length?values.reduce((sum,value)=>sum+value,0):NaN)}</td></tr>`}).join('');return `<table><thead><tr><th>Outcome</th><th>Latest window</th><th>Displayed total</th></tr></thead><tbody>${body}</tbody></table>`}
-function saveDashboardState(){const views={};document.querySelectorAll('.plot').forEach(node=>{const view={};if(node._fullLayout?.xaxis?.autorange===false)view.x=[...node._fullLayout.xaxis.range];if(node._fullLayout?.yaxis?.autorange===false)view.y=[...node._fullLayout.yaxis.range];if(view.x||view.y)views[node.id]=view});try{sessionStorage.setItem(refreshKey,JSON.stringify({version:versionSelect.value,followLatest:versionSelect.value===names.at(-1),xaxis:xaxis.value,smooth:smooth.checked,ema:ema.value,scroll:[scrollX,scrollY],views}))}catch{}}
-function restoreDashboardState(){if(saved?.version===versionSelect.value&&saved.xaxis===xaxis.value)for(const [id,view] of Object.entries(saved.views||{})){const update={};if(view.x)update['xaxis.range']=view.x;if(view.y)update['yaxis.range']=view.y;if(Object.keys(update).length)Plotly.relayout(id,update)}if(saved?.scroll)scrollTo(...saved.scroll)}
-function showStatus(run){const age=Date.now()/1000-(run.last_event_time||0),timeout=run.manifest.sessions?.at(-1)?.training?.sampler_timeout||120;document.querySelector('#status').textContent=run.status==='running'&&age>timeout?'stalled':run.status||''}function showVersion(){const run=versions[versionSelect.value],reports=monotonic(run.reports);updateSteps(reports);speedMetrics(reports);const timed=reports.find(row=>Number.isFinite(Number(row._written))&&Number.isFinite(Number(row.metrics.seconds)));timeOrigin=timed?timed._written-timed.metrics.seconds:0;document.querySelector('#title').textContent=`Spirefysh V${run.version} · ${run.run}`;showStatus(run);plot('advantage',series(reports,'mean_advantage'),{history:reports,run});plot('optimizer-rate',series(reports,'optimizer_steps_per_second'),{tozero:true,history:reports,run});plot('row-rate',series(reports,'used_rows_per_second'),{tozero:true,history:reports,run});floorPlot(reports,run);stagePlot('ascension',reports,'ascension','#fb7185',run);stagePlot('bonus',reports,'bonus','#f59e0b',run);plot('wins',reports.map(row=>({x:x(row),y:row.metrics.wins/Math.max(1,row.metrics.episodes)})),{range:[0,1],percent:true,history:reports,run});plot('clip',series(reports,'clip_fraction'),{range:[0,1],percent:true,history:reports,run});plot('kl',series(reports,'kl'),{tozero:true,history:reports,run});plot('entropy',series(reports,'entropy'),{tozero:true,history:reports,run});document.querySelector('#promotion').innerHTML=promotionSummary(run.promotions.at(-1))}
-function refreshLive(){const selected=versionSelect.value,run=versions[selected];if(!run?.live)return;const script=document.createElement('script');script.src=encodeURI(run.live)+`?${Date.now()}`;script.onload=()=>{script.remove();const live=window.spirefyshLive;if(versionSelect.value!==selected||live?.version!==run.version)return;if(live.schema===2){if(live.run_id!==run.run_id||live.leaf_session_id<run.trainer_session)return;if(live.leaf_session_id===run.trainer_session&&live.revision<=run.live_revision){showStatus(run);return}run.reports=live.reports;run.promotions=live.promotions||[];run.trainer_session=live.leaf_session_id;run.live_revision=live.revision;run.status=live.status;run.last_event_time=live.last_event_time;showVersion();return}let changed=false;if(live.trainer_session!==run.trainer_session){run.reports=run.reports.filter(row=>row.step<=live.parent_checkpoint_step);run.trainer_session=live.trainer_session;changed=true}const report=live.report;report._session=`${selected}:${live.trainer_session}:${report.sampler_session}`;const last=run.reports.at(-1);if(!last||report.step>last.step||report._written>last._written){run.reports=[...run.reports.filter(row=>row.step!==report.step),report].sort((a,b)=>a.step-b.step);changed=true}if(changed)showVersion()};script.onerror=()=>script.remove();document.head.append(script)}
-lineageSelect.onchange=()=>{showBranches();showVersion()};versionSelect.onchange=showVersion;xaxis.onchange=showVersion;smooth.onchange=showVersion;ema.oninput=showVersion;showVersion();setTimeout(restoreDashboardState,100);window.addEventListener('beforeunload',saveDashboardState);setInterval(refreshLive,2000)</script>"""
-    content = content.replace(
-        "<section class=panel><h2>Entropy</h2><div id=entropy class=plot></div></section></div><section class=panel><h2>Promotion</h2>",
-        "<section class=panel><h2>Entropy</h2><div id=entropy class=plot></div></section><section class=panel><h2>Policy loss</h2><div id=policy class=plot></div></section><section class=panel><h2>Critic loss</h2><div id=critic class=plot></div></section><section class=panel><h2>Update duration</h2><div id=duration class=plot></div></section><section class=panel><h2>Policy lag</h2><div id=lag class=plot></div></section><section class=panel><h2>Gradient norm</h2><div id=gradient class=plot></div></section><section class=panel><h2>Dataset size</h2><div id=dataset class=plot></div></section></div><section class=panel><h2>Row outcomes</h2><div id=rows></div></section><section class=panel><h2>Promotion</h2>",
-    ).replace(
-        "plot('entropy',series(reports,'entropy'),{tozero:true,history:reports,run});document.querySelector('#promotion')",
-        "plot('entropy',series(reports,'entropy'),{tozero:true,history:reports,run});plot('policy',series(reports,'policy_loss'),{history:reports,run});plot('critic',series(reports,'critic_loss'),{tozero:true,history:reports,run});plot('duration',series(reports,'total_seconds'),{tozero:true,history:reports,run});plot('lag',series(reports,'policy_lag_p95'),{tozero:true,history:reports,run});plot('gradient',series(reports,'gradient_norm'),{tozero:true,history:reports,run});plot('dataset',series(reports,'dataset_rows'),{tozero:true,history:reports,run});document.querySelector('#rows').innerHTML=rowSummary(reports);document.querySelector('#promotion')",
-    )
+function saveDashboardState(){try{sessionStorage.setItem(refreshKey,JSON.stringify({version:versionSelect.value,compare:compareSelect.value,metrics:[...selectedMetrics],followLatest:versionSelect.value===names.at(-1),xaxis:xaxis.value,smooth:smooth.checked,ema:ema.value,subsample:subsample.value,scroll:[scrollX,scrollY]}))}catch{}}function restoreDashboardState(){if(saved?.scroll)scrollTo(...saved.scroll)}
+function showStatus(run){const age=Date.now()/1000-(run.last_event_time||0),timeout=run.manifest.sessions?.at(-1)?.training?.sampler_timeout||120;document.querySelector('#status').textContent=run.status==='running'&&age>timeout?'stalled':run.status||''}function showLegend(primary,comparison){const runs=[primary,comparison].filter(Boolean),runItems=runs.map((item,index)=>`<span class=legend-item><i class=legend-line style="border-color:${runColors[index]}"></i>${item.run.run}</span>`).join(''),characters=characterNames.map((name,index)=>`<span class=legend-item><i class=legend-dot style="background:${characterColors[index]}"></i>${name}</span>`).join('');document.querySelector('#legend').innerHTML=`${runItems}<span class=note>${smooth.checked?'thin raw · bold EMA':'raw'} · terminal floors:</span>${characters}`}function dynamicPlots(reports,run,label,index=0){for(const [key,id] of Object.entries(metricIds))if(selectedMetrics.has(key)){const points=series(reports,key);index?addPlot(id,points,label):plot(id,points,{history:reports,run,label})}}function addComparison({run,reports,steps,end}){timeOrigin=run._timeOrigin;const label=run.run;addPlot('advantage',series(reports,'advantage_mean','mean_advantage'),label);addPlot('optimizer-rate',optimizerSeries(steps,reports,'optimizer_steps_per_second'),label);addPlot('row-rate',optimizerSeries(steps,reports,'used_rows_per_second'),label);addFloor(reports,label);addStage('ascension',reports,'ascension',run,label,end);addStage('bonus',reports,'bonus',run,label,end);addPlot('wins',reports.map(row=>({x:x(row),y:row.metrics.wins/Math.max(1,row.metrics.episodes)})),label);addPlot('clip',series(reports,'clip_fraction'),label);addPlot('kl',series(reports,'post_kl','kl'),label);addPlot('entropy',series(reports,'entropy'),label);addPlot('policy',series(reports,'policy_loss'),label);addPlot('critic',series(reports,'critic_loss'),label);addPlot('duration',optimizerSeries(steps,reports,'total_seconds'),label);addPlot('lag',series(reports,'policy_lag_p95'),label);addPlot('gradient',series(reports,'gradient_norm'),label);addPlot('dataset',series(reports,'dataset_rows'),label);dynamicPlots(reports,run,label,1)}function showVersion(resetRange=true){updateMetricPanels();if(compareSelect.value===versionSelect.value)compareSelect.value='';for(const option of compareSelect.options)option.disabled=option.value===versionSelect.value;const primary=prepareRun(versions[versionSelect.value]),{run,reports,steps}=primary,selectedComparison=compareSelect.value&&prepareRun(versions[compareSelect.value]),comparison=selectedComparison&&clipComparison(selectedComparison,primary),label=comparison?run.run:'';uiRevision=`${versionSelect.value}:${compareSelect.value}:${xaxis.value}`;if(resetRange)setFullRange([primary]);timeOrigin=run._timeOrigin;document.querySelector('#title').textContent=`Spirefysh V${run.version} · ${run.run}${comparison?` vs ${comparison.run.run}`:''}`;showStatus(run);showLegend(primary,comparison);plot('advantage',series(reports,'advantage_mean','mean_advantage'),{history:reports,run,label});plot('optimizer-rate',optimizerSeries(steps,reports,'optimizer_steps_per_second'),{tozero:true,history:reports,run,label});plot('row-rate',optimizerSeries(steps,reports,'used_rows_per_second'),{tozero:true,history:reports,run,label});floorPlot(reports,run,label);stagePlot('ascension',reports,'ascension',runColors[0],run,label);stagePlot('bonus',reports,'bonus',runColors[0],run,label);plot('wins',reports.map(row=>({x:x(row),y:row.metrics.wins/Math.max(1,row.metrics.episodes)})),{range:[0,1],percent:true,history:reports,run,label});plot('clip',series(reports,'clip_fraction'),{range:[0,1],percent:true,history:reports,run,label});plot('kl',series(reports,'post_kl','kl'),{tozero:true,history:reports,run,label});plot('entropy',series(reports,'entropy'),{tozero:true,history:reports,run,label});plot('policy',series(reports,'policy_loss'),{history:reports,run,label});plot('critic',series(reports,'critic_loss'),{tozero:true,history:reports,run,label});plot('duration',optimizerSeries(steps,reports,'total_seconds'),{tozero:true,history:reports,run,label});plot('lag',series(reports,'policy_lag_p95'),{tozero:true,history:reports,run,label});plot('gradient',series(reports,'gradient_norm'),{tozero:true,history:reports,run,label});plot('dataset',series(reports,'dataset_rows'),{tozero:true,history:reports,run,label});dynamicPlots(reports,run,label);if(comparison)addComparison(comparison);timeOrigin=run._timeOrigin;document.querySelector('#rows').innerHTML=rowSummary(reports);document.querySelector('#promotion').innerHTML=promotionSummary(run.promotions.at(-1));bindAxes()}
+function extendFloor(history,index=0){const completed=history.filter(report=>Number(report.metrics.episodes)>0||(report.metrics.trajectory_floors?.length??0)>0);if(!completed.length)return;const node=document.querySelector('#floor'),state=node._floor[index],bands=[['min','max'],['p01','p99'],['p05','p95'],['p10','p90'],['p25','p75']],xs=[],ys=[];for(const [band,[low,high]] of bands.entries()){let rows=completed.map(report=>({x:x(report),low:report.metrics.floor_bands?.[low],high:report.metrics.floor_bands?.[high]})).filter(row=>Number.isFinite(row.low)&&Number.isFinite(row.high)),visible=sampled(rows,state.bands[band]);state.bands[band]+=rows.length;xs.push(visible.map(row=>row.x),visible.map(row=>row.x));ys.push(visible.map(row=>row.low),visible.map(row=>row.high))}if(xs.some(values=>values.length))Plotly.extendTraces(node,{x:xs,y:ys},bands.flatMap((_,band)=>[state.start+2*band,state.start+2*band+1]));let points=trajectoryPoints(completed),visible=sampled(points,state.points);state.points+=points.length;if(visible.length)Plotly.extendTraces(node,{x:[visible.map(point=>point.x)],y:[visible.map(point=>point.y)],customdata:[visible.map(point=>[characterNames[point.character],point.updates,point.step])],'marker.color':[visible.map(point=>characterColors[point.character])]},[state.start+10]);const means=completed.map(report=>({x:x(report),y:report.metrics.floor_bands?.mean??report.metrics.floor_mean})).filter(point=>Number.isFinite(point.y)),offset=state.means,line=means.map(point=>({x:point.x,y:state.ema=state.ema===undefined?point.y:Math.max(.01,Math.min(1,Number(ema.value)||.2))*point.y+(1-Math.max(.01,Math.min(1,Number(ema.value)||.2)))*state.ema})),shown=sampled(means,offset),update={x:[shown.map(point=>point.x)],y:[shown.map(point=>point.y)]},traces=[state.start+11];state.means+=means.length;if(state.smooth!==null){visible=sampled(line,offset);update.x.push(visible.map(point=>point.x));update.y.push(visible.map(point=>point.y));traces.push(state.smooth)}if(update.x.some(values=>values.length))Plotly.extendTraces(node,update,traces)}function extendStage(id,reports,key,index){let points=reports.filter(row=>Number.isFinite(Number(row.stage?.[key]))).map(row=>({x:x(row),y:row.stage[key]}));if(!points.length)return;const node=document.querySelector(`#${id}`),state=node._stage[index],visible=sampled(points,state.seen);state.seen+=points.length;if(visible.length)Plotly.extendTraces(node,{x:[visible.map(point=>point.x)],y:[visible.map(point=>point.y)]},[state.trace])}
+function appendData(run,reports,steps){run.reports=run.reports.filter(row=>!row._open).concat(reports);const all=monotonic(run.reports);updateSteps(all);const last=all.at(-1),revision=Number(last?.metrics.weights_revision??last?.metrics.updates)||0;run._updateOffset=(last?last._updates:0)-revision;speedMetrics(reports);for(const step of steps)step._updates=run._updateOffset+step.weights_revision;run.optimizer_steps.push(...steps);return all}function appendReports(run,reports,steps,index=0){const all=appendData(run,reports,steps);extendPlot('advantage',series(reports,'advantage_mean','mean_advantage'),index);extendPlot('optimizer-rate',optimizerSeries(steps,[],'optimizer_steps_per_second'),index);extendPlot('row-rate',optimizerSeries(steps,[],'used_rows_per_second'),index);if(selectedMetrics.has('floor_bands'))extendFloor(reports,index);if(selectedMetrics.has('ascension'))extendStage('ascension',reports,'ascension',index);if(selectedMetrics.has('bonus'))extendStage('bonus',reports,'bonus',index);extendPlot('wins',reports.map(row=>({x:x(row),y:row.metrics.wins/Math.max(1,row.metrics.episodes)})),index);extendPlot('clip',series(reports,'clip_fraction'),index);extendPlot('kl',series(reports,'post_kl','kl'),index);extendPlot('entropy',series(reports,'entropy'),index);extendPlot('policy',series(reports,'policy_loss'),index);extendPlot('critic',series(reports,'critic_loss'),index);extendPlot('duration',optimizerSeries(steps,[],'total_seconds'),index);extendPlot('lag',series(reports,'policy_lag_p95'),index);extendPlot('gradient',series(reports,'gradient_norm'),index);extendPlot('dataset',series(reports,'dataset_rows'),index);for(const [key,id] of Object.entries(metricIds))if(selectedMetrics.has(key))extendPlot(id,series(reports,key),index);if(index===0){const history=all.filter(row=>!row._open);for(const id of ['ascension','bonus'])if(selectedMetrics.has(id))Plotly.relayout(id,{shapes:stageLines(history,run)});document.querySelector('#rows').innerHTML=rowSummary(history);document.querySelector('#promotion').innerHTML=promotionSummary(run.promotions.at(-1))}}
+let refreshing=false;async function refreshLive(){const selected=[versionSelect.value,...compareSelect.value&&compareSelect.value!==versionSelect.value?[compareSelect.value]:[]];if(refreshing||!selected.some(name=>versions[name]?.live))return;refreshing=true;let redraw=false;try{for(const [index,name] of selected.entries()){const run=versions[name];if(!run.live)continue;const url=`${run.live}&reports=${run.report_count}&steps=${run.optimizer_step_count}&promotions=${run.promotion_count}&token=${encodeURIComponent(run.live_token)}`,live=await fetch(url,{cache:'no-store'}).then(response=>{if(!response.ok)throw Error(response.statusText);return response.json()});if(versionSelect.value!==selected[0]||compareSelect.value!==(selected[1]||''))return;if(live.reset){location.reload();return}run.promotions.push(...live.promotions);timeOrigin=run._timeOrigin||0;if(selected.length>1){appendData(run,live.reports,live.optimizer_steps);redraw||=Boolean(live.reports.length||live.optimizer_steps.length||live.promotions.length)}else appendReports(run,live.reports,live.optimizer_steps,index);run.report_count=live.report_count;run.optimizer_step_count=live.optimizer_step_count;run.promotion_count=live.promotion_count;run.live_revision=live.revision;run.status=live.status;run.last_event_time=live.last_event_time}if(redraw)showVersion(false);else showStatus(versions[selected[0]])}catch{document.querySelector('#status').textContent='offline'}finally{refreshing=false}}
+lineageSelect.onchange=()=>{showBranches();showVersion()};versionSelect.onchange=()=>showVersion();compareSelect.onchange=()=>showVersion();xaxis.onchange=()=>showVersion();smooth.onchange=()=>showVersion(false);ema.oninput=()=>showVersion(false);subsample.oninput=()=>showVersion(false);showVersion();bindAxes();setTimeout(restoreDashboardState,100);window.addEventListener('beforeunload',saveDashboardState);setInterval(refreshLive,2000)</script>"""
     content = content.replace(
         "['Priority',`1+|Awin|+|Aprogress|+terminal/win bonuses`,`Each row gets priority 1 + |policy advantage| + |progress advantage| + 4×terminal + 4×winning-return. Sampling uses the square root of priority.",
         "[manifest.model_version>=66?'Reusable priority':'Priority',manifest.model_version>=66?'initial score, then −3 per use':`1+|Awin|+|Aprogress|+terminal/win bonuses`,manifest.model_version>=66?'Rows remain in the dataset after use, lose three priority points, and retire only below zero. Selection itself is uniform.':'Each row gets priority 1 + |policy advantage| + |progress advantage| + 4×terminal + 4×winning-return. Sampling uses the square root of priority.",
@@ -6007,18 +6083,109 @@ lineageSelect.onchange=()=>{showBranches();showVersion()};versionSelect.onchange
         "['Balanced one-pass batch',`up to ${n(batch)} rows`,`Each batch draws evenly across the five characters when possible, without replacement, then deletes those rows from the dataset.",
         "[manifest.model_version>=66?'Reusable random batch':'Balanced one-pass batch',`up to ${n(batch)} usable rows`,manifest.model_version>=66?'Rows are sampled uniformly across all compute costs. Used rows remain until their priority falls below zero.':'Each batch draws evenly across the five characters when possible, without replacement, then deletes those rows from the dataset.",
     )
-    floor_start = content.index("function floorPlot(")
-    floor_end = content.index("function stagePlot(", floor_start)
-    content = content[:floor_start] + r"""function floorPlot(history,run){const completed=history.filter(report=>Number(report.metrics.episodes)>0||(report.metrics.trajectory_floors?.length??0)>0),points=[],traces=[],bands=[['min','max','min–max','.04'],['p01','p99','p1–p99','.06'],['p05','p95','p5–p95','.09'],['p10','p90','p10–p90','.13'],['p25','p75','p25–p75','.20']];for(const [low,high,name,alpha] of bands){const rows=completed.map(report=>({x:x(report),low:report.metrics.floor_bands?.[low],high:report.metrics.floor_bands?.[high]})).filter(row=>Number.isFinite(row.low)&&Number.isFinite(row.high));traces.push({x:rows.map(row=>row.x),y:rows.map(row=>row.low),mode:'lines',showlegend:false,hoverinfo:'skip',line:{width:0}},{x:rows.map(row=>row.x),y:rows.map(row=>row.high),mode:'lines',name,line:{width:0},fill:'tonexty',fillcolor:`rgba(111,177,255,${alpha})`,hovertemplate:`${name}<br>upper %{y:.2f}<extra></extra>`})}for(const report of completed){let inferred=0,last=-Infinity;for(const row of report.metrics.trajectory_floors||[]){const [iteration,floor,stored]=row;if(stored===undefined&&iteration<last)inferred++;const character=stored??Math.min(inferred,4);points.push({x:x(report),y:floor,character,updates:report._updates,step:report.step});last=iteration}}for(let i=points.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[points[i],points[j]]=[points[j],points[i]]}traces.push({x:points.map(point=>point.x),y:points.map(point=>point.y),customdata:points.map(point=>[characterNames[point.character],point.updates,point.step]),mode:'markers',name:'trajectories',marker:{color:points.map(point=>characterColors[point.character]),size:5,opacity:.28},hovertemplate:'%{customdata[0]}<br>floor %{y}<br>optimizer steps %{customdata[1]:,}<br>report decisions %{customdata[2]:,}<extra></extra>'});const means=completed.map(report=>({x:x(report),y:report.metrics.floor_bands?.mean??report.metrics.floor_mean})).filter(point=>Number.isFinite(point.y));traces.push({x:means.map(point=>point.x),y:means.map(point=>point.y),mode:'lines+markers',name:'mean',line:{color:'#ffb454',width:3},marker:{size:5},hovertemplate:'mean %{y:.2f}<extra></extra>'});if(smooth.checked&&means.length>1){const line=emaLine(means);traces.push({x:line.map(point=>point.x),y:line.map(point=>point.y),mode:'lines',name:`mean EMA α=${Number(ema.value)||.2}`,line:{color:'#f97316',width:2,dash:'dot'},hovertemplate:'mean EMA %{y:.2f}<extra></extra>'})}for(const [character,name] of characterNames.entries())traces.push({x:[null],y:[null],mode:'markers',name,hoverinfo:'skip',marker:{color:characterColors[character],size:7,opacity:.6}});const options=layout(false,[0,52],history,run);options.yaxis.title='Terminal floor';Plotly.react('floor',traces,options,config)}
-""" + content[floor_end:]
     target.mkdir(parents=True, exist_ok=True)
     temporary = target / "dashboard.html.tmp"
     temporary.write_text(content)
     temporary.replace(target / "dashboard.html")
 
 
+class DashboardSource:
+    def __init__(self, target):
+        self.target = target.resolve()
+        self.projectors = {}
+        self.lock = threading.Lock()
+
+    def delta(self, name, version, report_count, step_count, promotion_count, token):
+        with self.lock:
+            run = (self.target / name).resolve()
+            if not run.is_relative_to(self.target):
+                raise ValueError("invalid run")
+            manifest = json.loads((run / "run.json").read_text())
+            session = manifest["sessions"][-1]["id"]
+            key = manifest["run_id"], session
+            projector = self.projectors.get(name)
+            if projector is None or projector[0] != key:
+                projector = key, MetricsProjector(self.target, run, manifest, session)
+                self.projectors[name] = projector
+            metrics = projector[1]
+            if metrics.cursor > metrics.path.stat().st_size:
+                metrics = MetricsProjector(self.target, run, manifest, session)
+                self.projectors[name] = key, metrics
+            else:
+                metrics.cursor = metrics.read(metrics.path, start=metrics.cursor)
+            current_report = metrics.render(metrics.current) if metrics.current else None
+            reports = metrics.closed + ([current_report] if current_report
+                                         and metrics.status != "running" else [])
+            reports = [row for row in reports if report_version(row, manifest) == version]
+            current = [current_report] if current_report and metrics.status == "running" \
+                and report_version(current_report, manifest) == version else []
+            steps = [step for row in reports + current
+                     for step in row["metrics"].get("optimizer_steps", ())]
+            promotions = [row for row in metrics.promotions
+                          if not reports or reports[0]["step"] <= row.get("step", 0)
+                          <= (current or reports)[-1]["step"]]
+            current_token = f"{manifest['run_id']}:{session}:{version}"
+            reset = token not in (None, current_token) or report_count > len(reports) \
+                or step_count > len(steps) or promotion_count > len(promotions)
+            return {
+                "token": current_token, "reset": reset, "revision": metrics.cursor,
+                "status": metrics.status, "last_event_time": metrics.last_time,
+                "reports": reports[report_count:] if not reset else [],
+                "optimizer_steps": steps[step_count:] if not reset else [],
+                "promotions": promotions[promotion_count:] if not reset else [],
+                "report_count": len(reports), "optimizer_step_count": len(steps),
+                "promotion_count": len(promotions),
+            }
+
+
+def serve_dashboard(target, host, port):
+    target = (target.parent if (target / "run.json").exists() else target).resolve()
+    dashboard(target)
+    source = DashboardSource(target)
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            request = urlparse(self.path)
+            try:
+                if request.path in ("/", "/dashboard.html"):
+                    body, content_type = (target / "dashboard.html").read_bytes(), "text/html"
+                elif request.path == "/api":
+                    query = parse_qs(request.query)
+                    value = source.delta(
+                        query["run"][0], int(query["version"][0]),
+                        int(query.get("reports", [0])[0]),
+                        int(query.get("steps", [0])[0]),
+                        int(query.get("promotions", [0])[0]),
+                        query.get("token", [None])[0],
+                    )
+                    if value["reset"]:
+                        dashboard(target)
+                    body, content_type = json.dumps(value, separators=(",", ":")).encode(), \
+                        "application/json"
+                else:
+                    self.send_error(404); return
+            except (KeyError, OSError, ValueError, json.JSONDecodeError) as error:
+                self.send_error(400, str(error)); return
+            self.send_response(200)
+            self.send_header("Content-Type", f"{content_type}; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers(); self.wfile.write(body)
+
+        def log_message(self, format, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer((host, port), Handler)
+    print(f"Dashboard: http://{host}:{server.server_port}/", flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
 def train(args):
-    global _LIVE_PROJECTOR
     if args.expert_batch is None:
         args.expert_batch = args.batch
     qos = getattr(ctypes.CDLL(None), "pthread_set_qos_class_self_np", None)
@@ -6049,12 +6216,15 @@ def train(args):
         raise ValueError("invalid replay setting")
     if min(args.head_learning_rate_multiplier, args.critic_learning_rate_multiplier) <= 0:
         raise ValueError("invalid head learning-rate multiplier")
+    if not all(math.isfinite(getattr(args, f"potential_{term}_weight"))
+               for term in POTENTIAL_TERMS):
+        raise ValueError("invalid potential weights")
     if (args.segment_steps or not 0 <= args.gae_gamma <= 1
-            or not 0 <= args.gae_lambda <= 1 or not 0 <= args.critic_lambda <= 1
+            or not 0 <= args.gae_lambda <= 1
             or not 0 <= args.critic_balance_decay < 1
             or args.blended_critic or args.critic_consistency_weight
             or args.search_consistency_weight and not args.critic_only):
-        raise ValueError("invalid categorical critic settings")
+        raise ValueError("invalid critic settings")
     if args.entropy_weight is not None and args.entropy_weight < 0:
         raise ValueError("invalid entropy weight")
     if (not 0 <= args.mcts_fraction <= 1
@@ -6076,6 +6246,9 @@ def train(args):
         raise ValueError("invalid promotion rates")
     if seed_panel(args.development_seed, args.development_runs)[1] > args.promotion_seed:
         raise ValueError("development and promotion seed panels overlap")
+    potential_weights = tuple(
+        getattr(args, f"potential_{term}_weight") for term in POTENTIAL_TERMS
+    )
     probe_env = sts2_sim.Batch(1, args.training_seed, None, ascension=STAGES[0][0])
     source = None
     if args.checkpoint:
@@ -6091,6 +6264,8 @@ def train(args):
         }
         if any(model.pooling[name] != mode for name, mode in requested_pooling.items()):
             raise ValueError("checkpoint pooling configuration cannot be changed")
+        if model.potential_weights != potential_weights:
+            raise ValueError("checkpoint potential weights cannot be changed")
         args.width, args.layers, args.heads, args.feedforward = loaded
     else:
         config = tuple(value if value is not None else default for value, default in zip(
@@ -6100,7 +6275,8 @@ def train(args):
         layout = dict(probe_env.token_layout(*config))
         pooling = {name: getattr(args, name + "_pooling") or default
                    for name, default in POOLING_DEFAULTS.items()}
-        model = Agent(layout, *config, pooling=pooling).to(target)
+        model = Agent(layout, *config, pooling=pooling,
+                      potential_weights=potential_weights).to(target)
     late_stage = (source["stage"] if source else args.start_stage) >= 5
     if (late_stage or args.freeze_backbone) and args.samplers == 1 and args.envs % 2 == 0:
         args.samplers, args.sampler_threads = 2, min(args.sampler_threads, 4)
@@ -6331,13 +6507,8 @@ def train(args):
         )
         active_checkpoint = write_checkpoint(migrated, decisions, "migration")
         activate_checkpoint(active_checkpoint)
-    _LIVE_PROJECTOR = LiveProjector(
-        output.parent, output, manifest, args.trainer_session,
-    )
-    dashboard(output.parent)
     started = time.monotonic()
     training_started[0] = started
-    dashboard_ready = bool(previous_reports)
     run_started = started - elapsed_offset
     deadline = started + args.hours * 3600 if args.hours else math.inf
     training_seconds = promotion_seconds = 0.0
@@ -6402,7 +6573,6 @@ def train(args):
         atomic_json(best_path, best)
         promotion_seconds += time.monotonic() - promotion_started
         activate_checkpoint(active_checkpoint)
-        dashboard(output.parent)
 
     if args.promote_now:
         promote()
@@ -6420,7 +6590,6 @@ def train(args):
             activate_checkpoint(active_checkpoint)
             last_checkpoint = active_checkpoint
         def save_report(point, pipeline, window):
-            nonlocal dashboard_ready
             written = time.time()
             row = {
                 "schema": 1, "step": point["steps"], "window": window,
@@ -6430,8 +6599,6 @@ def train(args):
                 "pipeline": pipeline, "metrics": point,
             }
             emit_event({"event": "report", **row}, event_time=written)
-            if not dashboard_ready:
-                dashboard(output.parent); dashboard_ready = True
             keep = {output / active_checkpoint["checkpoint"]}
             initial = json.loads((output / "initial.json").read_text())
             keep.add(output / initial["checkpoint"])
@@ -6476,9 +6643,6 @@ def train(args):
         "training_elapsed_seconds": elapsed_offset + time.monotonic() - started,
         **revisions,
     })
-    projector, _LIVE_PROJECTOR = _LIVE_PROJECTOR, None
-    projector.close()
-    dashboard(output.parent)
     shutdown_logging()
 
 
@@ -6512,7 +6676,8 @@ def load(path, target):
     try:
         model = Agent(layout, *(config[key] for key in (
             "width", "layers", "heads", "feedforward", "head_width"
-        )), pooling=config["pooling"], model_version=version).to(target)
+        )), pooling=config["pooling"], model_version=version,
+                      potential_weights=config["potential_weights"]).to(target)
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError("invalid checkpoint architecture") from error
     if config != architecture(model):
@@ -6691,7 +6856,7 @@ def compare_search(args):
 
 
 def value_dataset(model, args, target, seed, runs, deadline):
-    states = []; labels = []; characters = []
+    states = []; targets = []; terminal_values = []; potentials = []; characters = []
     reports = []
     model.eval()
     for character in range(5):
@@ -6701,6 +6866,7 @@ def value_dataset(model, args, target, seed, runs, deadline):
                 raise TimeoutError("finalization exceeded --hours")
             count = min(args.batch, runs - start)
             env = sts2_sim.Batch(count, seed + character * 1_000_000 + start, character, ascension=10)
+            env.set_potential_weights(model.potential_weights)
             active = np.ones(count, bool)
             episode_steps = np.zeros(count, np.int32)
             combat_steps = np.zeros(count, np.int32)
@@ -6735,12 +6901,13 @@ def value_dataset(model, args, target, seed, runs, deadline):
                 choice = np.zeros(count, np.int64); choice[indices] = selected
                 for index in np.flatnonzero(active):
                     seen[index] += 1
+                    sample = packed[index], float(observation[4][index])
                     if len(pending[index]) < args.states_per_run:
-                        pending[index].append(packed[index])
+                        pending[index].append(sample)
                     else:
                         slot = int(rng.integers(seen[index]))
                         if slot < args.states_per_run:
-                            pending[index][slot] = packed[index]
+                            pending[index][slot] = sample
                 in_combat = np.asarray([row[4] == 1 for row in env.stats()])
                 combat_steps = np.where(active & in_combat, combat_steps + 1, 0)
                 _, done, _ = env.step(choice.tolist(), active.tolist())
@@ -6754,7 +6921,12 @@ def value_dataset(model, args, target, seed, runs, deadline):
                 caps += int(capped.sum())
                 for index in np.flatnonzero(done):
                     won = int(stats[index][4] == 12)
-                    states.extend(pending[index]); labels.extend([won] * len(pending[index]))
+                    terminal = CATEGORIES - 1 if won else int(stats[index][9])
+                    value = terminal / (CATEGORIES - 1)
+                    rows, row_potentials = zip(*pending[index]) if pending[index] else ((), ())
+                    states.extend(rows); potentials.extend(row_potentials)
+                    targets.extend(value - potential for potential in row_potentials)
+                    terminal_values.extend([value] * len(rows))
                     characters.extend([character] * len(pending[index]))
                     outcomes.append(won); floors.append((stats[index][0] - 1) * 17 + stats[index][1])
                 for index in np.flatnonzero(capped):
@@ -6767,17 +6939,18 @@ def value_dataset(model, args, target, seed, runs, deadline):
         })
     if not states:
         raise RuntimeError("no resolved trajectories")
-    return states, np.asarray(labels, np.float32), np.asarray(characters), reports
+    return (states, np.asarray(targets, np.float32), np.asarray(terminal_values, np.float32),
+            np.asarray(potentials, np.float32), np.asarray(characters), reports)
 
 
-def value_logits(model, states, batch, target):
+def value_predictions(model, states, potentials, batch, target):
     values = []
     model.eval()
     with torch.no_grad():
         for start in range(0, len(states), batch):
             inputs = unpack(states[start : start + batch], target, model)
-            values.extend(critic_win_logit(model(*inputs[:6])[1]).cpu().tolist())
-    return np.asarray(values, np.float32)
+            values.extend(critic_value(model(*inputs[:6])[1]).cpu().tolist())
+    return np.asarray(values, np.float32) + potentials
 
 
 def calibration(logits, labels):
@@ -6835,7 +7008,7 @@ def export_value_model(path, model, fingerprint, temperature, bias, actor=False)
         b"STSVALUE", struct.pack("<IIQ", model.model_version, FEATURE_VERSION, fingerprint),
         struct.pack("<10I", model.width, model.layers, model.heads, model.feedforward,
                     len(TOKEN_SPECS), len(SEMANTIC_NAMES), model.concepts.num_embeddings,
-                    ACTION_FIELDS[2], ACTION_FIELDS[3], CATEGORIES),
+                    ACTION_FIELDS[2], ACTION_FIELDS[3], 1),
         struct.pack("<64I", *(value for _name, unsigned, signed, semantic, numeric in TOKEN_SPECS
                               for value in (unsigned, signed, semantic, numeric))),
         struct.pack(f"<{len(SEMANTIC_NAMES)}I", *model.concepts.sizes),
@@ -6849,6 +7022,7 @@ def export_value_model(path, model, fingerprint, temperature, bias, actor=False)
         ]),
         bytes([actor]),
         struct.pack("<2f", temperature, bias),
+        struct.pack(f"<{len(POTENTIAL_TERMS)}f", *model.potential_weights),
     ]
 
     values = []
@@ -6944,7 +7118,7 @@ def finalize(args):
     if args.precision != "fp32" and target.type not in ("mps", "cuda"):
         raise ValueError(f"{args.precision} requires MPS or CUDA")
     fit = value_dataset(model, args, target, args.fit_seed, args.fit_runs, deadline)
-    fit_states, fit_report = len(fit[0]), fit[3]
+    fit_states, fit_report = len(fit[0]), fit[5]
     for parameter in model.parameters():
         parameter.requires_grad_(False)
     for parameter in model.critic.parameters():
@@ -6960,28 +7134,31 @@ def finalize(args):
             index = order[start : start + args.head_batch]
             inputs = unpack([fit[0][row] for row in index], target, model)
             labels = torch.as_tensor(fit[1][index], device=target)
-            loss = nn.functional.binary_cross_entropy_with_logits(
-                critic_win_logit(model(*inputs[:6])[1]), labels,
-            )
+            loss = nn.functional.mse_loss(critic_value(model(*inputs[:6])[1]), labels)
             optimizer.zero_grad(set_to_none=True); loss.backward(); optimizer.step()
     del fit
     calibrate = value_dataset(model, args, target, args.calibration_seed, args.calibration_runs, deadline)
-    calibration_logits = value_logits(model, calibrate[0], args.head_batch, target)
-    temperature, bias = calibration(calibration_logits, calibrate[1])
+    calibration_values = value_predictions(
+        model, calibrate[0], calibrate[3], args.head_batch, target
+    )
+    calibration_labels = (calibrate[2] == 1).astype(np.float32)
+    temperature, bias = calibration(calibration_values, calibration_labels)
     base_rates = [
-        float(calibrate[1][calibrate[2] == character].mean())
-        if (calibrate[2] == character).any() else float(calibrate[1].mean())
+        float(calibration_labels[calibrate[4] == character].mean())
+        if (calibrate[4] == character).any() else float(calibration_labels.mean())
         for character in range(5)
     ]
     calibration_metrics = value_metrics(
-        calibration_logits, calibrate[1], calibrate[2], temperature, bias, base_rates
+        calibration_values, calibration_labels, calibrate[4], temperature, bias, base_rates
     )
-    calibration_report = calibrate[3]
+    calibration_report = calibrate[5]
     del calibrate
     test = value_dataset(model, args, target, args.test_seed, args.test_runs, deadline)
-    test_logits = value_logits(model, test[0], args.head_batch, target)
-    test_metrics = value_metrics(test_logits, test[1], test[2], temperature, bias, base_rates)
-    test_metrics["held_out_win_each_character"] = all(row["wins"] for row in test[3])
+    test_values = value_predictions(model, test[0], test[3], args.head_batch, target)
+    test_metrics = value_metrics(
+        test_values, test[2] == 1, test[4], temperature, bias, base_rates
+    )
+    test_metrics["held_out_win_each_character"] = all(row["wins"] for row in test[5])
     if not test_metrics["held_out_win_each_character"]:
         raise RuntimeError("final test requires a held-out win for every character")
     if not test_metrics["beats_constant"] or not all(
@@ -6991,11 +7168,13 @@ def finalize(args):
     output = Path(args.output)
     digest = export_value_model(output, model, checkpoint["fingerprint"], temperature, bias)
     parity_env = sts2_sim.Batch(8, args.test_seed + 99_000_000, None, ascension=10)
-    parity_inputs = tensors(parity_env.observe_tokens(), target, model)
+    parity_env.set_potential_weights(model.potential_weights)
+    parity_observation = parity_env.observe_tokens()
+    parity_inputs = tensors(parity_observation, target, model)
     with torch.no_grad():
-        python_values = (
-            critic_win_logit(predict(model, parity_inputs, "fp32")[1]) / temperature + bias
-        ).sigmoid().cpu().numpy()
+        base = critic_value(predict(model, parity_inputs, "fp32")[1]).cpu().numpy() \
+            + np.asarray(parity_observation[4])
+        python_values = torch.from_numpy(base / temperature + bias).sigmoid().numpy()
     rust_values = np.asarray(parity_env.rust_values(str(output)))
     parity_error = float(np.max(np.abs(python_values - rust_values)))
     if parity_error > 1e-5:
@@ -7014,7 +7193,7 @@ def finalize(args):
         "rust_pytorch_max_abs": parity_error,
         "fit": {"trajectories": fit_report, "states": fit_states},
         "calibration": calibration_metrics | {"trajectories": calibration_report, "base_rates": base_rates},
-        "test": test_metrics | {"trajectories": test[3]},
+        "test": test_metrics | {"trajectories": test[5]},
         "supported_states": "states visited by this frozen player-visible policy",
     }
     atomic_json(output.with_suffix(".json"), report)
@@ -7120,14 +7299,14 @@ def probe():
                 inputs = tensors(observation, target, model)
                 with torch.no_grad():
                     policy, critic = predict(model, inputs, "fp32")
-                assert policy.shape[0] == critic.shape[0] == 2 and critic.shape[1] == CATEGORIES
+                assert policy.shape[0] == critic.shape[0] == 2 and critic.shape[1] == 1
                 assert torch.isfinite(policy).all() and torch.isfinite(critic).all()
                 assert np.array_equal(model._sequence_lengths.cpu(),
                                       expected_lengths(observation, model.pooling))
             exported = Path(parity_directory) / f"{number}.bin"
             export_value_model(exported, model, env.fingerprint(), 1, 0)
             rust = np.asarray(env.rust_values(str(exported)))
-            python = critic_win_logit(critic).sigmoid().numpy()
+            python = critic_value(critic).sigmoid().numpy()
             assert np.max(np.abs(python - rust)) <= 1e-5
 
     model = Agent(layout).eval()
@@ -7142,7 +7321,7 @@ def probe():
     with torch.no_grad():
         policy, critic = predict(model, tensors(no_actions, target, model), "fp32")
     assert policy.shape == empty_actions[5].shape and not policy.any()
-    assert critic.shape == (len(noncombat[0]), CATEGORIES)
+    assert critic.shape == (len(noncombat[0]), 1)
     assert np.array_equal(model._sequence_lengths.cpu(), expected_lengths(no_actions, model.pooling))
 
     sequence = torch.randn(1, 3, model.width)
@@ -7176,11 +7355,14 @@ def probe():
         "phase": "sum", "generation_pool": "sum",
     }
     torch.manual_seed(12)
-    model = Agent(layout, pooling=mixed).eval()
+    model = Agent(layout, pooling=mixed, potential_weights=(.001,) + (0.,) * 12).eval()
     model.critic.weight.data.normal_(std=.1); model.critic.bias.data.normal_(std=.1)
+    env.set_potential_weights(model.potential_weights)
+    combat = env.observe_tokens()
     inputs = tensors(combat, target, model)
     with torch.no_grad():
-        python = (critic_win_logit(predict(model, inputs, "fp32")[1]) / .83 - .17).sigmoid().numpy()
+        base = critic_value(predict(model, inputs, "fp32")[1]).numpy() + combat[4]
+        python = torch.from_numpy(base / .83 - .17).sigmoid().numpy()
     with tempfile.TemporaryDirectory() as directory:
         exported = Path(directory) / "value.bin"
         export_value_model(exported, model, env.fingerprint(), .83, -.17)
@@ -7231,12 +7413,12 @@ def probe():
             raise AssertionError("accepted incompatible checkpoint architecture")
         except ValueError:
             pass
-        compact = Agent(compact_layout, 64, 2, 4, 128, model_version=71).eval()
+        compact = Agent(compact_layout, 64, 2, 4, 128).eval()
         compact.critic.weight.data.normal_(std=.1)
         compact_path = Path(directory) / "compact.bin"
         export_value_model(compact_path, compact, env.fingerprint(), 1, 0)
         with torch.no_grad():
-            compact_python = critic_win_logit(predict(
+            compact_python = critic_value(predict(
                 compact, tensors(combat, target, compact), "fp32",
             )[1]).sigmoid().numpy()
         compact_rust = np.asarray(env.rust_values(str(compact_path)))
@@ -7244,22 +7426,22 @@ def probe():
         compact_checkpoint = Path(directory) / "compact.pt"
         compact_optimizer = torch.optim.Adam(compact.parameters())
         torch.save({
-            "schema": 1, "model_version": 71, "feature_version": FEATURE_VERSION,
+            "schema": 1, "model_version": MODEL_VERSION, "feature_version": FEATURE_VERSION,
             "fingerprint": env.fingerprint(), "layout": compact_layout,
             "architecture": architecture(compact), "model": compact.state_dict(),
             "optimizer": compact_optimizer.state_dict(),
         }, compact_checkpoint)
         restored, loaded = load(compact_checkpoint, target)
         assert (restored.model_version, restored.width, restored.layers,
-                restored.heads, restored.feedforward) == (71, 64, 2, 4, 128)
-        assert loaded["model_version"] == 71
+                restored.heads, restored.feedforward) == (MODEL_VERSION, 64, 2, 4, 128)
+        assert loaded["model_version"] == MODEL_VERSION
         incompatible = torch.load(checkpoint, weights_only=False)
         incompatible["architecture"]["position_caps"]["enemy"] = 32
-        incompatible["model_version"] = 70
+        incompatible["model_version"] = MODEL_VERSION - 1
         torch.save(incompatible, checkpoint)
         try:
             load(checkpoint, target)
-            raise AssertionError("accepted pre-v71 checkpoint")
+            raise AssertionError("accepted obsolete checkpoint")
         except ValueError:
             pass
     assert np.max(np.abs(python - rust)) <= 1e-5
@@ -7284,7 +7466,8 @@ def parser():
     root = argparse.ArgumentParser()
     commands = root.add_subparsers(dest="command", required=True)
     run = commands.add_parser("train")
-    run.add_argument("--output", default="target/v71")
+    run._negative_number_matcher = re.compile(r"^-\d*\.?\d+(?:[eE][+-]?\d+)?$")
+    run.add_argument("--output", default="target/v73")
     run.add_argument("--checkpoint")
     run.add_argument("--width", type=int)
     run.add_argument("--layers", type=int)
@@ -7347,7 +7530,8 @@ def parser():
     run.add_argument("--freeze-backbone", action="store_true")
     run.add_argument("--gae-gamma", type=float, default=1.0)
     run.add_argument("--gae-lambda", type=float, default=1.0)
-    run.add_argument("--critic-lambda", type=float, default=1.0)
+    for term in POTENTIAL_TERMS:
+        run.add_argument(f"--potential-{term.replace('_', '-')}-weight", type=float, default=0.)
     run.add_argument("--critic-balance-decay", type=float, default=.99)
     run.add_argument("--critic-consistency-weight", type=float, default=0)
     run.add_argument("--critic-consistency-batch", type=int, default=1024)
@@ -7379,8 +7563,8 @@ def parser():
     run.add_argument("--evaluation-batch", type=int, default=32)
     run.add_argument("--evaluation-max-steps", type=int, default=2048)
     run.add_argument("--evaluation-max-combat-steps", type=int, default=512)
-    run.add_argument("--max-steps", type=int, default=2048)
-    run.add_argument("--max-combat-steps", type=int, default=512)
+    run.add_argument("--max-steps", type=int, default=65_536)
+    run.add_argument("--max-combat-steps", type=int, default=2_048)
     run.add_argument("--seed", type=int, default=1)
     run.add_argument("--promote-now", action="store_true")
     evaluate_parser = commands.add_parser("evaluate")
@@ -7441,6 +7625,8 @@ def parser():
     final.add_argument("--seed", type=int, default=29)
     dashboard_parser = commands.add_parser("dashboard")
     dashboard_parser.add_argument("target", nargs="?", default="target")
+    dashboard_parser.add_argument("--host", default="127.0.0.1")
+    dashboard_parser.add_argument("--port", type=int, default=8000)
     search = commands.add_parser("search-diagnostics")
     search.add_argument("checkpoint")
     search.add_argument("--output", default="target/search-diagnostics-v68")
@@ -7488,12 +7674,6 @@ if __name__ == "__main__":
                     "event": "session_error", "error": repr(error),
                     "traceback": traceback.format_exc(),
                 }, "ERROR")
-            if _LIVE_PROJECTOR is not None:
-                projector, _LIVE_PROJECTOR = _LIVE_PROJECTOR, None
-                try:
-                    projector.close()
-                except BaseException:
-                    pass
             shutdown_logging()
             raise
     elif args.command == "finalize":
@@ -7507,7 +7687,7 @@ if __name__ == "__main__":
     elif args.command == "evaluate-search-policies":
         evaluate_search_policies(args)
     elif args.command == "dashboard":
-        dashboard(Path(args.target))
+        serve_dashboard(Path(args.target), args.host, args.port)
     elif args.command == "search-diagnostics":
         diagnose_search(args)
     elif args.command == "compare-search":

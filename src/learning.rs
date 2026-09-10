@@ -15,9 +15,10 @@ use std::{
 
 const MAGIC: &[u8; 8] = b"STSVALUE";
 const VERSION: u32 = 56;
-const VALUE_MODEL_VERSION: u32 = 72;
-const MIN_VALUE_MODEL_VERSION: u32 = 71;
-const VALUE_CATEGORIES: usize = 83;
+const VALUE_MODEL_VERSION: u32 = 73;
+const MIN_VALUE_MODEL_VERSION: u32 = 73;
+const TERMINAL_CATEGORIES: usize = 83;
+const POTENTIAL_WEIGHT_COUNT: usize = 13;
 const TOKEN_CATEGORICAL: usize = 10;
 const TOKEN_NUMERIC: usize = 24;
 const TOKEN_VALUES: usize = TOKEN_CATEGORICAL + TOKEN_NUMERIC;
@@ -362,7 +363,7 @@ struct ObservationV56 {
     globals: Vec<f32>,
     domains: [DomainRows; 16],
     candidates: Vec<CandidateRow>,
-    potential: f32,
+    potential: [f32; POTENTIAL_WEIGHT_COUNT],
 }
 
 const POOL_COLLECTIONS: [usize; 6] = [
@@ -9535,7 +9536,7 @@ fn observation_v56_with_candidates(
         globals: observation_globals_with_bonuses(game, content, layout, bonuses, true),
         domains,
         candidates,
-        potential: potential(game),
+        potential: potential(game, content),
     }
 }
 
@@ -9726,31 +9727,65 @@ fn resample_canonical_combat_hidden(game: &mut Game, seed: u64) {
     }
 }
 
-fn potential(game: &Game) -> f32 {
+fn potential(game: &Game, content: &Content) -> [f32; POTENTIAL_WEIGHT_COUNT] {
     if matches!(game.phase, Phase::Won | Phase::Dead) {
-        return 0.0;
+        return [0.0; POTENTIAL_WEIGHT_COUNT];
     }
-    let progress = ((game.run.act.saturating_sub(1) as f32 * 17.0 + game.run.floor as f32) / 52.0)
-        .clamp(0.0, 1.0);
     let hp = game
         .combat()
         .map_or(game.run.hp, |combat| combat.player.hp)
-        .max(0) as f32
-        / game.run.max_hp.max(1) as f32;
-    let combat = game.combat().map_or(0.0, |combat| {
-        let current: i32 = combat
-            .enemies
+        .max(0) as f32;
+    let relics = &game.run.relics;
+    let deck = &game.run.deck;
+    [
+        1.0,
+        game.run.max_hp as f32,
+        deck.iter()
+            .map(|card| card.upgrades as usize)
+            .sum::<usize>() as f32,
+        relics.len() as f32,
+        game.run.potions.iter().flatten().count() as f32,
+        game.run.gold as f32,
+        deck.len() as f32,
+        relics
             .iter()
-            .map(|enemy| enemy.creature.hp.max(0) as i32)
-            .sum();
-        let maximum: i32 = combat
-            .enemies
+            .filter(|&&id| crate::game::relic_group(id) == Some(1))
+            .count() as f32,
+        relics
             .iter()
-            .map(|enemy| enemy.creature.max_hp.max(1) as i32)
-            .sum();
-        1.0 - current as f32 / maximum.max(1) as f32
-    });
-    0.7 * progress + 0.2 * hp + 0.1 * combat
+            .filter(|&&id| crate::game::relic_group(id) == Some(2))
+            .count() as f32,
+        game.run
+            .potions
+            .iter()
+            .flatten()
+            .filter(|id| crate::foundation::UNCOMMON_POTIONS.contains(id))
+            .count() as f32,
+        game.run
+            .potions
+            .iter()
+            .flatten()
+            .filter(|id| crate::foundation::RARE_POTIONS.contains(id))
+            .count() as f32,
+        deck.iter()
+            .filter(|card| content.cards[card.id as usize].rarity == CardRarity::Uncommon)
+            .count() as f32,
+        deck.iter()
+            .filter(|card| content.cards[card.id as usize].rarity == CardRarity::Rare)
+            .count() as f32,
+    ]
+    .map(|term| hp * term)
+}
+
+fn potential_value(
+    potential: &[f32; POTENTIAL_WEIGHT_COUNT],
+    weights: &[f32; POTENTIAL_WEIGHT_COUNT],
+) -> f32 {
+    potential
+        .iter()
+        .zip(weights)
+        .map(|(term, weight)| term * weight)
+        .sum()
 }
 
 struct ContentHasher(u64);
@@ -9988,6 +10023,7 @@ pub struct ValueModel {
     critic: LinearWeights,
     temperature: f32,
     bias: f32,
+    potential_weights: [f32; POTENTIAL_WEIGHT_COUNT],
     encode_caches: Vec<Mutex<EncodingCache>>,
 }
 
@@ -10020,7 +10056,7 @@ impl ValueModel {
             concept_vocab,
             action_c,
             action_f,
-            categories,
+            critic_outputs,
         ] = <[u32; 10]>::try_from(dimensions).unwrap();
         let widths = (0..domains)
             .map(|_| {
@@ -10053,7 +10089,7 @@ impl ValueModel {
             || concept_vocab as usize != layout.concept_vocab()
             || action_c as usize != ACTION_C
             || action_f as usize != ACTION_F
-            || categories as usize != VALUE_CATEGORIES
+            || critic_outputs != 1
             || widths != DOMAIN_WIDTHS
             || concept_sizes != layout.semantic_sizes
             || position_caps != POSITION_CAPS
@@ -10063,7 +10099,16 @@ impl ValueModel {
         }
         let temperature = read_f32(&mut input)?;
         let bias = read_f32(&mut input)?;
-        if !temperature.is_finite() || temperature <= 0.0 || !bias.is_finite() {
+        let potential_weights = <[f32; POTENTIAL_WEIGHT_COUNT]>::try_from(read_f32s(
+            &mut input,
+            POTENTIAL_WEIGHT_COUNT,
+        )?)
+        .unwrap();
+        if !temperature.is_finite()
+            || temperature <= 0.0
+            || !bias.is_finite()
+            || potential_weights.iter().any(|weight| !weight.is_finite())
+        {
             return Err(invalid("invalid value calibration"));
         }
         let semantic_embedding = read_f32s(&mut input, concept_vocab as usize * width)?;
@@ -10110,7 +10155,7 @@ impl ValueModel {
         let policy = actor
             .then(|| LinearWeights::read(&mut input, width, 1))
             .transpose()?;
-        let critic = LinearWeights::read(&mut input, width, VALUE_CATEGORIES)?;
+        let critic = LinearWeights::read(&mut input, width, 1)?;
         if !input.is_empty() {
             return Err(invalid("trailing value model data"));
         }
@@ -10148,6 +10193,7 @@ impl ValueModel {
             critic,
             temperature,
             bias,
+            potential_weights,
             encode_caches: (0..16).map(|_| Mutex::default()).collect(),
         })
     }
@@ -10946,24 +10992,19 @@ impl ValueModel {
             .collect::<Vec<_>>();
         let normalizer = log_sum_exp(&raw);
         let scores = raw.into_iter().map(|score| score - normalizer).collect();
-        let probabilities = softmax(&self.critic.apply(&state));
-        let expected = probabilities
-            .iter()
-            .enumerate()
-            .map(|(i, p)| i as f32 * p)
-            .sum::<f32>()
-            / (VALUE_CATEGORIES - 1) as f32;
+        let shaped = self.critic.apply(&state)[0];
+        let expected = shaped + potential_value(&observation.potential, &self.potential_weights);
         Ok((
             scores,
-            probabilities[VALUE_CATEGORIES - 1],
+            sigmoid(expected / self.temperature + self.bias),
             expected,
-            probabilities,
+            vec![shaped],
         ))
     }
 
     fn evaluate_batch(
         &self,
-        _observations: &[&ObservationV56],
+        observations: &[&ObservationV56],
         features: &[(Vec<f32>, Vec<Vec<f32>>)],
         temperature: f32,
         rollout_temperature: Option<f32>,
@@ -10976,7 +11017,9 @@ impl ValueModel {
         if !temperature.is_finite() || temperature <= 0.0 {
             return Err(invalid("invalid policy temperature"));
         }
-        let evaluate = |(state, actions): &(Vec<f32>, Vec<Vec<f32>>)| {
+        let evaluate = |index: usize| {
+            let observation = observations[index];
+            let (state, actions) = &features[index];
             let scores = |temperature: f32| {
                 let input = actions.iter().flatten().copied().collect::<Vec<_>>();
                 let raw = linear_batch(&input, actions.len(), &policy.w, &policy.b)
@@ -10988,27 +11031,22 @@ impl ValueModel {
                     .map(|score| score - normalizer)
                     .collect::<Vec<_>>()
             };
-            let probabilities = values
-                .then(|| softmax(&self.critic.apply(state)))
-                .unwrap_or_default();
-            let expected = probabilities
-                .iter()
-                .enumerate()
-                .map(|(i, p)| i as f32 * p)
-                .sum::<f32>()
-                / (VALUE_CATEGORIES - 1) as f32;
+            let shaped = values.then(|| self.critic.apply(state)[0]);
+            let expected = shaped.map_or(0.0, |value| {
+                value + potential_value(&observation.potential, &self.potential_weights)
+            });
             (
                 scores(temperature),
-                probabilities.last().copied().unwrap_or_default(),
+                shaped.map_or(0.0, |_| sigmoid(expected / self.temperature + self.bias)),
                 expected,
-                probabilities,
+                shaped.into_iter().collect(),
                 rollout_temperature.map(scores),
             )
         };
         #[cfg(feature = "python")]
-        let output = features.par_iter().map(evaluate).collect();
+        let output = (0..features.len()).into_par_iter().map(evaluate).collect();
         #[cfg(not(feature = "python"))]
-        let output = features.iter().map(evaluate).collect();
+        let output = (0..features.len()).map(evaluate).collect();
         Ok(output)
     }
 
@@ -11019,9 +11057,9 @@ impl ValueModel {
             _ => {}
         }
         let observation = observation_v56(game, content, self.layout, (0, 0));
-        let logits = self.critic.apply(&self.state(&observation));
-        let logit = logits[VALUE_CATEGORIES - 1] - log_sum_exp(&logits[..VALUE_CATEGORIES - 1]);
-        sigmoid(logit / self.temperature + self.bias)
+        let value = self.critic.apply(&self.state(&observation))[0]
+            + potential_value(&observation.potential, &self.potential_weights);
+        sigmoid(value / self.temperature + self.bias)
     }
 }
 
@@ -11250,18 +11288,6 @@ fn log_sum_exp(values: &[f32]) -> f32 {
             .map(|value| (value - maximum).exp())
             .sum::<f32>()
             .ln()
-}
-
-fn softmax(values: &[f32]) -> Vec<f32> {
-    let maximum = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let mut output = values
-        .iter()
-        .map(|value| value - maximum)
-        .collect::<Vec<_>>();
-    exp_in_place(&mut output);
-    let total = output.iter().sum::<f32>();
-    output.iter_mut().for_each(|value| *value /= total);
-    output
 }
 
 fn invalid(message: &'static str) -> io::Error {
@@ -12292,6 +12318,7 @@ mod python {
         first_teacher: Option<(usize, usize)>,
         training_strength: i16,
         training_dexterity: i16,
+        potential_weights: [f32; POTENTIAL_WEIGHT_COUNT],
         resample_archive: bool,
         archive_depth: usize,
         policy: Option<ValueModel>,
@@ -12316,6 +12343,7 @@ mod python {
 
     struct SearchNode {
         value: f32,
+        potential: f32,
         value_samples: u32,
         packed: Option<Vec<u8>>,
         action_count: usize,
@@ -12330,6 +12358,7 @@ mod python {
             candidates: Vec<CandidateRow>,
             log_policy: &[f32],
             value: f32,
+            potential: f32,
             depth: usize,
             behavior_exponent: f32,
             packed: Option<Vec<u8>>,
@@ -12384,6 +12413,7 @@ mod python {
             }
             Self {
                 value,
+                potential,
                 value_samples: 1,
                 packed,
                 action_count,
@@ -12486,7 +12516,7 @@ mod python {
         match game.phase {
             Phase::Won => Some(1.0),
             Phase::Dead if progress => {
-                Some(canonical_progress(game) as f32 / (VALUE_CATEGORIES - 1) as f32)
+                Some(canonical_progress(game) as f32 / (TERMINAL_CATEGORIES - 1) as f32)
             }
             Phase::Dead => Some(0.0),
             _ => None,
@@ -12525,6 +12555,7 @@ mod python {
         turns: usize,
         max_depth: usize,
         nodes: Vec<SearchNode>,
+        potential_weights: [f32; POTENTIAL_WEIGHT_COUNT],
         lookup: FastMap<(u64, usize), usize>,
         games: Option<Vec<Game>>,
         progress: bool,
@@ -12567,6 +12598,7 @@ mod python {
             layout: Layout,
             log_policy: &[f32],
             value: f32,
+            potential_weights: [f32; POTENTIAL_WEIGHT_COUNT],
             budget: usize,
             turns: usize,
             max_depth: usize,
@@ -12594,6 +12626,7 @@ mod python {
                 observation.candidates.clone(),
                 log_policy,
                 value,
+                potential_value(&observation.potential, &potential_weights),
                 0,
                 behavior_exponent,
                 Some(compact_packed_observation_known(observation, Some(digest))),
@@ -12609,6 +12642,7 @@ mod python {
                 turns,
                 max_depth,
                 nodes,
+                potential_weights,
                 lookup,
                 games,
                 progress,
@@ -12868,10 +12902,12 @@ mod python {
             }
             let index = self.nodes.len();
             self.lookup.insert(key, index);
+            let potential = potential_value(&observation.potential, &self.potential_weights);
             self.nodes.push(SearchNode::new(
                 observation.candidates,
                 log_policy,
                 value,
+                potential,
                 depth,
                 self.behavior_exponent,
                 packed,
@@ -13015,6 +13051,10 @@ mod python {
             }
             let mut children = children.into_iter().collect::<Vec<_>>();
             children.sort_by_key(|&(child, _)| child);
+            let child_potential = children
+                .iter()
+                .map(|(child, weight)| self.nodes[*child].potential * weight)
+                .sum::<f32>();
             let (packed, weights) = children
                 .into_iter()
                 .map(|(child, weight)| {
@@ -13027,11 +13067,15 @@ mod python {
                     )
                 })
                 .unzip();
+            let self_weight = (1.0 - covered).max(0.0);
             SearchConsistency {
                 packed,
                 weights,
-                self_weight: (1.0 - covered).max(0.0),
-                terminal_value,
+                self_weight,
+                terminal_value: terminal_value
+                    + self_weight * self.nodes[node].potential
+                    + child_potential
+                    - self.nodes[node].potential,
             }
         }
     }
@@ -13655,6 +13699,7 @@ mod python {
                         layout,
                         &prior,
                         *progress,
+                        model.potential_weights,
                         budget,
                         turns,
                         max_depth,
@@ -14002,7 +14047,7 @@ mod python {
                     }
                 })
                 .collect::<Vec<_>>();
-            let node = SearchNode::new(row.candidates.clone(), &policy, 0.0, depth, 1.0, None);
+            let node = SearchNode::new(row.candidates.clone(), &policy, 0.0, 0.0, depth, 1.0, None);
             if node.edges.is_empty() {
                 return self.leaf(&particles, Some(&row), depth, rng);
             }
@@ -14225,6 +14270,7 @@ mod python {
             layout,
             &prior,
             value,
+            model.potential_weights,
             simulations,
             turns,
             max_depth,
@@ -16297,6 +16343,7 @@ mod python {
                 first_teacher: None,
                 training_strength: 0,
                 training_dexterity: 0,
+                potential_weights: [0.0; POTENTIAL_WEIGHT_COUNT],
                 resample_archive: true,
                 archive_depth: 0,
                 policy: None,
@@ -16499,6 +16546,18 @@ mod python {
             }
             (self.training_strength, self.training_dexterity) = bonuses;
             self.plans.iter_mut().for_each(Vec::clear);
+        }
+
+        fn set_potential_weights(&mut self, weights: Vec<f32>) -> PyResult<()> {
+            if weights.len() != POTENTIAL_WEIGHT_COUNT
+                || weights.iter().any(|weight| !weight.is_finite())
+            {
+                return Err(PyValueError::new_err(
+                    "potential weights must be 13 finite numbers",
+                ));
+            }
+            self.potential_weights = weights.try_into().unwrap();
+            Ok(())
         }
 
         fn set_archive_resampling(&mut self, enabled: bool) {
@@ -17289,6 +17348,7 @@ mod python {
             let layout = self.layout;
             let content = &self.content;
             let bonuses = (self.training_strength, self.training_dexterity);
+            let potential_weights = self.potential_weights;
             let active = active.unwrap_or_else(|| vec![true; self.games.len()]);
             if active.len() != self.games.len() {
                 return Err(PyValueError::new_err("invalid active mask"));
@@ -17334,7 +17394,7 @@ mod python {
                 characters[batch] = row.character;
                 globals[batch * globals_len(layout)..(batch + 1) * globals_len(layout)]
                     .copy_from_slice(&row.globals);
-                potentials[batch] = row.potential;
+                potentials[batch] = potential_value(&row.potential, &potential_weights);
                 for (position, candidate) in row.candidates.iter().enumerate() {
                     let base = batch * max_actions + position;
                     if !flat {
@@ -17875,6 +17935,7 @@ mod python {
                                 observation.candidates.clone(),
                                 &policy,
                                 0.0,
+                                0.0,
                                 0,
                                 1.0,
                                 None,
@@ -17956,7 +18017,6 @@ mod python {
             mcts_timeout=0.0,
             cache_features=false,
             skip_forced=false,
-            compact_critic=false,
         ))]
         fn policy<'py>(
             &mut self,
@@ -17980,7 +18040,6 @@ mod python {
             mcts_timeout: f64,
             cache_features: bool,
             skip_forced: bool,
-            compact_critic: bool,
         ) -> PyResult<Bound<'py, PyTuple>> {
             if !(0.0..=1.0).contains(&mcts_fraction)
                 || mcts_max_depth == 0
@@ -18022,11 +18081,13 @@ mod python {
             let content = &self.content;
             let layout = self.layout;
             let bonuses = (self.training_strength, self.training_dexterity);
+            let potential_weights = self.potential_weights;
             let skip_forced = (cache_features || skip_forced) && !search_enabled;
             let rows = py.allow_threads(|| {
                 self.games
                     .par_iter()
                     .map(|game| {
+                        let potential = potential(game, content);
                         let (mut actions, legal) = candidate_actions(game, content);
                         if !skip_forced || actions.len() != 1 {
                             return observation_v56_with_candidates(
@@ -18045,7 +18106,7 @@ mod python {
                                 f: [0.0; ACTION_F],
                                 legal: true,
                             }],
-                            potential: 0.0,
+                            potential,
                         }
                     })
                     .collect::<Vec<_>>()
@@ -18148,11 +18209,14 @@ mod python {
             let mut characters = Vec::with_capacity(rows.len());
             let mut choices = Vec::with_capacity(rows.len());
             let mut log_probabilities = Vec::with_capacity(rows.len());
-            let critic_columns = if compact_critic { 2 } else { VALUE_CATEGORIES };
-            let mut critic_probabilities = Vec::with_capacity(rows.len() * critic_columns);
+            let mut critic_values = Vec::with_capacity(rows.len());
             let mut packed_rows = Vec::with_capacity(rows.len());
             let mut cached_features = Vec::with_capacity(rows.len());
             let mut selected_actions = Vec::with_capacity(rows.len());
+            let potentials = rows
+                .iter()
+                .map(|row| potential_value(&row.potential, &potential_weights))
+                .collect::<Vec<_>>();
             self.actions.clear();
             if advance {
                 self.actions.resize_with(rows.len(), Vec::new);
@@ -18163,13 +18227,7 @@ mod python {
                     characters.push(row.character);
                     choices.push(0);
                     log_probabilities.push(0.0);
-                    if compact_critic {
-                        critic_probabilities.extend([0.0, 0.0]);
-                    } else {
-                        critic_probabilities.push(1.0);
-                        critic_probabilities
-                            .resize(critic_probabilities.len() + VALUE_CATEGORIES - 1, 0.0);
-                    }
+                    critic_values.push(0.0);
                     if advance {
                         selected_actions.push(row.candidates[0].action.clone());
                     } else {
@@ -18179,7 +18237,7 @@ mod python {
                     packed_rows.push(PyBytes::new(py, &packed));
                     continue;
                 }
-                let ((state, actions), (log_policy, win, expected, probabilities, _)) =
+                let ((state, actions), (log_policy, _win, _expected, values, _)) =
                     evaluated.next().unwrap();
                 let choice = if sample {
                     sample_policy(&log_policy, &mut random)
@@ -18195,11 +18253,7 @@ mod python {
                 characters.push(row.character);
                 choices.push(choice as i64);
                 log_probabilities.push(log_policy[choice]);
-                if compact_critic {
-                    critic_probabilities.extend([win, expected]);
-                } else {
-                    critic_probabilities.extend(probabilities);
-                }
+                critic_values.push(values[0]);
                 if advance {
                     selected_actions.push(row.candidates[choice].action.clone());
                 } else {
@@ -18277,7 +18331,6 @@ mod python {
                     .map(Bound::into_any)
                 })
                 .collect::<PyResult<Vec<_>>>()?;
-            let batch = characters.len();
             let mut output = vec![
                 ndarray::Array1::from_vec(characters)
                     .into_pyarray(py)
@@ -18288,8 +18341,7 @@ mod python {
                 ndarray::Array1::from_vec(log_probabilities)
                     .into_pyarray(py)
                     .into_any(),
-                ndarray::Array2::from_shape_vec((batch, critic_columns), critic_probabilities)
-                    .unwrap()
+                ndarray::Array1::from_vec(critic_values)
                     .into_pyarray(py)
                     .into_any(),
                 PyTuple::new(py, packed_rows)?.into_any(),
@@ -18401,6 +18453,9 @@ mod python {
                     ndarray::Array1::from_vec(phases)
                         .into_pyarray(py)
                         .into_any(),
+                    ndarray::Array1::from_vec(potentials)
+                        .into_pyarray(py)
+                        .into_any(),
                 ]);
             }
             if cache_features {
@@ -18470,6 +18525,7 @@ mod python {
                 .map(|action| matches!(action, Some(Action::Path(_))))
                 .collect::<Vec<_>>();
             let content = &self.content;
+            let potential_weights = self.potential_weights;
             let results = py
                 .allow_threads(|| {
                     self.games
@@ -18484,7 +18540,12 @@ mod python {
                                 .map_err(|error| format!("{error:?}"))?;
                             let reward = matches!(game.phase, Phase::Won) as u8 as f32;
                             let done = matches!(game.phase, Phase::Won | Phase::Dead);
-                            Ok((reward, done, 0.0, !was_combat && game.combat().is_some()))
+                            Ok((
+                                reward,
+                                done,
+                                potential_value(&potential(game, content), &potential_weights),
+                                !was_combat && game.combat().is_some(),
+                            ))
                         })
                         .collect::<Result<Vec<_>, String>>()
                 })
@@ -22018,7 +22079,7 @@ mod tests {
                 state_tokens(game, &content, layout),
                 actions,
                 action_rows,
-                potential(game),
+                potential(game, &content),
             )
         };
         let mut game = Game::new_character_ascension(&content, 9, 0, 10).unwrap();
@@ -23934,9 +23995,56 @@ mod tests {
         let mut game = Game::new_character_ascension(&content, 12, 0, 10).unwrap();
         game.begin_act(&content, 0).unwrap();
         game.phase = Phase::Won;
-        assert_eq!(potential(&game), 0.0);
+        assert_eq!(potential(&game, &content), [0.0; POTENTIAL_WEIGHT_COUNT]);
         game.phase = Phase::Dead;
-        assert_eq!(potential(&game), 0.0);
+        assert_eq!(potential(&game, &content), [0.0; POTENTIAL_WEIGHT_COUNT]);
+    }
+
+    #[test]
+    fn potential_is_hp_times_weighted_run_resources() {
+        let content = foundation_content();
+        let mut game = Game::new_character_ascension(&content, 12, 0, 10).unwrap();
+        game.begin_act(&content, 0).unwrap();
+        let uncommon = content
+            .cards
+            .iter()
+            .position(|card| card.rarity == CardRarity::Uncommon)
+            .unwrap() as Id;
+        let rare = content
+            .cards
+            .iter()
+            .position(|card| card.rarity == CardRarity::Rare)
+            .unwrap() as Id;
+        game.run.hp = 7;
+        game.run.max_hp = 80;
+        game.run.gold = 123;
+        game.run.deck = vec![
+            Card {
+                id: uncommon,
+                upgrades: 2,
+                ..Card::default()
+            },
+            Card {
+                id: rare,
+                upgrades: 1,
+                ..Card::default()
+            },
+            Card::default(),
+        ];
+        game.run.relics = vec![
+            crate::foundation::COMMON_RELICS[0],
+            crate::foundation::UNCOMMON_RELICS[0],
+            crate::foundation::RARE_RELICS[0],
+        ];
+        game.run.potions = vec![
+            Some(crate::foundation::UNCOMMON_POTIONS[0]),
+            Some(crate::foundation::RARE_POTIONS[0]),
+            None,
+        ];
+        assert_eq!(
+            potential_value(&potential(&game, &content), &[1.0; POTENTIAL_WEIGHT_COUNT]),
+            1547.0
+        );
     }
 
     #[test]
@@ -26468,7 +26576,7 @@ mod tests {
     #[test]
     fn v56_layout_uses_explicit_token_dimensions_and_positions() {
         let layout = Layout::new(&foundation_content());
-        assert_eq!((VERSION, VALUE_MODEL_VERSION), (56, 72));
+        assert_eq!((VERSION, VALUE_MODEL_VERSION), (56, 73));
         assert_eq!(
             (
                 DEFAULT_MODEL_WIDTH,

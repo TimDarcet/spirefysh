@@ -5,6 +5,7 @@ from argparse import Namespace
 from pathlib import Path
 
 import numpy as np
+import torch
 
 import train
 
@@ -50,7 +51,11 @@ class TelemetryTest(unittest.TestCase):
                  "policy_trained_rows": 20, "critic_trained_rows": 20,
                  "policy_outcome": "accepted", "commit_kind": "full",
                  "retired_rows": 4,
-                 "policy_loss": 2, "critic_loss": 3, "total_seconds": 1,
+                 "policy_loss": 2, "critic_loss": 3,
+                 "search_consistency_loss": .25, "gradient_clipped": True,
+                 "critic_explained_reward_variance": .5, "total_seconds": 1,
+                 "critic_explained_reward_variance_by_floor": {
+                     "12": {"value": .5, "target_variance": .25, "rows": 20}},
                  "training_elapsed_seconds": 3},
             ])
             projector = train.MetricsProjector(root, run, manifest, 1)
@@ -68,9 +73,21 @@ class TelemetryTest(unittest.TestCase):
             self.assertEqual(metrics["floor_bands"]["median"], 12)
             self.assertEqual(metrics["characters"][2]["wins"], 1)
             self.assertEqual(metrics["policy_loss"], 2)
+            self.assertEqual(metrics["critic_explained_reward_variance"], .5)
+            self.assertEqual(metrics["critic_explained_reward_variance_by_floor"], {
+                "12": {"value": .5, "target_variance": .25, "rows": 20},
+            })
+            self.assertEqual(metrics["critic_floor_conditioned_explained_reward_variance"], .5)
+            self.assertEqual(metrics["search_consistency_loss"], .25)
+            self.assertEqual(metrics["gradient_clipped"], 1)
             self.assertEqual(metrics["dataset_rows"], 7)
             self.assertEqual(metrics["optimizer_steps_per_second"], 1)
             self.assertEqual(metrics["used_rows_per_second"], 20)
+            self.assertEqual(metrics["optimizer_steps"], [{
+                "step": 40, "weights_revision": 1, "seconds": 3,
+                "optimizer_steps_per_second": 1,
+                "used_rows_per_second": 20, "total_seconds": 1,
+            }])
             self.assertEqual(metrics["dataset_rollout_dropped"], 3)
             self.assertEqual(metrics["dataset_budget_dropped"], 2)
             self.assertEqual(metrics["dataset_forced_dropped"], 3)
@@ -84,16 +101,47 @@ class TelemetryTest(unittest.TestCase):
             write_events(run / "events/000001.jsonl", [
                 {"event": "training_batch", "time": 1, "step": 40, "stage": 0,
                  "policy_outcome": "pre_kl_rejected", "commit_kind": "critic_only",
-                 "fresh_rows": 5, "critic_trained_rows": 5, "total_seconds": 2},
+                 "fresh_rows": 5, "critic_trained_rows": 5,
+                 "critic_explained_reward_variance": .2,
+                 "critic_explained_reward_variance_by_floor": {
+                     "10": {"value": .2, "target_variance": .25, "rows": 5}},
+                 "total_seconds": 2},
                 {"event": "training_batch", "time": 2, "step": 40, "stage": 0,
                  "policy_outcome": "post_kl_rejected", "commit_kind": "critic_only",
-                 "fresh_rows": 7, "critic_trained_rows": 7, "total_seconds": 2},
+                 "fresh_rows": 7, "critic_trained_rows": 7,
+                 "critic_explained_reward_variance": .8,
+                 "critic_explained_reward_variance_by_floor": {
+                     "10": {"value": .8, "target_variance": .5, "rows": 7}},
+                 "total_seconds": 2},
             ])
             metrics = train.MetricsProjector(root, run, manifest, 1).value()["reports"][-1]["metrics"]
             self.assertEqual(metrics["optimizer_steps_per_second"], .5)
             self.assertEqual(metrics["used_rows_per_second"], 3)
             self.assertEqual(metrics["dataset_kl_dropped"], 5)
             self.assertEqual(metrics["dataset_post_kl_dropped"], 7)
+            self.assertAlmostEqual(metrics["critic_explained_reward_variance"], .55)
+            floor = metrics["critic_explained_reward_variance_by_floor"]["10"]
+            self.assertAlmostEqual(floor["value"], 3.05 / 4.75)
+            self.assertAlmostEqual(floor["target_variance"], 4.75 / 12)
+            self.assertEqual(floor["rows"], 12)
+            self.assertAlmostEqual(
+                metrics["critic_floor_conditioned_explained_reward_variance"], 3.05 / 4.75
+            )
+
+    def test_critic_explained_reward_variance(self):
+        targets = torch.tensor([0., 1.])
+        midpoint = torch.tensor([.5, .5])
+        self.assertEqual(float(train.critic_explained_reward_variance(targets, targets)), 1)
+        self.assertEqual(float(train.critic_explained_reward_variance(midpoint, targets)), 0)
+        self.assertEqual(float(train.critic_explained_reward_variance(targets, targets[:1].repeat(2))), 0)
+        _, conditioned, floors = train.critic_explained_reward_variance(
+            torch.cat((targets, midpoint)), torch.cat((targets, targets)), [1, 1, 2, 2]
+        )
+        self.assertEqual(conditioned, .5)
+        self.assertEqual(floors, {
+            "1": {"value": 1., "target_variance": .25, "rows": 2},
+            "2": {"value": 0., "target_variance": .25, "rows": 2},
+        })
 
     def test_branch_reads_parent_only_to_checkpoint(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -142,7 +190,7 @@ class TelemetryTest(unittest.TestCase):
             write_events(log, [event])
             self.assertIsNone(train.checkpoint_origin(checkpoint, digest))
 
-    def test_dashboard_rebuilds_live_metrics_without_reports(self):
+    def test_dashboard_rebuilds_metrics_from_events(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); run = root / "run"; (run / "events").mkdir(parents=True)
             manifest = self.manifest("run", 1); manifest["model_version"] = 999
@@ -153,15 +201,58 @@ class TelemetryTest(unittest.TestCase):
                 "training_elapsed_seconds": 0,
             }])
             train.dashboard(root)
-            live = train.read_live(run / "live.js")
             html = (root / "dashboard.html").read_text()
-            self.assertEqual(live["reports"][0]["step"], 0)
+            self.assertIn('"step":0', html)
+            self.assertFalse((run / "live.js").exists())
             self.assertTrue(all(label in html for label in (
-                "Lineage", "Branch", "Weights revision", "Policy loss", "Gradient norm",
-                "Optimizer steps / second", "Used rows / second", "Row outcomes",
+                "Lineage", "Branch", "Compare", "Metrics", "Subsample", "Weights revision", "Policy loss", "Gradient norm",
+                "Optimizer steps / second", "Used rows / second", "Optimizer step time",
+                "Policy lag (p95)",
+                "Row outcomes",
             )))
             self.assertIn("weights_revision??report.metrics.updates", html)
+            self.assertIn("series(reports,'advantage_mean','mean_advantage')", html)
+            self.assertIn("optimizerSeries(steps,reports,'used_rows_per_second')", html)
+            self.assertIn("function addComparison", html)
+            self.assertIn("function clipComparison", html)
+            self.assertIn("setFullRange([primary])", html)
+            self.assertIn("compareSelect.onchange=()=>showVersion()", html)
+            self.assertIn("id=legend class=legend", html)
+            self.assertIn("plotly_relayout", html)
+            self.assertIn("showlegend:false", html)
+            self.assertIn("uirevision:uiRevision", html)
+            self.assertIn("id=subsample type=number min=1 step=1 value=3", html)
+            self.assertIn("appendReports(run,live.reports,live.optimizer_steps,index)", html)
+            self.assertIn("critic_explained_reward_variance", html)
+            self.assertIn("metricPicker.onchange", html)
+            self.assertIn("</div><details class=panel open><summary>Metrics", html)
+            self.assertNotIn("lines+markers", html)
+            self.assertIn("Plotly.extendTraces", html)
+            self.assertIn("fetch(url", html)
             self.assertIn("row.step>step", html)
+
+    def test_dashboard_source_returns_only_new_points(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); run = root / "run"; (run / "events").mkdir(parents=True)
+            manifest = self.manifest("run", 1)
+            (run / "run.json").write_text(json.dumps(manifest))
+            log = run / "events/000001.jsonl"
+            write_events(log, [{
+                "event": "training_batch", "time": 1, "step": 40, "stage": 0,
+                "weights_revision": 1, "policy_revision": 1,
+                "policy_outcome": "accepted", "commit_kind": "full",
+                "critic_trained_rows": 20, "total_seconds": 2,
+                "training_elapsed_seconds": 2,
+            }])
+            source = train.DashboardSource(root)
+            first = source.delta("run", train.MODEL_VERSION, 0, 0, 0, None)
+            self.assertEqual(first["reports"], [])
+            self.assertEqual(first["optimizer_steps"][0]["used_rows_per_second"], 10)
+            write_events(log, [{"event": "heartbeat", "time": 3, "step": 120,
+                                "stage": 0, "training_elapsed_seconds": 3}])
+            second = source.delta("run", train.MODEL_VERSION, 0, 1, 0, first["token"])
+            self.assertEqual(len(second["reports"]), 1)
+            self.assertEqual(second["optimizer_steps"], [])
 
     def test_legacy_heartbeat_does_not_create_a_zero_step(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -180,36 +271,60 @@ class TelemetryTest(unittest.TestCase):
             self.assertEqual([row["step"] for row in reports], [120, 140])
 
     def test_floor_delta_gae(self):
-        def advantages(canonical, expected, gamma=1, gae_lambda=1, won=False):
+        def values(canonical, expected, gamma=1, gae_lambda=1, won=False,
+                   potentials=None, field="advantage"):
             length = len(canonical)
             trajectory = {
                 "rows": list(range(length)), "choices": [0] * length,
                 "old_log": [0] * length,
-                "critic_probabilities": np.column_stack((np.zeros(length), expected)),
+                "critic_values": expected,
                 "canonical_progress": canonical, "phases": [0] * length,
                 "win_rewards": [0] * (length - 1) + [won],
                 "terminals": [False] * (length - 1) + [True],
                 "characters": [0] * length, "versions": [0] * length,
+                "potentials": np.zeros(length) if potentials is None else potentials,
             }
             dataset = train.ExperienceDataset()
             dataset.add({"trajectories": [trajectory]}, Namespace(
-                critic_lambda=1, critic_only=True, gae_gamma=gamma,
-                gae_lambda=gae_lambda,
+                critic_only=True, gae_gamma=gamma, gae_lambda=gae_lambda,
             ))
-            return dataset.data["advantage"][:length]
+            return dataset.data[field][:length]
 
         maximum = train.CATEGORIES - 1
         expected = np.array([.2, .4, .6])
         np.testing.assert_allclose(
-            advantages([0, 1, 2], expected), 2 / maximum - expected, atol=1e-7,
+            values([0, 1, 2], expected), 2 / maximum - expected, atol=1e-7,
         )
         np.testing.assert_allclose(
-            advantages([0, 1, 2], np.arange(3) / maximum, .5, .5),
+            values([0, 1, 2], np.arange(3) / maximum, .5, .5),
             np.array([1.25, 1, 0]) / maximum, atol=1e-7,
         )
         np.testing.assert_allclose(
-            advantages([0, 72], np.array([0, 72]) / maximum, won=True),
+            values([0, 1, 2], expected, .5, .5, field="critic_target"),
+            np.array([1.5, 2, 2]) / maximum, atol=1e-7,
+        )
+        np.testing.assert_allclose(
+            values([0, 72], np.array([0, 72]) / maximum, won=True),
             np.array([1, 10 / maximum]), atol=1e-7,
+        )
+        potentials = np.array([.1, .2])
+        np.testing.assert_allclose(
+            values([0, 72], 1 - potentials, won=True, potentials=potentials),
+            0, atol=1e-7,
+        )
+        np.testing.assert_allclose(
+            values([0, 72], [0, 0], won=True, potentials=potentials,
+                   field="critic_target"),
+            1 - potentials, atol=1e-7,
+        )
+        np.testing.assert_allclose(
+            values([0, 0], [0, 0], gamma=.5, potentials=[.1, .2]),
+            [-.1, -.2], atol=1e-7,
+        )
+        np.testing.assert_allclose(
+            values([0, 0], [0, 0], gamma=.5, potentials=[.1, .2],
+                   field="critic_target"),
+            [-.1, -.2], atol=1e-7,
         )
 
 
