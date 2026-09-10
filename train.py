@@ -4457,7 +4457,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 winning_rejected += len(rejected)
                 for sample in rejected:
                     winning_evicted_characters[packed_character(sample[0])] += 1
-                replay_weight = replay_valid.to(replay_value.dtype)
+                replay_weight = replay_valid.to(replay_kl.dtype)
                 replay_denominator = replay_weight.sum().clamp_min(1)
                 replay_log_probability = replay_distribution.log_prob(replay_action)
                 reference_log_probability = reference_distribution.log_prob(replay_action)
