@@ -15,8 +15,8 @@ use std::{
 
 const MAGIC: &[u8; 8] = b"STSVALUE";
 const VERSION: u32 = 56;
-const VALUE_MODEL_VERSION: u32 = 73;
-const MIN_VALUE_MODEL_VERSION: u32 = 73;
+const VALUE_MODEL_VERSION: u32 = 74;
+const MIN_VALUE_MODEL_VERSION: u32 = 74;
 const TERMINAL_CATEGORIES: usize = 83;
 const POTENTIAL_WEIGHT_COUNT: usize = 13;
 const TOKEN_CATEGORICAL: usize = 10;
@@ -357,13 +357,19 @@ struct CandidateRow {
     legal: bool,
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Potential {
+    floor: f32,
+    resources: [f32; POTENTIAL_WEIGHT_COUNT],
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct ObservationV56 {
     character: u8,
     globals: Vec<f32>,
     domains: [DomainRows; 16],
     candidates: Vec<CandidateRow>,
-    potential: [f32; POTENTIAL_WEIGHT_COUNT],
+    potential: Potential,
 }
 
 const POOL_COLLECTIONS: [usize; 6] = [
@@ -9727,9 +9733,9 @@ fn resample_canonical_combat_hidden(game: &mut Game, seed: u64) {
     }
 }
 
-fn potential(game: &Game, content: &Content) -> [f32; POTENTIAL_WEIGHT_COUNT] {
+fn potential(game: &Game, content: &Content) -> Potential {
     if matches!(game.phase, Phase::Won | Phase::Dead) {
-        return [0.0; POTENTIAL_WEIGHT_COUNT];
+        return Potential::default();
     }
     let hp = game
         .combat()
@@ -9737,7 +9743,7 @@ fn potential(game: &Game, content: &Content) -> [f32; POTENTIAL_WEIGHT_COUNT] {
         .max(0) as f32;
     let relics = &game.run.relics;
     let deck = &game.run.deck;
-    [
+    let resources = [
         1.0,
         game.run.max_hp as f32,
         deck.iter()
@@ -9774,18 +9780,21 @@ fn potential(game: &Game, content: &Content) -> [f32; POTENTIAL_WEIGHT_COUNT] {
             .filter(|card| content.cards[card.id as usize].rarity == CardRarity::Rare)
             .count() as f32,
     ]
-    .map(|term| hp * term)
+    .map(|term| hp * term);
+    Potential {
+        floor: canonical_progress(game) as f32 / (TERMINAL_CATEGORIES - 1) as f32,
+        resources,
+    }
 }
 
-fn potential_value(
-    potential: &[f32; POTENTIAL_WEIGHT_COUNT],
-    weights: &[f32; POTENTIAL_WEIGHT_COUNT],
-) -> f32 {
-    potential
+fn potential_value(potential: &Potential, weights: &[f32; POTENTIAL_WEIGHT_COUNT]) -> f32 {
+    let resources = potential
+        .resources
         .iter()
         .zip(weights)
         .map(|(term, weight)| term * weight)
-        .sum()
+        .sum::<f32>();
+    potential.floor + resources
 }
 
 struct ContentHasher(u64);
@@ -23995,13 +24004,13 @@ mod tests {
         let mut game = Game::new_character_ascension(&content, 12, 0, 10).unwrap();
         game.begin_act(&content, 0).unwrap();
         game.phase = Phase::Won;
-        assert_eq!(potential(&game, &content), [0.0; POTENTIAL_WEIGHT_COUNT]);
+        assert_eq!(potential(&game, &content), Potential::default());
         game.phase = Phase::Dead;
-        assert_eq!(potential(&game, &content), [0.0; POTENTIAL_WEIGHT_COUNT]);
+        assert_eq!(potential(&game, &content), Potential::default());
     }
 
     #[test]
-    fn potential_is_hp_times_weighted_run_resources() {
+    fn potential_is_floor_plus_twice_hp_weighted_run_resources() {
         let content = foundation_content();
         let mut game = Game::new_character_ascension(&content, 12, 0, 10).unwrap();
         game.begin_act(&content, 0).unwrap();
@@ -24041,9 +24050,15 @@ mod tests {
             Some(crate::foundation::RARE_POTIONS[0]),
             None,
         ];
+        let value = potential(&game, &content);
         assert_eq!(
-            potential_value(&potential(&game, &content), &[1.0; POTENTIAL_WEIGHT_COUNT]),
-            1547.0
+            value.floor,
+            canonical_progress(&game) as f32 / (TERMINAL_CATEGORIES - 1) as f32
+        );
+        assert_eq!(value.resources.iter().sum::<f32>(), 1547.0);
+        assert_eq!(
+            potential_value(&value, &[1.0; POTENTIAL_WEIGHT_COUNT]),
+            value.floor + 2.0 * 1547.0
         );
     }
 
@@ -26576,7 +26591,7 @@ mod tests {
     #[test]
     fn v56_layout_uses_explicit_token_dimensions_and_positions() {
         let layout = Layout::new(&foundation_content());
-        assert_eq!((VERSION, VALUE_MODEL_VERSION), (56, 73));
+        assert_eq!((VERSION, VALUE_MODEL_VERSION), (56, 74));
         assert_eq!(
             (
                 DEFAULT_MODEL_WIDTH,

@@ -32,14 +32,14 @@ import sts2_sim
 
 
 FEATURE_VERSION = 56
-MODEL_VERSION = 73
-COMPATIBLE_MODEL_VERSIONS = (73,)
+MODEL_VERSION = 74
+COMPATIBLE_MODEL_VERSIONS = (74,)
 DEFAULT_ARCHITECTURE = (128, 4, 8, 384)
 CATEGORIES = 83
 MAX_PROGRESS = 72
 PRECISIONS = ("fp32", "bf16")
 WINNING_CAPACITY = 0
-CHANGE = "Discount-consistent scalar shaped progress critic."
+CHANGE = "Current-floor plus doubled resource-potential residual critic."
 COLLECTION_POOLING = ("sum", "transformer", "global_tokens")
 EFFECT_POOLING = (
     "sum_into_actor", "transformer_into_actor", "sum_token", "transformer_token",
@@ -1884,6 +1884,12 @@ def critic_only_step(model, optimizer, parameters=None):
     return gradient_norm
 
 
+def set_learning_rate(optimizer, rate, warmup_steps, weights_revision):
+    warmup = min(1., (weights_revision + 1) / warmup_steps) if warmup_steps else 1.
+    for group in optimizer.param_groups:
+        group["lr"] = rate * group["lr_scale"] * warmup
+
+
 def sequence_index(row, batch, target, pad=False, items=None):
     counts = np.bincount(row, minlength=batch).astype(np.int32)
     lengths = counts + 1
@@ -2740,7 +2746,7 @@ class RolloutCollector:
                     mcts_heuristic=args.mcts_heuristic,
                     mcts_timeout=bounded_mcts_timeout(args.mcts_timeout, args.sampler_timeout),
                     cache_features=args.cache_features,
-                    skip_forced=args.gae_lambda == 1 and not args.critic_only,
+                    skip_forced=True,
                 )
                 characters, choice, log_probability, critic_value, step_rows, \
                     step_experts, step_search_stats, *cached = result
@@ -3135,30 +3141,21 @@ class ExperienceDataset:
         return len(self.rows)
 
     def add(self, result, args, limit=None):
-        trajectories = result["trajectories"]
-        if not trajectories:
+        source = result["trajectories"]
+        if not source:
             return 0, 0, 0
-        def joined(key, dtype):
-            return np.concatenate([np.asarray(row[key], dtype) for row in trajectories])
         fields = (
             "rows", "choices", "old_log", "critic_values", "canonical_progress",
             "phases", "win_rewards", "terminals", "characters", "versions", "potentials",
         )
-        rows = [item for trajectory in trajectories for item in trajectory["rows"]]
-        features = [item for trajectory in trajectories for item in trajectory.get("features", [])]
-        if features and len(features) != len(rows):
-            raise ValueError("invalid cached features")
-        advantage = np.empty(len(rows), np.float32)
-        targets = np.empty(len(rows), np.float32)
-        terminal_categories = np.empty(len(rows), np.int8)
-        wins = np.empty(len(rows), bool)
-        values = np.empty(len(rows), np.float32)
-        end = 0
-        for trajectory in trajectories:
+        trajectories = []
+        positions = []
+        total = 0
+        cached = any("features" in trajectory for trajectory in source)
+        for trajectory in source:
             length = len(trajectory["rows"])
             if not length or any(len(trajectory[key]) != length for key in fields):
                 raise ValueError("invalid trajectory fields")
-            start, end = end, end + length
             terminal = np.asarray(trajectory["terminals"], bool)
             predicted = np.asarray(trajectory["critic_values"], np.float32)
             canonical = np.asarray(trajectory["canonical_progress"], np.int64)
@@ -3168,30 +3165,64 @@ class ExperienceDataset:
                     or canonical.min() < 0 or canonical.max() > MAX_PROGRESS
                     or not np.isfinite(potential).all()):
                 raise ValueError("invalid trajectory terminal")
-            category = CATEGORIES - 1 if trajectory["win_rewards"][-1] > .5 else int(canonical.max())
+            if cached and len(trajectory.get("features", ())) != length:
+                raise ValueError("invalid cached features")
+            indices = np.flatnonzero([
+                packed_legal_count(row) > 1 for row in trajectory["rows"]
+            ])
+            if len(indices):
+                category = CATEGORIES - 1 if trajectory["win_rewards"][-1] > .5 \
+                    else int(canonical.max())
+                trajectories.append((trajectory, indices, category))
+                positions.extend(total + indices)
+            total += length
+        accepted = total if limit is None else max(0, min(total, limit))
+        if not positions:
+            self.next_id += accepted
+            self.seen += accepted
+            self.forced_dropped += accepted
+            return accepted, accepted, total - accepted
+        positions = np.asarray(positions, np.int64)
+        selected = positions < accepted
+        def joined(key, dtype):
+            return np.concatenate([
+                np.asarray(trajectory[key], dtype)[indices]
+                for trajectory, indices, _category in trajectories
+            ])
+        rows = [trajectory["rows"][index] for trajectory, indices, _category in trajectories
+                for index in indices]
+        features = ([trajectory["features"][index]
+                     for trajectory, indices, _category in trajectories for index in indices]
+                    if cached else [])
+        advantage = np.empty(len(rows), np.float32)
+        targets = np.empty(len(rows), np.float32)
+        terminal_categories = np.empty(len(rows), np.int8)
+        wins = np.empty(len(rows), bool)
+        values = np.empty(len(rows), np.float32)
+        terminal = np.zeros(len(rows), bool)
+        end = 0
+        for trajectory, indices, category in trajectories:
+            length = len(indices)
+            start, end = end, end + length
+            predicted = np.asarray(trajectory["critic_values"], np.float32)[indices]
+            canonical = np.asarray(trajectory["canonical_progress"], np.int64)[indices]
+            potential = np.asarray(trajectory["potentials"], np.float32)[indices]
             terminal_value = category / (CATEGORIES - 1)
             terminal_categories[start:end] = category
             wins[start:end] = category == CATEGORIES - 1
             values[start:end] = predicted
-            floor_value = canonical.astype(np.float32) / (CATEGORIES - 1)
-            reward = np.diff(np.append(floor_value, terminal_value))
-            reward += args.gae_gamma * np.append(potential[1:], 0.) - potential
-            remaining_value = predicted - floor_value
+            terminal[end - 1] = True
+            reward = args.gae_gamma * np.append(potential[1:], 0.) - potential
+            reward[-1] += terminal_value
             gae = next_value = discounted_return = 0.
             for index in range(length - 1, -1, -1):
-                delta = reward[index] + args.gae_gamma * next_value - remaining_value[index]
+                delta = reward[index] + args.gae_gamma * next_value - predicted[index]
                 gae = delta + args.gae_gamma * args.gae_lambda * gae
                 advantage[start + index] = gae
                 discounted_return = reward[index] + args.gae_gamma * discounted_return
-                targets[start + index] = floor_value[index] + discounted_return
-                next_value = remaining_value[index]
-        terminal = np.asarray([
-            item for trajectory in trajectories for item in trajectory["terminals"]
-        ], bool)
+                targets[start + index] = discounted_return
+                next_value = predicted[index]
         priority = 1 + np.abs(advantage) + 4 * terminal + 4 * wins
-        actionable = np.ones(len(rows), bool) if getattr(args, "critic_only", False) else np.asarray([
-            packed_legal_count(row) > 1 for row in rows
-        ])
         data = {
             "action": joined("choices", np.int64),
             "old": joined("old_log", np.float32),
@@ -3202,12 +3233,10 @@ class ExperienceDataset:
             "character": joined("characters", np.int8),
             "priority": priority.astype(np.float32),
             "version": joined("versions", np.int64),
-            "id": np.arange(self.next_id, self.next_id + len(rows), dtype=np.int64),
+            "id": self.next_id + positions,
         }
-        accepted = len(rows) if limit is None else max(0, min(len(rows), limit))
-        rows, actionable = rows[:accepted], actionable[:accepted]
         size = len(self)
-        required = size + int(actionable.sum())
+        required = size + int(selected.sum())
         if required > self.capacity:
             self.capacity = max(required, max(1024, self.capacity * 2))
             for key, value in self.data.items():
@@ -3215,16 +3244,16 @@ class ExperienceDataset:
                 storage[:size] = value[:size]
                 self.data[key] = storage
         self.next_id += accepted
-        self.rows.extend(row for row, keep in zip(rows, actionable) if keep)
+        self.rows.extend(row for row, keep in zip(rows, selected) if keep)
         if features:
-            self.features.extend(row for row, keep in zip(features[:accepted], actionable) if keep)
+            self.features.extend(row for row, keep in zip(features, selected) if keep)
         for key, value in data.items():
-            self.data[key][size:required] = value[:accepted][actionable]
+            self.data[key][size:required] = value[selected]
         self.seen += accepted
         self.admitted += required - size
         forced = accepted - required + size
         self.forced_dropped += forced
-        return accepted, forced, len(data["action"]) - accepted
+        return accepted, forced, total - accepted
 
     def prune(self, version, lag, limit=None):
         stale = np.flatnonzero(self.data["version"][:len(self)] < version - lag)
@@ -3444,11 +3473,11 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
            else "complete terminal trajectories"),
         "Bounded queue → policy-lag and action-ratio freshness filters",
         f"{'Character-balanced' if args.character_balanced else 'Uniform'} reusable rows; "
-        f"prefilter forced/stale/ratio-invalid; priority −{args.priority_decay:g} per use",
+        f"prefilter forced/stale/ratio-invalid; priority -{args.priority_decay:g} per use",
         f"{model.layers}-layer global Transformer over state, entity, and action tokens → heads",
-        f"Canonical floor delta + potential shaping γΦ(next)−Φ(current) → "
+        f"Terminal progress shaped by phi=current floor + resource potential → "
         f"GAE γ={args.gae_gamma:g}, λ={args.gae_lambda:g}; "
-        "scalar critic predicts current floor plus discounted shaped progress",
+        "scalar critic predicts the shaped residual",
         "Critic loss balanced by EMA character/phase/canonical-floor frequency",
         "Turn-start native MCTS → expectimax-Q targets and policy-expectation critic transitions",
         ("Frozen encoder and policy; critic head only" if args.critic_only else
@@ -3836,8 +3865,6 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         reported_trajectories = len(trajectory_lengths)
         for key, values in losses.items():
             reported_metrics[key] = len(values)
-        if target.type == "mps":
-            torch.mps.empty_cache()
         replay_fraction = winning_replayed / max(1, trained + winning_replayed)
         assert replay_fraction <= .1 + 1e-9
         _, _, curriculum = curriculum_weights(
@@ -4314,6 +4341,10 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 values["terminal"][fresh_cpu],
                 (squared_error.detach() * critic_weights).cpu().numpy(),
             )
+            set_learning_rate(
+                optimizer, args.learning_rate, args.learning_rate_warmup_steps,
+                revisions["weights_revision"],
+            )
             policy_update_attempts += int(not args.critic_only)
             if not args.critic_only and kl_value > args.target_kl:
                 dataset.kl_dropped += fresh_rows
@@ -4322,6 +4353,9 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 optimizer.zero_grad(set_to_none=True); critic_loss.backward(inputs=critic_parameters)
                 gradient_norm = critic_only_step(model, optimizer, critic_parameters)
                 revisions["weights_revision"] += 1
+                if (target.type == "mps" and args.mps_empty_cache_updates
+                        and revisions["weights_revision"] % args.mps_empty_cache_updates == 0):
+                    torch.mps.empty_cache()
                 critic_only_updates += 1
                 backward_seconds = time.monotonic() - backward_started
                 backward_durations.append(backward_seconds)
@@ -4480,7 +4514,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             if args.critic_only:
                 gradient_norm = critic_only_step(model, optimizer); critic_only_updates += 1
                 accepted, proposals, post_log_ratio = True, [0.], log_ratio.detach()
-            elif args.target_kl >= 1:
+            elif args.disable_post_kl_check or args.target_kl >= 1:
                 gradient_norm = float(nn.utils.clip_grad_norm_(model.parameters(), .5))
                 optimizer.step()
                 accepted, proposals, post_log_ratio = True, [], log_ratio.detach()
@@ -4519,6 +4553,9 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 retry_critic_loss.backward(inputs=critic_parameters)
                 gradient_norm = critic_only_step(model, optimizer, critic_parameters)
                 revisions["weights_revision"] += 1
+                if (target.type == "mps" and args.mps_empty_cache_updates
+                        and revisions["weights_revision"] % args.mps_empty_cache_updates == 0):
+                    torch.mps.empty_cache()
                 critic_only_updates += 1
                 update_elapsed = time.monotonic() - update_started
                 update_seconds += update_elapsed
@@ -4615,7 +4652,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     losses["winning_loss"].append(winning_loss.detach())
                     losses["winning_kl"].append(replay_kl_mean.detach())
                     winning_replayed += replay_count
-            if target.type == "mps":
+            if (target.type == "mps" and args.mps_empty_cache_updates
+                    and revisions["weights_revision"] % args.mps_empty_cache_updates == 0):
                 torch.mps.empty_cache()
             backward_seconds = time.monotonic() - backward_started
             backward_durations.append(backward_seconds)
@@ -6210,6 +6248,8 @@ def train(args):
         raise ValueError("invalid asynchronous replay settings")
     if args.sampler_timeout <= 0 or args.sampler_restarts < 0:
         raise ValueError("invalid sampler watchdog")
+    if args.mps_empty_cache_updates < 0 or args.learning_rate_warmup_steps < 0:
+        raise ValueError("invalid optimizer interval")
     if (args.segment_steps < 0 or args.winning_capacity < 0 or args.priority_decay <= 0
             or min(args.critic_consistency_weight, args.search_consistency_weight) < 0
             or min(args.critic_consistency_batch, args.search_consistency_batch) < 1):
@@ -7306,7 +7346,7 @@ def probe():
             exported = Path(parity_directory) / f"{number}.bin"
             export_value_model(exported, model, env.fingerprint(), 1, 0)
             rust = np.asarray(env.rust_values(str(exported)))
-            python = critic_value(critic).sigmoid().numpy()
+            python = (critic_value(critic) + torch.as_tensor(combat[4])).sigmoid().numpy()
             assert np.max(np.abs(python - rust)) <= 1e-5
 
     model = Agent(layout).eval()
@@ -7415,12 +7455,15 @@ def probe():
             pass
         compact = Agent(compact_layout, 64, 2, 4, 128).eval()
         compact.critic.weight.data.normal_(std=.1)
+        env.set_potential_weights(compact.potential_weights)
+        compact_observation = env.observe_tokens()
         compact_path = Path(directory) / "compact.bin"
         export_value_model(compact_path, compact, env.fingerprint(), 1, 0)
         with torch.no_grad():
             compact_python = critic_value(predict(
-                compact, tensors(combat, target, compact), "fp32",
-            )[1]).sigmoid().numpy()
+                compact, tensors(compact_observation, target, compact), "fp32",
+            )[1]) + torch.as_tensor(compact_observation[4])
+            compact_python = compact_python.sigmoid().numpy()
         compact_rust = np.asarray(env.rust_values(str(compact_path)))
         assert np.max(np.abs(compact_python - compact_rust)) < 1e-5
         compact_checkpoint = Path(directory) / "compact.pt"
@@ -7467,7 +7510,7 @@ def parser():
     commands = root.add_subparsers(dest="command", required=True)
     run = commands.add_parser("train")
     run._negative_number_matcher = re.compile(r"^-\d*\.?\d+(?:[eE][+-]?\d+)?$")
-    run.add_argument("--output", default="target/v73")
+    run.add_argument("--output", default="target/v74")
     run.add_argument("--checkpoint")
     run.add_argument("--width", type=int)
     run.add_argument("--layers", type=int)
@@ -7498,11 +7541,12 @@ def parser():
     run.add_argument("--sampler-steps", type=int, default=4)
     run.add_argument("--sampler-timeout", type=float, default=120)
     run.add_argument("--sampler-restarts", type=int, default=3)
+    run.add_argument("--mps-empty-cache-updates", type=int, default=4)
     run.add_argument("--segment-steps", type=int, default=0)
     run.add_argument("--publish-updates", type=int, default=8)
     run.add_argument("--report-decisions", type=int, default=32_768)
     run.add_argument("--save-decisions", type=int, default=262_144)
-    run.add_argument("--max-policy-lag", type=int, default=8)
+    run.add_argument("--max-policy-lag", type=int, default=20)
     run.add_argument("--max-log-ratio", type=float, default=.5)
     run.add_argument("--policy-temperature", type=float, default=.8)
     run.add_argument("--mcts-fraction", type=float, default=0)
@@ -7524,6 +7568,7 @@ def parser():
     run.add_argument("--expert-capacity", type=int, default=131_072)
     run.add_argument("--batch", type=int, default=4096)
     run.add_argument("--learning-rate", type=float, default=3e-4)
+    run.add_argument("--learning-rate-warmup-steps", type=int, default=200)
     run.add_argument("--head-learning-rate-multiplier", type=float, default=1)
     run.add_argument("--critic-learning-rate-multiplier", type=float, default=1)
     run.add_argument("--critic-only", action="store_true")
@@ -7552,6 +7597,7 @@ def parser():
     run.add_argument("--entropy-end", type=float, default=0.001)
     run.add_argument("--entropy-weight", type=float, default=.1)
     run.add_argument("--target-kl", type=float, default=0.004)
+    run.add_argument("--disable-post-kl-check", action="store_true")
     run.add_argument("--training-seed", type=int, default=1_900_000_000)
     run.add_argument("--development-seed", type=int, default=3_500_000_000)
     run.add_argument("--development-runs", type=int, default=32)

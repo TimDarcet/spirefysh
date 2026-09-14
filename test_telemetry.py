@@ -16,7 +16,40 @@ def write_events(path, rows):
             output.write((json.dumps({"event_schema": 2} | row) + "\n").encode())
 
 
+def packed_row(legal=2):
+    return (0, (), (), (), np.ones((legal, 1), np.uint32), 0)
+
+
 class TelemetryTest(unittest.TestCase):
+    def test_training_performance_controls(self):
+        args = train.parser().parse_args([
+            "train", "--disable-post-kl-check", "--mps-empty-cache-updates", "8",
+        ])
+        self.assertTrue(args.disable_post_kl_check)
+        self.assertEqual(args.mps_empty_cache_updates, 8)
+        self.assertEqual(args.batch, 16_384)
+        self.assertEqual(args.max_policy_lag, 20)
+        self.assertEqual(args.gae_gamma, 1)
+        self.assertEqual(args.gae_lambda, .99)
+        self.assertEqual(args.learning_rate_warmup_steps, 200)
+
+    def test_learning_rate_warmup_uses_global_weights_revision(self):
+        optimizer = Namespace(param_groups=[
+            {"lr_scale": 1.}, {"lr_scale": 2.}, {"lr_scale": .5},
+        ])
+        train.set_learning_rate(optimizer, .01, 200, 0)
+        np.testing.assert_allclose(
+            [group["lr"] for group in optimizer.param_groups], [.00005, .0001, .000025]
+        )
+        train.set_learning_rate(optimizer, .01, 200, 199)
+        np.testing.assert_allclose(
+            [group["lr"] for group in optimizer.param_groups], [.01, .02, .005]
+        )
+        train.set_learning_rate(optimizer, .01, 200, 2000)
+        np.testing.assert_allclose(
+            [group["lr"] for group in optimizer.param_groups], [.01, .02, .005]
+        )
+
     def manifest(self, run_id, session, parent=None):
         return {
             "schema": 2, "run_id": run_id, "lineage_id": "lineage",
@@ -270,12 +303,12 @@ class TelemetryTest(unittest.TestCase):
             reports = train.MetricsProjector(root, run, manifest, 1).value()["reports"]
             self.assertEqual([row["step"] for row in reports], [120, 140])
 
-    def test_floor_delta_gae(self):
+    def test_potential_gae(self):
         def values(canonical, expected, gamma=1, gae_lambda=1, won=False,
                    potentials=None, field="advantage"):
             length = len(canonical)
             trajectory = {
-                "rows": list(range(length)), "choices": [0] * length,
+                "rows": [packed_row() for _ in range(length)], "choices": [0] * length,
                 "old_log": [0] * length,
                 "critic_values": expected,
                 "canonical_progress": canonical, "phases": [0] * length,
@@ -286,7 +319,7 @@ class TelemetryTest(unittest.TestCase):
             }
             dataset = train.ExperienceDataset()
             dataset.add({"trajectories": [trajectory]}, Namespace(
-                critic_only=True, gae_gamma=gamma, gae_lambda=gae_lambda,
+                critic_only=False, gae_gamma=gamma, gae_lambda=gae_lambda,
             ))
             return dataset.data[field][:length]
 
@@ -297,11 +330,11 @@ class TelemetryTest(unittest.TestCase):
         )
         np.testing.assert_allclose(
             values([0, 1, 2], np.arange(3) / maximum, .5, .5),
-            np.array([1.25, 1, 0]) / maximum, atol=1e-7,
+            np.array([.5, 0, 0]) / maximum, atol=1e-7,
         )
         np.testing.assert_allclose(
             values([0, 1, 2], expected, .5, .5, field="critic_target"),
-            np.array([1.5, 2, 2]) / maximum, atol=1e-7,
+            np.array([.5, 1, 2]) / maximum, atol=1e-7,
         )
         np.testing.assert_allclose(
             values([0, 72], np.array([0, 72]) / maximum, won=True),
@@ -326,6 +359,55 @@ class TelemetryTest(unittest.TestCase):
                    field="critic_target"),
             [-.1, -.2], atol=1e-7,
         )
+
+    def test_forced_actions_do_not_advance_gae_clock(self):
+        rows = [packed_row(legal) for legal in (1, 2, 1, 2, 1)]
+        trajectory = {
+            "rows": rows, "choices": [0] * 5, "old_log": [0] * 5,
+            "critic_values": [0] * 5, "canonical_progress": [0] * 5,
+            "phases": [0] * 5, "win_rewards": [0, 0, 0, 0, 1],
+            "terminals": [False, False, False, False, True], "characters": [0] * 5,
+            "versions": [10, 11, 12, 13, 14], "potentials": [0] * 5,
+        }
+        dataset = train.ExperienceDataset()
+        counts = dataset.add({"trajectories": [trajectory]}, Namespace(
+            critic_only=True, gae_gamma=.5, gae_lambda=.5,
+        ))
+
+        self.assertEqual(counts, (5, 3, 0))
+        self.assertEqual(dataset.rows, [rows[1], rows[3]])
+        np.testing.assert_allclose(dataset.data["advantage"][:2], [.25, 1])
+        np.testing.assert_allclose(dataset.data["critic_target"][:2], [.5, 1])
+        np.testing.assert_array_equal(dataset.data["version"][:2], [11, 13])
+        np.testing.assert_allclose(dataset.data["priority"][:2], [5.25, 10])
+
+        limited = train.ExperienceDataset()
+        self.assertEqual(limited.add({"trajectories": [trajectory]}, Namespace(
+            critic_only=False, gae_gamma=.5, gae_lambda=.5,
+        ), limit=3), (3, 2, 2))
+        self.assertEqual(limited.rows, [rows[1]])
+        np.testing.assert_array_equal(limited.data["id"][:1], [1])
+
+    def test_forced_terminal_chain_ends_the_last_decision(self):
+        trajectory = {
+            "rows": [packed_row(2), packed_row(1), packed_row(1)],
+            "choices": [0] * 3, "old_log": [0] * 3, "critic_values": [0] * 3,
+            "canonical_progress": [0, 4, 7], "phases": [0] * 3,
+            "win_rewards": [0] * 3, "terminals": [False, False, True],
+            "characters": [0] * 3, "versions": [0] * 3, "potentials": [0] * 3,
+        }
+        dataset = train.ExperienceDataset()
+        counts = dataset.add({"trajectories": [trajectory]}, Namespace(
+            critic_only=False, gae_gamma=1, gae_lambda=.995,
+        ))
+
+        expected = 7 / (train.CATEGORIES - 1)
+        self.assertEqual(counts, (3, 2, 0))
+        self.assertEqual(len(dataset), 1)
+        self.assertEqual(dataset.data["terminal"][0], 7)
+        self.assertAlmostEqual(dataset.data["advantage"][0], expected)
+        self.assertAlmostEqual(dataset.data["critic_target"][0], expected)
+        self.assertAlmostEqual(dataset.data["priority"][0], 5 + expected)
 
 
 if __name__ == "__main__":
