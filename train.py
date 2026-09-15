@@ -3131,8 +3131,9 @@ class ExperienceDataset:
             "phase": np.empty(0, np.int8), "character": np.empty(0, np.int8),
             "priority": np.empty(0, np.float32),
             "version": np.empty(0, np.int64), "id": np.empty(0, np.int64),
+            "trajectory": np.empty(0, np.int64),
         }
-        self.next_id = 0
+        self.next_id = self.next_trajectory = 0
         self.capacity = 0
         self.seen = self.admitted = self.uses = self.retired = self.forced_dropped = 0
         self.stale_dropped = self.ratio_dropped = self.kl_dropped = self.post_kl_dropped = 0
@@ -3152,7 +3153,7 @@ class ExperienceDataset:
         positions = []
         total = 0
         cached = any("features" in trajectory for trajectory in source)
-        for trajectory in source:
+        for trajectory_id, trajectory in enumerate(source, self.next_trajectory):
             length = len(trajectory["rows"])
             if not length or any(len(trajectory[key]) != length for key in fields):
                 raise ValueError("invalid trajectory fields")
@@ -3173,9 +3174,10 @@ class ExperienceDataset:
             if len(indices):
                 category = CATEGORIES - 1 if trajectory["win_rewards"][-1] > .5 \
                     else int(canonical.max())
-                trajectories.append((trajectory, indices, category))
+                trajectories.append((trajectory, indices, category, trajectory_id))
                 positions.extend(total + indices)
             total += length
+        self.next_trajectory += len(source)
         accepted = total if limit is None else max(0, min(total, limit))
         if not positions:
             self.next_id += accepted
@@ -3187,12 +3189,14 @@ class ExperienceDataset:
         def joined(key, dtype):
             return np.concatenate([
                 np.asarray(trajectory[key], dtype)[indices]
-                for trajectory, indices, _category in trajectories
+                for trajectory, indices, _category, _trajectory_id in trajectories
             ])
-        rows = [trajectory["rows"][index] for trajectory, indices, _category in trajectories
+        rows = [trajectory["rows"][index]
+                for trajectory, indices, _category, _trajectory_id in trajectories
                 for index in indices]
         features = ([trajectory["features"][index]
-                     for trajectory, indices, _category in trajectories for index in indices]
+                     for trajectory, indices, _category, _trajectory_id in trajectories
+                     for index in indices]
                     if cached else [])
         advantage = np.empty(len(rows), np.float32)
         targets = np.empty(len(rows), np.float32)
@@ -3201,7 +3205,7 @@ class ExperienceDataset:
         values = np.empty(len(rows), np.float32)
         terminal = np.zeros(len(rows), bool)
         end = 0
-        for trajectory, indices, category in trajectories:
+        for trajectory, indices, category, _trajectory_id in trajectories:
             length = len(indices)
             start, end = end, end + length
             predicted = np.asarray(trajectory["critic_values"], np.float32)[indices]
@@ -3234,6 +3238,10 @@ class ExperienceDataset:
             "priority": priority.astype(np.float32),
             "version": joined("versions", np.int64),
             "id": self.next_id + positions,
+            "trajectory": np.concatenate([
+                np.full(len(indices), trajectory_id, np.int64)
+                for _trajectory, indices, _category, trajectory_id in trajectories
+            ]),
         }
         size = len(self)
         required = size + int(selected.sum())
@@ -3259,9 +3267,9 @@ class ExperienceDataset:
         stale = np.flatnonzero(self.data["version"][:len(self)] < version - lag)
         if limit is not None:
             stale = stale[:max(0, limit)]
-        self.stale_dropped += len(stale)
-        self.discard(stale)
-        return len(stale)
+        dropped = self.discard_trajectories(self.data["trajectory"][stale])
+        self.stale_dropped += dropped
+        return dropped
 
     def discard(self, indices):
         if not len(indices):
@@ -3282,6 +3290,11 @@ class ExperienceDataset:
 
     def discard_ids(self, ids):
         indices = np.flatnonzero(np.isin(self.data["id"][:len(self)], ids))
+        self.discard(indices)
+        return len(indices)
+
+    def discard_trajectories(self, ids):
+        indices = np.flatnonzero(np.isin(self.data["trajectory"][:len(self)], ids))
         self.discard(indices)
         return len(indices)
 
@@ -3471,9 +3484,10 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         f"{args.samplers} continuous CPU actor{'s' if args.samplers > 1 else ''} → "
         + (f"{args.segment_steps}-decision bootstrapped segments" if args.segment_steps
            else "complete terminal trajectories"),
-        "Bounded queue → policy-lag and action-ratio freshness filters",
+        "Bounded queue → trajectory-level policy-lag and action-ratio freshness filters",
         f"{'Character-balanced' if args.character_balanced else 'Uniform'} reusable rows; "
-        f"prefilter forced/stale/ratio-invalid; priority -{args.priority_decay:g} per use",
+        f"prefilter forced; stale/ratio-invalid rows reject their trajectory; "
+        f"priority -{args.priority_decay:g} per use",
         f"{model.layers}-layer global Transformer over state, entity, and action tokens → heads",
         f"Terminal progress shaped by phi=current floor + resource potential → "
         f"GAE γ={args.gae_gamma:g}, λ={args.gae_lambda:g}; "
@@ -4281,14 +4295,16 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             fresh = torch.ones_like(log_ratio, dtype=torch.bool) if args.critic_only \
                 else log_ratio.abs() <= args.max_log_ratio
             invalid = ~fresh.detach().cpu().numpy()
-            rejected = selected[invalid].tolist()
+            if invalid.any():
+                invalid = np.isin(values["trajectory"], values["trajectory"][invalid])
+                fresh = torch.as_tensor(~invalid, device=target)
+            rejected_trajectories = values["trajectory"][invalid]
             selected = np.asarray(selected, np.int64)[~invalid]
             expired = dataset.use(selected, args.priority_decay)
-            removed = np.asarray(rejected + expired.tolist(), np.int64)
-            dataset.ratio_dropped += len(rejected)
-            if len(removed):
-                dataset.discard(np.unique(removed))
-            handled += len(removed)
+            dataset.discard(expired)
+            ratio_rejected = dataset.discard_trajectories(rejected_trajectories)
+            dataset.ratio_dropped += ratio_rejected
+            handled += len(expired) + ratio_rejected
             batch_policy_lags = (
                 revisions["policy_revision"] - values["version"][~invalid]
             ).tolist()
@@ -4316,7 +4332,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 training_batch_event(
                     "no_fresh_rows", "none", attempted_rows=len(rows), fresh_rows=0,
                     policy_trained_rows=0, critic_trained_rows=0,
-                    ratio_rejected_rows=len(rejected), retired_rows=len(expired),
+                    ratio_rejected_rows=ratio_rejected, retired_rows=len(expired),
                     pre_kl=kl_value, unpack_seconds=unpack_seconds,
                     forward_seconds=forward_seconds, backward_seconds=0.,
                     total_seconds=update_elapsed,
@@ -4347,6 +4363,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             )
             policy_update_attempts += int(not args.critic_only)
             if not args.critic_only and kl_value > args.target_kl:
+                handled += dataset.discard_trajectories(values["trajectory"][fresh_cpu])
                 dataset.kl_dropped += fresh_rows
                 pre_kl_rejected_updates += 1
                 backward_started = time.monotonic()
@@ -4367,7 +4384,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 training_batch_event(
                     "pre_kl_rejected", "critic_only", attempted_rows=len(rows),
                     fresh_rows=fresh_rows, policy_trained_rows=0,
-                    critic_trained_rows=fresh_rows, ratio_rejected_rows=len(rejected),
+                    critic_trained_rows=fresh_rows, ratio_rejected_rows=ratio_rejected,
                     retired_rows=len(expired), critic_loss=float(value_loss.detach()),
                     critic_explained_reward_variance=float(explained_reward_variance),
                     critic_floor_conditioned_explained_reward_variance=
@@ -4484,12 +4501,12 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 replay_valid = replay_eligible & (replay_kl <= args.target_kl)
                 eligible_cpu = replay_eligible.cpu().numpy()
                 valid_cpu = replay_valid.cpu().numpy()
-                rejected = [sample for sample, eligible, keep in zip(
+                replay_rejected = [sample for sample, eligible, keep in zip(
                     replay, eligible_cpu, valid_cpu,
                 ) if eligible and not keep]
-                reservoir.evict(rejected)
-                winning_rejected += len(rejected)
-                for sample in rejected:
+                reservoir.evict(replay_rejected)
+                winning_rejected += len(replay_rejected)
+                for sample in replay_rejected:
                     winning_evicted_characters[packed_character(sample[0])] += 1
                 replay_weight = replay_valid.to(replay_kl.dtype)
                 replay_denominator = replay_weight.sum().clamp_min(1)
@@ -4533,6 +4550,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             post_kl_retries += max(0, len(proposals) - 1)
             post_kl_retry_depth = max(post_kl_retry_depth, max(0, len(proposals) - 1))
             if not accepted:
+                handled += dataset.discard_trajectories(values["trajectory"][fresh_cpu])
                 dataset.post_kl_dropped += fresh_rows
                 post_kl_discarded_updates += 1
                 optimizer.zero_grad(set_to_none=True)
@@ -4569,7 +4587,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 training_batch_event(
                     "post_kl_rejected", "critic_only", attempted_rows=len(rows),
                     fresh_rows=fresh_rows, policy_trained_rows=0,
-                    critic_trained_rows=fresh_rows, ratio_rejected_rows=len(rejected),
+                    critic_trained_rows=fresh_rows, ratio_rejected_rows=ratio_rejected,
                     retired_rows=len(expired), critic_loss=float(retry_value_loss.detach()),
                     critic_explained_reward_variance=float(retry_explained_reward_variance),
                     critic_floor_conditioned_explained_reward_variance=
@@ -4665,7 +4683,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 "critic_only" if args.critic_only else "full",
                 attempted_rows=len(rows), fresh_rows=fresh_rows,
                 policy_trained_rows=0 if args.critic_only else fresh_rows,
-                critic_trained_rows=fresh_rows, ratio_rejected_rows=len(rejected),
+                critic_trained_rows=fresh_rows, ratio_rejected_rows=ratio_rejected,
                 retired_rows=len(expired), local_policy_updates=updates,
                 expert_rows=expert_count, replay_rows=len(replay),
                 policy_loss=float(policy_loss.detach()),

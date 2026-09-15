@@ -388,6 +388,29 @@ class TelemetryTest(unittest.TestCase):
         self.assertEqual(limited.rows, [rows[1]])
         np.testing.assert_array_equal(limited.data["id"][:1], [1])
 
+    def test_policy_rejection_discards_trajectory(self):
+        def trajectory(versions):
+            length = len(versions)
+            return {
+                "rows": [packed_row() for _ in versions], "choices": [0] * length,
+                "old_log": [0] * length, "critic_values": [0] * length,
+                "canonical_progress": [0] * length, "phases": [0] * length,
+                "win_rewards": [0] * length,
+                "terminals": [False] * (length - 1) + [True],
+                "characters": [0] * length, "versions": versions,
+                "potentials": [0] * length,
+            }
+
+        dataset = train.ExperienceDataset()
+        dataset.add({"trajectories": [trajectory([0, 2, 2]), trajectory([2, 2])]},
+                    Namespace(gae_gamma=1, gae_lambda=1))
+        np.testing.assert_array_equal(dataset.data["trajectory"][:5], [0, 0, 0, 1, 1])
+
+        self.assertEqual(dataset.prune(2, 1), 3)
+        np.testing.assert_array_equal(dataset.data["trajectory"][:2], [1, 1])
+        self.assertEqual(dataset.discard_trajectories([1]), 2)
+        self.assertEqual(len(dataset), 0)
+
     def test_forced_terminal_chain_ends_the_last_decision(self):
         trajectory = {
             "rows": [packed_row(2), packed_row(1), packed_row(1)],
