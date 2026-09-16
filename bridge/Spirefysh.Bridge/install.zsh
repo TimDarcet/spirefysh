@@ -2,13 +2,48 @@
 set -euo pipefail
 setopt extendedglob
 
+script_dir=${0:A:h}
+repo_root=${script_dir:h:h}
+if [[ ${1:-} == advisor ]]; then
+  shift
+  if (( $# > 2 )); then
+    print -u2 "usage: bridge/Spirefysh.Bridge/install.zsh advisor [GAME_DATA_DIR] [MODEL.pt]"
+    exit 2
+  fi
+  game_data_dir=${${1:-"/Users/timdarcet/Library/Application Support/Steam/steamapps/common/Slay the Spire 2/SlayTheSpire2.app/Contents/Resources/data_sts2_macos_arm64"}:A}
+  model=${2:-}
+  if pgrep -x "Slay the Spire 2" >/dev/null 2>&1 || pgrep -x "SlayTheSpire2" >/dev/null 2>&1; then
+    print -u2 "quit the game before installing Spirefysh"
+    exit 2
+  fi
+  output=$(mktemp -d /tmp/spirefysh-advisor-build.XXXXXX)
+  trap 'rm -rf -- "$output"' EXIT INT TERM
+  args=("$game_data_dir")
+  [[ -n "$model" ]] && args+=("$model")
+  SPIREFYSH_ADVISOR_PACKAGE=1 SPIREFYSH_BRIDGE_OUTPUT_DIR=$output \
+    /bin/zsh "$script_dir/package-bridge.zsh" "${args[@]}"
+  mods_dir=${game_data_dir:h:h}/MacOS/mods
+  install_dir=$mods_dir/spirefysh-bridge
+  backup_dir=${mods_dir:h}/mod-backups
+  mkdir -p "$mods_dir" "$backup_dir"
+  stage=$(mktemp -d "$mods_dir/.spirefysh-bridge.install.XXXXXX")
+  cp "$output"/Spirefysh.Bridge.{dll,json,advisor-config,model.pt} \
+    "$output"/{advisor,model}.py "$stage/"
+  if [[ -e "$install_dir" ]]; then
+    backup="$backup_dir/spirefysh-bridge.backup.$(date +%Y%m%d-%H%M%S)"
+    mv "$install_dir" "$backup"
+    print "previous_install=$backup"
+  fi
+  mv "$stage" "$install_dir"
+  print "installed=$install_dir"
+  exit
+fi
+
 if (( $# != 4 )); then
   print -u2 "usage: bridge/Spirefysh.Bridge/install.zsh GAME_DATA_DIR TRACE.ndjson PROFILE_DIR PROFILE_SNAPSHOT.json"
   exit 2
 fi
 
-script_dir=${0:A:h}
-repo_root=${script_dir:h:h}
 supported_game_hash=e7ceb80669bfaf5c8fccabaa126ae2bb283aba514be5b5b55612579cfd285f18
 supported_content_hash=62c887be791250b7a90c6cd929c19d03d33e17cc76aa7ff610b2889cccdadadb
 supported_release_hash=93838093ff803a60a8f086355a1d1a9cb103358089f8a46ae41743ddd8919b42
@@ -311,7 +346,7 @@ if [[ "$test_mode" == true ]]; then
 else
   build_output=$(mktemp -d /tmp/spirefysh-bridge-install-build.XXXXXX)
   SPIREFYSH_BRIDGE_OUTPUT_DIR="$build_output" \
-    SPIREFYSH_ADVISOR_PACKAGE=0 /bin/zsh "$script_dir/build.zsh" "$game_data_dir"
+    SPIREFYSH_ADVISOR_PACKAGE=0 /bin/zsh "$script_dir/package-bridge.zsh" "$game_data_dir"
   artifact_dir=$build_output
 fi
 verify_exact_artifact_directory "$artifact_dir"

@@ -6,3 +6,4 @@
 /tools/**/bin/
 /tools/**/obj/
 *.pyc
+.DS_Store
