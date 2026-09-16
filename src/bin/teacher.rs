@@ -1,4 +1,4 @@
-use std::{env, time::Instant};
+use std::{env, process::ExitCode, time::Instant};
 use sts2_sim::{
     Action, Card, CardRarity, CardType, Content, Game, Phase, Room, foundation_content,
 };
@@ -515,11 +515,15 @@ fn search_run(
     (false, floor, nodes)
 }
 
-fn main() {
+fn main() -> ExitCode {
     let runs = env::args()
         .nth(1)
         .and_then(|x| x.parse().ok())
         .unwrap_or(20);
+    if runs == 0 {
+        eprintln!("runs must be greater than zero");
+        return ExitCode::FAILURE;
+    }
     let width = env::args()
         .nth(2)
         .and_then(|x| x.parse().ok())
@@ -560,4 +564,5 @@ fn main() {
             started.elapsed().as_secs_f32(),
         );
     }
+    ExitCode::SUCCESS
 }

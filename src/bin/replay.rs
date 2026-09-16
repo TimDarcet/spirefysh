@@ -41,5 +41,9 @@ fn main() -> ExitCode {
     if report.divergences.len() > limit {
         println!("... {} more divergences", report.divergences.len() - limit);
     }
-    ExitCode::SUCCESS
+    if report.divergences.is_empty() && report.unsupported == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
