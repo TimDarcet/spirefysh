@@ -1,3 +1,5 @@
+using System.Collections;
+using System.Diagnostics;
 using System.Reflection;
 using System.Runtime.Loader;
 using System.Security.Cryptography;
@@ -10,6 +12,7 @@ sealed class GameLoadContext(string directory) : AssemblyLoadContext(true)
 {
     protected override Assembly? Load(AssemblyName name)
     {
+        if (name.Name?.StartsWith("System.") == true) return null;
         var path = Path.Combine(directory, $"{name.Name}.dll");
         return File.Exists(path) ? LoadFromAssemblyPath(path) : null;
     }
@@ -26,8 +29,9 @@ static class Program
                 ["profile", "snapshot", var profile, var output] => Snapshot(profile, output),
                 ["profile", "verify", var profile, var snapshot] => Verify(profile, snapshot),
                 ["bridge", var game, var bridge] => VerifyBridge(game, bridge),
+                ["advisor", var game, var bridge] => VerifyAdvisor(game, bridge),
                 _ => throw new ArgumentException(
-                    "usage: Spirefysh.Tools profile snapshot|verify PROFILE SNAPSHOT | bridge GAME_DLL BRIDGE_DLL")
+                    "usage: Spirefysh.Tools profile snapshot|verify PROFILE SNAPSHOT | bridge|advisor GAME_DLL BRIDGE_DLL")
             };
         }
         catch (Exception exception)
@@ -131,6 +135,73 @@ static class Program
             context.Unload();
         }
         Console.WriteLine("bridge-verify valid=true");
+        return 0;
+    }
+
+    static int VerifyAdvisor(string gamePath, string bridgePath)
+    {
+        var context = new GameLoadContext(Path.GetDirectoryName(Path.GetFullPath(gamePath))!);
+        var assembly = context.LoadFromAssemblyPath(Path.GetFullPath(bridgePath));
+        var clientType = assembly.GetType("Spirefysh.Bridge.AdvisorClient", true)!;
+        var configType = assembly.GetType("Spirefysh.Bridge.AdvisorConfiguration", true)!;
+        var config = Activator.CreateInstance(configType, false, false, "", "")!;
+        var script = "while IFS= read -r line; do case $line in slow) sleep .2; print '{\"win_probability\":0.1,\"delta\":0}' ;; hang) sleep 10 ;; hover) print '{\"win_probability\":0.8,\"delta\":0}' ;; *) print '{\"win_probability\":0.5,\"delta\":0}' ;; esac; done";
+        var start = new ProcessStartInfo("/bin/zsh")
+        {
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            UseShellExecute = false
+        };
+        start.ArgumentList.Add("-c");
+        start.ArgumentList.Add(script);
+        using var process = Process.Start(start)!;
+        var constructor = clientType.GetConstructors(BindingFlags.Instance | BindingFlags.NonPublic).Single();
+        using var client = (IDisposable)constructor.Invoke([process, config]);
+        var enqueue = clientType.GetMethod("Enqueue", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        object? Call(string key, string request, int priority) =>
+            enqueue.Invoke(client, [key, request, priority]);
+        object Wait(string key, string request, int priority, double seconds = 2)
+        {
+            var deadline = Stopwatch.GetTimestamp() + seconds * Stopwatch.Frequency;
+            while (Stopwatch.GetTimestamp() < deadline)
+            {
+                var result = Call(key, request, priority);
+                if (result is not null) return result;
+                Thread.Sleep(5);
+            }
+            throw new TimeoutException($"advisor result timed out: {key}");
+        }
+
+        Call("slow", "slow", 0);
+        Call("discarded-low", "discarded-low", 0);
+        Call("hover", "hover", 1);
+        Call("discarded-later-low", "discarded-later-low", 0);
+        var hover = Wait("hover", "hover", 1);
+        if ((double)hover.GetType().GetProperty("WinProbability")!.GetValue(hover)! != .8)
+            throw new InvalidDataException("hover request did not win coalescing");
+        var cache = (IDictionary)clientType.GetField(
+            "_cache", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(client)!;
+        if (!cache.Contains("slow") || !cache.Contains("hover") || cache.Contains("discarded-low") ||
+            cache.Contains("discarded-later-low"))
+            throw new InvalidDataException("advisor priorities were not coalesced");
+        for (var index = 0; index < 260; index++)
+            Wait($"cache-{index}", $"cache-{index}", 1);
+        if (cache.Count != 256)
+            throw new InvalidDataException($"advisor cache is not bounded: {cache.Count}");
+
+        Call("hang", "hang", 1);
+        var failed = false;
+        var timeout = Stopwatch.GetTimestamp() + 7 * Stopwatch.Frequency;
+        while (Stopwatch.GetTimestamp() < timeout && !failed)
+        {
+            try { Call("hang", "hang", 1); }
+            catch (TargetInvocationException exception)
+                when (exception.InnerException is InvalidOperationException) { failed = true; }
+            Thread.Sleep(20);
+        }
+        if (!failed || !process.HasExited)
+            throw new InvalidDataException("hung advisor was not failed and killed");
+        Console.WriteLine("advisor-worker-verify valid=true cache=256 coalescing=true timeout=true");
         return 0;
     }
 }

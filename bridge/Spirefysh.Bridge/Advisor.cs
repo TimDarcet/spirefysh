@@ -5,6 +5,8 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
 using Godot;
 using HarmonyLib;
 using MegaCrit.Sts2.Core.Combat;
@@ -28,8 +30,22 @@ internal sealed record AdvisorResult(double WinProbability, double Delta, string
 
 internal sealed class AdvisorClient : IDisposable
 {
+    private const int CacheCapacity = 256;
     private readonly Process _process;
+    private readonly object _gate = new();
     private readonly Dictionary<string, AdvisorResult> _cache = [];
+    private readonly Queue<string> _cacheOrder = [];
+    private readonly CancellationTokenSource _stopping = new();
+    private Work? _queued;
+    private Task? _worker;
+    private string? _activeKey;
+    private Exception? _failure;
+    private bool _disposed;
+
+    private sealed record Work(
+        string Key,
+        string Request,
+        int Priority);
 
     internal bool ShowWinProbabilityDelta { get; }
     internal bool ShowCurrentWinProbability { get; }
@@ -76,40 +92,120 @@ internal sealed class AdvisorClient : IDisposable
         return new(process, config);
     }
 
-    internal AdvisorResult Analyze(SemanticAction action, AdvisorSelector selector) =>
-        Analyze(Snapshotter.Capture([action]), selector);
+    internal AdvisorResult? Analyze(SemanticAction action, AdvisorSelector selector) =>
+        Analyze(Snapshotter.Capture([action]), selector, 1);
 
-    internal AdvisorResult AnalyzeCurrent() => Analyze(Snapshotter.Capture(), new());
+    internal AdvisorResult? AnalyzeCurrent() => Analyze(Snapshotter.Capture(), new(), 0);
 
-    private AdvisorResult Analyze(CapturedSnapshot snapshot, AdvisorSelector selector)
+    private AdvisorResult? Analyze(CapturedSnapshot snapshot, AdvisorSelector selector, int priority)
     {
         var key = $"{snapshot.PublicHash}:{snapshot.OracleHash}:{selector}";
-        if (_cache.TryGetValue(key, out var cached)) return cached;
-        if (_process.HasExited) throw new InvalidOperationException("Advisor process exited.");
         var request = JsonSerializer.Serialize(new
         {
             before = snapshot.Public,
             oracle_before = snapshot.Oracle,
             selector
         }, TraceJson.Options);
-        _process.StandardInput.WriteLine(request);
-        _process.StandardInput.Flush();
-        var response = _process.StandardOutput.ReadLine()
-            ?? throw new EndOfStreamException("Advisor process closed its output.");
-        var result = JsonSerializer.Deserialize<AdvisorResult>(response, TraceJson.Options)
-            ?? throw new InvalidDataException("Advisor returned an empty response.");
-        if (result.Error is not null) throw new InvalidOperationException(result.Error);
-        _cache[key] = result;
-        return result;
+        return Enqueue(key, request, priority);
+    }
+
+    private AdvisorResult? Enqueue(string key, string request, int priority)
+    {
+        lock (_gate)
+        {
+            if (_cache.TryGetValue(key, out var cached)) return cached;
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_failure is not null)
+                throw new InvalidOperationException("Advisor process is unavailable.", _failure);
+            if (key == _activeKey || key == _queued?.Key) return null;
+            var work = new Work(key, request, priority);
+            if (_queued is null || priority >= _queued.Priority) _queued = work;
+            _worker ??= Task.Run(ProcessQueue);
+            return null;
+        }
+    }
+
+    private void ProcessQueue()
+    {
+        while (true)
+        {
+            Work? work;
+            lock (_gate)
+            {
+                if (_disposed || _queued is null)
+                {
+                    _activeKey = null;
+                    _worker = null;
+                    return;
+                }
+                work = _queued;
+                _queued = null;
+                _activeKey = work.Key;
+            }
+            AdvisorResult result;
+            try
+            {
+                result = Request(work.Request);
+            }
+            catch (Exception exception)
+            {
+                lock (_gate)
+                {
+                    if (!_disposed) _failure = exception;
+                    _activeKey = null;
+                    _worker = null;
+                }
+                return;
+            }
+            lock (_gate)
+            {
+                if (_disposed) return;
+                if (_cache.Count == CacheCapacity) _cache.Remove(_cacheOrder.Dequeue());
+                _cache[work.Key] = result;
+                _cacheOrder.Enqueue(work.Key);
+                _activeKey = null;
+            }
+        }
+    }
+
+    private AdvisorResult Request(string request)
+    {
+        try
+        {
+            if (_process.HasExited) throw new InvalidOperationException("Advisor process exited.");
+            _process.StandardInput.WriteLine(request);
+            _process.StandardInput.Flush();
+            var response = _process.StandardOutput.ReadLineAsync(_stopping.Token).AsTask()
+                .WaitAsync(TimeSpan.FromSeconds(5), _stopping.Token).GetAwaiter().GetResult()
+                ?? throw new EndOfStreamException("Advisor process closed its output.");
+            var result = JsonSerializer.Deserialize<AdvisorResult>(response, TraceJson.Options)
+                ?? throw new InvalidDataException("Advisor returned an empty response.");
+            if (result.Error is not null) throw new InvalidOperationException(result.Error);
+            return result;
+        }
+        catch
+        {
+            try { if (!_process.HasExited) _process.Kill(entireProcessTree: true); }
+            catch { }
+            throw;
+        }
     }
 
     public void Dispose()
     {
+        lock (_gate)
+        {
+            if (_disposed) return;
+            _disposed = true;
+            _queued = null;
+            _stopping.Cancel();
+        }
         try { _process.StandardInput.Close(); }
         catch { }
         try { if (!_process.HasExited) _process.Kill(entireProcessTree: true); }
         catch { }
         _process.Dispose();
+        _stopping.Dispose();
     }
 
     private static string Resolve(string directory, string path) =>
@@ -181,11 +277,19 @@ internal static class AdvisorTopBar
 internal static class AdvisorHover
 {
     private static AdvisorClient? _client;
+    private static SceneTree? _tree;
     private static Label? _label;
+    private static Control? _owner;
+    private static SemanticAction? _action;
+    private static AdvisorSelector? _selector;
+    private static long _nextUpdate;
 
     internal static void Install(Harmony harmony, AdvisorClient client)
     {
         _client = client;
+        _tree = Engine.GetMainLoop() as SceneTree
+            ?? throw new InvalidOperationException("Godot scene tree is unavailable.");
+        _tree.ProcessFrame += Update;
         foreach (var type in new[]
                  {
                      typeof(NCardHolder), typeof(NHandCardHolder), typeof(NEndTurnButton),
@@ -277,6 +381,20 @@ internal static class AdvisorHover
 
     private static void Show(Control owner, SemanticAction action, AdvisorSelector selector)
     {
+        _owner = owner;
+        _action = action;
+        _selector = selector;
+        _nextUpdate = 0;
+        Update();
+    }
+
+    private static void Update()
+    {
+        if (_owner is not { } owner || _action is not { } action || _selector is not { } selector)
+            return;
+        var now = System.Environment.TickCount64;
+        if (now < _nextUpdate) return;
+        _nextUpdate = now + 100;
         try
         {
             var result = _client?.Analyze(action, selector);
@@ -307,5 +425,11 @@ internal static class AdvisorHover
         return _label;
     }
 
-    private static void Hide() { if (_label is not null) _label.Visible = false; }
+    private static void Hide()
+    {
+        _owner = null;
+        _action = null;
+        _selector = null;
+        if (_label is not null) _label.Visible = false;
+    }
 }
