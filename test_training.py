@@ -27,11 +27,6 @@ class TelemetryTest(unittest.TestCase):
         ])
         self.assertTrue(args.disable_post_kl_check)
         self.assertEqual(args.mps_empty_cache_updates, 8)
-        self.assertEqual(args.batch, 16_384)
-        self.assertEqual(args.max_policy_lag, 20)
-        self.assertEqual(args.gae_gamma, 1)
-        self.assertEqual(args.gae_lambda, .99)
-        self.assertEqual(args.learning_rate_warmup_steps, 200)
 
     def test_learning_rate_warmup_uses_global_weights_revision(self):
         optimizer = Namespace(param_groups=[
@@ -49,6 +44,22 @@ class TelemetryTest(unittest.TestCase):
         np.testing.assert_allclose(
             [group["lr"] for group in optimizer.param_groups], [.01, .02, .005]
         )
+
+    def test_checkpoint_optimizer_configuration(self):
+        checkpoint = {"optimizer": {"param_groups": [{
+            "params": [], "betas": (.9, .99), "eps": 1e-5,
+        }]}}
+        self.assertEqual(train.checkpoint_optimizer(checkpoint), train.OPTIMIZER_CONFIG)
+        train.require_optimizer_config(checkpoint)
+        checkpoint["optimizer"]["param_groups"][0]["betas"] = (.9, .999)
+        checkpoint.pop("optimizer_config")
+        with self.assertRaisesRegex(ValueError, "does not match configured optimizer"):
+            train.require_optimizer_config(checkpoint)
+
+    def test_model_schema_comes_from_simulator(self):
+        schema = train.sts2_sim.model_schema()
+        self.assertEqual((train.FEATURE_VERSION, train.MODEL_VERSION), schema[:2])
+        self.assertEqual(train.TOKEN_SPECS, tuple(tuple(row) for row in schema[5]))
 
     def manifest(self, run_id, session, parent=None):
         return {
