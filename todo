@@ -1,0 +1,8 @@
+Try beta2 0.99
+Try wd?
+try some lambda? ONce we have an okay critic
+lr warmup?
+lower gradient clipping?
+higher bs? The training is quite noisy
+lower lr?
+check out gae lambda
