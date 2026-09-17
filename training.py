@@ -1056,36 +1056,90 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             revisions["update_attempt"] += 1
             unpack_started = time.monotonic()
             pause_samplers()
-            cpu_inputs, _ = packed.result()
-            inputs = upload(cpu_inputs, target)
-            unpack_seconds = time.monotonic() - unpack_started
-            action = torch.as_tensor(values["action"], device=target)
-            old = torch.as_tensor(values["old"], device=target)
             lengths = np.asarray([packed_action_count(row) for row in rows], np.int64)
             expert_lengths = np.asarray([
                 packed_action_count(row) for row in expert_rows
             ], np.int64)
+            flat_policy = not replay
+            policy_actions = int(lengths.sum())
+            expert_actions = int(expert_lengths.sum())
+            if not args.critic_only:
+                known = np.isin(values["id"], refill_ids) if len(refill_ids) \
+                    else np.zeros(len(rows), bool)
+                screen_positions = np.flatnonzero(~known) if len(refill_ids) \
+                    else np.arange(min(512, len(rows)))
+                screen_rows = [rows[index] for index in screen_positions]
+                screen_cpu = unpack(screen_rows, torch.device("cpu"), model, False)
+                screen_inputs = upload(screen_cpu, target)
+                screen_lengths = lengths[screen_positions]
+                screen_choice = torch.as_tensor(
+                    np.cumsum(screen_lengths) - screen_lengths + values["action"][screen_positions],
+                    device=target,
+                )
+                unpack_seconds = time.monotonic() - unpack_started
+                screen_forward_started = time.monotonic()
+                with torch.no_grad():
+                    screened = predict(
+                        model, screen_inputs, args.precision, args.policy_temperature,
+                        policy_only=True, flat_policy=True,
+                    )
+                    screen_ratio = screened[screen_choice] \
+                        - torch.as_tensor(values["old"][screen_positions], device=target)
+                    screen_fresh = screen_ratio.abs() <= args.max_log_ratio
+                forward_seconds = time.monotonic() - screen_forward_started
+            else:
+                screen_positions = np.empty(0, np.int64)
+                unpack_seconds = time.monotonic() - unpack_started
+                forward_seconds = 0.
+                screen_fresh = torch.ones(0, dtype=torch.bool, device=target)
+            if len(screen_positions) and not bool(screen_fresh.all()):
+                invalid_trajectories = values["trajectory"][screen_positions][
+                    ~screen_fresh.cpu().numpy()
+                ]
+                invalid = np.isin(values["trajectory"], invalid_trajectories)
+                refill_ids = values["id"][~invalid]
+                ratio_rejected = dataset.discard_trajectories(values["trajectory"][invalid])
+                handled += ratio_rejected
+                prefetch()
+                update_elapsed = time.monotonic() - update_started
+                training_batch_event(
+                    "ratio_rejected", "none", attempted_rows=len(rows),
+                    fresh_rows=int((~invalid).sum()), policy_trained_rows=0,
+                    critic_trained_rows=0, ratio_rejected_rows=ratio_rejected,
+                    retired_rows=0, unpack_seconds=unpack_seconds,
+                    forward_seconds=forward_seconds, backward_seconds=0.,
+                    total_seconds=update_elapsed,
+                )
+                screened = screen_ratio = screen_fresh = screen_inputs = None
+                model._sequence_layouts.clear()
+                release_mps_cache(True)
+                resume_samplers()
+                continue
+            screened = screen_ratio = screen_fresh = screen_inputs = None
+            full_unpack_started = time.monotonic()
+            cpu_inputs, _ = packed.result()
+            inputs = upload(cpu_inputs, target)
+            unpack_seconds += time.monotonic() - full_unpack_started
+            action = torch.as_tensor(values["action"], device=target)
+            old = torch.as_tensor(values["old"], device=target)
             choice_index = torch.as_tensor(
                 np.cumsum(lengths) - lengths + values["action"], device=target,
             )
-            flat_policy = not replay
-            forward_started = time.monotonic()
+            full_forward_started = time.monotonic()
             all_logits, all_critic_logits = (
                 predict_cached(model, inputs, args.precision, args.policy_temperature) if cached else
                 predict(model, inputs, args.precision, args.policy_temperature, flat_policy=flat_policy)
             )
-            forward_seconds = time.monotonic() - forward_started
+            forward_seconds += time.monotonic() - full_forward_started
             backward_seconds = 0.0
             critic_logits = all_critic_logits[:len(rows)]
-            legal = None if cached else inputs[6][:len(rows)]
-            policy_actions = int(lengths.sum())
-            expert_actions = int(expert_lengths.sum())
             logits = all_logits[:policy_actions] if flat_policy else all_logits[:len(rows)]
             expert_logits = (all_logits[policy_actions:policy_actions + expert_actions]
                              if flat_policy else
                              all_logits[len(rows):len(rows) + len(expert_rows)])
             log_ratio = (logits[choice_index] if flat_policy else
                          logits.gather(1, action[:, None]).squeeze(1)) - old
+            legal = None if cached else inputs[6][:len(rows)]
             if not cached and not args.critic_only and not (legal.sum(1) > 1).all():
                 raise RuntimeError("forced action entered the dataset")
             fresh = torch.ones_like(log_ratio, dtype=torch.bool) if args.critic_only \
@@ -1107,8 +1161,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     total_seconds=update_elapsed,
                 )
                 all_logits = all_critic_logits = logits = expert_logits = critic_logits = None
-                log_ratio = fresh = None
-                inputs = None
+                log_ratio = fresh = inputs = None
                 model._sequence_layouts.clear()
                 release_mps_cache(True)
                 resume_samplers()
