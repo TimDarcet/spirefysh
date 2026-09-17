@@ -248,7 +248,7 @@ class RolloutCollector:
                 "stats": list(stats[index]), "actions": self.action_history[index],
             }, "WARNING", role=f"sampler-{self.worker}")
 
-    def collect(self, model, target, precision, deadline, steps, version, actor_revision,
+    def collect(self, model, target, precision, deadline, steps, version,
                 stop=None,
                 heartbeat=None, progress=None):
         args = self.args
@@ -260,13 +260,11 @@ class RolloutCollector:
         episodes = [[] for _ in range(5)]
         sample_keys = (
             "rows", "choices", "old_log", "critic_values", "canonical_progress",
-            "phases", "win_rewards", "terminals", "characters", "versions", "actor_versions",
-            "potentials",
+            "phases", "win_rewards", "terminals", "characters", "versions", "potentials",
         ) + (("features",) if native and args.cache_features else ())
         def materialize(trajectory):
             samples = trajectory.pop("samples")
             trajectory.update(zip(sample_keys, map(list, zip(*samples))))
-            trajectory.pop("actor_versions")
             return trajectory
         discarded_steps = orphan_empty_actions = sampled_steps = 0
         search_stats = np.zeros(17, np.int64)
@@ -328,13 +326,13 @@ class RolloutCollector:
                 potentials = np.asarray(potentials, np.float32)
                 search_stats += np.asarray(step_search_stats, np.int64)
                 for expert in step_experts:
-                    row, target, visits, depth, *consistency = expert
+                    row, target, _visits, _depth, *consistency = expert
                     consistency = (((), np.empty(0, np.float32), 1., 0.)
                                    if not consistency else
                                    (tuple(consistency[0]), np.asarray(consistency[1], np.float32),
                                     consistency[2], consistency[3]))
                     expert_rows.append((row, np.asarray(target, np.float16), version,
-                                        visits, depth, consistency))
+                                        consistency))
                 policy = None
             else:
                 state_stats = self.env.stats()
@@ -382,8 +380,7 @@ class RolloutCollector:
             if native:
                 self.native_steps.append((
                     step_rows, choice, log_probability, critic_value, canonical, phases,
-                    raw_reward, done, characters, version, actor_revision,
-                    potentials,
+                    raw_reward, done, characters, version, potentials,
                 ) + ((step_features,) if args.cache_features else ()))
             else:
                 for index, row in enumerate(step_rows):
@@ -394,8 +391,7 @@ class RolloutCollector:
                     trajectory["samples"].append((
                         row, choice[index], log_probability[index], critic_value[index],
                         canonical[index], phases[index], raw_reward[index], done[index],
-                        characters[index], version, actor_revision,
-                        potentials[index],
+                        characters[index], version, potentials[index],
                     ))
             if boundary.any():
                 reset = np.flatnonzero(boundary).tolist()
@@ -407,7 +403,6 @@ class RolloutCollector:
                     completion_seconds = (time.monotonic() - self.native_started[index] if native
                                           else time.monotonic() - self.trajectories[index]["started"])
                     policy_versions = [row[9] for row in history]
-                    actor_versions = [row[10] for row in history]
                     completions.append({
                         "character": int(characters[index]),
                         "floor": int((stats[index][0] - 1) * 17 + stats[index][1]),
@@ -419,8 +414,6 @@ class RolloutCollector:
                         "iteration": self.iteration,
                         "policy_revision_min": min(policy_versions, default=version),
                         "policy_revision_max": max(policy_versions, default=version),
-                        "actor_revision_min": min(actor_versions, default=actor_revision),
-                        "actor_revision_max": max(actor_versions, default=actor_revision),
                     })
                     episodes[characters[index]].append((
                         int(done[index] and stats[index][4] == 12),
@@ -433,13 +426,12 @@ class RolloutCollector:
                     if native and done[index]:
                         trajectory = {
                             key: ([step[column][index] for step in history]
-                                  if column in (0, 12) else np.asarray([
-                                      step[column] if column in (9, 10) else step[column][index]
+                                  if column in (0, 11) else np.asarray([
+                                      step[column] if column == 9 else step[column][index]
                                       for step in history
                                   ]))
                             for column, key in enumerate(sample_keys)
                         }
-                        trajectory.pop("actor_versions")
                         trajectory["completion_seconds"] = completion_seconds
                         finished.append(trajectory)
                     elif native:
@@ -549,7 +541,7 @@ class RolloutCollector:
             if not steps:
                 break
             result = self.collect(
-                model, target, precision, deadline, steps, version, actor_revision, stop,
+                model, target, precision, deadline, steps, version, stop,
                 heartbeat, progress,
             )
             if self.args.log_level == "DEBUG":

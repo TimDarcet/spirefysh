@@ -27,6 +27,7 @@ class TelemetryTest(unittest.TestCase):
         ])
         self.assertTrue(args.disable_post_kl_check)
         self.assertEqual(args.mps_empty_cache_updates, 8)
+        self.assertEqual(args.dataset_capacity, 131_072)
 
     def test_learning_rate_warmup_uses_global_weights_revision(self):
         optimizer = Namespace(param_groups=[
@@ -82,25 +83,34 @@ class TelemetryTest(unittest.TestCase):
                  "weights_revision": 0, "policy_revision": 0,
                  "training_elapsed_seconds": 0},
                 {"event": "sample_packet", "time": 2, "step": 40, "stage": 0,
+                 "policy_revision": 4, "resolved_decisions_total": 40,
                  "packet_sampled_decisions": 80, "admitted_rows": 30,
                  "discarded_decisions": 5, "forced_rows": 3,
-                 "budget_excess_rows": 2, "collect_seconds": 2,
+                 "budget_excess_rows": 2, "capacity_dropped_rows": 4,
+                 "collect_seconds": 2, "queue_delay_seconds": .5,
+                 "cache": {"card_hits": 9, "card_misses": 1},
+                 "mcts": {"roots": 2, "simulations": 10, "seconds": 2},
                  "episodes": [{"character": 2, "floor": 12, "won": True,
                                "step_cap": False, "combat_cap": False,
                                "empty_actions": False, "length": 20,
-                               "completion_seconds": 1, "iteration": 5}]},
+                               "completion_seconds": 1, "iteration": 5,
+                               "policy_revision_min": 2,
+                               "policy_revision_max": 4}]},
                 {"event": "training_batch", "time": 3, "step": 40, "stage": 0,
                  "weights_revision": 1, "policy_revision": 1,
                  "attempted_rows": 20, "fresh_rows": 20,
                  "policy_trained_rows": 20, "critic_trained_rows": 20,
                  "policy_outcome": "accepted", "commit_kind": "full",
-                 "retired_rows": 4,
+                 "retired_rows": 4, "policy_lag_counts": {"0": 10, "1": 10},
+                 "advantage_mean": 2, "advantage_stddev": 3,
                  "policy_loss": 2, "critic_loss": 3,
                  "search_consistency_loss": .25, "gradient_clipped": True,
                  "critic_explained_reward_variance": .5, "total_seconds": 1,
                  "critic_explained_reward_variance_by_floor": {
                      "12": {"value": .5, "target_variance": .25, "rows": 20}},
                  "training_elapsed_seconds": 3},
+                {"event": "dataset_pruned", "time": 3.5, "step": 40, "stage": 0,
+                 "incomplete_rows": 2},
             ])
             projector = train.MetricsProjector(root, run, manifest, 1)
             cursor = projector.cursor
@@ -124,6 +134,14 @@ class TelemetryTest(unittest.TestCase):
             self.assertEqual(metrics["critic_floor_conditioned_explained_reward_variance"], .5)
             self.assertEqual(metrics["search_consistency_loss"], .25)
             self.assertEqual(metrics["gradient_clipped"], 1)
+            self.assertEqual(metrics["advantage_stddev"], 3)
+            self.assertEqual(metrics["policy_lag_mean"], .5)
+            self.assertEqual(metrics["policy_lag_p95"], 1)
+            self.assertEqual(metrics["policy_lag_max"], 1)
+            self.assertEqual(metrics["trajectory_policy_span_max"], 2)
+            self.assertEqual(metrics["trajectory_arrival_lag_max"], 2)
+            self.assertEqual(metrics["card_cache_hit_rate"], .9)
+            self.assertEqual(metrics["mcts_simulations_per_root"], 5)
             self.assertEqual(metrics["dataset_rows"], 7)
             self.assertEqual(metrics["optimizer_steps_per_second"], 1)
             self.assertEqual(metrics["used_rows_per_second"], 20)
@@ -135,7 +153,12 @@ class TelemetryTest(unittest.TestCase):
             self.assertEqual(metrics["dataset_rollout_dropped"], 3)
             self.assertEqual(metrics["dataset_budget_dropped"], 2)
             self.assertEqual(metrics["dataset_forced_dropped"], 3)
+            self.assertEqual(metrics["dataset_capacity_dropped"], 4)
+            self.assertEqual(metrics["dataset_incomplete_dropped"], 2)
             self.assertEqual(metrics["dataset_retired"], 4)
+            for key in ("step", "stage", "resolved_decisions_total", "policy_revision",
+                        "update_attempt"):
+                self.assertNotIn(key, metrics)
 
     def test_projector_tracks_policy_rejections(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -171,6 +194,26 @@ class TelemetryTest(unittest.TestCase):
             self.assertAlmostEqual(
                 metrics["critic_floor_conditioned_explained_reward_variance"], 3.05 / 4.75
             )
+
+    def test_projector_combines_distributions_instead_of_batch_statistics(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); run = root / "run"; (run / "events").mkdir(parents=True)
+            manifest = self.manifest("run", 1)
+            (run / "run.json").write_text(json.dumps(manifest))
+            write_events(run / "events/000001.jsonl", [
+                {"event": "training_batch", "time": 1, "step": 1, "stage": 0,
+                 "fresh_rows": 2, "advantage_mean": 1, "advantage_stddev": 0,
+                 "policy_lag_counts": {"0": 1, "1": 1}},
+                {"event": "training_batch", "time": 2, "step": 2, "stage": 0,
+                 "fresh_rows": 2, "advantage_mean": 3, "advantage_stddev": 0,
+                 "policy_lag_counts": {"1": 1, "2": 1}},
+            ])
+            metrics = train.MetricsProjector(root, run, manifest, 1).value()["reports"][-1]["metrics"]
+            self.assertEqual(metrics["advantage_mean"], 2)
+            self.assertEqual(metrics["advantage_stddev"], 1)
+            self.assertEqual(metrics["policy_lag_mean"], 1)
+            self.assertAlmostEqual(metrics["policy_lag_p95"], 1.85)
+            self.assertEqual(metrics["policy_lag_max"], 2)
 
     def test_critic_explained_reward_variance(self):
         targets = torch.tensor([0., 1.])
@@ -261,6 +304,8 @@ class TelemetryTest(unittest.TestCase):
             self.assertIn("function clipComparison", html)
             self.assertIn("setFullRange([primary])", html)
             self.assertIn("compareSelect.onchange=()=>showVersion()", html)
+            self.assertIn("lineages=[...new Set(", html)
+            self.assertIn(".localeCompare(", html)
             self.assertIn("id=legend class=legend", html)
             self.assertIn("plotly_relayout", html)
             self.assertIn("showlegend:false", html)
@@ -399,7 +444,7 @@ class TelemetryTest(unittest.TestCase):
         self.assertEqual(limited.rows, [rows[1]])
         np.testing.assert_array_equal(limited.data["id"][:1], [1])
 
-    def test_policy_rejection_discards_trajectory(self):
+    def test_fifo_capacity_uses_arrival_order(self):
         def trajectory(versions):
             length = len(versions)
             return {
@@ -413,12 +458,23 @@ class TelemetryTest(unittest.TestCase):
             }
 
         dataset = train.ExperienceDataset()
-        dataset.add({"trajectories": [trajectory([0, 2, 2]), trajectory([2, 2])]},
+        dataset.add({"trajectories": [trajectory([9, 9, 9]), trajectory([0, 0])]},
                     Namespace(gae_gamma=1, gae_lambda=1))
         np.testing.assert_array_equal(dataset.data["trajectory"][:5], [0, 0, 0, 1, 1])
 
-        self.assertEqual(dataset.prune(2, 1), 3)
+        self.assertEqual(dataset.discard_ids([1]), 1)
+        self.assertEqual(dataset.trim(2), 2)
+        self.assertEqual(list(dataset.index), [3, 4])
         np.testing.assert_array_equal(dataset.data["trajectory"][:2], [1, 1])
+        np.testing.assert_array_equal(dataset.data["version"][:2], [0, 0])
+        np.testing.assert_array_equal(np.sort(dataset.data["id"][:2]), [3, 4])
+        np.testing.assert_array_equal(
+            np.sort(dataset.sample(2, np.random.default_rng(1), candidates=[0, 1])),
+            [0, 1],
+        )
+        np.testing.assert_array_equal(
+            dataset.sample(1, np.random.default_rng(1), True, candidates=[1]), [1],
+        )
         self.assertEqual(dataset.discard_trajectories([1]), 2)
         self.assertEqual(len(dataset), 0)
 

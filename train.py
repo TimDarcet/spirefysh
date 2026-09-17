@@ -70,6 +70,7 @@ def parser():
     run.add_argument("--expert-max-lag", type=int, default=4)
     run.add_argument("--expert-batch", type=int)
     run.add_argument("--expert-capacity", type=int, default=131_072)
+    run.add_argument("--dataset-capacity", type=int, default=131_072)
     run.add_argument("--batch", type=int, default=4096)
     run.add_argument("--learning-rate", type=float, default=3e-4)
     run.add_argument("--learning-rate-warmup-steps", type=int, default=200)

@@ -2,6 +2,7 @@ import atexit
 import fcntl
 import http.server
 import json
+import logging
 import math
 import os
 import sys
@@ -11,7 +12,6 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse
 
 import numpy as np
-import torch
 
 import sts2_sim
 from model import *
@@ -23,11 +23,25 @@ _EVENT_PATH = None
 _EVENT_LOCK = threading.Lock()
 _LOG_CAPTURES = []
 _CONSOLE_FDS = {}
+_CONSOLE_STREAM = None
+_CONSOLE_TTY = False
 _LOG_ACTIVE = False
 _LOG_STOP = b"\0spirefysh-log-stop\0"
+_LOGGER = logging.getLogger("spirefysh.training")
+_LOGGER.propagate = False
 
 
-def emit_event(value, level="INFO", console=True, role=None, event_time=None):
+def emit_event(value, level=None, console=True, role=None, event_time=None):
+    event = value.get("event", "event")
+    level = level or (
+        "ERROR" if event.endswith("_error") else
+        "WARNING" if event == "sampler_restart" else
+        "DEBUG" if event in (
+            "actor_loaded", "actor_published", "collect", "dataset_pruned",
+            "expert_pruned", "heartbeat", "packet", "sample_packet",
+            "sampler_start", "sampler_stop", "training_batch",
+        ) else "INFO"
+    )
     reserved = {"event_schema", "time", "level", "run_id", "session_id", "role", "pid", "thread"}
     overlap = reserved & value.keys()
     if overlap:
@@ -52,16 +66,19 @@ def emit_event(value, level="INFO", console=True, role=None, event_time=None):
             end = os.lseek(_EVENT_FD, 0, os.SEEK_END)
         finally:
             fcntl.flock(_EVENT_FD, fcntl.LOCK_UN)
-    if console and _CONSOLE_FDS and not record["role"].startswith("sampler-"):
+    if console and _CONSOLE_FDS and not (record["role"] or "").startswith("sampler-"):
         fields = {key: item for key, item in value.items()
                   if key not in ("event", "metrics", "pipeline", "result", "training", "time")}
         fields.update({key: item for key, item in value.get("metrics", {}).items()
                        if isinstance(item, (bool, int, float, str))})
-        message = value.get("event", "event") + " " + " ".join(
+        message = event + " " + " ".join(
             f"{key}={json.dumps(item, separators=(',', ':'))}" for key, item in fields.items()
-        ) + "\n"
-        fd = 2 if str(level).upper() in ("WARNING", "ERROR") else 1
-        os.write(_CONSOLE_FDS[fd], message.encode())
+        )
+        symbol = {"DEBUG": "·", "INFO": "●", "WARNING": "▲", "ERROR": "✖"}.get(
+            str(level).upper(), "●"
+        )
+        _LOGGER.log(getattr(logging, str(level).upper()),
+                    f"{symbol} {message}" if _CONSOLE_TTY else message)
     return end
 
 
@@ -71,7 +88,8 @@ def sync_events():
 
 def configure_logging(output, role, level="INFO", trainer_session=None, run_id=None,
                       event_log=None, first_event=None):
-    global _EVENT_FD, _EVENT_ROLE, _TRAINER_SESSION, _RUN_ID, _EVENT_PATH, _LOG_ACTIVE
+    global _EVENT_FD, _EVENT_ROLE, _TRAINER_SESSION, _RUN_ID, _EVENT_PATH
+    global _CONSOLE_STREAM, _CONSOLE_TTY, _LOG_ACTIVE
     if _LOG_ACTIVE:
         return
     _EVENT_PATH = Path(event_log) if event_log else Path(output) / "events.jsonl"
@@ -102,17 +120,51 @@ def configure_logging(output, role, level="INFO", trainer_session=None, run_id=N
         thread = threading.Thread(target=forward, name=f"{name}-capture", daemon=True)
         thread.start(); _LOG_CAPTURES.append((fd, saved, thread)); _CONSOLE_FDS[fd] = saved
 
+    _CONSOLE_TTY = sys.stdout.isatty()
     sys.stdout.flush(); sys.stderr.flush()
     capture(1, "stdout", "INFO")
     capture(2, "stderr", "WARNING")
     sys.stdout.reconfigure(line_buffering=True)
     sys.stderr.reconfigure(line_buffering=True)
+    _CONSOLE_STREAM = os.fdopen(os.dup(_CONSOLE_FDS[1]), "w", buffering=1)
+    if _CONSOLE_TTY:
+        try:
+            from rich.console import Console
+            from rich.logging import RichHandler
+        except ImportError:
+            class ColorFormatter(logging.Formatter):
+                def format(self, record):
+                    colors = {logging.DEBUG: "36", logging.INFO: "32",
+                              logging.WARNING: "33", logging.ERROR: "31"}
+                    return f"\33[{colors.get(record.levelno, '37')}m{super().format(record)}\33[0m"
+            handler = logging.StreamHandler(_CONSOLE_STREAM)
+            handler.setFormatter(ColorFormatter(
+                "%(asctime)s %(levelname)-8s %(message)s", "%H:%M:%S",
+            ))
+        else:
+            handler = RichHandler(
+                console=Console(
+                    file=_CONSOLE_STREAM, force_terminal=True,
+                    color_system="standard", no_color=False,
+                ),
+                rich_tracebacks=True, show_path=False,
+            )
+            handler.setFormatter(logging.Formatter("%(message)s"))
+    else:
+        handler = logging.StreamHandler(_CONSOLE_STREAM)
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)s %(message)s", "%Y-%m-%dT%H:%M:%S",
+        ))
+    handler.setLevel(str(level).upper())
+    _LOGGER.handlers[:] = [handler]
+    _LOGGER.setLevel(logging.DEBUG)
     sts2_sim.configure_logging(role, level)
     emit_event({"event": "logging_started"})
 
 
 def shutdown_logging():
-    global _EVENT_FD, _EVENT_ROLE, _TRAINER_SESSION, _RUN_ID, _EVENT_PATH, _LOG_ACTIVE
+    global _EVENT_FD, _EVENT_ROLE, _TRAINER_SESSION, _RUN_ID, _EVENT_PATH
+    global _CONSOLE_STREAM, _CONSOLE_TTY, _LOG_ACTIVE
     if not _LOG_ACTIVE:
         return
     sys.stdout.flush(); sys.stderr.flush()
@@ -124,8 +176,14 @@ def shutdown_logging():
         os.close(saved)
     _LOG_CAPTURES.clear()
     _CONSOLE_FDS.clear()
+    for handler in _LOGGER.handlers:
+        handler.flush(); handler.close()
+    _LOGGER.handlers.clear()
+    _CONSOLE_STREAM.close()
     os.close(_EVENT_FD)
     _EVENT_FD = _EVENT_ROLE = _TRAINER_SESSION = _RUN_ID = _EVENT_PATH = None
+    _CONSOLE_STREAM = None
+    _CONSOLE_TTY = False
     _LOG_ACTIVE = False
 
 
@@ -172,29 +230,6 @@ def episode_summary(rows):
         "combat_caps": sum(row[3] for row in rows),
         "empty_actions": sum(row[4] for row in rows),
     }
-
-
-def metric_means(metrics):
-    result = {}
-    pending = []
-    for key, values in metrics.items():
-        if not values:
-            result[key] = 0
-        elif torch.is_tensor(values[0]):
-            pending.append((key, values))
-        else:
-            result[key] = float(np.mean(values))
-    if pending:
-        values = torch.cat([torch.stack(rows) for _, rows in pending]).cpu().tolist()
-        start = 0
-        for key, rows in pending:
-            result[key] = float(np.mean(values[start : start + len(rows)]))
-            start += len(rows)
-    return result
-
-
-def summaries(episodes):
-    return [episode_summary(rows) for rows in episodes]
 
 
 def immutable_json(path, value):
@@ -311,20 +346,22 @@ def floor_bands(histogram):
 
 
 class MetricsProjector:
-    event_metadata = {
-        "event_schema", "time", "level", "event", "run_id", "session_id",
-        "trainer_session", "sampler_session", "role", "pid", "thread",
-    }
     means = {
-        "advantage_mean": "fresh_rows", "advantage_stddev": "fresh_rows",
+        "advantage_mean": "fresh_rows",
         "policy_loss": "policy_trained_rows", "critic_loss": "critic_trained_rows",
         "critic_explained_reward_variance": "critic_trained_rows",
         "critic_floor_conditioned_explained_reward_variance": None,
+        "critic_expected": "critic_trained_rows",
+        "critic_win_probability": "critic_trained_rows",
+        "expert_loss": "expert_rows", "ppo_head_grad": "expert_rows",
+        "expert_head_grad": "expert_rows", "expert_grad_cosine": "expert_rows",
+        "winning_collection_drift": "winning_replayed_rows",
+        "search_consistency_loss": None,
         "entropy": "policy_trained_rows", "entropy_weight": "policy_trained_rows",
         "pre_kl": "fresh_rows", "post_kl": "policy_trained_rows",
         "clip_fraction": "policy_trained_rows", "gradient_norm": None,
+        "gradient_clipped": None,
         "policy_lag_mean": "fresh_rows", "policy_lag_p95": "fresh_rows",
-        "policy_lag_max": None,
         "unpack_seconds": None, "forward_seconds": None, "backward_seconds": None,
         "total_seconds": None,
     }
@@ -360,6 +397,8 @@ class MetricsProjector:
                 "_floor_explained_sum": [0.] * (MAX_PROGRESS + 1),
                 "_floor_explained_weight": [0.] * (MAX_PROGRESS + 1),
                 "_floor_explained_rows": [0] * (MAX_PROGRESS + 1),
+                "_policy_lag_counts": [], "_policy_lag_max": None, "_totals": {},
+                "_advantage_square_sum": 0., "_advantage_rows": 0,
                 "_characters": [[0, 0] for _ in range(5)],
                 "_character_floors": [[0] * 53 for _ in range(5)],
                 "_character_caps": [[0, 0, 0] for _ in range(5)],
@@ -368,9 +407,13 @@ class MetricsProjector:
                 "_trained": 0, "_critic_trained": 0, "_discarded": 0, "_batches": 0,
                 "_optimizer_steps": [],
                 "_collect_seconds": 0., "_update_seconds": 0.,
-                "_episode_length": 0, "_episode_seconds": 0.,
+                "_episode_length": 0, "_episode_length_max": 0,
+                "_episode_seconds": 0., "_episode_seconds_max": 0.,
+                "_policy_episodes": 0, "_policy_span": 0, "_policy_span_max": 0,
+                "_arrival_lag": 0, "_arrival_lag_max": 0,
                 "_attempted": 0, "_admitted": 0, "_forced": 0,
-                "_budget_excess": 0, "_ratio_rejected": 0, "_stale": 0,
+                "_budget_excess": 0, "_capacity_dropped": 0,
+                "_incomplete": 0, "_ratio_rejected": 0, "_stale": 0,
                 "_retired": 0, "_pre_kl_rejected": 0, "_post_kl_rejected": 0,
             }
         self.current["step"] = max(self.current["step"], step)
@@ -414,6 +457,15 @@ class MetricsProjector:
             window["_ratio_rejected"] += event.get("ratio_rejected_rows", 0)
             window["_retired"] += event.get("retired_rows", 0)
             window["_update_seconds"] += event.get("total_seconds", 0.)
+            for source, target in (
+                ("expert_rows", "expert_rows_used"),
+                ("replay_rows", "winning_replay_candidates"),
+                ("winning_replayed_rows", "winning_replayed"),
+                ("winning_rejected_rows", "winning_rejected_kl"),
+            ):
+                value = event.get(source, 0)
+                if value:
+                    window["_totals"][target] = window["_totals"].get(target, 0) + value
             outcome, commit = event.get("policy_outcome"), event.get("commit_kind")
             duration = event.get("total_seconds", 0.)
             if commit and commit != "none" and duration > 0:
@@ -440,6 +492,26 @@ class MetricsProjector:
                     continue
                 window["_sum"][metric] = window["_sum"].get(metric, 0.) + value * weight
                 window["_weight"][metric] = window["_weight"].get(metric, 0) + weight
+            if event.get("advantage_mean") is not None \
+                    and event.get("advantage_stddev") is not None:
+                rows = event.get("fresh_rows", 0)
+                window["_advantage_square_sum"] += rows * (
+                    event["advantage_stddev"] ** 2 + event["advantage_mean"] ** 2
+                )
+                window["_advantage_rows"] += rows
+            counts = event.get("policy_lag_counts", ())
+            if counts:
+                counts = counts.items() if isinstance(counts, dict) else enumerate(counts)
+                counts = [(int(lag), count) for lag, count in counts]
+                window["_policy_lag_counts"] += [0] * (
+                    max(lag for lag, _ in counts) + 1 - len(window["_policy_lag_counts"])
+                )
+                for lag, count in counts:
+                    window["_policy_lag_counts"][lag] += count
+            if event.get("policy_lag_max") is not None:
+                window["_policy_lag_max"] = max(
+                    event["policy_lag_max"], window["_policy_lag_max"] or 0,
+                )
             for floor, metric in event.get(
                     "critic_explained_reward_variance_by_floor", {}).items():
                 floor, rows = int(floor), metric["rows"]
@@ -454,7 +526,38 @@ class MetricsProjector:
             window["_admitted"] += event.get("admitted_rows", 0)
             window["_forced"] += event.get("forced_rows", 0)
             window["_budget_excess"] += event.get("budget_excess_rows", 0)
+            window["_capacity_dropped"] += event.get("capacity_dropped_rows", 0)
             window["_collect_seconds"] += event.get("collect_seconds", 0.)
+            window["_caps"][2] += event.get("orphan_empty_actions", 0)
+            for source, target in (
+                ("trajectory_rows", "trajectory_rows"),
+                ("expert_rows", "expert_rows_collected"),
+                ("winning_candidates", "winning_candidates"),
+                ("winning_admitted", "winning_admitted"),
+                ("winning_episodes", "winning_episodes"),
+                ("winning_skipped", "winning_skipped"),
+                ("winning_forced_skipped", "winning_forced_skipped"),
+                ("queue_full_waits", "sample_queue_full_waits"),
+            ):
+                value = event.get(source, 0)
+                if value:
+                    window["_totals"][target] = window["_totals"].get(target, 0) + value
+            for group, prefix in ((event.get("cache", {}), ""), (event.get("mcts", {}), "mcts_")):
+                for metric, value in group.items():
+                    if not value:
+                        continue
+                    key = prefix + metric
+                    window["_totals"][key] = window["_totals"].get(key, 0) + value
+            if event.get("queue_delay_seconds") is not None:
+                window["_totals"]["sample_queue_delay_seconds"] = \
+                    window["_totals"].get("sample_queue_delay_seconds", 0.) \
+                    + event["queue_delay_seconds"]
+                window["_totals"]["sample_queue_packets"] = \
+                    window["_totals"].get("sample_queue_packets", 0) + 1
+            if event.get("queue_put_seconds"):
+                window["_totals"]["sample_queue_put_seconds"] = \
+                    window["_totals"].get("sample_queue_put_seconds", 0.) \
+                    + event["queue_put_seconds"]
             for index, episode in enumerate(event.get("episodes", ())):
                 character = int(episode["character"]); floor = max(0, min(52, int(episode["floor"])))
                 window["_floors"][floor] += 1
@@ -468,6 +571,22 @@ class MetricsProjector:
                     window["_character_caps"][character][target] += int(episode.get(key, False))
                 window["_episode_length"] += episode.get("length", 0)
                 window["_episode_seconds"] += episode.get("completion_seconds", 0.)
+                window["_episode_length_max"] = max(
+                    window["_episode_length_max"], episode.get("length", 0),
+                )
+                window["_episode_seconds_max"] = max(
+                    window["_episode_seconds_max"], episode.get("completion_seconds", 0.),
+                )
+                if "policy_revision_min" in episode:
+                    span = episode.get("policy_revision_max", 0) \
+                        - episode["policy_revision_min"]
+                    lag = max(0, event.get("policy_revision", 0)
+                              - episode["policy_revision_min"])
+                    window["_policy_span"] += span
+                    window["_policy_span_max"] = max(window["_policy_span_max"], span)
+                    window["_arrival_lag"] += lag
+                    window["_arrival_lag_max"] = max(window["_arrival_lag_max"], lag)
+                    window["_policy_episodes"] += 1
                 priority = hashlib.sha256(
                     f"{event.get('run_id')}:{event.get('session_id')}:{event_end}:{index}".encode()
                 ).digest()[:8]
@@ -480,6 +599,7 @@ class MetricsProjector:
                 "training_elapsed_seconds"
             ) is None else self.window(event)
             window["_stale"] += event.get("stale_rows", 0)
+            window["_incomplete"] += event.get("incomplete_rows", 0)
         elif fact and kind == "heartbeat":
             window = self.window(event)
             for source, target in (
@@ -488,9 +608,17 @@ class MetricsProjector:
                 ("winning_rows", "winning_reservoir"),
                 ("accelerator_allocated_bytes", "accelerator_allocated_bytes"),
                 ("accelerator_driver_allocated_bytes", "accelerator_driver_allocated_bytes"),
+                ("queue_capacity", "sample_queue_capacity"),
+                ("sampler_policy_revision", "sampler_policy_revision"),
+                ("dataset_priority_mean", "dataset_priority_mean"),
+                ("dataset_priority_max", "dataset_priority_max"),
+                ("watchdog_dropped_steps", "watchdog_dropped_steps"),
             ):
                 if source in event:
                     window[target] = event[source]
+            window["dataset_peak"] = max(
+                window.get("dataset_peak", 0), event.get("dataset_peak_rows", 0),
+            )
         elif fact and kind == "checkpoint":
             self.window(event)
         elif kind == "promotion":
@@ -505,14 +633,6 @@ class MetricsProjector:
             self.status = "completed"
         elif kind in ("session_error", "error") and event.get("role") == "learner":
             self.status = "failed"
-        if fact and "window" in locals():
-            for metric, value in event.items():
-                if metric in self.event_metadata or metric in self.means \
-                        or not isinstance(value, (int, float)):
-                    continue
-                window["_sum"][metric] = window["_sum"].get(metric, 0.) + value
-                window["_weight"][metric] = window["_weight"].get(metric, 0) + 1
-
     def render(self, window):
         metrics = {
             key: window["_sum"][key] / window["_weight"][key]
@@ -526,15 +646,16 @@ class MetricsProjector:
         start_seconds = window.get("_start_seconds")
         weight_commits = sum(value for key, value in window["_commits"].items()
                              if key != "none")
+        lag_counts = window["_policy_lag_counts"]
+        lags = np.repeat(np.arange(len(lag_counts)), lag_counts) if lag_counts else ()
         metrics |= {
-            "steps": window["step"], "updates": window["weights_revision"],
             "weights_revision": window["weights_revision"],
             "policy_version": window["policy_revision"], "episodes": episodes,
             "wins": wins, "win_rate": wins / max(1, episodes),
             "step_caps": window["_caps"][0], "combat_caps": window["_caps"][1],
             "empty_actions": window["_caps"][2], "floor_bands": floor_bands(window["_floors"]),
             "trajectory_floors": [list(sample[1:]) for rows in window["_samples"] for sample in rows],
-            "sampled_decisions": window["_sampled"], "dataset_trained": window["_trained"],
+            "sampled_decisions": window["_sampled"],
             "policy_trained_rows": window["_trained"],
             "critic_trained_rows": window["_critic_trained"],
             "discarded_steps": window["_discarded"], "seconds": elapsed,
@@ -563,16 +684,19 @@ class MetricsProjector:
             },
             "optimizer_steps": window["_optimizer_steps"],
             "trajectory_length_mean": window["_episode_length"] / max(1, episodes),
+            "trajectory_length_max": window["_episode_length_max"],
             "trajectory_completion_seconds_mean": window["_episode_seconds"] / max(1, episodes),
+            "trajectory_completion_seconds_max": window["_episode_seconds_max"],
             "dataset_attempted": window["_attempted"],
             "dataset_admitted": window["_admitted"],
             "dataset_forced_dropped": window["_forced"],
             "dataset_budget_dropped": window["_budget_excess"],
+            "dataset_capacity_dropped": window["_capacity_dropped"],
+            "dataset_incomplete_dropped": window["_incomplete"],
             "dataset_rollout_dropped": max(
                 0, window["_discarded"] - window["_budget_excess"]
             ),
             "dataset_ratio_dropped": window["_ratio_rejected"],
-            "dataset_stale_dropped": window["_stale"],
             "dataset_kl_dropped": window["_pre_kl_rejected"],
             "dataset_post_kl_dropped": window["_post_kl_rejected"],
             "dataset_retired": window["_retired"],
@@ -587,8 +711,61 @@ class MetricsProjector:
                 (window["step"] - window["_start_step"]) / max(1e-9, elapsed - start_seconds)
                 if start_seconds is not None and elapsed >= start_seconds else 0
             ),
+            **window["_totals"],
         }
-        for key in ("dataset_rows", "sample_queue_depth", "expert_buffer_rows",
+        if window["_stale"]:
+            metrics["dataset_stale_dropped"] = window["_stale"]
+        if window["_policy_episodes"]:
+            metrics |= {
+                "trajectory_policy_span_mean":
+                    window["_policy_span"] / window["_policy_episodes"],
+                "trajectory_policy_span_max": window["_policy_span_max"],
+                "trajectory_arrival_lag_mean":
+                    window["_arrival_lag"] / window["_policy_episodes"],
+                "trajectory_arrival_lag_max": window["_arrival_lag_max"],
+            }
+        if window["_advantage_rows"]:
+            metrics["advantage_stddev"] = math.sqrt(max(
+                0., window["_advantage_square_sum"] / window["_advantage_rows"]
+                - metrics["advantage_mean"] ** 2,
+            ))
+        if len(lags):
+            metrics["policy_lag_mean"] = float(np.mean(lags))
+            metrics["policy_lag_p95"] = float(np.quantile(lags, .95))
+            metrics["policy_lag_max"] = int(lags[-1])
+        elif window["_policy_lag_max"] is not None:
+            metrics["policy_lag_max"] = window["_policy_lag_max"]
+        cache = metrics.get("card_hits", 0) + metrics.get("card_misses", 0)
+        if cache:
+            metrics["card_cache_hit_rate"] = metrics.get("card_hits", 0) / cache
+        cache = metrics.get("graph_hits", 0) + metrics.get("graph_misses", 0)
+        if cache:
+            metrics["graph_cache_hit_rate"] = metrics.get("graph_hits", 0) / cache
+        packets = metrics.get("sample_queue_packets", 0)
+        if packets:
+            metrics["sample_queue_delay_mean"] = \
+                metrics["sample_queue_delay_seconds"] / packets
+        roots = metrics.get("mcts_roots", 0)
+        seconds = metrics.get("mcts_seconds", 0)
+        if roots:
+            metrics["mcts_simulations_per_root"] = metrics.get("mcts_simulations", 0) / roots
+            metrics["mcts_targets_per_root"] = metrics.get("mcts_targets", 0) / roots
+            metrics["mcts_roots_per_decision"] = roots / max(1, window["_sampled"])
+        turns = metrics.get("mcts_turn_starts", 0)
+        if turns:
+            metrics["mcts_root_fraction"] = roots / turns
+        batches = metrics.get("mcts_batches", 0)
+        if batches:
+            metrics["mcts_leaf_batch_mean"] = metrics.get("mcts_leaves", 0) / batches
+        if seconds:
+            metrics["mcts_simulations_per_second"] = \
+                metrics.get("mcts_simulations", 0) / seconds
+            for phase in ("simulate", "encode", "inference", "backup", "rollout"):
+                metrics[f"mcts_{phase}_fraction"] = \
+                    metrics.get(f"mcts_{phase}_seconds", 0) / seconds
+        for key in ("dataset_rows", "dataset_peak", "dataset_priority_mean",
+                    "dataset_priority_max", "sample_queue_depth", "sample_queue_capacity",
+                    "sampler_policy_revision", "watchdog_dropped_steps", "expert_buffer_rows",
                     "winning_reservoir", "accelerator_allocated_bytes",
                     "accelerator_driver_allocated_bytes"):
             if key in window:
@@ -902,7 +1079,7 @@ def dashboard(target):
     content = """<!doctype html><meta charset=utf-8><title>Spirefysh dashboard</title><script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script><style>
 body{font:14px system-ui;margin:24px;background:#101319;color:#e8ecf2}h1,h2{margin-bottom:6px}.controls,.legend{display:flex;align-items:center;gap:12px;flex-wrap:wrap}.controls{margin-bottom:12px}.legend{margin-bottom:22px}.legend-item{display:flex;align-items:center;gap:6px}.legend-line{width:24px;border-top:3px solid}.legend-dot{width:9px;height:9px;border-radius:50%}.metric-picker{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));margin-top:12px}.metric-picker label{padding:3px}summary{cursor:pointer;font-size:18px;font-weight:600}select,input{padding:7px;background:#202938;color:#e8ecf2;border:1px solid #526176;border-radius:5px}.charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(440px,1fr));gap:14px}.panel{margin:22px 0;padding:16px;background:#171d28;border:1px solid #303a49;border-radius:10px}.charts .panel{margin:0}.plot{height:340px;min-width:0}.note{color:#9aa8bb;margin:0}table{border-collapse:collapse;width:100%}th,td{padding:7px;border-bottom:1px solid #303a49;text-align:left}.yes{color:#75db91}.no{color:#ee7b7b}
 </style><h1 id=title>Spirefysh dashboard</h1><div class=controls><label>Lineage <select id=lineage></select></label><label>Branch <select id=version></select></label><label>Compare <select id=compare></select></label><label>X axis <select id=xaxis><option value=updates>Weights revision</option><option value=decisions selected># decisions</option><option value=time>Active training time</option></select></label><label><input id=smooth type=checkbox checked> EMA</label><label>EMA α <input id=ema type=number min=.01 max=1 step=.01 value=.2></label><label>Subsample <input id=subsample type=number min=1 step=1 value=3></label><span>Auto-refresh 2s</span><span id=status></span></div><div id=legend class=legend></div><div class=charts><section class=panel><h2>Mean advantage</h2><div id=advantage class=plot></div></section><section class=panel><h2>Optimizer steps / second</h2><p class=note>One point per committed step</p><div id=optimizer-rate class=plot></div></section><section class=panel><h2>Used rows / second</h2><p class=note>Critic-consumed rows per committed step</p><div id=row-rate class=plot></div></section><section class=panel><h2>Terminal floor</h2><div id=floor class=plot></div></section><section class=panel><h2>Ascension</h2><div id=ascension class=plot></div></section><section class=panel><h2>Bonus strength</h2><div id=bonus class=plot></div></section><section class=panel><h2>Win proportion</h2><div id=wins class=plot></div></section><section class=panel><h2>Clip fraction</h2><div id=clip class=plot></div></section><section class=panel><h2>KL</h2><div id=kl class=plot></div></section><section class=panel><h2>Entropy</h2><div id=entropy class=plot></div></section><section class=panel><h2>Policy loss</h2><div id=policy class=plot></div></section><section class=panel><h2>Critic loss</h2><div id=critic class=plot></div></section><section class=panel><h2>Optimizer step time</h2><p class=note>Seconds per committed step</p><div id=duration class=plot></div></section><section class=panel><h2>Policy lag (p95)</h2><div id=lag class=plot></div></section><section class=panel><h2>Gradient norm</h2><div id=gradient class=plot></div></section><section class=panel><h2>Dataset size</h2><div id=dataset class=plot></div></section></div><details class=panel open><summary>Metrics</summary><div id=metrics class=metric-picker></div></details><section class=panel><h2>Row outcomes</h2><div id=rows></div></section><section class=panel><h2>Promotion</h2><div id=promotion></div></section><script>const versions=""" + data + r""",lineageSelect=document.querySelector('#lineage'),versionSelect=document.querySelector('#version'),compareSelect=document.querySelector('#compare'),xaxis=document.querySelector('#xaxis'),smooth=document.querySelector('#smooth'),ema=document.querySelector('#ema'),subsample=document.querySelector('#subsample'),metricPicker=document.querySelector('#metrics'),charts=document.querySelector('.charts');
-const characterNames=['Ironclad','Defect','Silent','Regent','Necrobinder'],characterColors=['#ef4444','#38bdf8','#22c55e','#f59e0b','#a78bfa'],runColors=['#6fb1ff','#f472b6'],names=Object.keys(versions),lineages=[...new Set(names.map(name=>versions[name].lineage_id||name))],config={responsive:true,displaylogo:false},refreshKey='spirefysh-dashboard',saved=(()=>{try{return JSON.parse(sessionStorage.getItem(refreshKey))}catch{return null}})();let timeOrigin=0,sharedRange,syncingAxes=false,uiRevision='';const initial=saved?.followLatest?names.at(-1):names.includes(saved?.version)?saved.version:names.at(-1)||'';lineageSelect.innerHTML=lineages.map(id=>`<option value="${id}">${names.find(name=>(versions[name].lineage_id||name)===id)||id}</option>`).join('');lineageSelect.value=versions[initial]?.lineage_id||initial;function showBranches(preferred){const branches=names.filter(name=>(versions[name].lineage_id||name)===lineageSelect.value);versionSelect.innerHTML=branches.map(name=>`<option value="${name}">V${versions[name].version} · ${name}</option>`).join('');versionSelect.value=branches.includes(preferred)?preferred:branches.at(-1)||''}showBranches(initial);compareSelect.innerHTML='<option value="">None</option>'+names.map(name=>`<option value="${name}">V${versions[name].version} · ${name}</option>`).join('');compareSelect.value=names.includes(saved?.compare)?saved.compare:'';if(saved?.xaxis)xaxis.value=saved.xaxis==='iteration'?'updates':saved.xaxis;if(typeof saved?.smooth==='boolean')smooth.checked=saved.smooth;if(saved?.ema)ema.value=saved.ema;if(saved?.subsample)subsample.value=saved.subsample;
+const characterNames=['Ironclad','Defect','Silent','Regent','Necrobinder'],characterColors=['#ef4444','#38bdf8','#22c55e','#f59e0b','#a78bfa'],runColors=['#6fb1ff','#f472b6'],names=Object.keys(versions),lineages=[...new Set(names.map(name=>versions[name].lineage_id||name))].sort((left,right)=>names.find(name=>(versions[name].lineage_id||name)===left).localeCompare(names.find(name=>(versions[name].lineage_id||name)===right),undefined,{numeric:true})),config={responsive:true,displaylogo:false},refreshKey='spirefysh-dashboard',saved=(()=>{try{return JSON.parse(sessionStorage.getItem(refreshKey))}catch{return null}})();let timeOrigin=0,sharedRange,syncingAxes=false,uiRevision='';const initial=saved?.followLatest?names.at(-1):names.includes(saved?.version)?saved.version:names.at(-1)||'';lineageSelect.innerHTML=lineages.map(id=>`<option value="${id}">${names.find(name=>(versions[name].lineage_id||name)===id)||id}</option>`).join('');lineageSelect.value=versions[initial]?.lineage_id||initial;function showBranches(preferred){const branches=names.filter(name=>(versions[name].lineage_id||name)===lineageSelect.value);versionSelect.innerHTML=branches.map(name=>`<option value="${name}">V${versions[name].version} · ${name}</option>`).join('');versionSelect.value=branches.includes(preferred)?preferred:branches.at(-1)||''}showBranches(initial);compareSelect.innerHTML='<option value="">None</option>'+names.map(name=>`<option value="${name}">V${versions[name].version} · ${name}</option>`).join('');compareSelect.value=names.includes(saved?.compare)?saved.compare:'';if(saved?.xaxis)xaxis.value=saved.xaxis==='iteration'?'updates':saved.xaxis;if(typeof saved?.smooth==='boolean')smooth.checked=saved.smooth;if(saved?.ema)ema.value=saved.ema;if(saved?.subsample)subsample.value=saved.subsample;
 const staticMetrics={advantage_mean:'advantage',optimizer_steps_per_second:'optimizer-rate',used_rows_per_second:'row-rate',floor_bands:'floor',ascension:'ascension',bonus:'bonus',win_rate:'wins',clip_fraction:'clip',post_kl:'kl',entropy:'entropy',policy_loss:'policy',critic_loss:'critic',total_seconds:'duration',policy_lag_p95:'lag',gradient_norm:'gradient',dataset_rows:'dataset'},metricTitles={advantage_mean:'Mean advantage',optimizer_steps_per_second:'Optimizer steps / second',used_rows_per_second:'Used rows / second',floor_bands:'Terminal floor',ascension:'Ascension',bonus:'Bonus strength',win_rate:'Win proportion',clip_fraction:'Clip fraction',post_kl:'KL',entropy:'Entropy',policy_loss:'Policy loss',critic_loss:'Critic loss',total_seconds:'Optimizer step time',policy_lag_p95:'Policy lag (p95)',gradient_norm:'Gradient norm',dataset_rows:'Dataset size',critic_explained_reward_variance:'Critic explained variance'},defaults=[...Object.keys(staticMetrics),'critic_explained_reward_variance'],metricKeys=[...new Set(defaults.concat(Object.values(versions).flatMap(run=>run.reports).flatMap(report=>Object.entries(report.metrics).filter(([,value])=>typeof value==='number'&&Number.isFinite(value)).map(([key])=>key))))].sort(),metricIds=Object.fromEntries(metricKeys.filter(key=>!staticMetrics[key]).map((key,index)=>[key,`metric-${index}`]));let selectedMetrics=new Set(saved?.metrics?.filter(key=>metricKeys.includes(key))??defaults);function metricLabel(key){return metricTitles[key]||key.replaceAll('_',' ')}metricPicker.innerHTML=metricKeys.map(key=>`<label><input type=checkbox value="${key}"${selectedMetrics.has(key)?' checked':''}> ${metricLabel(key)}</label>`).join('');function updateMetricPanels(){for(const [key,id] of Object.entries(staticMetrics))document.querySelector(`#${id}`).parentElement.hidden=!selectedMetrics.has(key);for(const [key,id] of Object.entries(metricIds)){let node=document.querySelector(`#${id}`);if(selectedMetrics.has(key)&&!node){charts.insertAdjacentHTML('beforeend',`<section class=panel><h2>${metricLabel(key)}</h2><div id="${id}" class=plot></div></section>`);node=document.querySelector(`#${id}`)}if(node)node.parentElement.hidden=!selectedMetrics.has(key)}}metricPicker.onchange=()=>{selectedMetrics=new Set([...metricPicker.querySelectorAll('input:checked')].map(input=>input.value));showVersion(false)};
 function monotonic(history){let step=-Infinity;return history.filter(row=>row.step>step&&(step=row.step,true))}function updateSteps(history){let offset=0,last=0,session;for(const report of history){const updates=Number(report.metrics.weights_revision??report.metrics.updates)||0;if(session!==undefined&&(report._session!==session||updates<last)){offset+=last;last=0}report._updates=offset+updates;last=Math.max(last,updates);session=report._session}}function x(report){return xaxis.value==='time'?(Number.isFinite(Number(report.metrics.seconds))?report.metrics.seconds/60:Number.isFinite(Number(report._written))?(report._written-timeOrigin)/60:0):xaxis.value==='decisions'?report.step:report._updates}function optimizerX(step){return xaxis.value==='time'?step.seconds/60:xaxis.value==='decisions'?step.step:step._updates}function series(history,key,fallback){return history.map(report=>({x:x(report),y:Number(report.metrics[key]??report.metrics[fallback])})).filter(point=>Number.isFinite(point.y))}function optimizerSeries(steps,history,key){return steps.length?steps.map(step=>({x:optimizerX(step),y:Number(step[key])})):series(history.filter(report=>(report.metrics.update_attempts??1)>0),key)}function optimizerSteps(run,reports){if(!run.optimizer_steps)run.optimizer_steps=reports.flatMap(report=>{const offset=report._updates-Number(report.metrics.weights_revision??report.metrics.updates);return(report.metrics.optimizer_steps||[]).map(step=>({...step,_updates:offset+step.weights_revision}))});return run.optimizer_steps}function speedMetrics(history){for(const report of history){const metrics=report.metrics,seconds=Number(metrics.total_seconds)*Number(metrics.update_attempts);if(!Number.isFinite(Number(metrics.optimizer_steps_per_second))&&seconds>0)metrics.optimizer_steps_per_second=Number(metrics.weight_commits)/seconds;if(!Number.isFinite(Number(metrics.used_rows_per_second)))metrics.used_rows_per_second=seconds>0?Number(metrics.critic_trained_rows)/seconds:Number(metrics.learner_decisions_per_second)}}function prepareRun(run){const all=monotonic(run.reports);updateSteps(all);const reports=all.filter(row=>!row._open),steps=optimizerSteps(run,all),last=all.at(-1),revision=Number(last?.metrics.weights_revision??last?.metrics.updates)||0,timed=all.find(row=>Number.isFinite(Number(row._written))&&Number.isFinite(Number(row.metrics.seconds)));run._updateOffset=(last?last._updates:0)-revision;run._timeOrigin=timed?timed._written-timed.metrics.seconds:0;speedMetrics(reports);return{run,reports,steps}}function rangeOf(values){let low=Infinity,high=-Infinity;for(const value of values)if(Number.isFinite(value)){low=Math.min(low,value);high=Math.max(high,value)}if(low===Infinity)return;const padding=(high-low||Math.abs(high)*.02||1)*.02;return[low-padding,high+padding]}function setFullRange(data){sharedRange=rangeOf(data.flatMap(({run,reports,steps})=>{timeOrigin=run._timeOrigin;return reports.map(x).concat(steps.map(optimizerX))}))}function clipComparison(comparison,primary){timeOrigin=primary.run._timeOrigin;const end=Math.max(...primary.reports.map(x).concat(primary.steps.map(optimizerX)).filter(Number.isFinite));timeOrigin=comparison.run._timeOrigin;return{...comparison,end,reports:comparison.reports.filter(report=>x(report)<=end),steps:comparison.steps.filter(step=>optimizerX(step)<=end)}}
 function emaLine(points){const alpha=Math.max(.01,Math.min(1,Number(ema.value)||.2));let value;return points.map((point,index)=>({x:point.x,y:value=index?alpha*point.y+(1-alpha)*value:point.y}))}function sampled(points,offset=0){const factor=Math.max(1,Math.floor(Number(subsample.value)||3));return factor===1?points:points.filter((_,index)=>(offset+index)%factor===0)}
@@ -913,7 +1090,7 @@ function lineTraces(points,label,color){const prefix=label?`${label} · `:'',sho
 function trajectoryPoints(history){const points=[];for(const report of history){let inferred=0,last=-Infinity;for(const row of report.metrics.trajectory_floors||[]){const [iteration,floor,stored]=row;if(stored===undefined&&iteration<last)inferred++;const character=stored??Math.min(inferred,4);points.push({x:x(report),y:floor,character,updates:report._updates,step:report.step});last=iteration}}return points}function floorTraces(history,label='',secondary=false){const completed=history.filter(report=>Number(report.metrics.episodes)>0||(report.metrics.trajectory_floors?.length??0)>0),prefix=label?`${label} · `:'',rgb=secondary?'244,114,182':'111,177,255',traces=[],seen={bands:[],points:0,means:0},bands=[['min','max','min–max','.04'],['p01','p99','p1–p99','.06'],['p05','p95','p5–p95','.09'],['p10','p90','p10–p90','.13'],['p25','p75','p25–p75','.20']];for(const [low,high,name,alpha] of bands){let rows=completed.map(report=>({x:x(report),low:report.metrics.floor_bands?.[low],high:report.metrics.floor_bands?.[high]})).filter(row=>Number.isFinite(row.low)&&Number.isFinite(row.high));seen.bands.push(rows.length);rows=sampled(rows);traces.push({x:rows.map(row=>row.x),y:rows.map(row=>row.low),mode:'lines',showlegend:false,hoverinfo:'skip',line:{width:0}},{x:rows.map(row=>row.x),y:rows.map(row=>row.high),mode:'lines',name:`${prefix}${name}`,line:{width:0},fill:'tonexty',fillcolor:`rgba(${rgb},${alpha})`,hovertemplate:`${name}<br>upper %{y:.2f}<extra></extra>`})}let points=trajectoryPoints(completed);seen.points=points.length;points=sampled(points);for(let i=points.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[points[i],points[j]]=[points[j],points[i]]}traces.push({x:points.map(point=>point.x),y:points.map(point=>point.y),customdata:points.map(point=>[characterNames[point.character],point.updates,point.step]),mode:'markers',name:`${prefix}trajectories`,marker:{color:points.map(point=>characterColors[point.character]),symbol:secondary?'x':'circle',size:5,opacity:.28},hovertemplate:'%{customdata[0]}<br>floor %{y}<br>optimizer steps %{customdata[1]:,}<br>report decisions %{customdata[2]:,}<extra></extra>'});let means=completed.map(report=>({x:x(report),y:report.metrics.floor_bands?.mean??report.metrics.floor_mean})).filter(point=>Number.isFinite(point.y));seen.means=means.length;const line=emaLine(means);means=sampled(means);traces.push({x:means.map(point=>point.x),y:means.map(point=>point.y),mode:'lines',name:`${prefix}mean`,line:{color:runColors[secondary?1:0],width:3},hovertemplate:'mean %{y:.2f}<extra></extra>'});if(smooth.checked){const visible=sampled(line);traces.push({x:visible.map(point=>point.x),y:visible.map(point=>point.y),mode:'lines',name:`${prefix}mean EMA α=${Number(ema.value)||.2}`,line:{color:runColors[secondary?1:0],width:2,dash:'dot'},hovertemplate:'mean EMA %{y:.2f}<extra></extra>'})}return{traces,seen,ema:line.at(-1)?.y}}function rememberFloor(node,index,start,built){node._floor??=[];node._floor[index]={...built.seen,ema:built.ema,start,smooth:smooth.checked?start+12:null}}function floorPlot(history,run,label){const node=document.querySelector('#floor');if(node.parentElement.hidden)return;const built=floorTraces(history,label);rememberFloor(node,0,0,built);const options=layout(false,[0,52],history,run);options.yaxis.title='Terminal floor';Plotly.react(node,built.traces,options,config)}function addFloor(history,label){const node=document.querySelector('#floor');if(!node._floor)return;const built=floorTraces(history,label,true),start=node.data.length;rememberFloor(node,1,start,built);Plotly.addTraces(node,built.traces)}
 function stageTrace(history,key,color,run,label='',end=Infinity){let rows=history.filter(row=>Number.isFinite(Number(row.stage?.[key]))).map(row=>({x:x(row),y:row.stage[key]}));for(const transition of stageTransitions(history,run))if(Number.isFinite(Number(transition.stage?.[key])))rows.push({x:transition.x,y:transition.stage[key]});rows=rows.filter(row=>row.x<=end).sort((left,right)=>left.x-right.x);const seen=rows.length,name=key==='ascension'?'Ascension':'Bonus strength';rows=sampled(rows);return{seen,trace:{x:rows.map(row=>row.x),y:rows.map(row=>row.y),mode:'lines',name:label?`${label} · ${name}`:name,line:{color,width:3,shape:'hv'},hovertemplate:`${key==='ascension'?'ascension':'bonus'} %{y}<extra></extra>`}}}function stagePlot(id,history,key,color,run,label){const node=document.querySelector(`#${id}`);if(node.parentElement.hidden)return;const built=stageTrace(history,key,color,run,label);node._stage=[{seen:built.seen,trace:0}];const options=layout(false,undefined,history,run);options.yaxis={...options.yaxis,title:key==='ascension'?'Ascension':'Bonus strength',rangemode:'tozero',dtick:key==='ascension'?1:4};Plotly.react(node,[built.trace],options,config)}function addStage(id,history,key,run,label,end){const node=document.querySelector(`#${id}`);if(!node._stage)return;const built=stageTrace(history,key,runColors[1],run,label,end),trace=node.data.length;node._stage[1]={seen:built.seen,trace};Plotly.addTraces(node,[built.trace])}
 function promotionSummary(row){if(!row)return '<p>No promotion check yet.</p>';const characters=row.result?.characters||[],rows=characters.map(item=>`<tr><td>${characterNames[item.character]??`Character ${item.character}`}</td><td>${item.wins}/${item.runs}</td><td>${(100*item.wins/item.runs).toFixed(1)}%</td><td>${Number(item.floor_mean).toFixed(2)}</td><td>${item.caps}</td></tr>`).join('');return `<p class="${row.promoted?'yes':'no'}">${row.promoted?'Promoted':'Stayed at current stage'} · threshold ${(100*row.threshold).toFixed(0)}% per character · seed ${row.seed}</p><table><thead><tr><th>Character</th><th>Wins</th><th>Rate</th><th>Mean floor</th><th>Caps</th></tr></thead><tbody>${rows}</tbody></table>`}
-function rowSummary(history){const items=[['critic_trained_rows','Used by optimizer'],['discarded_steps','Sampler-discarded total'],['dataset_rollout_dropped','Rollout discard'],['dataset_budget_dropped','Over decision budget'],['dataset_forced_dropped','Forced-action excluded'],['dataset_stale_dropped','Stale'],['dataset_ratio_dropped','Behavior-ratio rejected'],['dataset_kl_dropped','Policy rejected before update (critic used)'],['dataset_post_kl_dropped','Policy rejected after trial (critic used)'],['dataset_retired','Used, then retired']],projected=history.filter(row=>'update_attempts'in row.metrics),rows=projected.length?projected:history.slice(-1),latest=rows.at(-1)?.metrics||{},number=value=>Number.isFinite(value)?value.toLocaleString():'—',body=items.map(([key,label])=>{const values=rows.map(row=>Number(row.metrics[key])).filter(Number.isFinite);return `<tr><td>${label}</td><td>${number(Number(latest[key]))}</td><td>${number(values.length?values.reduce((sum,value)=>sum+value,0):NaN)}</td></tr>`}).join('');return `<table><thead><tr><th>Outcome</th><th>Latest window</th><th>Displayed total</th></tr></thead><tbody>${body}</tbody></table>`}
+function rowSummary(history){const items=[['critic_trained_rows','Used by optimizer'],['discarded_steps','Sampler-discarded total'],['dataset_rollout_dropped','Rollout discard'],['dataset_budget_dropped','Over decision budget'],['dataset_forced_dropped','Forced-action excluded'],['dataset_capacity_dropped','FIFO capacity eviction'],['dataset_incomplete_dropped','Incomplete final batch'],['dataset_stale_dropped','Legacy stale eviction'],['dataset_ratio_dropped','Behavior-ratio rejected'],['dataset_kl_dropped','Policy rejected before update (critic used)'],['dataset_post_kl_dropped','Policy rejected after trial (critic used)'],['dataset_retired','Used, then retired']],projected=history.filter(row=>'update_attempts'in row.metrics),rows=projected.length?projected:history.slice(-1),latest=rows.at(-1)?.metrics||{},number=value=>Number.isFinite(value)?value.toLocaleString():'—',body=items.map(([key,label])=>{const values=rows.map(row=>Number(row.metrics[key])).filter(Number.isFinite);return `<tr><td>${label}</td><td>${number(Number(latest[key]))}</td><td>${number(values.length?values.reduce((sum,value)=>sum+value,0):NaN)}</td></tr>`}).join('');return `<table><thead><tr><th>Outcome</th><th>Latest window</th><th>Displayed total</th></tr></thead><tbody>${body}</tbody></table>`}
 function saveDashboardState(){try{sessionStorage.setItem(refreshKey,JSON.stringify({version:versionSelect.value,compare:compareSelect.value,metrics:[...selectedMetrics],followLatest:versionSelect.value===names.at(-1),xaxis:xaxis.value,smooth:smooth.checked,ema:ema.value,subsample:subsample.value,scroll:[scrollX,scrollY]}))}catch{}}function restoreDashboardState(){if(saved?.scroll)scrollTo(...saved.scroll)}
 function showStatus(run){const age=Date.now()/1000-(run.last_event_time||0),timeout=run.manifest.sessions?.at(-1)?.training?.sampler_timeout||120;document.querySelector('#status').textContent=run.status==='running'&&age>timeout?'stalled':run.status||''}function showLegend(primary,comparison){const runs=[primary,comparison].filter(Boolean),runItems=runs.map((item,index)=>`<span class=legend-item><i class=legend-line style="border-color:${runColors[index]}"></i>${item.run.run}</span>`).join(''),characters=characterNames.map((name,index)=>`<span class=legend-item><i class=legend-dot style="background:${characterColors[index]}"></i>${name}</span>`).join('');document.querySelector('#legend').innerHTML=`${runItems}<span class=note>${smooth.checked?'thin raw · bold EMA':'raw'} · terminal floors:</span>${characters}`}function dynamicPlots(reports,run,label,index=0){for(const [key,id] of Object.entries(metricIds))if(selectedMetrics.has(key)){const points=series(reports,key);index?addPlot(id,points,label):plot(id,points,{history:reports,run,label})}}function addComparison({run,reports,steps,end}){timeOrigin=run._timeOrigin;const label=run.run;addPlot('advantage',series(reports,'advantage_mean','mean_advantage'),label);addPlot('optimizer-rate',optimizerSeries(steps,reports,'optimizer_steps_per_second'),label);addPlot('row-rate',optimizerSeries(steps,reports,'used_rows_per_second'),label);addFloor(reports,label);addStage('ascension',reports,'ascension',run,label,end);addStage('bonus',reports,'bonus',run,label,end);addPlot('wins',reports.map(row=>({x:x(row),y:row.metrics.wins/Math.max(1,row.metrics.episodes)})),label);addPlot('clip',series(reports,'clip_fraction'),label);addPlot('kl',series(reports,'post_kl','kl'),label);addPlot('entropy',series(reports,'entropy'),label);addPlot('policy',series(reports,'policy_loss'),label);addPlot('critic',series(reports,'critic_loss'),label);addPlot('duration',optimizerSeries(steps,reports,'total_seconds'),label);addPlot('lag',series(reports,'policy_lag_p95'),label);addPlot('gradient',series(reports,'gradient_norm'),label);addPlot('dataset',series(reports,'dataset_rows'),label);dynamicPlots(reports,run,label,1)}function showVersion(resetRange=true){updateMetricPanels();if(compareSelect.value===versionSelect.value)compareSelect.value='';for(const option of compareSelect.options)option.disabled=option.value===versionSelect.value;const primary=prepareRun(versions[versionSelect.value]),{run,reports,steps}=primary,selectedComparison=compareSelect.value&&prepareRun(versions[compareSelect.value]),comparison=selectedComparison&&clipComparison(selectedComparison,primary),label=comparison?run.run:'';uiRevision=`${versionSelect.value}:${compareSelect.value}:${xaxis.value}`;if(resetRange)setFullRange([primary]);timeOrigin=run._timeOrigin;document.querySelector('#title').textContent=`Spirefysh V${run.version} · ${run.run}${comparison?` vs ${comparison.run.run}`:''}`;showStatus(run);showLegend(primary,comparison);plot('advantage',series(reports,'advantage_mean','mean_advantage'),{history:reports,run,label});plot('optimizer-rate',optimizerSeries(steps,reports,'optimizer_steps_per_second'),{tozero:true,history:reports,run,label});plot('row-rate',optimizerSeries(steps,reports,'used_rows_per_second'),{tozero:true,history:reports,run,label});floorPlot(reports,run,label);stagePlot('ascension',reports,'ascension',runColors[0],run,label);stagePlot('bonus',reports,'bonus',runColors[0],run,label);plot('wins',reports.map(row=>({x:x(row),y:row.metrics.wins/Math.max(1,row.metrics.episodes)})),{range:[0,1],percent:true,history:reports,run,label});plot('clip',series(reports,'clip_fraction'),{range:[0,1],percent:true,history:reports,run,label});plot('kl',series(reports,'post_kl','kl'),{tozero:true,history:reports,run,label});plot('entropy',series(reports,'entropy'),{tozero:true,history:reports,run,label});plot('policy',series(reports,'policy_loss'),{history:reports,run,label});plot('critic',series(reports,'critic_loss'),{tozero:true,history:reports,run,label});plot('duration',optimizerSeries(steps,reports,'total_seconds'),{tozero:true,history:reports,run,label});plot('lag',series(reports,'policy_lag_p95'),{tozero:true,history:reports,run,label});plot('gradient',series(reports,'gradient_norm'),{tozero:true,history:reports,run,label});plot('dataset',series(reports,'dataset_rows'),{tozero:true,history:reports,run,label});dynamicPlots(reports,run,label);if(comparison)addComparison(comparison);timeOrigin=run._timeOrigin;document.querySelector('#rows').innerHTML=rowSummary(reports);document.querySelector('#promotion').innerHTML=promotionSummary(run.promotions.at(-1));bindAxes()}
 function extendFloor(history,index=0){const completed=history.filter(report=>Number(report.metrics.episodes)>0||(report.metrics.trajectory_floors?.length??0)>0);if(!completed.length)return;const node=document.querySelector('#floor'),state=node._floor[index],bands=[['min','max'],['p01','p99'],['p05','p95'],['p10','p90'],['p25','p75']],xs=[],ys=[];for(const [band,[low,high]] of bands.entries()){let rows=completed.map(report=>({x:x(report),low:report.metrics.floor_bands?.[low],high:report.metrics.floor_bands?.[high]})).filter(row=>Number.isFinite(row.low)&&Number.isFinite(row.high)),visible=sampled(rows,state.bands[band]);state.bands[band]+=rows.length;xs.push(visible.map(row=>row.x),visible.map(row=>row.x));ys.push(visible.map(row=>row.low),visible.map(row=>row.high))}if(xs.some(values=>values.length))Plotly.extendTraces(node,{x:xs,y:ys},bands.flatMap((_,band)=>[state.start+2*band,state.start+2*band+1]));let points=trajectoryPoints(completed),visible=sampled(points,state.points);state.points+=points.length;if(visible.length)Plotly.extendTraces(node,{x:[visible.map(point=>point.x)],y:[visible.map(point=>point.y)],customdata:[visible.map(point=>[characterNames[point.character],point.updates,point.step])],'marker.color':[visible.map(point=>characterColors[point.character])]},[state.start+10]);const means=completed.map(report=>({x:x(report),y:report.metrics.floor_bands?.mean??report.metrics.floor_mean})).filter(point=>Number.isFinite(point.y)),offset=state.means,line=means.map(point=>({x:point.x,y:state.ema=state.ema===undefined?point.y:Math.max(.01,Math.min(1,Number(ema.value)||.2))*point.y+(1-Math.max(.01,Math.min(1,Number(ema.value)||.2)))*state.ema})),shown=sampled(means,offset),update={x:[shown.map(point=>point.x)],y:[shown.map(point=>point.y)]},traces=[state.start+11];state.means+=means.length;if(state.smooth!==null){visible=sampled(line,offset);update.x.push(visible.map(point=>point.x));update.y.push(visible.map(point=>point.y));traces.push(state.smooth)}if(update.x.some(values=>values.length))Plotly.extendTraces(node,update,traces)}function extendStage(id,reports,key,index){let points=reports.filter(row=>Number.isFinite(Number(row.stage?.[key]))).map(row=>({x:x(row),y:row.stage[key]}));if(!points.length)return;const node=document.querySelector(`#${id}`),state=node._stage[index],visible=sampled(points,state.seen);state.seen+=points.length;if(visible.length)Plotly.extendTraces(node,{x:[visible.map(point=>point.x)],y:[visible.map(point=>point.y)]},[state.trace])}

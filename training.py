@@ -11,6 +11,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from itertools import islice
 from pathlib import Path
 from queue import Empty, Full, Queue
 
@@ -209,9 +210,8 @@ class ExperienceDataset:
             "trajectory": np.empty(0, np.int64),
         }
         self.next_id = self.next_trajectory = 0
+        self.index = {}
         self.capacity = 0
-        self.seen = self.admitted = self.uses = self.retired = self.forced_dropped = 0
-        self.stale_dropped = self.ratio_dropped = self.kl_dropped = self.post_kl_dropped = 0
 
     def __len__(self):
         return len(self.rows)
@@ -256,8 +256,6 @@ class ExperienceDataset:
         accepted = total if limit is None else max(0, min(total, limit))
         if not positions:
             self.next_id += accepted
-            self.seen += accepted
-            self.forced_dropped += accepted
             return accepted, accepted, total - accepted
         positions = np.asarray(positions, np.int64)
         selected = positions < accepted
@@ -332,29 +330,30 @@ class ExperienceDataset:
             self.features.extend(row for row, keep in zip(features, selected) if keep)
         for key, value in data.items():
             self.data[key][size:required] = value[selected]
-        self.seen += accepted
-        self.admitted += required - size
+        for index, row_id in enumerate(data["id"][selected], size):
+            self.index[int(row_id)] = index
         forced = accepted - required + size
-        self.forced_dropped += forced
         return accepted, forced, total - accepted
 
-    def prune(self, version, lag, limit=None):
-        stale = np.flatnonzero(self.data["version"][:len(self)] < version - lag)
-        if limit is not None:
-            stale = stale[:max(0, limit)]
-        dropped = self.discard_trajectories(self.data["trajectory"][stale])
-        self.stale_dropped += dropped
-        return dropped
+    def trim(self, capacity):
+        excess = max(0, len(self) - capacity)
+        if excess:
+            self.discard_ids(islice(self.index, excess))
+        return excess
 
     def discard(self, indices):
         if not len(indices):
             return
         indices = np.unique(indices)
+        removed = self.data["id"][indices].copy()
         end = len(self) - len(indices)
         holes = indices[indices < end]
         sources = np.setdiff1d(np.arange(end, len(self)), indices, assume_unique=True)
+        for row_id in removed:
+            self.index.pop(int(row_id))
         for target, source in zip(holes, sources):
             self.rows[target] = self.rows[source]
+            self.index[int(self.data["id"][source])] = int(target)
         del self.rows[end:]
         if self.features:
             for target, source in zip(holes, sources):
@@ -364,7 +363,10 @@ class ExperienceDataset:
             values[holes] = values[sources]
 
     def discard_ids(self, ids):
-        indices = np.flatnonzero(np.isin(self.data["id"][:len(self)], ids))
+        indices = np.fromiter(
+            (self.index[int(row_id)] for row_id in ids if int(row_id) in self.index),
+            np.int64,
+        )
         self.discard(indices)
         return len(indices)
 
@@ -373,26 +375,25 @@ class ExperienceDataset:
         self.discard(indices)
         return len(indices)
 
-    def sample(self, size, rng, balanced=False):
-        size = min(size, len(self))
+    def sample(self, size, rng, balanced=False, candidates=None):
+        candidates = np.arange(len(self)) if candidates is None else np.asarray(candidates)
+        size = min(size, len(candidates))
         if balanced:
             pools = [list(rng.permutation(np.flatnonzero(
-                self.data["character"][:len(self)] == character)))
+                self.data["character"][candidates] == character)))
                      for character in range(5)]
+            pools = [[int(candidates[index]) for index in pool] for pool in pools]
             selected = []
             while len(selected) < size and any(pools):
                 for pool in pools:
                     if pool and len(selected) < size:
                         selected.append(pool.pop())
             return np.asarray(selected, np.int64)
-        return rng.choice(len(self), size, replace=False)
+        return rng.choice(candidates, size, replace=False)
 
     def use(self, indices, decay=3):
-        self.uses += len(indices)
         self.data["priority"][indices] -= decay
-        expired = indices[self.data["priority"][indices] < 0]
-        self.retired += len(expired)
-        return expired
+        return indices[self.data["priority"][indices] < 0]
 
 
 class CriticBalance:
@@ -403,7 +404,6 @@ class CriticBalance:
         if state:
             self.initialized = bool(state.get("initialized"))
             self.frequencies = [np.asarray(row, np.float64) for row in state["frequencies"]]
-        self.reset_report()
 
     def state_dict(self):
         return {"initialized": self.initialized,
@@ -425,34 +425,7 @@ class CriticBalance:
             for frequency, column in zip(self.frequencies, columns)
         ], axis=0) ** (1 / 3)
         weight = np.clip(weight, .25, 4); weight /= weight.mean()
-        for count, column in zip(self.counts, columns):
-            count += np.bincount(column, minlength=len(count))
-        self.ess += weight.sum() ** 2 / np.square(weight).sum()
-        self.rows += len(weight); self.batches += 1
         return weight.astype(np.float32)
-
-    def record_loss(self, target, weighted_loss):
-        self.target_counts += np.bincount(target, minlength=CATEGORIES)
-        np.add.at(self.loss_mass, target, weighted_loss)
-
-    def reset_report(self):
-        self.counts = [np.zeros(size, np.int64) for size in (5, 14, MAX_PROGRESS + 1)]
-        self.target_counts = np.zeros(CATEGORIES, np.float64)
-        self.loss_mass = np.zeros(CATEGORIES, np.float64)
-        self.ess = 0.; self.rows = self.batches = 0
-
-    def report(self):
-        result = {
-            "critic_preweight_character_counts": self.counts[0].tolist(),
-            "critic_preweight_phase_counts": self.counts[1].tolist(),
-            "critic_preweight_floor_counts": self.counts[2].tolist(),
-            "critic_preweight_target_counts": self.target_counts.tolist(),
-            "critic_postweight_loss_mass": self.loss_mass.tolist(),
-            "critic_weight_ess": self.ess / max(1, self.batches),
-            "critic_weight_ess_fraction": self.ess / max(1, self.rows),
-        }
-        self.reset_report()
-        return result
 
 class ExpertDataset:
     def __init__(self, capacity):
@@ -461,11 +434,8 @@ class ExpertDataset:
         self.targets = []
         self.consistencies = []
         self.versions = np.empty(0, np.int64)
-        self.visits = np.empty(0, np.int32)
-        self.depths = np.empty(0, np.int32)
         self.ids = np.empty(0, np.int64)
         self.next_id = 0
-        self.seen = self.used = self.stale = self.evicted = 0
 
     def __len__(self):
         return len(self.rows)
@@ -473,7 +443,7 @@ class ExpertDataset:
     def add(self, rows):
         if not rows:
             return
-        for row, target, _version, _visits, _depth, consistency in rows:
+        for row, target, _version, consistency in rows:
             target = np.asarray(target, np.float16)
             if (target.shape != (packed_action_count(row),) or not np.isfinite(target).all()
                     or abs(float(target.sum()) - 1) > 2e-3 or (target < 0).any()):
@@ -486,16 +456,12 @@ class ExpertDataset:
                 raise ValueError("invalid search consistency target")
         self.rows.extend(row for row, *_ in rows)
         self.targets.extend(np.asarray(target, np.float16) for _, target, *_ in rows)
-        self.consistencies.extend(row[5] for row in rows)
+        self.consistencies.extend(row[3] for row in rows)
         self.versions = np.r_[self.versions, np.asarray([row[2] for row in rows], np.int64)]
-        self.visits = np.r_[self.visits, np.asarray([row[3] for row in rows], np.int32)]
-        self.depths = np.r_[self.depths, np.asarray([row[4] for row in rows], np.int32)]
         self.ids = np.r_[self.ids, np.arange(self.next_id, self.next_id + len(rows))]
         self.next_id += len(rows)
-        self.seen += len(rows)
         if len(self) > self.capacity:
             count = len(self) - self.capacity
-            self.evicted += count
             self.discard(np.arange(count))
 
     def sample(self, size, rng):
@@ -503,7 +469,6 @@ class ExpertDataset:
 
     def prune(self, version, lag):
         stale = np.flatnonzero(self.versions < version - lag)
-        self.stale += len(stale)
         self.discard(stale)
 
     def discard(self, indices):
@@ -514,8 +479,6 @@ class ExpertDataset:
         self.targets = [row for row, selected in zip(self.targets, keep) if selected]
         self.consistencies = [row for row, selected in zip(self.consistencies, keep) if selected]
         self.versions = self.versions[keep]
-        self.visits = self.visits[keep]
-        self.depths = self.depths[keep]
         self.ids = self.ids[keep]
 
     def discard_ids(self, ids):
@@ -524,8 +487,7 @@ class ExpertDataset:
 
 def train_stream(model, optimizer, args, sampler_session, stage, target, deadline, budget,
                  base_decisions, auxiliary_decisions, stage_decisions, run_started, reservoir, progress_active,
-                 save_report, save_step, fingerprint, critic_balance, revisions):
-    ascension, bonus = STAGES[stage]
+                 prune_checkpoints, save_step, fingerprint, critic_balance, revisions):
     collector_args = copy.copy(args)
     collector_args.cache_features = (
         args.freeze_backbone and args.target_kl >= 1
@@ -535,76 +497,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
     collector_args.envs //= args.samplers
     dataset = ExperienceDataset()
     expert_dataset = ExpertDataset(args.expert_capacity)
-    episodes = [[] for _ in range(5)]
     promotion_episodes = []
-    losses = {key: [] for key in (
-        "mean_advantage", "policy_loss", "expert_loss", "expert_entropy", "expert_kl",
-        "expert_rows", "ppo_policy_head_grad_norm", "expert_policy_head_grad_norm",
-        "expert_ppo_grad_ratio", "expert_ppo_grad_cosine", "critic_loss",
-        "critic_explained_reward_variance", "search_consistency_loss", "critic_expected",
-        "critic_win_probability", "entropy", "entropy_weight", "kl",
-        "post_kl", "clip_fraction", "winning_loss", "winning_kl",
-    )}
-    floor_explained_sum = np.zeros(MAX_PROGRESS + 1)
-    floor_explained_weight = np.zeros(MAX_PROGRESS + 1)
-    floor_explained_rows = np.zeros(MAX_PROGRESS + 1, np.int64)
-    def record_floor_explained(metrics):
-        for floor, metric in metrics.items():
-            index, rows = int(floor), metric["rows"]
-            weight = rows * metric["target_variance"]
-            floor_explained_sum[index] += metric["value"] * weight
-            floor_explained_weight[index] += weight
-            floor_explained_rows[index] += rows
-    pipeline = [
-        f"{args.samplers} continuous CPU actor{'s' if args.samplers > 1 else ''} → "
-        + (f"{args.segment_steps}-decision bootstrapped segments" if args.segment_steps
-           else "complete terminal trajectories"),
-        "Bounded queue → trajectory-level policy-lag and action-ratio freshness filters",
-        f"{'Character-balanced' if args.character_balanced else 'Uniform'} reusable rows; "
-        f"prefilter forced; stale/ratio-invalid rows reject their trajectory; "
-        f"priority -{args.priority_decay:g} per use",
-        f"{model.layers}-layer global Transformer over state, entity, and action tokens → heads",
-        f"Terminal progress shaped by phi=current floor + resource potential → "
-        f"GAE γ={args.gae_gamma:g}, λ={args.gae_lambda:g}; "
-        "scalar critic predicts the shaped residual",
-        "Critic loss balanced by EMA character/phase/canonical-floor frequency",
-        "Turn-start native MCTS → expectimax-Q targets and policy-expectation critic transitions",
-        ("Frozen encoder and policy; critic head only" if args.critic_only else
-         "Asynchronous clipped PPO; policy and value heads updated every iteration"
-         if args.freeze_backbone else
-         "Asynchronous clipped PPO; full model updated every iteration") + "; "
-        f"policy-head LR ×{args.head_learning_rate_multiplier:g}; "
-        f"critic LR ×{args.critic_learning_rate_multiplier:g}; "
-        f"weights published every {args.publish_updates} updates",
-    ]
-    winning_behavior_drift = 0
-    decisions = discarded_steps = handled = sampled = attempted = forced = trained = updates = windows = 0
-    mcts_roots = mcts_simulations = mcts_leaves = mcts_nodes = mcts_batches = mcts_targets = 0
-    mcts_turn_starts = 0
-    mcts_seconds = mcts_simulate_seconds = mcts_encode_seconds = 0.0
-    mcts_inference_seconds = mcts_backup_seconds = mcts_rollout_seconds = 0.0
-    mcts_rollout_steps = mcts_rollout_completed = mcts_rollout_invalid = mcts_timeouts = 0
-    expert_visits = expert_depth = 0
-    segmented_trajectories = 0
-    winning_added = winning_replayed = winning_rejected = orphan_empty_actions = post_kl_checks = 0
-    policy_update_attempts = pre_kl_rejected_updates = post_kl_discarded_updates = 0
-    post_kl_proposals = post_kl_rejected_proposals = post_kl_retries = post_kl_retry_depth = 0
-    critic_only_updates = 0
-    accepted_pre_kl_sum = accepted_post_kl_sum = 0.0
-    winning_replayed_characters = [0] * 5
-    winning_evicted_characters = [0] * 5
-    trajectory_lengths = []
-    trajectory_policy_spans = []
-    trajectory_arrival_lags = []
-    trajectory_stale_steps = []
-    trajectory_seconds = []
-    update_durations = []
-    unpack_durations = []
-    forward_durations = []
-    backward_durations = []
-    collect_seconds = update_seconds = screen_seconds = 0.0
-    screen_unpack_seconds = screen_forward_seconds = 0.0
-    collector_seconds = [0.0] * args.samplers
+    decisions = discarded_steps = handled = sampled = trained = updates = 0
     worker_accounted = [0] * args.samplers
     worker_resolved = [0] * args.samplers
     sampler_generations = [0] * args.samplers
@@ -614,21 +508,12 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
     sampler_recovery_packets = [0] * args.samplers
     sampler_stale_since = [None] * args.samplers
     sampler_exhausted = [False] * args.samplers
-    watchdog_dropped = queue_full_waits = 0
-    queue_put_seconds = queue_delay_sum = 0.0
-    queue_packets = queue_peak = 0
-    cache_stats = dict.fromkeys(("card_hit", "card_miss", "graph_hit", "graph_miss"), 0)
-    observed_kl = observed_clip = 0.0
+    watchdog_dropped = queue_peak = 0
     latest_sampler_version = revisions["policy_revision"]
     dataset_peak = 0
     sampler_versions = [revisions["policy_revision"]] * args.samplers
     sampler_iterations = [base_decisions // args.envs] * args.samplers
-    latest_sampler_iteration = base_decisions // args.envs
-    policy_lags = []
-    reported_episodes = [0] * 5
-    reported_metrics = {key: 0 for key in losses}
-    reported_steps = reported_trajectories = 0
-    reported_seconds = 0.0
+    reported_steps = 0
     started = time.monotonic()
     next_heartbeat_log = started
     rng = np.random.default_rng(args.seed + sampler_session + 1_000_000_000)
@@ -719,7 +604,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     pass
 
     def ingest(item, packet=True):
-        nonlocal decisions, handled, forced, discarded_steps, sampled, collect_seconds, winning_added, orphan_empty_actions, latest_sampler_version, latest_sampler_iteration, dataset_peak, segmented_trajectories, queue_full_waits, queue_put_seconds, queue_delay_sum, queue_packets, queue_peak, mcts_roots, mcts_simulations, mcts_leaves, mcts_nodes, mcts_batches, mcts_targets, mcts_turn_starts, mcts_seconds, mcts_simulate_seconds, mcts_encode_seconds, mcts_inference_seconds, mcts_backup_seconds, mcts_rollout_steps, mcts_rollout_completed, mcts_rollout_invalid, mcts_rollout_seconds, mcts_timeouts
+        nonlocal decisions, handled, discarded_steps, sampled, latest_sampler_version
+        nonlocal dataset_peak, queue_peak
         worker, generation, version, result = item
         if generation != sampler_generations[worker]:
             return
@@ -730,12 +616,11 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         sampler_versions[worker] = version
         sampler_iterations[worker] = result["iteration"]
         latest_sampler_version = min(sampler_versions)
-        latest_sampler_iteration = max(sampler_iterations)
         added, excluded, excess = dataset.add(result, args, budget - decisions)
+        capacity_dropped = dataset.trim(args.dataset_capacity)
         expert_dataset.add(result.get("expert_rows", []))
         decisions += added
-        handled += excluded
-        forced += excluded
+        handled += excluded + capacity_dropped
         if decisions >= budget:
             stop.set()
         sampled += result["sampled_steps"]
@@ -745,34 +630,6 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         )
         discarded_steps += result["discarded_steps"]
         discarded_steps += excess
-        mcts_roots += result.get("mcts_roots", 0)
-        mcts_simulations += result.get("mcts_simulations", 0)
-        mcts_leaves += result.get("mcts_leaves", 0)
-        mcts_nodes += result.get("mcts_nodes", 0)
-        mcts_batches += result.get("mcts_batches", 0)
-        mcts_targets += result.get("mcts_targets", 0)
-        mcts_turn_starts += result.get("mcts_turn_starts", 0)
-        mcts_seconds += result.get("mcts_seconds", 0.0)
-        mcts_simulate_seconds += result.get("mcts_simulate_seconds", 0.0)
-        mcts_encode_seconds += result.get("mcts_encode_seconds", 0.0)
-        mcts_inference_seconds += result.get("mcts_inference_seconds", 0.0)
-        mcts_backup_seconds += result.get("mcts_backup_seconds", 0.0)
-        mcts_rollout_steps += result.get("mcts_rollout_steps", 0)
-        mcts_rollout_completed += result.get("mcts_rollout_completed", 0)
-        mcts_rollout_invalid += result.get("mcts_rollout_invalid", 0)
-        mcts_rollout_seconds += result.get("mcts_rollout_seconds", 0.0)
-        mcts_timeouts += result.get("mcts_timeouts", 0)
-        for trajectory in result["trajectories"]:
-            segmented_trajectories += int(not trajectory["terminals"][-1])
-            trajectory_lengths.append(len(trajectory["rows"]))
-            trajectory_policy_spans.append(int(
-                max(trajectory["versions"]) - min(trajectory["versions"])
-            ))
-            trajectory_arrival_lags.append(int(max(0, updates - min(trajectory["versions"]))))
-            trajectory_stale_steps.append(int(sum(
-                version < updates - args.max_policy_lag for version in trajectory["versions"]
-            )))
-            trajectory_seconds.append(trajectory["completion_seconds"])
         dataset_peak = max(dataset_peak, len(dataset))
         update = result["reservoir"]
         missing = [index for index, row in enumerate(update["rows"]) if row[4] is None]
@@ -792,23 +649,11 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         packet_winning_added = reservoir.admit(
             update["rows"], update["wins"], update["skipped"], update["forced"], rng,
         )
-        winning_added += packet_winning_added
-        for target_episodes, collected in zip(episodes, result["episodes"]):
-            target_episodes.extend(collected)
         for character, collected in enumerate(result["episodes"]):
             promotion_episodes.extend((character, row) for row in collected)
-        collector_seconds[worker] += result["collect_seconds"]
-        collect_seconds = max(collector_seconds)
-        for key in cache_stats:
-            cache_stats[key] += result[key]
-        orphan_empty_actions += result["orphan_empty_actions"]
-        queue_full_waits += result.get("queue_full_waits", 0)
-        queue_put_seconds += result.get("queue_put_seconds", 0)
         queue_delay = None
         if "queued_at" in result:
             queue_delay = time.monotonic() - result["queued_at"]
-            queue_delay_sum += queue_delay
-            queue_packets += 1
         try:
             queue_peak = max(queue_peak, samples.qsize())
         except NotImplementedError:
@@ -826,12 +671,17 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             "trajectory_rows": sum(len(row["rows"]) for row in result["trajectories"]),
             "accepted_rows": added, "admitted_rows": added - excluded,
             "forced_rows": excluded, "budget_excess_rows": excess,
+            "capacity_dropped_rows": capacity_dropped,
             "discarded_decisions": result["discarded_steps"] + excess,
             "expert_rows": len(result.get("expert_rows", ())),
             "winning_candidates": len(update["rows"]),
             "winning_admitted": packet_winning_added,
+            "winning_episodes": update["wins"], "winning_skipped": update["skipped"],
+            "winning_forced_skipped": update["forced"],
+            "orphan_empty_actions": result["orphan_empty_actions"],
             "queue_delay_seconds": queue_delay,
             "queue_put_seconds": result.get("queue_put_seconds", 0.0),
+            "queue_full_waits": result.get("queue_full_waits", 0),
             "collect_seconds": result.get("collect_seconds", 0.0),
             "cache": {
                 "card_hits": result.get("card_hit", 0),
@@ -869,15 +719,22 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         return cached_tensors(features, model.width), time.monotonic() - prepared
 
     def reserve_batch(size):
-        selected = dataset.sample(size, rng, args.character_balanced)
+        if len(refill_ids):
+            ids = dataset.data["id"][:len(dataset)]
+            retained = np.isin(ids, refill_ids)
+            kept = np.flatnonzero(retained)
+            selected = np.concatenate((kept, dataset.sample(
+                size - len(kept), rng, args.character_balanced,
+                np.flatnonzero(~retained),
+            )))
+        else:
+            selected = dataset.sample(size, rng, args.character_balanced)
         rows = [dataset.rows[index] for index in selected]
         expert_selected = expert_dataset.sample(args.expert_batch, rng) \
             if args.expert_weight or args.search_consistency_weight else np.empty(0, np.int64)
         expert_rows = [expert_dataset.rows[index] for index in expert_selected]
         expert_targets = [expert_dataset.targets[index] for index in expert_selected]
         expert_ids = expert_dataset.ids[expert_selected].copy()
-        expert_visits_batch = expert_dataset.visits[expert_selected].copy()
-        expert_depths_batch = expert_dataset.depths[expert_selected].copy()
         consistency_positions = np.asarray([
             index for index, selected in enumerate(expert_selected)
             if expert_dataset.consistencies[selected][2] < 1
@@ -898,201 +755,23 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         replay = reservoir.sample(len(selected) // 9, rng)
         cached = bool(dataset.features) and not expert_rows and not replay and not search_children
         return selected, rows, expert_ids, expert_rows, expert_targets, \
-            expert_visits_batch, expert_depths_batch, values, replay, search_groups, \
+            values, replay, search_groups, \
             search_children, cached, packer.submit(
             prepare_cached, [dataset.features[index] for index in selected]
         ) if cached else packer.submit(
             prepare, rows + expert_rows + [sample[0] for sample in replay] + search_children
         )
 
-    def optimizer_metrics():
-        return {
-            "policy_rows_attempted": attempted,
-            "policy_rows_forced": forced,
-            "policy_rows_accepted": trained,
-            "policy_rows_discarded": attempted - trained,
-            "ratio_rejected_rows": dataset.ratio_dropped,
-            "pre_kl_rejected_rows": dataset.kl_dropped,
-            "post_kl_discarded_rows": dataset.post_kl_dropped,
-            "policy_update_attempts": policy_update_attempts,
-            "policy_updates_accepted": updates,
-            "pre_kl_rejected_updates": pre_kl_rejected_updates,
-            "post_kl_proposals": post_kl_proposals,
-            "post_kl_rejected_proposals": post_kl_rejected_proposals,
-            "post_kl_retries": post_kl_retries,
-            "post_kl_retry_depth_max": post_kl_retry_depth,
-            "post_kl_discarded_updates": post_kl_discarded_updates,
-            "critic_only_updates": critic_only_updates,
-            "accepted_pre_kl_sum": accepted_pre_kl_sum,
-            "accepted_post_kl_sum": accepted_post_kl_sum,
-            "accepted_kl_count": updates,
-            "dataset_ultimately_discarded": attempted - trained,
-        }
-
-    def report():
-        nonlocal reported_steps, reported_seconds, reported_trajectories
-        recent_by_character = [rows[reported_episodes[index]:] for index, rows in enumerate(episodes)]
-        recent = [episode for rows in recent_by_character for episode in rows]
-        recent_summary = episode_summary(recent)
-        reported_episodes[:] = map(len, episodes)
-        elapsed = time.monotonic() - run_started
-        segment_elapsed = time.monotonic() - started
-        recent_metrics = metric_means({
-            key: values[reported_metrics[key]:]
-            for key, values in losses.items() if len(values) > reported_metrics[key]
-        })
-        recent_lengths = trajectory_lengths[reported_trajectories:]
-        recent_spans = trajectory_policy_spans[reported_trajectories:]
-        recent_arrival_lags = trajectory_arrival_lags[reported_trajectories:]
-        recent_stale_steps = trajectory_stale_steps[reported_trajectories:]
-        recent_seconds = trajectory_seconds[reported_trajectories:]
-        reported_trajectories = len(trajectory_lengths)
-        for key, values in losses.items():
-            reported_metrics[key] = len(values)
-        replay_fraction = winning_replayed / max(1, trained + winning_replayed)
-        assert replay_fraction <= .1 + 1e-9
-        _, _, curriculum = curriculum_weights(
-            stage, stage_decisions + handled, auxiliary_decisions + handled, args, progress_active
-        )
-        point = {
-            "steps": base_decisions + handled, "sampled_decisions": base_decisions + sampled,
-            "accepted_decisions": base_decisions + decisions,
-            "iteration": latest_sampler_iteration, "samplers": args.samplers,
-            "updates": updates, "episodes": len(recent),
-            "wins": sum(row[0] for row in recent), "caps": sum(row[2] or row[3] or row[4] for row in recent),
-            "win_rate": recent_summary["win_rate"],
-            "win_rate_interval": recent_summary["win_rate_interval"],
-            "boss_entries": recent_summary["boss_entries"],
-            "boss_entry_rate": recent_summary["boss_entry_rate"],
-            "boss_entry_rate_interval": recent_summary["boss_entry_rate_interval"],
-            "boss_conversion": recent_summary["boss_conversion"],
-            "boss_conversion_interval": recent_summary["boss_conversion_interval"],
-            "seconds": elapsed,
-            "decisions_per_second": (handled - reported_steps) / max(1e-9, segment_elapsed - reported_seconds),
-            "trajectory_floors": [(row[5], row[1], character)
-                                  for character, rows in enumerate(recent_by_character) for row in rows],
-            "step_caps": sum(row[2] for row in recent), "combat_caps": sum(row[3] for row in recent),
-            "empty_actions": sum(row[4] for row in recent),
-            "collect_seconds": collect_seconds, "screen_seconds": screen_seconds,
-            "screen_unpack_seconds": screen_unpack_seconds,
-            "screen_forward_seconds": screen_forward_seconds,
-            "update_seconds": update_seconds,
-            "actor_decisions_per_second": sampled / max(1e-9, collect_seconds),
-            "learner_decisions_per_second": trained / max(1e-9, update_seconds),
-            "mcts_roots": mcts_roots, "mcts_simulations": mcts_simulations,
-            "mcts_leaves": mcts_leaves, "mcts_nodes": mcts_nodes,
-            "mcts_batches": mcts_batches, "mcts_targets": mcts_targets,
-            "mcts_turn_starts": mcts_turn_starts,
-            "mcts_seconds": mcts_seconds,
-            "mcts_root_fraction": mcts_roots / max(1, mcts_turn_starts),
-            "mcts_roots_per_decision": mcts_roots / max(1, sampled),
-            "mcts_simulations_per_root": mcts_simulations / max(1, mcts_roots),
-            "mcts_simulations_per_second": mcts_simulations / max(1e-9, mcts_seconds),
-            "mcts_leaf_batch_mean": mcts_leaves / max(1, mcts_batches),
-            "mcts_targets_per_root": mcts_targets / max(1, mcts_roots),
-            "mcts_simulate_fraction": mcts_simulate_seconds / max(1e-9, mcts_seconds),
-            "mcts_encode_fraction": mcts_encode_seconds / max(1e-9, mcts_seconds),
-            "mcts_inference_fraction": mcts_inference_seconds / max(1e-9, mcts_seconds),
-            "mcts_backup_fraction": mcts_backup_seconds / max(1e-9, mcts_seconds),
-            "mcts_rollout_steps": mcts_rollout_steps,
-            "mcts_rollout_completed": mcts_rollout_completed,
-            "mcts_rollout_invalid": mcts_rollout_invalid,
-            "mcts_timeouts": mcts_timeouts,
-            "mcts_rollout_fraction": mcts_rollout_seconds / max(1e-9, mcts_seconds),
-            "expert_buffer_rows": len(expert_dataset),
-            "expert_rows_seen": expert_dataset.seen,
-            "expert_rows_used": expert_dataset.used,
-            "expert_rows_stale": expert_dataset.stale,
-            "expert_rows_evicted": expert_dataset.evicted,
-            "expert_visit_mean": expert_visits / max(1, expert_dataset.used),
-            "expert_depth_mean": expert_depth / max(1, expert_dataset.used),
-            "row_utilization": trained / max(1, attempted),
-            "update_seconds_p95": float(np.quantile(update_durations, .95)) if update_durations else 0,
-            "unpack_seconds_p95": float(np.quantile(unpack_durations, .95)) if unpack_durations else 0,
-            "forward_seconds_p95": float(np.quantile(forward_durations, .95)) if forward_durations else 0,
-            "backward_seconds_p95": float(np.quantile(backward_durations, .95)) if backward_durations else 0,
-            **cache_stats,
-            "card_cache_hit_rate": cache_stats["card_hit"] / max(
-                1, cache_stats["card_hit"] + cache_stats["card_miss"]
-            ),
-            "graph_cache_hit_rate": cache_stats["graph_hit"] / max(
-                1, cache_stats["graph_hit"] + cache_stats["graph_miss"]
-            ),
-            "mps_allocated_bytes": torch.mps.current_allocated_memory() if target.type == "mps" else 0,
-            "mps_driver_allocated_bytes": torch.mps.driver_allocated_memory() if target.type == "mps" else 0,
-            "floor_bands": bands([row[1] for row in recent]),
-            "dataset_rows": len(dataset), "dataset_peak": dataset_peak,
-            "dataset_seen": dataset.seen, "dataset_admitted": dataset.admitted,
-            "dataset_uses": dataset.uses, "dataset_retired": dataset.retired,
-            "dataset_forced_dropped": dataset.forced_dropped,
-            "dataset_priority_mean": float(dataset.data["priority"][:len(dataset)].mean()) if len(dataset) else 0,
-            "dataset_priority_max": float(dataset.data["priority"][:len(dataset)].max()) if len(dataset) else 0,
-            "dataset_attempted": attempted, "dataset_trained": trained,
-            "dataset_stale_dropped": dataset.stale_dropped,
-            "dataset_ratio_dropped": dataset.ratio_dropped, "dataset_kl_dropped": dataset.kl_dropped,
-            "dataset_post_kl_dropped": dataset.post_kl_dropped,
-            "post_kl_checks": post_kl_checks,
-            **optimizer_metrics(),
-            "discarded_steps": discarded_steps,
-            "discarded_step_fraction": discarded_steps / max(1, sampled),
-            "completed_trajectories": len(trajectory_lengths),
-            "bootstrapped_segments": segmented_trajectories,
-            "trajectory_length_mean": float(np.mean(recent_lengths)) if recent_lengths else 0,
-            "trajectory_length_max": max(recent_lengths, default=0),
-            "trajectory_policy_span_mean": float(np.mean(recent_spans)) if recent_spans else 0,
-            "trajectory_policy_span_max": max(recent_spans, default=0),
-            "trajectory_arrival_lag_mean": float(np.mean(recent_arrival_lags)) if recent_arrival_lags else 0,
-            "trajectory_arrival_lag_max": max(recent_arrival_lags, default=0),
-            "trajectory_stale_step_fraction": sum(recent_stale_steps) / max(1, sum(recent_lengths)),
-            "trajectory_completion_seconds_mean": float(np.mean(recent_seconds)) if recent_seconds else 0,
-            "trajectory_completion_seconds_max": max(recent_seconds, default=0),
-            "policy_version": revisions["policy_revision"],
-            "weights_revision": revisions["weights_revision"],
-            "actor_revision": revisions["actor_revision"],
-            "sampler_version": latest_sampler_version,
-            "policy_lag_mean": float(np.mean(policy_lags)) if policy_lags else 0,
-            "sampler_heartbeats": [time.monotonic() - value for value in heartbeat[:]],
-            "sampler_restarts": sampler_restarts, "sampler_wedges": sampler_wedges,
-            "sampler_restart_streaks": sampler_restart_streaks,
-            "watchdog_dropped_steps": watchdog_dropped,
-            "sample_queue_capacity": sample_capacity, "sample_queue_peak": queue_peak,
-            "sample_queue_packets": queue_packets,
-            "sample_queue_delay_mean": queue_delay_sum / max(1, queue_packets),
-            "sample_queue_full_waits": queue_full_waits,
-            "sample_queue_put_seconds": queue_put_seconds,
-            "winning_reservoir": len(reservoir.rows), "winning_seen": reservoir.seen,
-            "winning_character_rows": list(map(len, reservoir.by_character())),
-            "winning_episodes": reservoir.wins, "winning_added": winning_added,
-            "winning_skipped": reservoir.skipped, "winning_forced_skipped": reservoir.forced,
-            "winning_replayed": winning_replayed,
-            "winning_rejected_kl": winning_rejected,
-            "winning_replayed_characters": winning_replayed_characters,
-            "winning_evicted_characters": winning_evicted_characters,
-            "winning_replay_fraction": replay_fraction,
-            "winning_loss_weight": args.winning_loss_weight,
-            "winning_collection_drift": float(winning_behavior_drift),
-            "observed_kl": observed_kl, "observed_clip_fraction": observed_clip,
-            "progress_active": progress_active, "curriculum": curriculum,
-            "critic_floor_conditioned_explained_reward_variance":
-                floor_explained_sum.sum() / floor_explained_weight.sum()
-                if floor_explained_weight.any() else 0.,
-            "critic_explained_reward_variance_by_floor": {
-                str(floor): {
-                    "value": floor_explained_sum[floor] / floor_explained_weight[floor]
-                    if floor_explained_weight[floor] else 0.,
-                    "target_variance": floor_explained_weight[floor] / rows,
-                    "rows": int(rows),
-                }
-                for floor, rows in enumerate(floor_explained_rows) if rows
-            },
-            **critic_balance.report(),
-            **recent_metrics,
-        }
+    def finish_window():
+        nonlocal reported_steps
         reported_steps = handled
-        reported_seconds = segment_elapsed
-        point["characters"] = summaries([rows[-args.promotion_window:] for rows in episodes])
-        save_report(point, pipeline, windows)
-        floor_explained_sum.fill(0); floor_explained_weight.fill(0); floor_explained_rows.fill(0)
+        emit_event({
+            "event": "training_window", "step": base_decisions + handled,
+            "stage": stage, "weights_revision": revisions["weights_revision"],
+            "policy_revision": revisions["policy_revision"],
+            "training_elapsed_seconds": time.monotonic() - run_started,
+        })
+        prune_checkpoints()
     next_report = base_decisions + args.report_decisions
     next_save = base_decisions + args.save_decisions
     promotion_ready = False
@@ -1105,6 +784,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             promotion_episodes, args.promotion_window, args.promote_win_rate,
         )
     pending = []
+    refill_ids = np.empty(0, np.int64)
     def drain_results():
         while True:
             try:
@@ -1239,9 +919,16 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     "actor_revision": revisions["actor_revision"],
                     "stage": stage, "dataset_rows": len(dataset),
                     "dataset_peak_rows": dataset_peak, "expert_rows": len(expert_dataset),
+                    "dataset_priority_mean": float(
+                        dataset.data["priority"][:len(dataset)].mean()
+                    ) if len(dataset) else 0.,
+                    "dataset_priority_max": float(
+                        dataset.data["priority"][:len(dataset)].max()
+                    ) if len(dataset) else 0.,
                     "winning_rows": len(reservoir.rows), "queue_depth": queue_size,
                     "queue_capacity": sample_capacity,
                     "sampler_policy_revision": latest_sampler_version,
+                    "watchdog_dropped_steps": watchdog_dropped,
                     "sampler_age_seconds": [now - value for value in heartbeat[:]],
                     "sampler_generations": sampler_generations,
                     "sampler_restarts": sampler_restarts,
@@ -1266,18 +953,14 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                         continue
                     sampler_done = (stop.is_set() or all(not worker.is_alive() for worker in workers)) and samples.empty()
                 absolute = base_decisions + handled
-                boundary = min(next_report, next_save) - absolute
-                stale = dataset.prune(revisions["policy_revision"], args.max_policy_lag, boundary)
                 expert_stale = len(expert_dataset)
                 expert_dataset.prune(revisions["policy_revision"], args.expert_max_lag)
                 expert_stale -= len(expert_dataset)
-                handled += stale
-                if stale or expert_stale:
+                if expert_stale:
                     emit_event({
-                        "event": "dataset_pruned", "step": base_decisions + handled,
+                        "event": "expert_pruned", "step": base_decisions + handled,
                         "resolved_decisions_total": base_decisions + handled,
-                        "stage": stage, "stale_rows": stale,
-                        "expert_stale_rows": expert_stale,
+                        "stage": stage, "expert_stale_rows": expert_stale,
                         "weights_revision": revisions["weights_revision"],
                         "policy_revision": revisions["policy_revision"],
                         "training_elapsed_seconds": time.monotonic() - run_started,
@@ -1287,18 +970,27 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     save_step(absolute)
                     next_save += args.save_decisions
                 if absolute >= next_report:
-                    windows += 1
-                    report()
+                    finish_window()
                     next_report += args.report_decisions
                     update_promotion()
                     if promotion_ready:
                         stop.set()
                     continue
-                if not len(dataset):
+                if len(dataset) < args.batch:
                     if sampler_done:
+                        remaining = len(dataset)
+                        dataset.discard(np.arange(remaining))
+                        handled += remaining
+                        if remaining:
+                            emit_event({
+                                "event": "dataset_pruned", "step": base_decisions + handled,
+                                "resolved_decisions_total": base_decisions + handled,
+                                "stage": stage, "incomplete_rows": remaining,
+                                "weights_revision": revisions["weights_revision"],
+                                "policy_revision": revisions["policy_revision"],
+                                "training_elapsed_seconds": time.monotonic() - run_started,
+                            })
                         break
-                    continue
-                if len(dataset) < args.batch and not sampler_done:
                     continue
             while len(pending) < 1:
                 ingested = False
@@ -1308,32 +1000,30 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     ingested = decisions != before
                     sampler_done = (stop.is_set() or all(not worker.is_alive() for worker in workers)) and samples.empty()
                 boundary = min(next_report, next_save) - (base_decisions + handled)
-                enough = len(dataset) >= args.batch or sampler_done and len(dataset)
+                enough = len(dataset) >= args.batch
                 if boundary <= 0:
                     break
                 if not enough:
                     if sampler_done or not ingested:
                         break
                     continue
-                pending.append(reserve_batch(min(args.batch, len(dataset)) if sampler_done else args.batch))
+                pending.append(reserve_batch(args.batch))
             if not pending:
                 if sampler_done and not len(dataset):
                     break
                 continue
             update_started = time.monotonic()
             (selected, rows, expert_ids, expert_rows, expert_targets,
-             expert_visits_batch, expert_depths_batch, values, replay, search_groups, search_children,
+             values, replay, search_groups, search_children,
              cached, packed) = pending.pop(0)
             if not rows:
                 continue
+            assert len(rows) == args.batch
             revisions["update_attempt"] += 1
-            screen_started = time.monotonic()
             unpack_started = time.monotonic()
-            cpu_inputs, unpack_elapsed = packed.result()
-            screen_unpack_seconds += unpack_elapsed
+            cpu_inputs, _ = packed.result()
             inputs = upload(cpu_inputs, target)
             unpack_seconds = time.monotonic() - unpack_started
-            unpack_durations.append(unpack_seconds)
             action = torch.as_tensor(values["action"], device=target)
             old = torch.as_tensor(values["old"], device=target)
             lengths = np.asarray([packed_action_count(row) for row in rows], np.int64)
@@ -1350,9 +1040,6 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 predict(model, inputs, args.precision, args.policy_temperature, flat_policy=flat_policy)
             )
             forward_seconds = time.monotonic() - forward_started
-            screen_forward_seconds += forward_seconds
-            screen_seconds += time.monotonic() - screen_started
-            forward_durations.append(forward_seconds)
             backward_seconds = 0.0
             critic_logits = all_critic_logits[:len(rows)]
             legal = None if cached else inputs[6][:len(rows)]
@@ -1371,18 +1058,30 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             invalid = ~fresh.detach().cpu().numpy()
             if invalid.any():
                 invalid = np.isin(values["trajectory"], values["trajectory"][invalid])
-                fresh = torch.as_tensor(~invalid, device=target)
-            rejected_trajectories = values["trajectory"][invalid]
-            selected = np.asarray(selected, np.int64)[~invalid]
+                refill_ids = values["id"][~invalid]
+                ratio_rejected = dataset.discard_trajectories(values["trajectory"][invalid])
+                handled += ratio_rejected
+                update_elapsed = time.monotonic() - update_started
+                training_batch_event(
+                    "ratio_rejected", "none", attempted_rows=len(rows),
+                    fresh_rows=int((~invalid).sum()), policy_trained_rows=0,
+                    critic_trained_rows=0, ratio_rejected_rows=ratio_rejected,
+                    retired_rows=0, unpack_seconds=unpack_seconds,
+                    forward_seconds=forward_seconds, backward_seconds=0.,
+                    total_seconds=update_elapsed,
+                )
+                continue
+            refill_ids = np.empty(0, np.int64)
+            selected = np.asarray(selected, np.int64)
             expired = dataset.use(selected, args.priority_decay)
             dataset.discard(expired)
-            ratio_rejected = dataset.discard_trajectories(rejected_trajectories)
-            dataset.ratio_dropped += ratio_rejected
-            handled += len(expired) + ratio_rejected
+            ratio_rejected = 0
+            handled += len(expired)
             batch_policy_lags = (
                 revisions["policy_revision"] - values["version"][~invalid]
             ).tolist()
-            policy_lags.extend(batch_policy_lags)
+            lag_values, lag_counts = np.unique(batch_policy_lags, return_counts=True)
+            policy_lag_counts = dict(zip(map(int, lag_values), map(int, lag_counts)))
             mask = fresh.to(log_ratio.dtype)
             fresh_count = mask.sum()
             denominator = fresh_count.clamp_min(1)
@@ -1393,25 +1092,11 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 .div(denominator).detach()
             fresh_cpu = fresh.detach().cpu().numpy()
             fresh_rows = int(fresh_count)
-            attempted += len(rows)
             kl_value = float(kl)
             _, entropy_weight, _ = curriculum_weights(
                 stage, stage_decisions + handled, auxiliary_decisions + handled, args, progress_active
             )
-            if not fresh_rows:
-                update_elapsed = time.monotonic() - update_started
-                update_seconds += update_elapsed
-                update_durations.append(update_elapsed)
-                backward_durations.append(0.)
-                training_batch_event(
-                    "no_fresh_rows", "none", attempted_rows=len(rows), fresh_rows=0,
-                    policy_trained_rows=0, critic_trained_rows=0,
-                    ratio_rejected_rows=ratio_rejected, retired_rows=len(expired),
-                    pre_kl=kl_value, unpack_seconds=unpack_seconds,
-                    forward_seconds=forward_seconds, backward_seconds=0.,
-                    total_seconds=update_elapsed,
-                )
-                continue
+            assert fresh_rows == args.batch
             batch_target = torch.as_tensor(values["critic_target"][fresh_cpu], device=target)
             critic_weights = critic_balance.weights(
                 values["character"][fresh_cpu], values["phase"][fresh_cpu],
@@ -1427,19 +1112,12 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     prediction.detach(), batch_target, values["canonical"][fresh_cpu]
                 )
             critic_parameters = tuple(model.critic.parameters())
-            critic_balance.record_loss(
-                values["terminal"][fresh_cpu],
-                (squared_error.detach() * critic_weights).cpu().numpy(),
-            )
             set_learning_rate(
                 optimizer, args.learning_rate, args.learning_rate_warmup_steps,
                 revisions["weights_revision"],
             )
-            policy_update_attempts += int(not args.critic_only)
             if not args.critic_only and kl_value > args.target_kl:
                 handled += dataset.discard_trajectories(values["trajectory"][fresh_cpu])
-                dataset.kl_dropped += fresh_rows
-                pre_kl_rejected_updates += 1
                 backward_started = time.monotonic()
                 optimizer.zero_grad(set_to_none=True); critic_loss.backward(inputs=critic_parameters)
                 gradient_norm = critic_only_step(model, optimizer, critic_parameters)
@@ -1447,14 +1125,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 if (target.type == "mps" and args.mps_empty_cache_updates
                         and revisions["weights_revision"] % args.mps_empty_cache_updates == 0):
                     torch.mps.empty_cache()
-                critic_only_updates += 1
                 backward_seconds = time.monotonic() - backward_started
-                backward_durations.append(backward_seconds)
                 update_elapsed = time.monotonic() - update_started
-                update_seconds += update_elapsed
-                update_durations.append(update_elapsed)
-                losses["critic_explained_reward_variance"].append(explained_reward_variance)
-                record_floor_explained(explained_reward_variance_by_floor)
                 training_batch_event(
                     "pre_kl_rejected", "critic_only", attempted_rows=len(rows),
                     fresh_rows=fresh_rows, policy_trained_rows=0,
@@ -1466,9 +1138,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     critic_explained_reward_variance_by_floor=explained_reward_variance_by_floor,
                     advantage_mean=float(np.mean(values["advantage"][fresh_cpu])),
                     advantage_stddev=float(np.std(values["advantage"][fresh_cpu])),
-                    policy_lag_mean=float(np.mean(batch_policy_lags)),
-                    policy_lag_p95=float(np.quantile(batch_policy_lags, .95)),
-                    policy_lag_max=max(batch_policy_lags), pre_kl=kl_value,
+                    policy_lag_counts=policy_lag_counts, pre_kl=kl_value,
                     gradient_norm=gradient_norm,
                     gradient_clipped=gradient_norm > .5, unpack_seconds=unpack_seconds,
                     forward_seconds=forward_seconds, backward_seconds=backward_seconds,
@@ -1502,7 +1172,6 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 entropy_by_row = -(logits.exp() * logits * legal).sum(1)
             entropy = (entropy_by_row * mask).sum() / denominator
             expert_loss = logits.sum() * 0
-            expert_entropy = expert_loss
             expert_count = len(expert_rows)
             if expert_count and args.expert_weight:
                 if flat_policy:
@@ -1514,8 +1183,6 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 expert_target = torch.as_tensor(expert_target, device=target)
                 positive = expert_target > 0
                 expert_loss = -(expert_target[positive] * expert_logits[positive]).sum() \
-                    / expert_count
-                expert_entropy = -(expert_target[positive] * expert_target[positive].log()).sum() \
                     / expert_count
             search_consistency_loss = critic_logits.sum() * 0
             if search_groups:
@@ -1556,7 +1223,9 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 expert_ppo_grad_cosine = torch.stack([
                     (left * right).sum() for left, right in pairs
                 ]).sum() / (ppo_head_grad * expert_head_grad).clamp_min(1e-12)
-            replay_valid = replay_eligible = eligible_cpu = valid_cpu = None
+            replay_valid = valid_cpu = None
+            replay_rejected_count = replay_count = 0
+            winning_drift = 0.
             if replay:
                 replay_start = len(rows) + len(expert_rows)
                 replay_logits = all_logits[replay_start:]
@@ -1573,17 +1242,14 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 replay_capacity = fresh_count.to(torch.int64) // 9
                 replay_eligible = torch.arange(len(replay), device=target) < replay_capacity
                 replay_valid = replay_eligible & (replay_kl <= args.target_kl)
-                eligible_cpu = replay_eligible.cpu().numpy()
+                eligible = replay_eligible.cpu().numpy()
                 valid_cpu = replay_valid.cpu().numpy()
                 replay_rejected = [sample for sample, eligible, keep in zip(
-                    replay, eligible_cpu, valid_cpu,
+                    replay, eligible, valid_cpu,
                 ) if eligible and not keep]
                 reservoir.evict(replay_rejected)
-                winning_rejected += len(replay_rejected)
-                for sample in replay_rejected:
-                    winning_evicted_characters[packed_character(sample[0])] += 1
+                replay_rejected_count = len(replay_rejected)
                 replay_weight = replay_valid.to(replay_kl.dtype)
-                replay_denominator = replay_weight.sum().clamp_min(1)
                 replay_log_probability = replay_distribution.log_prob(replay_action)
                 reference_log_probability = reference_distribution.log_prob(replay_action)
                 replay_log_ratio = torch.where(
@@ -1599,34 +1265,23 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     replay_ratio.clamp(1 - args.clip, 1 + args.clip) * replay_advantage,
                 ) * replay_weight).sum() / replay_capacity.clamp_min(1)
                 loss = loss + winning_loss
-                replay_kl_mean = (replay_kl * replay_weight).sum() / replay_denominator
             backward_started = time.monotonic()
             optimizer.zero_grad(set_to_none=True); loss.backward()
             if args.critic_only:
-                gradient_norm = critic_only_step(model, optimizer); critic_only_updates += 1
-                accepted, proposals, post_log_ratio = True, [0.], log_ratio.detach()
+                gradient_norm = critic_only_step(model, optimizer)
+                accepted, proposals = True, [0.]
             elif args.disable_post_kl_check or args.target_kl >= 1:
                 gradient_norm = float(nn.utils.clip_grad_norm_(model.parameters(), .5))
                 optimizer.step()
-                accepted, proposals, post_log_ratio = True, [], log_ratio.detach()
+                accepted, proposals = True, []
             else:
-                accepted, proposals, post_log_ratio, gradient_norm = trust_region_step(
+                accepted, proposals, _, gradient_norm = trust_region_step(
                     model, optimizer, inputs, action, old, fresh, denominator,
                     args.precision, args.target_kl, args.policy_temperature,
                     choice_index=choice_index if flat_policy else None,
                 )
-            rejected_proposals = sum(
-                not math.isfinite(value) or value > args.target_kl for value in proposals
-            )
-            post_kl_checks += len(proposals)
-            post_kl_proposals += len(proposals)
-            post_kl_rejected_proposals += rejected_proposals
-            post_kl_retries += max(0, len(proposals) - 1)
-            post_kl_retry_depth = max(post_kl_retry_depth, max(0, len(proposals) - 1))
             if not accepted:
                 handled += dataset.discard_trajectories(values["trajectory"][fresh_cpu])
-                dataset.post_kl_dropped += fresh_rows
-                post_kl_discarded_updates += 1
                 optimizer.zero_grad(set_to_none=True)
                 retry_logits = predict(
                     model, inputs, args.precision, args.policy_temperature,
@@ -1648,16 +1303,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 if (target.type == "mps" and args.mps_empty_cache_updates
                         and revisions["weights_revision"] % args.mps_empty_cache_updates == 0):
                     torch.mps.empty_cache()
-                critic_only_updates += 1
                 update_elapsed = time.monotonic() - update_started
-                update_seconds += update_elapsed
-                update_durations.append(update_elapsed)
                 backward_seconds = time.monotonic() - backward_started
-                backward_durations.append(backward_seconds)
-                losses["critic_explained_reward_variance"].append(
-                    retry_explained_reward_variance
-                )
-                record_floor_explained(retry_explained_reward_variance_by_floor)
                 training_batch_event(
                     "post_kl_rejected", "critic_only", attempted_rows=len(rows),
                     fresh_rows=fresh_rows, policy_trained_rows=0,
@@ -1670,9 +1317,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     retry_explained_reward_variance_by_floor,
                     advantage_mean=float(np.mean(values["advantage"][fresh_cpu])),
                     advantage_stddev=float(np.std(values["advantage"][fresh_cpu])),
-                    policy_lag_mean=float(np.mean(batch_policy_lags)),
-                    policy_lag_p95=float(np.quantile(batch_policy_lags, .95)),
-                    policy_lag_max=max(batch_policy_lags),
+                    policy_lag_counts=policy_lag_counts,
                     entropy=float(entropy.detach()), entropy_weight=entropy_weight,
                     pre_kl=kl_value, post_kl_proposals=proposals,
                     clip_fraction=float(clip_fraction), gradient_norm=gradient_norm,
@@ -1683,83 +1328,38 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 publish()
                 continue
             post_kl = proposals[-1] if proposals else kl_value
-            post_ratio = post_log_ratio.exp()
-            observed_kl = post_kl
-            observed_clip = float(
-                (((post_ratio - 1).abs() > args.clip) * fresh).sum() / denominator
-            )
-            losses["post_kl"].append(post_kl)
-            accepted_pre_kl_sum += kl_value
-            accepted_post_kl_sum += post_kl
-            losses["mean_advantage"].append(float(np.mean(values["advantage"][fresh_cpu])))
-            losses["policy_loss"].append(policy_loss.detach())
-            if expert_count and args.expert_weight:
-                losses["expert_loss"].append(expert_loss.detach())
-                losses["expert_entropy"].append(expert_entropy.detach())
-                losses["expert_kl"].append((expert_loss - expert_entropy).detach())
-                losses["expert_rows"].append(expert_count)
-                losses["ppo_policy_head_grad_norm"].append(ppo_head_grad.detach())
-                losses["expert_policy_head_grad_norm"].append(expert_head_grad.detach())
-                losses["expert_ppo_grad_ratio"].append(
-                    (expert_head_grad / ppo_head_grad.clamp_min(1e-12)).detach()
-                )
-                losses["expert_ppo_grad_cosine"].append(expert_ppo_grad_cosine.detach())
-            losses["critic_loss"].append(value_loss.detach())
-            losses["critic_explained_reward_variance"].append(explained_reward_variance)
-            record_floor_explained(explained_reward_variance_by_floor)
-            if search_groups:
-                losses["search_consistency_loss"].append(search_consistency_loss.detach())
             base_prediction = prediction.detach() + torch.as_tensor(
                 values["potential"][fresh_cpu], device=target
             )
-            losses["critic_expected"].append(base_prediction.mean())
-            losses["critic_win_probability"].append(
-                critic_win_probability(base_prediction).mean()
-            )
-            losses["entropy"].append(entropy.detach())
-            losses["entropy_weight"].append(entropy_weight)
-            losses["kl"].append(kl); losses["clip_fraction"].append(clip_fraction)
             trained += fresh_rows; updates += 1
             revisions["weights_revision"] += 1
             if not args.critic_only:
                 revisions["policy_revision"] += 1
             if expert_count:
-                expert_visits += int(expert_visits_batch.sum())
-                expert_depth += int(expert_depths_batch.sum())
-                expert_dataset.used += expert_count
                 expert_dataset.discard_ids(expert_ids)
             if replay_valid is not None:
-                replay_characters = [packed_character(sample[0]) for sample in replay]
-                for character, eligible, keep in zip(
-                    replay_characters, eligible_cpu, valid_cpu
-                ):
-                    if eligible and keep:
-                        winning_replayed_characters[character] += 1
                 replay_count = int(valid_cpu.sum())
                 if replay_count:
                     behavior = torch.as_tensor([sample[2] for sample in replay], device=target)
-                    winning_behavior_drift = (
+                    winning_drift = float((
                         replay_log_probability.detach()[replay_valid] - behavior[replay_valid]
-                    ).abs().mean()
-                    losses["winning_loss"].append(winning_loss.detach())
-                    losses["winning_kl"].append(replay_kl_mean.detach())
-                    winning_replayed += replay_count
+                    ).abs().mean())
             if (target.type == "mps" and args.mps_empty_cache_updates
                     and revisions["weights_revision"] % args.mps_empty_cache_updates == 0):
                 torch.mps.empty_cache()
             backward_seconds = time.monotonic() - backward_started
-            backward_durations.append(backward_seconds)
             update_elapsed = time.monotonic() - update_started
-            update_seconds += update_elapsed
-            update_durations.append(update_elapsed)
             training_batch_event(
                 "disabled" if args.critic_only else "accepted",
                 "critic_only" if args.critic_only else "full",
                 attempted_rows=len(rows), fresh_rows=fresh_rows,
                 policy_trained_rows=0 if args.critic_only else fresh_rows,
                 critic_trained_rows=fresh_rows, ratio_rejected_rows=ratio_rejected,
-                retired_rows=len(expired), local_policy_updates=updates,
+                retired_rows=len(expired),
                 expert_rows=expert_count, replay_rows=len(replay),
+                winning_replayed_rows=replay_count,
+                winning_rejected_rows=replay_rejected_count,
+                winning_collection_drift=winning_drift,
                 policy_loss=float(policy_loss.detach()),
                 expert_loss=float(expert_loss.detach()),
                 ppo_head_grad=float(ppo_head_grad.detach()) if ppo_head_grad is not None else 0,
@@ -1777,9 +1377,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 critic_win_probability=float(critic_win_probability(base_prediction).mean()),
                 advantage_mean=float(np.mean(values["advantage"][fresh_cpu])),
                 advantage_stddev=float(np.std(values["advantage"][fresh_cpu])),
-                policy_lag_mean=float(np.mean(batch_policy_lags)),
-                policy_lag_p95=float(np.quantile(batch_policy_lags, .95)),
-                policy_lag_max=max(batch_policy_lags),
+                policy_lag_counts=policy_lag_counts,
                 entropy=float(entropy.detach()), entropy_weight=entropy_weight,
                 pre_kl=kl_value, post_kl=post_kl,
                 post_kl_proposals=proposals, clip_fraction=float(clip_fraction),
@@ -1808,8 +1406,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 save_step(absolute)
                 next_save += args.save_decisions
             if absolute >= next_report:
-                windows += 1
-                report()
+                finish_window()
                 next_report += args.report_decisions
                 update_promotion()
                 if promotion_ready:
@@ -1859,123 +1456,10 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
     assert unresolved >= 0, (sampled, decisions, discarded_steps)
     discarded_steps += unresolved
     if handled > reported_steps:
-        windows += 1
-        report()
-    terminal = [episode for character in episodes for episode in character]
-    terminal_summary = episode_summary(terminal)
-    terminal_summary["empty_actions"] += orphan_empty_actions
-    _, _, curriculum = curriculum_weights(
-        stage, stage_decisions + decisions, auxiliary_decisions + decisions, args, progress_active
-    )
+        finish_window()
     return {
-        "decisions": decisions, "updates": updates, "windows": windows,
-        "decisions_per_second": decisions / (time.monotonic() - started),
-        "seconds": time.monotonic() - started,
-        "collect_seconds": collect_seconds, "screen_seconds": screen_seconds,
-        "screen_unpack_seconds": screen_unpack_seconds,
-        "screen_forward_seconds": screen_forward_seconds,
-        "update_seconds": update_seconds,
-        "actor_decisions_per_second": sampled / max(1e-9, collect_seconds),
-        "learner_decisions_per_second": trained / max(1e-9, update_seconds),
-        "mcts_roots": mcts_roots, "mcts_simulations": mcts_simulations,
-        "mcts_leaves": mcts_leaves, "mcts_nodes": mcts_nodes,
-        "mcts_batches": mcts_batches, "mcts_targets": mcts_targets,
-        "mcts_turn_starts": mcts_turn_starts,
-        "mcts_seconds": mcts_seconds,
-        "mcts_root_fraction": mcts_roots / max(1, mcts_turn_starts),
-        "mcts_roots_per_decision": mcts_roots / max(1, sampled),
-        "mcts_simulations_per_root": mcts_simulations / max(1, mcts_roots),
-        "mcts_simulations_per_second": mcts_simulations / max(1e-9, mcts_seconds),
-        "mcts_leaf_batch_mean": mcts_leaves / max(1, mcts_batches),
-        "mcts_targets_per_root": mcts_targets / max(1, mcts_roots),
-        "mcts_simulate_fraction": mcts_simulate_seconds / max(1e-9, mcts_seconds),
-        "mcts_encode_fraction": mcts_encode_seconds / max(1e-9, mcts_seconds),
-        "mcts_inference_fraction": mcts_inference_seconds / max(1e-9, mcts_seconds),
-        "mcts_backup_fraction": mcts_backup_seconds / max(1e-9, mcts_seconds),
-        "mcts_rollout_steps": mcts_rollout_steps,
-        "mcts_rollout_completed": mcts_rollout_completed,
-        "mcts_rollout_invalid": mcts_rollout_invalid,
-        "mcts_timeouts": mcts_timeouts,
-        "mcts_rollout_fraction": mcts_rollout_seconds / max(1e-9, mcts_seconds),
-        "expert_buffer_rows": len(expert_dataset),
-        "expert_rows_seen": expert_dataset.seen,
-        "expert_rows_used": expert_dataset.used,
-        "expert_rows_stale": expert_dataset.stale,
-        "expert_rows_evicted": expert_dataset.evicted,
-        "expert_visit_mean": expert_visits / max(1, expert_dataset.used),
-        "expert_depth_mean": expert_depth / max(1, expert_dataset.used),
-        "row_utilization": trained / max(1, attempted),
-        "update_seconds_p95": float(np.quantile(update_durations, .95)) if update_durations else 0,
-        "unpack_seconds_p95": float(np.quantile(unpack_durations, .95)) if unpack_durations else 0,
-        "forward_seconds_p95": float(np.quantile(forward_durations, .95)) if forward_durations else 0,
-        "backward_seconds_p95": float(np.quantile(backward_durations, .95)) if backward_durations else 0,
-        **cache_stats,
-        "card_cache_hit_rate": cache_stats["card_hit"] / max(
-            1, cache_stats["card_hit"] + cache_stats["card_miss"]
-        ),
-        "graph_cache_hit_rate": cache_stats["graph_hit"] / max(
-            1, cache_stats["graph_hit"] + cache_stats["graph_miss"]
-        ),
-        "stage": {"index": stage, "ascension": ascension, "bonus": bonus},
-        "characters": summaries(episodes),
-        "terminals": terminal_summary,
-        "description": f"Continuously trained V{model.model_version} on A{ascension}/+{bonus} trajectories.",
-        "pipeline": pipeline, "promotion_ready": promotion_ready,
-        "promotion_result": promotion_result,
-        "dataset_rows": len(dataset), "dataset_peak": dataset_peak,
-        "dataset_seen": dataset.seen, "dataset_admitted": dataset.admitted,
-        "dataset_uses": dataset.uses, "dataset_retired": dataset.retired,
-        "dataset_forced_dropped": dataset.forced_dropped,
-        "dataset_priority_mean": float(dataset.data["priority"][:len(dataset)].mean()) if len(dataset) else 0,
-        "dataset_priority_max": float(dataset.data["priority"][:len(dataset)].max()) if len(dataset) else 0,
-        "dataset_attempted": attempted, "dataset_trained": trained,
-        "dataset_stale_dropped": dataset.stale_dropped,
-        "dataset_ratio_dropped": dataset.ratio_dropped, "dataset_kl_dropped": dataset.kl_dropped,
-        "dataset_post_kl_dropped": dataset.post_kl_dropped,
-        "post_kl_checks": post_kl_checks,
-        **optimizer_metrics(),
-        "sampled_decisions": sampled, "discarded_steps": discarded_steps,
-        "discarded_step_fraction": discarded_steps / max(1, sampled),
-        "completed_trajectories": len(trajectory_lengths),
-        "bootstrapped_segments": segmented_trajectories,
-        "trajectory_length_mean": float(np.mean(trajectory_lengths)) if trajectory_lengths else 0,
-        "trajectory_length_max": max(trajectory_lengths, default=0),
-        "trajectory_policy_span_mean": float(np.mean(trajectory_policy_spans)) if trajectory_policy_spans else 0,
-        "trajectory_policy_span_max": max(trajectory_policy_spans, default=0),
-        "trajectory_arrival_lag_mean": float(np.mean(trajectory_arrival_lags)) if trajectory_arrival_lags else 0,
-        "trajectory_arrival_lag_max": max(trajectory_arrival_lags, default=0),
-        "trajectory_stale_step_fraction": sum(trajectory_stale_steps) / max(1, sum(trajectory_lengths)),
-        "trajectory_completion_seconds_mean": float(np.mean(trajectory_seconds)) if trajectory_seconds else 0,
-        "trajectory_completion_seconds_max": max(trajectory_seconds, default=0),
-        "policy_version": revisions["policy_revision"],
-        "weights_revision": revisions["weights_revision"],
-        "actor_revision": revisions["actor_revision"],
-        "sampler_version": latest_sampler_version,
-        "policy_lag_mean": float(np.mean(policy_lags)) if policy_lags else 0,
-        "sampler_heartbeats": [time.monotonic() - value for value in heartbeat[:]],
-        "sampler_restarts": sampler_restarts, "sampler_wedges": sampler_wedges,
-        "sampler_restart_streaks": sampler_restart_streaks,
-        "watchdog_dropped_steps": watchdog_dropped,
-        "sample_queue_capacity": sample_capacity, "sample_queue_peak": queue_peak,
-        "sample_queue_packets": queue_packets,
-        "sample_queue_delay_mean": queue_delay_sum / max(1, queue_packets),
-        "sample_queue_full_waits": queue_full_waits,
-        "sample_queue_put_seconds": queue_put_seconds,
-        "winning_reservoir": len(reservoir.rows), "winning_seen": reservoir.seen,
-        "winning_character_rows": list(map(len, reservoir.by_character())),
-        "winning_episodes": reservoir.wins, "winning_added": winning_added,
-        "winning_skipped": reservoir.skipped, "winning_forced_skipped": reservoir.forced,
-        "winning_replayed": winning_replayed,
-        "winning_rejected_kl": winning_rejected,
-        "winning_replayed_characters": winning_replayed_characters,
-        "winning_evicted_characters": winning_evicted_characters,
-        "winning_replay_fraction": winning_replayed / max(1, trained + winning_replayed),
-        "winning_loss_weight": args.winning_loss_weight,
-        "winning_collection_drift": float(winning_behavior_drift),
-        "observed_kl": observed_kl, "observed_clip_fraction": observed_clip,
-        "progress_active": progress_active, "curriculum": curriculum,
-        **critic_balance.report(),
-        **metric_means(losses),
+        "decisions": decisions, "seconds": time.monotonic() - started,
+        "promotion_ready": promotion_ready, "promotion_result": promotion_result,
     }
 
 
@@ -2447,9 +1931,11 @@ def train(args):
            args.publish_updates,
            args.report_decisions,
            args.save_decisions, args.promotion_window, args.promotion_runs,
-           args.development_runs, args.progress_decisions,
+           args.development_runs, args.progress_decisions, args.dataset_capacity,
            args.max_policy_lag + 1) < 1 or min(args.max_log_ratio, args.policy_temperature) <= 0:
         raise ValueError("invalid asynchronous replay settings")
+    if args.dataset_capacity < args.batch:
+        raise ValueError("dataset capacity must cover one batch")
     if args.sampler_timeout <= 0 or args.sampler_restarts < 0:
         raise ValueError("invalid sampler watchdog")
     if args.mps_empty_cache_updates < 0 or args.learning_rate_warmup_steps < 0:
@@ -2596,7 +2082,7 @@ def train(args):
     }
     manifest.setdefault("run_id", run_id)
     manifest.setdefault("lineage_id", manifest["run_id"])
-    manifest.setdefault("telemetry_window_decisions", 32_768)
+    manifest.setdefault("telemetry_window_decisions", args.report_decisions)
     if parent and not parent.get("run_id") and continuing:
         parent["run_id"] = manifest["run_id"]
     if continuing and manifest.get("model_version") != model.model_version:
@@ -2838,16 +2324,7 @@ def train(args):
             active_checkpoint = write_checkpoint(checkpoint, step, "periodic")
             activate_checkpoint(active_checkpoint)
             last_checkpoint = active_checkpoint
-        def save_report(point, pipeline, window):
-            written = time.time()
-            row = {
-                "schema": 1, "step": point["steps"], "window": window,
-                "sampler_session": sampler_session,
-                "stage": {"index": stage, "ascension": STAGES[stage][0], "bonus": STAGES[stage][1]},
-                "description": f"Continuous V{model.model_version} training at A{STAGES[stage][0]}/+{STAGES[stage][1]}.",
-                "pipeline": pipeline, "metrics": point,
-            }
-            emit_event({"event": "report", **row}, event_time=written)
+        def prune_checkpoints():
             keep = {output / active_checkpoint["checkpoint"]}
             initial = json.loads((output / "initial.json").read_text())
             keep.add(output / initial["checkpoint"])
@@ -2861,7 +2338,7 @@ def train(args):
         training = train_stream(
             model, optimizer, args, sampler_session, stage, target, deadline, budget,
             base, auxiliary_decisions, stage_decisions, run_started, reservoir, progress_active,
-            save_report, save_step, manifest["fingerprint"], critic_balance, revisions,
+            prune_checkpoints, save_step, manifest["fingerprint"], critic_balance, revisions,
         )
         if not training["decisions"]:
             break
