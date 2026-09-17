@@ -1,10 +1,12 @@
 import atexit
 import fcntl
+import gzip
 import http.server
 import json
 import logging
 import math
 import os
+import shutil
 import sys
 import threading
 import time
@@ -20,6 +22,7 @@ _EVENT_ROLE = None
 _TRAINER_SESSION = None
 _RUN_ID = None
 _EVENT_PATH = None
+_LOG_OUTPUT = None
 _EVENT_LOCK = threading.Lock()
 _LOG_CAPTURES = []
 _CONSOLE_FDS = {}
@@ -27,6 +30,7 @@ _CONSOLE_STREAM = None
 _CONSOLE_TTY = False
 _LOG_ACTIVE = False
 _LOG_STOP = b"\0spirefysh-log-stop\0"
+_LOG_COMPRESSION_BYTES = 16 * 1024 * 1024
 _LOGGER = logging.getLogger("spirefysh.training")
 _LOGGER.propagate = False
 
@@ -86,22 +90,97 @@ def sync_events():
     os.fsync(_EVENT_FD)
 
 
+def _open_event_log(path, mode="rb"):
+    return gzip.open(path, mode) if path.suffix == ".gz" else path.open(mode)
+
+
+def _event_log_size(path):
+    with _open_event_log(path) as source:
+        source.seek(0, os.SEEK_END)
+        return source.tell()
+
+
+def _compress_event_log(output, path):
+    if path.stat().st_size < _LOG_COMPRESSION_BYTES:
+        return
+    compressed = path.with_suffix(path.suffix + ".gz")
+    temporary = compressed.with_suffix(compressed.suffix + ".tmp")
+    try:
+        with path.open("rb") as source, gzip.open(temporary, "wb") as target:
+            shutil.copyfileobj(source, target)
+        temporary.replace(compressed)
+        relative = str(compressed.relative_to(output))
+        original = str(path.relative_to(output))
+        manifest_path = output / "run.json"
+        if manifest_path.exists():
+            manifest = json.loads(manifest_path.read_text())
+            for session in manifest.get("sessions", ()):
+                if session.get("log") == original:
+                    session["log"] = relative
+            atomic_json(manifest_path, manifest)
+        for name in ("initial.json", "latest.json"):
+            metadata_path = output / name
+            if metadata_path.exists():
+                metadata = json.loads(metadata_path.read_text())
+                if metadata.get("event_log") == original:
+                    metadata["event_log"] = relative
+                    atomic_json(metadata_path, metadata)
+        path.unlink()
+    except (OSError, ValueError, json.JSONDecodeError):
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _console_handler(stream, tty, level):
+    if tty:
+        try:
+            from rich.console import Console
+            from rich.logging import RichHandler
+        except ImportError:
+            class ColorFormatter(logging.Formatter):
+                def format(self, record):
+                    colors = {logging.DEBUG: "36", logging.INFO: "32",
+                              logging.WARNING: "33", logging.ERROR: "31"}
+                    return f"\33[{colors.get(record.levelno, '37')}m{super().format(record)}\33[0m"
+            handler = logging.StreamHandler(stream)
+            handler.setFormatter(ColorFormatter(
+                "%(asctime)s %(levelname)-8s %(message)s", "%H:%M:%S",
+            ))
+        else:
+            handler = RichHandler(
+                console=Console(
+                    file=stream, force_terminal=True,
+                    color_system="standard", no_color=False,
+                ),
+                rich_tracebacks=True, show_path=False,
+            )
+            handler.setFormatter(logging.Formatter("%(message)s"))
+    else:
+        handler = logging.StreamHandler(stream)
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)s %(message)s", "%Y-%m-%dT%H:%M:%S",
+        ))
+    handler.setLevel(level)
+    return handler
+
+
 def configure_logging(output, role, level="INFO", trainer_session=None, run_id=None,
                       event_log=None, first_event=None):
     global _EVENT_FD, _EVENT_ROLE, _TRAINER_SESSION, _RUN_ID, _EVENT_PATH
-    global _CONSOLE_STREAM, _CONSOLE_TTY, _LOG_ACTIVE
+    global _CONSOLE_STREAM, _CONSOLE_TTY, _LOG_ACTIVE, _LOG_OUTPUT
     if _LOG_ACTIVE:
         return
+    level = str(level).upper()
+    if level not in logging.getLevelNamesMapping():
+        raise ValueError(f"invalid log level {level}")
     _EVENT_PATH = Path(event_log) if event_log else Path(output) / "events.jsonl"
+    _LOG_OUTPUT = Path(output)
     _EVENT_PATH.parent.mkdir(parents=True, exist_ok=True)
     _EVENT_FD = os.open(_EVENT_PATH, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
     _EVENT_ROLE = role
     _TRAINER_SESSION = trainer_session
     _RUN_ID = run_id
     _LOG_ACTIVE = True
-    if first_event:
-        emit_event(first_event, console=False)
-
     def capture(fd, name, severity):
         saved = os.dup(fd)
         read_fd, write_fd = os.pipe()
@@ -120,51 +199,28 @@ def configure_logging(output, role, level="INFO", trainer_session=None, run_id=N
         thread = threading.Thread(target=forward, name=f"{name}-capture", daemon=True)
         thread.start(); _LOG_CAPTURES.append((fd, saved, thread)); _CONSOLE_FDS[fd] = saved
 
-    _CONSOLE_TTY = sys.stdout.isatty()
-    sys.stdout.flush(); sys.stderr.flush()
-    capture(1, "stdout", "INFO")
-    capture(2, "stderr", "WARNING")
-    sys.stdout.reconfigure(line_buffering=True)
-    sys.stderr.reconfigure(line_buffering=True)
-    _CONSOLE_STREAM = os.fdopen(os.dup(_CONSOLE_FDS[1]), "w", buffering=1)
-    if _CONSOLE_TTY:
-        try:
-            from rich.console import Console
-            from rich.logging import RichHandler
-        except ImportError:
-            class ColorFormatter(logging.Formatter):
-                def format(self, record):
-                    colors = {logging.DEBUG: "36", logging.INFO: "32",
-                              logging.WARNING: "33", logging.ERROR: "31"}
-                    return f"\33[{colors.get(record.levelno, '37')}m{super().format(record)}\33[0m"
-            handler = logging.StreamHandler(_CONSOLE_STREAM)
-            handler.setFormatter(ColorFormatter(
-                "%(asctime)s %(levelname)-8s %(message)s", "%H:%M:%S",
-            ))
-        else:
-            handler = RichHandler(
-                console=Console(
-                    file=_CONSOLE_STREAM, force_terminal=True,
-                    color_system="standard", no_color=False,
-                ),
-                rich_tracebacks=True, show_path=False,
-            )
-            handler.setFormatter(logging.Formatter("%(message)s"))
-    else:
-        handler = logging.StreamHandler(_CONSOLE_STREAM)
-        handler.setFormatter(logging.Formatter(
-            "%(asctime)s %(levelname)s %(message)s", "%Y-%m-%dT%H:%M:%S",
-        ))
-    handler.setLevel(str(level).upper())
-    _LOGGER.handlers[:] = [handler]
-    _LOGGER.setLevel(logging.DEBUG)
-    sts2_sim.configure_logging(role, level)
-    emit_event({"event": "logging_started"})
+    try:
+        if first_event:
+            emit_event(first_event, console=False)
+        _CONSOLE_TTY = sys.stdout.isatty()
+        sys.stdout.flush(); sys.stderr.flush()
+        capture(1, "stdout", "INFO")
+        capture(2, "stderr", "WARNING")
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+        _CONSOLE_STREAM = os.fdopen(os.dup(_CONSOLE_FDS[1]), "w", buffering=1)
+        _LOGGER.handlers[:] = [_console_handler(_CONSOLE_STREAM, _CONSOLE_TTY, level)]
+        _LOGGER.setLevel(logging.DEBUG)
+        sts2_sim.configure_logging(role, level)
+        emit_event({"event": "logging_started"})
+    except BaseException:
+        shutdown_logging()
+        raise
 
 
 def shutdown_logging():
     global _EVENT_FD, _EVENT_ROLE, _TRAINER_SESSION, _RUN_ID, _EVENT_PATH
-    global _CONSOLE_STREAM, _CONSOLE_TTY, _LOG_ACTIVE
+    global _CONSOLE_STREAM, _CONSOLE_TTY, _LOG_ACTIVE, _LOG_OUTPUT
     if not _LOG_ACTIVE:
         return
     sys.stdout.flush(); sys.stderr.flush()
@@ -179,10 +235,17 @@ def shutdown_logging():
     for handler in _LOGGER.handlers:
         handler.flush(); handler.close()
     _LOGGER.handlers.clear()
-    _CONSOLE_STREAM.close()
-    os.close(_EVENT_FD)
+    if _EVENT_FD is not None:
+        os.close(_EVENT_FD)
+    if _EVENT_ROLE == "learner" and _EVENT_PATH is not None:
+        try:
+            _compress_event_log(_LOG_OUTPUT, _EVENT_PATH)
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            _LOGGER.warning("log compression failed: %s", error)
+    if _CONSOLE_STREAM is not None:
+        _CONSOLE_STREAM.close()
     _EVENT_FD = _EVENT_ROLE = _TRAINER_SESSION = _RUN_ID = _EVENT_PATH = None
-    _CONSOLE_STREAM = None
+    _CONSOLE_STREAM = _LOG_OUTPUT = None
     _CONSOLE_TTY = False
     _LOG_ACTIVE = False
 
@@ -251,7 +314,13 @@ def seed_panel(seed, runs):
 
 def event_logs(run):
     legacy = run / "events.jsonl"
-    return ([legacy] if legacy.exists() else []) + sorted((run / "events").glob("*.jsonl"))
+    if not legacy.exists():
+        legacy = legacy.with_suffix(".jsonl.gz")
+    logs = {}
+    for path in (*((run / "events").glob("*.jsonl.gz")),
+                 *((run / "events").glob("*.jsonl"))):
+        logs[path.name.removesuffix(".gz")] = path
+    return ([legacy] if legacy.exists() else []) + [logs[name] for name in sorted(logs)]
 
 
 def checkpoint_origin(path, digest):
@@ -285,7 +354,7 @@ def checkpoint_origin(path, digest):
             }
     matches = []
     for log in event_logs(run):
-        with log.open("rb") as source:
+        with _open_event_log(log) as source:
             while line := source.readline():
                 try:
                     row = json.loads(line)
@@ -378,7 +447,8 @@ class MetricsProjector:
         for index, (path, end) in enumerate(segments):
             self.read(path, end)
             if index + 1 == len(segments):
-                self.path, self.cursor = path, min(path.stat().st_size, end or path.stat().st_size)
+                size = _event_log_size(path)
+                self.path, self.cursor = path, min(size, end or size)
 
     def window(self, event):
         step, stage = int(event.get("step", 0)), int(event.get("stage", 0))
@@ -431,6 +501,168 @@ class MetricsProjector:
             self.current["_last_seconds"] = elapsed
         return self.current
 
+    def fold_batch(self, event):
+        window = self.window(event); window["_batches"] += 1
+        window["_trained"] += event.get("policy_trained_rows", 0)
+        window["_critic_trained"] += event.get("critic_trained_rows", 0)
+        window["_attempted"] += event.get("attempted_rows", 0)
+        window["_ratio_rejected"] += event.get("ratio_rejected_rows", 0)
+        window["_retired"] += event.get("retired_rows", 0)
+        window["_update_seconds"] += event.get("total_seconds", 0.)
+        for source, target in (
+            ("expert_rows", "expert_rows_used"),
+            ("replay_rows", "winning_replay_candidates"),
+            ("winning_replayed_rows", "winning_replayed"),
+            ("winning_rejected_rows", "winning_rejected_kl"),
+        ):
+            value = event.get(source, 0)
+            if value:
+                window["_totals"][target] = window["_totals"].get(target, 0) + value
+        outcome, commit = event.get("policy_outcome"), event.get("commit_kind")
+        duration = event.get("total_seconds", 0.)
+        if commit and commit != "none" and duration > 0:
+            window["_optimizer_steps"].append({
+                "step": event.get("step", 0),
+                "weights_revision": event.get("weights_revision", 0),
+                "seconds": event.get("training_elapsed_seconds", 0),
+                "optimizer_steps_per_second": 1 / duration,
+                "used_rows_per_second": event.get("critic_trained_rows", 0) / duration,
+                "total_seconds": duration,
+            })
+        if outcome == "pre_kl_rejected":
+            window["_pre_kl_rejected"] += event.get("fresh_rows", 0)
+        elif outcome == "post_kl_rejected":
+            window["_post_kl_rejected"] += event.get("fresh_rows", 0)
+        if outcome:
+            window["_outcomes"][outcome] = window["_outcomes"].get(outcome, 0) + 1
+        if commit:
+            window["_commits"][commit] = window["_commits"].get(commit, 0) + 1
+        for metric, denominator in self.means.items():
+            value = event.get(metric)
+            weight = event.get(denominator, 1) if denominator else 1
+            if value is None or not weight:
+                continue
+            window["_sum"][metric] = window["_sum"].get(metric, 0.) + value * weight
+            window["_weight"][metric] = window["_weight"].get(metric, 0) + weight
+        if event.get("advantage_mean") is not None \
+                and event.get("advantage_stddev") is not None:
+            rows = event.get("fresh_rows", 0)
+            window["_advantage_square_sum"] += rows * (
+                event["advantage_stddev"] ** 2 + event["advantage_mean"] ** 2
+            )
+            window["_advantage_rows"] += rows
+        counts = event.get("policy_lag_counts", ())
+        if counts:
+            counts = counts.items() if isinstance(counts, dict) else enumerate(counts)
+            counts = [(int(lag), count) for lag, count in counts]
+            window["_policy_lag_counts"] += [0] * (
+                max(lag for lag, _ in counts) + 1 - len(window["_policy_lag_counts"])
+            )
+            for lag, count in counts:
+                window["_policy_lag_counts"][lag] += count
+        if event.get("policy_lag_max") is not None:
+            window["_policy_lag_max"] = max(
+                event["policy_lag_max"], window["_policy_lag_max"] or 0,
+            )
+        for floor, metric in event.get(
+                "critic_explained_reward_variance_by_floor", {}).items():
+            floor, rows = int(floor), metric["rows"]
+            weight = rows * metric.get("target_variance", 1)
+            window["_floor_explained_sum"][floor] += metric["value"] * weight
+            window["_floor_explained_weight"][floor] += weight
+            window["_floor_explained_rows"][floor] += rows
+
+    def fold_packet(self, event, event_end):
+        window = self.window(event)
+        window["_sampled"] += event.get("packet_sampled_decisions", 0)
+        window["_discarded"] += event.get("discarded_decisions", 0)
+        window["_admitted"] += event.get("admitted_rows", 0)
+        window["_forced"] += event.get("forced_rows", 0)
+        window["_budget_excess"] += event.get("budget_excess_rows", 0)
+        window["_capacity_dropped"] += event.get("capacity_dropped_rows", 0)
+        window["_collect_seconds"] += event.get("collect_seconds", 0.)
+        window["_caps"][2] += event.get("orphan_empty_actions", 0)
+        for source, target in (
+            ("trajectory_rows", "trajectory_rows"),
+            ("expert_rows", "expert_rows_collected"),
+            ("winning_candidates", "winning_candidates"),
+            ("winning_admitted", "winning_admitted"),
+            ("winning_episodes", "winning_episodes"),
+            ("winning_skipped", "winning_skipped"),
+            ("winning_forced_skipped", "winning_forced_skipped"),
+            ("queue_full_waits", "sample_queue_full_waits"),
+        ):
+            value = event.get(source, 0)
+            if value:
+                window["_totals"][target] = window["_totals"].get(target, 0) + value
+        for group, prefix in ((event.get("cache", {}), ""), (event.get("mcts", {}), "mcts_")):
+            for metric, value in group.items():
+                if value:
+                    key = prefix + metric
+                    window["_totals"][key] = window["_totals"].get(key, 0) + value
+        if event.get("queue_delay_seconds") is not None:
+            window["_totals"]["sample_queue_delay_seconds"] = \
+                window["_totals"].get("sample_queue_delay_seconds", 0.) \
+                + event["queue_delay_seconds"]
+            window["_totals"]["sample_queue_packets"] = \
+                window["_totals"].get("sample_queue_packets", 0) + 1
+        if event.get("queue_put_seconds"):
+            window["_totals"]["sample_queue_put_seconds"] = \
+                window["_totals"].get("sample_queue_put_seconds", 0.) \
+                + event["queue_put_seconds"]
+        for index, episode in enumerate(event.get("episodes", ())):
+            character = int(episode["character"])
+            floor = max(0, min(52, int(episode["floor"])))
+            window["_floors"][floor] += 1
+            window["_characters"][character][0] += 1
+            window["_characters"][character][1] += int(episode["won"])
+            window["_character_floors"][character][floor] += 1
+            window["_caps"][0] += int(episode.get("step_cap", False))
+            window["_caps"][1] += int(episode.get("combat_cap", False))
+            window["_caps"][2] += int(episode.get("empty_actions", False))
+            for target, key in enumerate(("step_cap", "combat_cap", "empty_actions")):
+                window["_character_caps"][character][target] += int(episode.get(key, False))
+            length = episode.get("length", 0)
+            seconds = episode.get("completion_seconds", 0.)
+            window["_episode_length"] += length
+            window["_episode_seconds"] += seconds
+            window["_episode_length_max"] = max(window["_episode_length_max"], length)
+            window["_episode_seconds_max"] = max(window["_episode_seconds_max"], seconds)
+            if "policy_revision_min" in episode:
+                span = episode.get("policy_revision_max", 0) - episode["policy_revision_min"]
+                lag = max(0, event.get("policy_revision", 0) - episode["policy_revision_min"])
+                window["_policy_span"] += span
+                window["_policy_span_max"] = max(window["_policy_span_max"], span)
+                window["_arrival_lag"] += lag
+                window["_arrival_lag_max"] = max(window["_arrival_lag_max"], lag)
+                window["_policy_episodes"] += 1
+            priority = hashlib.sha256(
+                f"{event.get('run_id')}:{event.get('session_id')}:{event_end}:{index}".encode()
+            ).digest()[:8]
+            samples = window["_samples"][character]
+            samples.append((priority, episode.get("iteration", 0), floor, character))
+            samples.sort()
+            del samples[8:]
+
+    def fold_heartbeat(self, event):
+        window = self.window(event)
+        for source, target in (
+            ("dataset_rows", "dataset_rows"), ("queue_depth", "sample_queue_depth"),
+            ("expert_rows", "expert_buffer_rows"), ("winning_rows", "winning_reservoir"),
+            ("accelerator_allocated_bytes", "accelerator_allocated_bytes"),
+            ("accelerator_driver_allocated_bytes", "accelerator_driver_allocated_bytes"),
+            ("queue_capacity", "sample_queue_capacity"),
+            ("sampler_policy_revision", "sampler_policy_revision"),
+            ("dataset_priority_mean", "dataset_priority_mean"),
+            ("dataset_priority_max", "dataset_priority_max"),
+            ("watchdog_dropped_steps", "watchdog_dropped_steps"),
+        ):
+            if source in event:
+                window[target] = event[source]
+        window["dataset_peak"] = max(
+            window.get("dataset_peak", 0), event.get("dataset_peak_rows", 0),
+        )
+
     def fold(self, event, event_end=0):
         self.last_time = event.get("time", self.last_time)
         kind = event.get("event")
@@ -450,150 +682,9 @@ class MetricsProjector:
                     == event.get("step", 0) != 0:
                 window["_start_seconds"] = event.get("training_elapsed_seconds", 0)
         elif fact and kind == "training_batch":
-            window = self.window(event); window["_batches"] += 1
-            window["_trained"] += event.get("policy_trained_rows", 0)
-            window["_critic_trained"] += event.get("critic_trained_rows", 0)
-            window["_attempted"] += event.get("attempted_rows", 0)
-            window["_ratio_rejected"] += event.get("ratio_rejected_rows", 0)
-            window["_retired"] += event.get("retired_rows", 0)
-            window["_update_seconds"] += event.get("total_seconds", 0.)
-            for source, target in (
-                ("expert_rows", "expert_rows_used"),
-                ("replay_rows", "winning_replay_candidates"),
-                ("winning_replayed_rows", "winning_replayed"),
-                ("winning_rejected_rows", "winning_rejected_kl"),
-            ):
-                value = event.get(source, 0)
-                if value:
-                    window["_totals"][target] = window["_totals"].get(target, 0) + value
-            outcome, commit = event.get("policy_outcome"), event.get("commit_kind")
-            duration = event.get("total_seconds", 0.)
-            if commit and commit != "none" and duration > 0:
-                window["_optimizer_steps"].append({
-                    "step": event.get("step", 0),
-                    "weights_revision": event.get("weights_revision", 0),
-                    "seconds": event.get("training_elapsed_seconds", 0),
-                    "optimizer_steps_per_second": 1 / duration,
-                    "used_rows_per_second": event.get("critic_trained_rows", 0) / duration,
-                    "total_seconds": duration,
-                })
-            if outcome == "pre_kl_rejected":
-                window["_pre_kl_rejected"] += event.get("fresh_rows", 0)
-            elif outcome == "post_kl_rejected":
-                window["_post_kl_rejected"] += event.get("fresh_rows", 0)
-            if outcome:
-                window["_outcomes"][outcome] = window["_outcomes"].get(outcome, 0) + 1
-            if commit:
-                window["_commits"][commit] = window["_commits"].get(commit, 0) + 1
-            for metric, denominator in self.means.items():
-                value = event.get(metric)
-                weight = event.get(denominator, 1) if denominator else 1
-                if value is None or not weight:
-                    continue
-                window["_sum"][metric] = window["_sum"].get(metric, 0.) + value * weight
-                window["_weight"][metric] = window["_weight"].get(metric, 0) + weight
-            if event.get("advantage_mean") is not None \
-                    and event.get("advantage_stddev") is not None:
-                rows = event.get("fresh_rows", 0)
-                window["_advantage_square_sum"] += rows * (
-                    event["advantage_stddev"] ** 2 + event["advantage_mean"] ** 2
-                )
-                window["_advantage_rows"] += rows
-            counts = event.get("policy_lag_counts", ())
-            if counts:
-                counts = counts.items() if isinstance(counts, dict) else enumerate(counts)
-                counts = [(int(lag), count) for lag, count in counts]
-                window["_policy_lag_counts"] += [0] * (
-                    max(lag for lag, _ in counts) + 1 - len(window["_policy_lag_counts"])
-                )
-                for lag, count in counts:
-                    window["_policy_lag_counts"][lag] += count
-            if event.get("policy_lag_max") is not None:
-                window["_policy_lag_max"] = max(
-                    event["policy_lag_max"], window["_policy_lag_max"] or 0,
-                )
-            for floor, metric in event.get(
-                    "critic_explained_reward_variance_by_floor", {}).items():
-                floor, rows = int(floor), metric["rows"]
-                weight = rows * metric.get("target_variance", 1)
-                window["_floor_explained_sum"][floor] += metric["value"] * weight
-                window["_floor_explained_weight"][floor] += weight
-                window["_floor_explained_rows"][floor] += rows
+            self.fold_batch(event)
         elif fact and kind == "sample_packet":
-            window = self.window(event)
-            window["_sampled"] += event.get("packet_sampled_decisions", 0)
-            window["_discarded"] += event.get("discarded_decisions", 0)
-            window["_admitted"] += event.get("admitted_rows", 0)
-            window["_forced"] += event.get("forced_rows", 0)
-            window["_budget_excess"] += event.get("budget_excess_rows", 0)
-            window["_capacity_dropped"] += event.get("capacity_dropped_rows", 0)
-            window["_collect_seconds"] += event.get("collect_seconds", 0.)
-            window["_caps"][2] += event.get("orphan_empty_actions", 0)
-            for source, target in (
-                ("trajectory_rows", "trajectory_rows"),
-                ("expert_rows", "expert_rows_collected"),
-                ("winning_candidates", "winning_candidates"),
-                ("winning_admitted", "winning_admitted"),
-                ("winning_episodes", "winning_episodes"),
-                ("winning_skipped", "winning_skipped"),
-                ("winning_forced_skipped", "winning_forced_skipped"),
-                ("queue_full_waits", "sample_queue_full_waits"),
-            ):
-                value = event.get(source, 0)
-                if value:
-                    window["_totals"][target] = window["_totals"].get(target, 0) + value
-            for group, prefix in ((event.get("cache", {}), ""), (event.get("mcts", {}), "mcts_")):
-                for metric, value in group.items():
-                    if not value:
-                        continue
-                    key = prefix + metric
-                    window["_totals"][key] = window["_totals"].get(key, 0) + value
-            if event.get("queue_delay_seconds") is not None:
-                window["_totals"]["sample_queue_delay_seconds"] = \
-                    window["_totals"].get("sample_queue_delay_seconds", 0.) \
-                    + event["queue_delay_seconds"]
-                window["_totals"]["sample_queue_packets"] = \
-                    window["_totals"].get("sample_queue_packets", 0) + 1
-            if event.get("queue_put_seconds"):
-                window["_totals"]["sample_queue_put_seconds"] = \
-                    window["_totals"].get("sample_queue_put_seconds", 0.) \
-                    + event["queue_put_seconds"]
-            for index, episode in enumerate(event.get("episodes", ())):
-                character = int(episode["character"]); floor = max(0, min(52, int(episode["floor"])))
-                window["_floors"][floor] += 1
-                window["_characters"][character][0] += 1
-                window["_characters"][character][1] += int(episode["won"])
-                window["_character_floors"][character][floor] += 1
-                window["_caps"][0] += int(episode.get("step_cap", False))
-                window["_caps"][1] += int(episode.get("combat_cap", False))
-                window["_caps"][2] += int(episode.get("empty_actions", False))
-                for target, key in enumerate(("step_cap", "combat_cap", "empty_actions")):
-                    window["_character_caps"][character][target] += int(episode.get(key, False))
-                window["_episode_length"] += episode.get("length", 0)
-                window["_episode_seconds"] += episode.get("completion_seconds", 0.)
-                window["_episode_length_max"] = max(
-                    window["_episode_length_max"], episode.get("length", 0),
-                )
-                window["_episode_seconds_max"] = max(
-                    window["_episode_seconds_max"], episode.get("completion_seconds", 0.),
-                )
-                if "policy_revision_min" in episode:
-                    span = episode.get("policy_revision_max", 0) \
-                        - episode["policy_revision_min"]
-                    lag = max(0, event.get("policy_revision", 0)
-                              - episode["policy_revision_min"])
-                    window["_policy_span"] += span
-                    window["_policy_span_max"] = max(window["_policy_span_max"], span)
-                    window["_arrival_lag"] += lag
-                    window["_arrival_lag_max"] = max(window["_arrival_lag_max"], lag)
-                    window["_policy_episodes"] += 1
-                priority = hashlib.sha256(
-                    f"{event.get('run_id')}:{event.get('session_id')}:{event_end}:{index}".encode()
-                ).digest()[:8]
-                samples = window["_samples"][character]
-                samples.append((priority, episode.get("iteration", 0), floor, character))
-                samples.sort()
-                del samples[8:]
+            self.fold_packet(event, event_end)
         elif fact and kind == "dataset_pruned":
             window = self.current if self.current and event.get(
                 "training_elapsed_seconds"
@@ -601,24 +692,7 @@ class MetricsProjector:
             window["_stale"] += event.get("stale_rows", 0)
             window["_incomplete"] += event.get("incomplete_rows", 0)
         elif fact and kind == "heartbeat":
-            window = self.window(event)
-            for source, target in (
-                ("dataset_rows", "dataset_rows"), ("queue_depth", "sample_queue_depth"),
-                ("expert_rows", "expert_buffer_rows"),
-                ("winning_rows", "winning_reservoir"),
-                ("accelerator_allocated_bytes", "accelerator_allocated_bytes"),
-                ("accelerator_driver_allocated_bytes", "accelerator_driver_allocated_bytes"),
-                ("queue_capacity", "sample_queue_capacity"),
-                ("sampler_policy_revision", "sampler_policy_revision"),
-                ("dataset_priority_mean", "dataset_priority_mean"),
-                ("dataset_priority_max", "dataset_priority_max"),
-                ("watchdog_dropped_steps", "watchdog_dropped_steps"),
-            ):
-                if source in event:
-                    window[target] = event[source]
-            window["dataset_peak"] = max(
-                window.get("dataset_peak", 0), event.get("dataset_peak_rows", 0),
-            )
+            self.fold_heartbeat(event)
         elif fact and kind == "checkpoint":
             self.window(event)
         elif kind == "promotion":
@@ -791,7 +865,7 @@ class MetricsProjector:
 
     def read(self, path, end=None, start=0):
         try:
-            source = path.open("rb")
+            source = _open_event_log(path)
         except OSError:
             return start
         with source:
@@ -835,7 +909,7 @@ def logged_history(run, manifest):
     saw_report = saw_promotion = False
     for path in event_logs(run):
         try:
-            lines = path.open()
+            lines = _open_event_log(path, "rt")
         except OSError:
             continue
         with lines:
@@ -884,6 +958,32 @@ def report_version(report, manifest):
     )
 
 
+def _cached_projection(root, run, manifest, session_id):
+    segments = lineage_segments(root, manifest["run_id"], session_id)
+    if not segments:
+        segments = [(run / manifest["sessions"][-1]["log"], None)]
+    signature = {
+        "version": 1,
+        "window": manifest.get("telemetry_window_decisions", 32_768),
+        "manifest": [(run / "run.json").stat().st_size,
+                     (run / "run.json").stat().st_mtime_ns],
+        "logs": [
+            [str(path.resolve()), path.stat().st_size, path.stat().st_mtime_ns, end]
+            for path, end in segments
+        ],
+    }
+    cache = run / ".telemetry-cache.json"
+    try:
+        saved = json.loads(cache.read_text())
+        if saved["signature"] == signature:
+            return saved["projection"]
+    except (OSError, KeyError, json.JSONDecodeError):
+        pass
+    projection = MetricsProjector(root, run, manifest, session_id).value()
+    atomic_json(cache, {"signature": signature, "projection": projection})
+    return projection
+
+
 def dashboard(target):
     if (target / "run.json").exists():
         target = target.parent
@@ -899,7 +999,7 @@ def dashboard(target):
         if sessions and manifest.get("schema", 1) >= 2:
             session_id = sessions[-1]["id"]
             try:
-                projected = MetricsProjector(target, run, manifest, session_id).value()
+                projected = _cached_projection(target, run, manifest, session_id)
             except (OSError, ValueError):
                 pass
         if projected:
@@ -1132,7 +1232,7 @@ class DashboardSource:
                 projector = key, MetricsProjector(self.target, run, manifest, session)
                 self.projectors[name] = projector
             metrics = projector[1]
-            if metrics.cursor > metrics.path.stat().st_size:
+            if metrics.cursor > _event_log_size(metrics.path):
                 metrics = MetricsProjector(self.target, run, manifest, session)
                 self.projectors[name] = key, metrics
             else:

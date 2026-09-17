@@ -7,3 +7,4 @@
 /tools/**/obj/
 *.pyc
 .DS_Store
+.telemetry-cache.json

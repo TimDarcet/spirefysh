@@ -5,7 +5,6 @@ import signal
 import traceback
 from pathlib import Path
 
-import training as _training
 import telemetry as _telemetry
 from training import *
 
@@ -46,11 +45,9 @@ def parser():
     run.add_argument("--sampler-timeout", type=float, default=120)
     run.add_argument("--sampler-restarts", type=int, default=3)
     run.add_argument("--mps-empty-cache-updates", type=int, default=4)
-    run.add_argument("--segment-steps", type=int, default=0)
     run.add_argument("--publish-updates", type=int, default=8)
     run.add_argument("--report-decisions", type=int, default=32_768)
     run.add_argument("--save-decisions", type=int, default=262_144)
-    run.add_argument("--max-policy-lag", type=int, default=20)
     run.add_argument("--max-log-ratio", type=float, default=.5)
     run.add_argument("--policy-temperature", type=float, default=.8)
     run.add_argument("--mcts-fraction", type=float, default=0)
@@ -83,13 +80,8 @@ def parser():
     for term in POTENTIAL_TERMS:
         run.add_argument(f"--potential-{term.replace('_', '-')}-weight", type=float, default=0.)
     run.add_argument("--critic-balance-decay", type=float, default=.99)
-    run.add_argument("--critic-consistency-weight", type=float, default=0)
-    run.add_argument("--critic-consistency-batch", type=int, default=1024)
     run.add_argument("--search-consistency-weight", type=float, default=0)
     run.add_argument("--search-consistency-batch", type=int, default=256)
-    run.add_argument("--blended-critic", action="store_true")
-    run.add_argument("--critic-win-ema-decay", type=float, default=.9)
-    run.add_argument("--critic-blend-power", type=float, default=.4)
     run.add_argument("--progress-decisions", type=int, default=5_000_000)
     run.add_argument("--progress-beta", type=float)
     run.add_argument("--clip", type=float, default=0.2)
@@ -108,12 +100,9 @@ def parser():
     run.add_argument("--development-runs", type=int, default=32)
     run.add_argument("--promotion-seed", type=int, default=3_700_000_000)
     run.add_argument("--promotion-window", type=int, default=200)
-    run.add_argument("--promotion-trigger-rate", type=float, default=.2)
     run.add_argument("--promotion-runs", type=int, default=256)
     run.add_argument("--promote-win-rate", type=float, default=0.2)
     run.add_argument("--evaluation-batch", type=int, default=32)
-    run.add_argument("--evaluation-max-steps", type=int, default=2048)
-    run.add_argument("--evaluation-max-combat-steps", type=int, default=512)
     run.add_argument("--max-steps", type=int, default=65_536)
     run.add_argument("--max-combat-steps", type=int, default=2_048)
     run.add_argument("--seed", type=int, default=1)

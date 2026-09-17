@@ -456,13 +456,6 @@ class RolloutCollector:
                     if drop:
                         del self.native_steps[:drop]
                         self.native_starts -= drop
-            segment = [
-                index for index, trajectory in enumerate(self.trajectories)
-                if trajectory is not None and args.segment_steps
-                and len(trajectory["samples"]) >= args.segment_steps
-            ]
-            if segment:
-                raise ValueError("critic requires complete terminal trajectories")
             self.observation = next_observation
             collect_seconds += time.monotonic() - step_started
             if finished and not native:

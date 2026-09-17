@@ -543,8 +543,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         "event": "actor_published", "actor_revision": actor_revision,
         "weights_revision": revisions["weights_revision"],
         "policy_revision": policy_version, "step": base_decisions,
-        "resolved_decisions_total": base_decisions, "stage": stage,
-        "training_elapsed_seconds": time.monotonic() - run_started,
+        "stage": stage, "training_elapsed_seconds": time.monotonic() - run_started,
     })
 
     def receive_samples():
@@ -590,8 +589,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             "event": "actor_published", "actor_revision": actor_revision,
             "weights_revision": revisions["weights_revision"],
             "policy_revision": policy_version, "step": base_decisions + handled,
-            "resolved_decisions_total": base_decisions + handled, "stage": stage,
-            "training_elapsed_seconds": time.monotonic() - run_started,
+            "stage": stage, "training_elapsed_seconds": time.monotonic() - run_started,
         })
         for queue in models:
             try:
@@ -660,7 +658,6 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             pass
         emit_event({
             "event": "sample_packet", "step": base_decisions + handled,
-            "resolved_decisions_total": base_decisions + handled,
             "sampled_decisions_total": base_decisions + sampled,
             "training_elapsed_seconds": time.monotonic() - run_started,
             "stage": stage, "worker": worker, "generation": generation,
@@ -669,7 +666,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             "packet_policy_revision": version,
             "packet_sampled_decisions": result["sampled_steps"],
             "trajectory_rows": sum(len(row["rows"]) for row in result["trajectories"]),
-            "accepted_rows": added, "admitted_rows": added - excluded,
+            "admitted_rows": added - excluded,
             "forced_rows": excluded, "budget_excess_rows": excess,
             "capacity_dropped_rows": capacity_dropped,
             "discarded_decisions": result["discarded_steps"] + excess,
@@ -800,7 +797,6 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             "update_attempt": revisions["update_attempt"],
             "weights_revision": revisions["weights_revision"],
             "policy_revision": revisions["policy_revision"], "stage": stage,
-            "resolved_decisions_total": base_decisions + handled,
             "training_elapsed_seconds": time.monotonic() - run_started,
             **values,
         })
@@ -908,7 +904,6 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     queue_size = -1
                 emit_event({
                     "event": "heartbeat", "step": base_decisions + handled,
-                    "resolved_decisions_total": base_decisions + handled,
                     "sampled_decisions_total": base_decisions + sampled,
                     "accepted_decisions_total": base_decisions + decisions,
                     "policy_trained_rows_total": trained,
@@ -959,7 +954,6 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 if expert_stale:
                     emit_event({
                         "event": "expert_pruned", "step": base_decisions + handled,
-                        "resolved_decisions_total": base_decisions + handled,
                         "stage": stage, "expert_stale_rows": expert_stale,
                         "weights_revision": revisions["weights_revision"],
                         "policy_revision": revisions["policy_revision"],
@@ -984,7 +978,6 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                         if remaining:
                             emit_event({
                                 "event": "dataset_pruned", "step": base_decisions + handled,
-                                "resolved_decisions_total": base_decisions + handled,
                                 "stage": stage, "incomplete_rows": remaining,
                                 "weights_revision": revisions["weights_revision"],
                                 "policy_revision": revisions["policy_revision"],
@@ -1926,13 +1919,12 @@ def train(args):
         raise ValueError("precision must be fp32 or bf16")
     if args.precision != "fp32" and target.type not in ("mps", "cuda"):
         raise ValueError(f"{args.precision} requires MPS or CUDA")
-    if min(args.envs, args.samplers, args.torch_threads, args.sampler_threads,
-           args.batch, args.sampler_steps,
-           args.publish_updates,
-           args.report_decisions,
-           args.save_decisions, args.promotion_window, args.promotion_runs,
-           args.development_runs, args.progress_decisions, args.dataset_capacity,
-           args.max_policy_lag + 1) < 1 or min(args.max_log_ratio, args.policy_temperature) <= 0:
+    if min(
+        args.envs, args.samplers, args.torch_threads, args.sampler_threads,
+        args.batch, args.sampler_steps, args.publish_updates, args.report_decisions,
+        args.save_decisions, args.promotion_window, args.promotion_runs,
+        args.development_runs, args.progress_decisions, args.dataset_capacity,
+    ) < 1 or min(args.max_log_ratio, args.policy_temperature) <= 0:
         raise ValueError("invalid asynchronous replay settings")
     if args.dataset_capacity < args.batch:
         raise ValueError("dataset capacity must cover one batch")
@@ -1940,19 +1932,16 @@ def train(args):
         raise ValueError("invalid sampler watchdog")
     if args.mps_empty_cache_updates < 0 or args.learning_rate_warmup_steps < 0:
         raise ValueError("invalid optimizer interval")
-    if (args.segment_steps < 0 or args.winning_capacity < 0 or args.priority_decay <= 0
-            or min(args.critic_consistency_weight, args.search_consistency_weight) < 0
-            or min(args.critic_consistency_batch, args.search_consistency_batch) < 1):
+    if (args.winning_capacity < 0 or args.priority_decay <= 0
+            or args.search_consistency_weight < 0 or args.search_consistency_batch < 1):
         raise ValueError("invalid replay setting")
     if min(args.head_learning_rate_multiplier, args.critic_learning_rate_multiplier) <= 0:
         raise ValueError("invalid head learning-rate multiplier")
     if not all(math.isfinite(getattr(args, f"potential_{term}_weight"))
                for term in POTENTIAL_TERMS):
         raise ValueError("invalid potential weights")
-    if (args.segment_steps or not 0 <= args.gae_gamma <= 1
-            or not 0 <= args.gae_lambda <= 1
+    if (not 0 <= args.gae_gamma <= 1 or not 0 <= args.gae_lambda <= 1
             or not 0 <= args.critic_balance_decay < 1
-            or args.blended_critic or args.critic_consistency_weight
             or args.search_consistency_weight and not args.critic_only):
         raise ValueError("invalid critic settings")
     if args.entropy_weight is not None and args.entropy_weight < 0:
@@ -1972,7 +1961,7 @@ def train(args):
         raise ValueError("invalid training limit")
     if args.critic_only and not args.checkpoint:
         raise ValueError("critic-only training requires --checkpoint")
-    if not 0 <= args.promotion_trigger_rate <= args.promote_win_rate <= 1:
+    if not 0 <= args.promote_win_rate <= 1:
         raise ValueError("invalid promotion rates")
     if seed_panel(args.development_seed, args.development_runs)[1] > args.promotion_seed:
         raise ValueError("development and promotion seed panels overlap")
@@ -2119,7 +2108,8 @@ def train(args):
     )))
     event_dir = output / "events"; event_dir.mkdir(exist_ok=True)
     saved_ids = [int(row["id"]) for row in sessions if str(row.get("id", "")).isdigit()]
-    file_ids = [int(path.stem) for path in event_dir.glob("*.jsonl") if path.stem.isdigit()]
+    file_ids = [int(path.name.split(".", 1)[0]) for path in event_dir.glob("*.jsonl*")
+                if path.name.split(".", 1)[0].isdigit()]
     args.trainer_session = max(saved_ids + file_ids, default=0) + 1
     event_log = event_dir / f"{args.trainer_session:06}.jsonl"
     descriptor = os.open(event_log, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
@@ -2141,7 +2131,6 @@ def train(args):
         {
         "event": "session_start", "model_version": model.model_version,
         "step": source["decisions"] if source else 0,
-        "resolved_decisions_total": source["decisions"] if source else 0,
         "stage": source["stage"] if source else args.start_stage,
         "training_elapsed_seconds": elapsed_offset,
         "checkpoint": args.checkpoint,
@@ -2203,7 +2192,7 @@ def train(args):
         )
         event_end = emit_event({
             "event": "checkpoint", "checkpoint_id": checkpoint_id, "kind": kind,
-            "step": step, "resolved_decisions_total": step, "stage": stage,
+            "step": step, "stage": stage,
             "update_attempt": revisions["update_attempt"],
             "weights_revision": revisions["weights_revision"],
             "policy_revision": revisions["policy_revision"],
@@ -2294,7 +2283,7 @@ def train(args):
         promotion["next_stage"] = {
             "index": stage, "ascension": STAGES[stage][0], "bonus": STAGES[stage][1],
         }
-        emit_event({"event": "promotion", "resolved_decisions_total": decisions, **promotion})
+        emit_event({"event": "promotion", **promotion})
         entry = entries_dir / (
             f"{stage:02}-{decisions:012}-w{revisions['weights_revision']:012}.pt"
         )
@@ -2362,7 +2351,6 @@ def train(args):
     activate_checkpoint(active_checkpoint)
     emit_event({
         "event": "session_complete", "decisions": decisions,
-        "resolved_decisions_total": decisions,
         "stage": stage, "training_seconds": training_seconds,
         "promotion_seconds": promotion_seconds,
         "training_fraction": training_seconds / max(1e-9, training_seconds + promotion_seconds),

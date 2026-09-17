@@ -1,13 +1,19 @@
+import io
 import json
+import logging
+import subprocess
+import sys
 import tempfile
 import unittest
 from argparse import Namespace
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import torch
 
 import train
+import telemetry
 
 
 def write_events(path, rows):
@@ -21,6 +27,64 @@ def packed_row(legal=2):
 
 
 class TelemetryTest(unittest.TestCase):
+    def test_console_handler_uses_plain_output_without_a_tty(self):
+        stream = io.StringIO()
+        handler = telemetry._console_handler(stream, False, "INFO")
+        logger = logging.Logger("plain", logging.DEBUG); logger.addHandler(handler)
+        logger.debug("hidden")
+        logger.info("plain")
+        output = stream.getvalue()
+        self.assertIn("INFO plain", output)
+        self.assertNotIn("hidden", output)
+        self.assertNotIn("\33", output)
+        self.assertTrue(output.isascii())
+
+    def test_console_handler_uses_rich_output_for_a_tty(self):
+        stream = io.StringIO()
+        handler = telemetry._console_handler(stream, True, "INFO")
+        logger = logging.Logger("rich", logging.DEBUG); logger.addHandler(handler)
+        logger.warning("▲ warning")
+        output = stream.getvalue()
+        self.assertIn("\33[", output)
+        self.assertIn("▲ warning", output)
+
+    def test_logging_setup_rolls_back_after_failure(self):
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+                telemetry.sts2_sim, "configure_logging", side_effect=RuntimeError("boom")):
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                telemetry.configure_logging(temporary, "learner")
+        self.assertFalse(telemetry._LOG_ACTIVE)
+        self.assertFalse(telemetry._LOG_CAPTURES)
+        self.assertFalse(telemetry._LOGGER.handlers)
+
+    def test_logging_filters_and_restores_redirected_output(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            code = """
+from telemetry import configure_logging, emit_event, shutdown_logging
+import sys
+configure_logging(sys.argv[1], 'learner', 'WARNING')
+emit_event({'event': 'heartbeat'})
+emit_event({'event': 'checkpoint'})
+emit_event({'event': 'slow_update'}, 'WARNING')
+print('captured')
+shutdown_logging()
+print('restored')
+"""
+            result = subprocess.run(
+                [sys.executable, "-c", code, temporary], cwd=Path(__file__).parent,
+                capture_output=True, text=True, check=True,
+            )
+            self.assertNotIn("heartbeat", result.stdout)
+            self.assertNotIn("checkpoint", result.stdout)
+            self.assertNotIn("\33", result.stdout)
+            self.assertIn("WARNING slow_update", result.stdout)
+            self.assertIn("captured\nrestored\n", result.stdout)
+            events = [json.loads(line) for line in
+                      (Path(temporary) / "events.jsonl").read_text().splitlines()]
+            self.assertEqual([row["event"] for row in events], [
+                "logging_started", "heartbeat", "checkpoint", "slow_update", "log",
+            ])
+
     def test_training_performance_controls(self):
         args = train.parser().parse_args([
             "train", "--disable-post-kl-check", "--mps-empty-cache-updates", "8",
@@ -28,6 +92,12 @@ class TelemetryTest(unittest.TestCase):
         self.assertTrue(args.disable_post_kl_check)
         self.assertEqual(args.mps_empty_cache_updates, 8)
         self.assertEqual(args.dataset_capacity, 131_072)
+        self.assertFalse(vars(args).keys() & {
+            "max_policy_lag", "segment_steps", "blended_critic",
+            "critic_consistency_weight", "critic_consistency_batch",
+            "critic_win_ema_decay", "critic_blend_power", "promotion_trigger_rate",
+            "evaluation_max_steps", "evaluation_max_combat_steps",
+        })
 
     def test_learning_rate_warmup_uses_global_weights_revision(self):
         optimizer = Namespace(param_groups=[
@@ -159,6 +229,48 @@ class TelemetryTest(unittest.TestCase):
             for key in ("step", "stage", "resolved_decisions_total", "policy_revision",
                         "update_attempt"):
                 self.assertNotIn(key, metrics)
+
+    def test_projection_cache_is_reused_until_the_log_changes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); run = root / "run"; (run / "events").mkdir(parents=True)
+            manifest = self.manifest("run", 1)
+            (run / "run.json").write_text(json.dumps(manifest))
+            log = run / "events/000001.jsonl"
+            write_events(log, [{"event": "checkpoint", "time": 1, "step": 0, "stage": 0}])
+            expected = telemetry._cached_projection(root, run, manifest, 1)
+            with mock.patch.object(telemetry, "MetricsProjector",
+                                   side_effect=AssertionError("cache miss")):
+                self.assertEqual(telemetry._cached_projection(root, run, manifest, 1), expected)
+                write_events(log, [{"event": "checkpoint", "time": 2,
+                                    "step": 1, "stage": 0}])
+                with self.assertRaisesRegex(AssertionError, "cache miss"):
+                    telemetry._cached_projection(root, run, manifest, 1)
+
+    def test_closed_event_logs_are_compressed_and_remain_readable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); run = root / "run"; (run / "events").mkdir(parents=True)
+            manifest = self.manifest("run", 1)
+            (run / "run.json").write_text(json.dumps(manifest))
+            log = run / "events/000001.jsonl"
+            write_events(log, [
+                {"event": "session_start", "time": 1, "step": 0, "stage": 0,
+                 "role": "learner"},
+                {"event": "checkpoint", "time": 2, "step": 3, "stage": 0},
+            ])
+            for name in ("initial.json", "latest.json"):
+                (run / name).write_text(json.dumps({"event_log": "events/000001.jsonl"}))
+            with mock.patch.object(telemetry, "_LOG_COMPRESSION_BYTES", 1):
+                telemetry._compress_event_log(run, log)
+            compressed = log.with_suffix(".jsonl.gz")
+            self.assertFalse(log.exists())
+            self.assertEqual(telemetry.event_logs(run), [compressed])
+            self.assertEqual(json.loads((run / "run.json").read_text())
+                             ["sessions"][0]["log"], "events/000001.jsonl.gz")
+            self.assertEqual(json.loads((run / "latest.json").read_text())
+                             ["event_log"], "events/000001.jsonl.gz")
+            manifest = json.loads((run / "run.json").read_text())
+            self.assertEqual(telemetry.MetricsProjector(root, run, manifest, 1)
+                             .value()["reports"][-1]["step"], 3)
 
     def test_projector_tracks_policy_rejections(self):
         with tempfile.TemporaryDirectory() as temporary:
