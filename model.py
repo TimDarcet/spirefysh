@@ -52,6 +52,7 @@ _TRAINING_METAL = r"""
 #include <metal_stdlib>
 using namespace metal;
 constant uint SIMD_WIDTH = 32;
+constant uint TOKEN_REDUCTION = 128;
 
 inline float head_sum(float value, uint dimension, uint lane) {
     if (dimension == SIMD_WIDTH) return simd_sum(value);
@@ -192,6 +193,79 @@ kernel void attention_forward_bfloat(
     if (column == 0) lse[query_index * heads + head] = maximum + log(sum);
 }
 
+kernel void attention_forward_bfloat_x4(
+    device const bfloat *qkv, device const int *offsets, device const int *sequence,
+    device const int *selected, device bfloat *output, device float *lse,
+    constant uint& queries, constant uint& heads, constant uint& dimension,
+    constant bool& sparse,
+    uint tid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+    uint first = tid / SIMD_WIDTH * 4, total = queries * heads, width = heads * dimension;
+    uint first_head = first / queries, first_query = first % queries;
+    bool shared = first + 3 < total && (first + 3) / queries == first_head;
+    uint tokens[4];
+    int rows[4];
+    for (uint slot = 0; slot < 4 && shared; ++slot) {
+        uint query_index = first_query + slot;
+        tokens[slot] = sparse ? selected[query_index] : query_index;
+        rows[slot] = sequence[tokens[slot]];
+        shared &= rows[slot] == rows[0];
+    }
+    if (shared) {
+        int begin = offsets[rows[0]], end = offsets[rows[0] + 1];
+        float q[4], maximum[4], sum[4] = {0}, values[4] = {0};
+        for (uint slot = 0; slot < 4; ++slot) {
+            uint query = tokens[slot] * 3 * width + first_head * dimension + lane;
+            q[slot] = float(qkv[query]);
+            maximum[slot] = -INFINITY;
+        }
+        for (int key = begin; key < end; ++key) {
+            uint k = key * 3 * width + width + first_head * dimension + lane;
+            float key_value = float(qkv[k]), value = float(qkv[k + width]);
+            for (uint slot = 0; slot < 4; ++slot) {
+                float score = head_sum(q[slot] * key_value, dimension, lane)
+                    * rsqrt(float(dimension));
+                float next = max(maximum[slot], score);
+                float old = exp(maximum[slot] - next), weight = exp(score - next);
+                sum[slot] = sum[slot] * old + weight;
+                values[slot] = values[slot] * old + weight * value;
+                maximum[slot] = next;
+            }
+        }
+        for (uint slot = 0; slot < 4; ++slot) {
+            uint out = (first_query + slot) * width + first_head * dimension + lane;
+            output[out] = bfloat(values[slot] / sum[slot]);
+            if (lane == 0)
+                lse[(first_query + slot) * heads + first_head] = maximum[slot] + log(sum[slot]);
+        }
+        return;
+    }
+    for (uint logical = first; logical < min(first + 4, total); ++logical) {
+        uint head = logical / queries, query_index = logical % queries;
+        uint token = sparse ? selected[query_index] : query_index;
+        int row = sequence[token], begin = offsets[row], end = offsets[row + 1];
+        uint query = token * 3 * width + head * dimension + lane;
+        uint out = query_index * width + head * dimension + lane;
+        if (end == begin + 1) {
+            output[out] = qkv[query + 2 * width];
+            if (lane == 0) lse[query_index * heads + head] = 0.0f;
+            continue;
+        }
+        float q = float(qkv[query]), maximum = -INFINITY, sum = 0.0f, value = 0.0f;
+        for (int key = begin; key < end; ++key) {
+            uint k = key * 3 * width + width + head * dimension;
+            float score = head_sum(q * float(qkv[k + lane]), dimension, lane)
+                * rsqrt(float(dimension));
+            float next = max(maximum, score), old = exp(maximum - next);
+            float weight = exp(score - next);
+            sum = sum * old + weight;
+            value = value * old + weight * float(qkv[k + width + lane]);
+            maximum = next;
+        }
+        output[out] = bfloat(value / sum);
+        if (lane == 0) lse[query_index * heads + head] = maximum + log(sum);
+    }
+}
+
 kernel void attention_backward_query_bfloat(
     device const bfloat *qkv, device const int *offsets, device const int *sequence,
     device const int *selected,
@@ -222,6 +296,80 @@ kernel void attention_backward_query_bfloat(
     }
     grad_qkv[query] = bfloat(dq);
     if (column == 0) delta[query_index * heads + head] = correction;
+}
+
+kernel void attention_backward_query_bfloat_x4(
+    device const bfloat *qkv, device const int *offsets, device const int *sequence,
+    device const int *selected, device const bfloat *output, device const float *lse,
+    device const bfloat *grad_output, device bfloat *grad_qkv, device float *delta,
+    constant uint& queries, constant uint& heads, constant uint& dimension,
+    constant bool& sparse,
+    uint tid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+    uint first = tid / SIMD_WIDTH * 4, total = queries * heads, width = heads * dimension;
+    uint first_head = first / queries, first_query = first % queries;
+    bool shared = first + 3 < total && (first + 3) / queries == first_head;
+    uint tokens[4];
+    int rows[4];
+    for (uint slot = 0; slot < 4 && shared; ++slot) {
+        uint query_index = first_query + slot;
+        tokens[slot] = sparse ? selected[query_index] : query_index;
+        rows[slot] = sequence[tokens[slot]];
+        shared &= rows[slot] == rows[0];
+    }
+    if (shared) {
+        int begin = offsets[rows[0]], end = offsets[rows[0] + 1];
+        float q[4], grad[4], correction[4], dq[4] = {0};
+        for (uint slot = 0; slot < 4; ++slot) {
+            uint query = tokens[slot] * 3 * width + first_head * dimension + lane;
+            uint out = (first_query + slot) * width + first_head * dimension + lane;
+            q[slot] = float(qkv[query]);
+            grad[slot] = float(grad_output[out]);
+            correction[slot] = head_sum(grad[slot] * float(output[out]), dimension, lane);
+        }
+        for (int key = begin; key < end; ++key) {
+            uint k = key * 3 * width + width + first_head * dimension + lane;
+            float key_value = float(qkv[k]), value = float(qkv[k + width]);
+            for (uint slot = 0; slot < 4; ++slot) {
+                float probability = exp(head_sum(q[slot] * key_value, dimension, lane)
+                    * rsqrt(float(dimension))
+                    - lse[(first_query + slot) * heads + first_head]);
+                float dp = head_sum(grad[slot] * value, dimension, lane);
+                dq[slot] += probability * (dp - correction[slot]) * key_value
+                    * rsqrt(float(dimension));
+            }
+        }
+        for (uint slot = 0; slot < 4; ++slot) {
+            uint query = tokens[slot] * 3 * width + first_head * dimension + lane;
+            grad_qkv[query] = bfloat(dq[slot]);
+            if (lane == 0)
+                delta[(first_query + slot) * heads + first_head] = correction[slot];
+        }
+        return;
+    }
+    for (uint logical = first; logical < min(first + 4, total); ++logical) {
+        uint head = logical / queries, query_index = logical % queries;
+        uint token = sparse ? selected[query_index] : query_index;
+        int row = sequence[token], begin = offsets[row], end = offsets[row + 1];
+        uint query = token * 3 * width + head * dimension + lane;
+        uint out = query_index * width + head * dimension + lane;
+        if (end == begin + 1) {
+            grad_qkv[query] = bfloat(0.0f);
+            if (lane == 0) delta[query_index * heads + head] = 0.0f;
+            continue;
+        }
+        float q = float(qkv[query]), grad = float(grad_output[out]);
+        float correction = head_sum(grad * float(output[out]), dimension, lane), dq = 0.0f;
+        for (int key = begin; key < end; ++key) {
+            uint k = key * 3 * width + width + head * dimension + lane;
+            float key_value = float(qkv[k]);
+            float probability = exp(head_sum(q * key_value, dimension, lane)
+                * rsqrt(float(dimension)) - lse[query_index * heads + head]);
+            float dp = head_sum(grad * float(qkv[k + width]), dimension, lane);
+            dq += probability * (dp - correction) * key_value * rsqrt(float(dimension));
+        }
+        grad_qkv[query] = bfloat(dq);
+        if (lane == 0) delta[query_index * heads + head] = correction;
+    }
 }
 
 kernel void attention_backward_key_value_bfloat(
@@ -260,6 +408,90 @@ kernel void attention_backward_key_value_bfloat(
         grad_qkv[key * 3 * width + head * dimension + column] = bfloat(0.0f);
     grad_qkv[k + column] = bfloat(dk);
     grad_qkv[k + width + column] = bfloat(dv);
+}
+
+kernel void attention_backward_key_value_bfloat_x4(
+    device const bfloat *qkv, device const int *offsets, device const int *sequence,
+    device const int *selected, device const int *query_offsets,
+    device const bfloat *output, device const float *lse, device const bfloat *grad_output,
+    device const float *delta, device bfloat *grad_qkv, constant uint& keys,
+    constant uint& heads, constant uint& dimension, constant bool& sparse,
+    uint tid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+    uint first = tid / SIMD_WIDTH * 4, total = keys * heads, width = heads * dimension;
+    uint first_head = first / keys, first_key = first % keys;
+    bool shared = first + 3 < total && (first + 3) / keys == first_head;
+    int rows[4];
+    for (uint slot = 0; slot < 4 && shared; ++slot) {
+        rows[slot] = sequence[first_key + slot];
+        shared &= rows[slot] == rows[0];
+    }
+    if (shared) {
+        int begin = sparse ? query_offsets[rows[0]] : offsets[rows[0]];
+        int end = sparse ? query_offsets[rows[0] + 1] : offsets[rows[0] + 1];
+        float key_values[4], values[4], dk[4] = {0}, dv[4] = {0};
+        bool selected_queries[4] = {false};
+        for (uint slot = 0; slot < 4; ++slot) {
+            uint base = (first_key + slot) * 3 * width + width
+                + first_head * dimension + lane;
+            key_values[slot] = float(qkv[base]);
+            values[slot] = float(qkv[base + width]);
+        }
+        for (int query_index = begin; query_index < end; ++query_index) {
+            uint token = sparse ? selected[query_index] : query_index;
+            uint query = token * 3 * width + first_head * dimension + lane;
+            uint out = query_index * width + first_head * dimension + lane;
+            float q = float(qkv[query]), grad = float(grad_output[out]);
+            for (uint slot = 0; slot < 4; ++slot) {
+                selected_queries[slot] |= token == first_key + slot;
+                float probability = exp(head_sum(q * key_values[slot], dimension, lane)
+                    * rsqrt(float(dimension)) - lse[query_index * heads + first_head]);
+                float ds = probability * (head_sum(grad * values[slot], dimension, lane)
+                    - delta[query_index * heads + first_head]);
+                dk[slot] += ds * q * rsqrt(float(dimension));
+                dv[slot] += probability * grad;
+            }
+        }
+        for (uint slot = 0; slot < 4; ++slot) {
+            uint key = first_key + slot;
+            uint base = key * 3 * width + width + first_head * dimension + lane;
+            if (sparse && !selected_queries[slot])
+                grad_qkv[key * 3 * width + first_head * dimension + lane] = bfloat(0.0f);
+            grad_qkv[base] = bfloat(dk[slot]);
+            grad_qkv[base + width] = bfloat(dv[slot]);
+        }
+        return;
+    }
+    for (uint logical = first; logical < min(first + 4, total); ++logical) {
+        uint head = logical / keys, key = logical % keys;
+        int row = sequence[key], begin = sparse ? query_offsets[row] : offsets[row];
+        int end = sparse ? query_offsets[row + 1] : offsets[row + 1];
+        uint base = key * 3 * width + width + head * dimension + lane;
+        if (offsets[row + 1] == offsets[row] + 1) {
+            grad_qkv[base] = bfloat(0.0f);
+            grad_qkv[base + width] = grad_output[begin * width + head * dimension + lane];
+            continue;
+        }
+        bool selected_query = false;
+        float key_value = float(qkv[base]), value = float(qkv[base + width]);
+        float dk = 0.0f, dv = 0.0f;
+        for (int query_index = begin; query_index < end; ++query_index) {
+            uint token = sparse ? selected[query_index] : query_index;
+            if (sparse) selected_query |= token == key;
+            uint query = token * 3 * width + head * dimension + lane;
+            uint out = query_index * width + head * dimension + lane;
+            float q = float(qkv[query]), grad = float(grad_output[out]);
+            float probability = exp(head_sum(q * key_value, dimension, lane)
+                * rsqrt(float(dimension)) - lse[query_index * heads + head]);
+            float ds = probability * (head_sum(grad * value, dimension, lane)
+                - delta[query_index * heads + head]);
+            dk += ds * q * rsqrt(float(dimension));
+            dv += probability * grad;
+        }
+        if (sparse && !selected_query)
+            grad_qkv[key * 3 * width + head * dimension + lane] = bfloat(0.0f);
+        grad_qkv[base] = bfloat(dk);
+        grad_qkv[base + width] = bfloat(dv);
+    }
 }
 
 kernel void summary_forward(
@@ -465,6 +697,295 @@ kernel void summary_backward_bfloat(
     grad_q[query] = bfloat(dq);
 }
 
+kernel void semantic_forward_bfloat(
+    device const int *semantic, device const bfloat *numeric, device const float *embedding,
+    device const float *gamma, device const float *beta, device float *input,
+    device float *output, device float *stats, constant uint& rows, constant uint& fields,
+    constant uint& width,
+    uint tid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+    uint row = tid / 32, base = row * width + lane;
+    float4 value;
+    for (uint part = 0; part < width / 32; ++part) {
+        uint column = lane + part * 32;
+        value[part] = float(numeric[row * width + column]);
+        for (uint position = 0; position < fields; ++position)
+            value[part] += embedding[semantic[row * fields + position] * width + column];
+    }
+    float local_sum = 0.0f, local_square = 0.0f;
+    for (uint part = 0; part < width / 32; ++part) {
+        local_sum += value[part];
+        local_square += value[part] * value[part];
+    }
+    float sum = simd_sum(local_sum), square = simd_sum(local_square);
+    float mean = sum / width;
+    float inverse_std = rsqrt(max(0.0f, square / width - mean * mean) + 1e-5f);
+    for (uint part = 0; part < width / 32; ++part) {
+        uint column = lane + part * 32, index = base + part * 32;
+        input[index] = value[part];
+        output[index] = (value[part] - mean) * inverse_std * gamma[column] + beta[column];
+    }
+    if (lane == 0) {
+        stats[row * 2] = mean;
+        stats[row * 2 + 1] = inverse_std;
+    }
+}
+
+kernel void semantic_backward_input(
+    device const float *input, device const float *gamma, device const float *stats,
+    device const float *grad_output, device float *grad_input, constant uint& width,
+    uint tid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+    uint row = tid / 32, base = row * width + lane;
+    float mean = stats[row * 2], inverse_std = stats[row * 2 + 1];
+    float4 normalized, grad;
+    for (uint part = 0; part < width / 32; ++part) {
+        uint column = lane + part * 32, index = base + part * 32;
+        normalized[part] = (input[index] - mean) * inverse_std;
+        grad[part] = grad_output[index] * gamma[column];
+    }
+    float local_sum = 0.0f, local_product = 0.0f;
+    for (uint part = 0; part < width / 32; ++part) {
+        local_sum += grad[part];
+        local_product += grad[part] * normalized[part];
+    }
+    float sum = simd_sum(local_sum), product = simd_sum(local_product);
+    for (uint part = 0; part < width / 32; ++part)
+        grad_input[base + part * 32] = (
+            grad[part] - sum / width - normalized[part] * product / width
+        ) * inverse_std;
+}
+
+kernel void semantic_backward_norm_partial(
+    device const float *input, device const float *stats, device const float *grad_output,
+    device float *partial, constant uint& rows, constant uint& block_rows, constant uint& width,
+    uint tid [[thread_position_in_grid]]) {
+    uint block = tid / width, column = tid % width;
+    uint begin = block * block_rows, end = min(rows, begin + block_rows);
+    float dg = 0.0f, db = 0.0f;
+    for (uint row = begin; row < end; ++row) {
+        uint index = row * width + column;
+        float normalized = (input[index] - stats[row * 2]) * stats[row * 2 + 1];
+        dg += grad_output[index] * normalized;
+        db += grad_output[index];
+    }
+    partial[block * 2 * width + column] = dg;
+    partial[(block * 2 + 1) * width + column] = db;
+}
+
+kernel void token_backward_norm_reduce(
+    device const float *partial, device float *grad_gamma, device float *grad_beta,
+    constant uint& blocks, constant uint& width,
+    uint tid [[thread_position_in_grid]], uint lane [[thread_index_in_threadgroup]]) {
+    threadgroup float gamma_sum[TOKEN_REDUCTION], beta_sum[TOKEN_REDUCTION];
+    uint column = tid / TOKEN_REDUCTION;
+    float dg = 0.0f, db = 0.0f;
+    for (uint block = lane; block < blocks; block += TOKEN_REDUCTION) {
+        dg += partial[block * 2 * width + column];
+        db += partial[(block * 2 + 1) * width + column];
+    }
+    gamma_sum[lane] = dg;
+    beta_sum[lane] = db;
+    for (uint stride = TOKEN_REDUCTION / 2; stride; stride /= 2) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane < stride) {
+            gamma_sum[lane] += gamma_sum[lane + stride];
+            beta_sum[lane] += beta_sum[lane + stride];
+        }
+    }
+    if (lane == 0) {
+        grad_gamma[column] = gamma_sum[0];
+        grad_beta[column] = beta_sum[0];
+    }
+}
+
+
+kernel void semantic_backward_embedding(
+    device const int *semantic, device const float *grad_input,
+    device atomic_float *grad_embedding, constant uint& rows, constant uint& fields,
+    constant uint& width, uint index [[thread_position_in_grid]]) {
+    uint row = index / width, column = index % width;
+    float grad = grad_input[index];
+    for (uint field = 0; field < fields; ++field) {
+        int id = semantic[row * fields + field];
+        if (id) atomic_fetch_add_explicit(
+            grad_embedding + id * width + column, grad, memory_order_relaxed
+        );
+    }
+}
+
+kernel void group_sum_forward(
+    device const float *input, device const long *group, device atomic_float *output,
+    constant uint& width, uint index [[thread_position_in_grid]]) {
+    atomic_fetch_add_explicit(
+        output + group[index / width] * width + index % width,
+        input[index], memory_order_relaxed
+    );
+}
+
+kernel void group_sum_backward(
+    device const float *grad_output, device const long *group, device float *grad_input,
+    constant uint& width, uint index [[thread_position_in_grid]]) {
+    grad_input[index] = grad_output[group[index / width] * width + index % width];
+}
+
+kernel void indexed_group_sum_forward(
+    device const float *input, device const long *source, device const long *group,
+    device atomic_float *output, constant uint& width,
+    uint index [[thread_position_in_grid]]) {
+    uint item = index / width, column = index % width;
+    atomic_fetch_add_explicit(
+        output + group[item] * width + column,
+        input[source[item] * width + column], memory_order_relaxed
+    );
+}
+
+kernel void indexed_group_sum_backward(
+    device const float *grad_output, device const long *source, device const long *group,
+    device atomic_float *grad_input, constant uint& width,
+    uint index [[thread_position_in_grid]]) {
+    uint item = index / width, column = index % width;
+    atomic_fetch_add_explicit(
+        grad_input + source[item] * width + column,
+        grad_output[group[item] * width + column], memory_order_relaxed
+    );
+}
+
+kernel void indexed_scatter_add(
+    device const float *input, device const long *source, device const long *target,
+    device atomic_float *output, constant uint& offset, constant uint& width,
+    uint index [[thread_position_in_grid]]) {
+    uint item = index / width, column = index % width;
+    atomic_fetch_add_explicit(
+        output + target[offset + item] * width + column,
+        input[source[item] * width + column], memory_order_relaxed
+    );
+}
+
+kernel void indexed_scatter_backward(
+    device const float *grad_output, device const long *source, device const long *target,
+    device atomic_float *grad_input, constant uint& offset, constant uint& width,
+    uint index [[thread_position_in_grid]]) {
+    uint item = index / width, column = index % width;
+    atomic_fetch_add_explicit(
+        grad_input + source[item] * width + column,
+        grad_output[target[offset + item] * width + column], memory_order_relaxed
+    );
+}
+
+kernel void action_nodes_forward(
+    device const float *nodes, device const long *path, device float *output,
+    constant uint& width, uint index [[thread_position_in_grid]]) {
+    uint action = index / width;
+    if (path[action] >= 0)
+        output[index] += nodes[path[action] * width + index % width];
+}
+
+kernel void action_nodes_backward(
+    device const float *grad_output, device const long *path, device atomic_float *grad_nodes,
+    constant uint& width, uint index [[thread_position_in_grid]]) {
+    uint action = index / width;
+    if (path[action] >= 0) atomic_fetch_add_explicit(
+        grad_nodes + path[action] * width + index % width,
+        grad_output[index], memory_order_relaxed
+    );
+}
+
+kernel void layer_norm_forward_bfloat(
+    device const float *input, device const float *gamma, device const float *beta,
+    device bfloat *output, device float *stats, constant uint& rows, constant uint& width,
+    uint tid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+    uint row = tid / 32, base = row * width + lane;
+    float4 value;
+    float local_sum = 0.0f, local_square = 0.0f;
+    for (uint part = 0; part < width / 32; ++part) {
+        value[part] = input[base + part * 32];
+        local_sum += value[part];
+        local_square += value[part] * value[part];
+    }
+    float sum = simd_sum(local_sum), square = simd_sum(local_square);
+    float mean = sum / width;
+    float inverse_std = rsqrt(max(0.0f, square / width - mean * mean) + 1e-5f);
+    for (uint part = 0; part < width / 32; ++part) {
+        uint column = lane + part * 32;
+        output[base + part * 32] = bfloat(
+            (value[part] - mean) * inverse_std * gamma[column] + beta[column]
+        );
+    }
+    if (lane == 0) {
+        stats[row * 2] = mean;
+        stats[row * 2 + 1] = inverse_std;
+    }
+}
+
+kernel void layer_norm_backward_input_bfloat(
+    device const float *input, device const float *gamma, device const float *stats,
+    device const bfloat *grad_output, device float *grad_input, constant uint& width,
+    uint tid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+    uint row = tid / 32, base = row * width + lane;
+    float mean = stats[row * 2], inverse_std = stats[row * 2 + 1];
+    float4 normalized, grad;
+    float local_sum = 0.0f, local_product = 0.0f;
+    for (uint part = 0; part < width / 32; ++part) {
+        uint column = lane + part * 32, index = base + part * 32;
+        normalized[part] = (input[index] - mean) * inverse_std;
+        grad[part] = float(grad_output[index]) * gamma[column];
+        local_sum += grad[part];
+        local_product += grad[part] * normalized[part];
+    }
+    float sum = simd_sum(local_sum), product = simd_sum(local_product);
+    for (uint part = 0; part < width / 32; ++part)
+        grad_input[base + part * 32] = (
+            grad[part] - sum / width - normalized[part] * product / width
+        ) * inverse_std;
+}
+
+kernel void layer_norm_backward_partial_bfloat(
+    device const float *input, device const float *stats, device const bfloat *grad_output,
+    device float *partial, constant uint& rows, constant uint& block_rows, constant uint& width,
+    uint tid [[thread_position_in_grid]]) {
+    uint block = tid / width, column = tid % width;
+    uint begin = block * block_rows, end = min(rows, begin + block_rows);
+    float dg = 0.0f, db = 0.0f;
+    for (uint row = begin; row < end; ++row) {
+        uint index = row * width + column;
+        float grad = float(grad_output[index]);
+        dg += grad * (input[index] - stats[row * 2]) * stats[row * 2 + 1];
+        db += grad;
+    }
+    partial[block * 2 * width + column] = dg;
+    partial[(block * 2 + 1) * width + column] = db;
+}
+
+kernel void norm_head_forward(
+    device const float *input, device const float *gamma, device const float *beta,
+    device const float *weight, device const float *bias, device bfloat *normalized,
+    device bfloat *output, device float *stats, constant uint& width,
+    uint tid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+    uint row = tid / 32, base = row * width + lane;
+    float4 value;
+    float local_sum = 0.0f, local_square = 0.0f;
+    for (uint part = 0; part < width / 32; ++part) {
+        value[part] = input[base + part * 32];
+        local_sum += value[part];
+        local_square += value[part] * value[part];
+    }
+    float sum = simd_sum(local_sum), square = simd_sum(local_square);
+    float mean = sum / width;
+    float inverse_std = rsqrt(max(0.0f, square / width - mean * mean) + 1e-5f);
+    float dot = 0.0f;
+    for (uint part = 0; part < width / 32; ++part) {
+        uint column = lane + part * 32, index = base + part * 32;
+        bfloat item = bfloat((value[part] - mean) * inverse_std
+                             * gamma[column] + beta[column]);
+        normalized[index] = item;
+        dot += float(item) * float(bfloat(weight[column]));
+    }
+    dot = simd_sum(dot);
+    if (lane == 0) {
+        output[row] = bfloat(dot + float(bfloat(bias[0])));
+        stats[row * 2] = mean;
+        stats[row * 2 + 1] = inverse_std;
+    }
+}
 
 kernel void ragged_log_softmax(
     device const float *score, device const int *offsets, device float *output,
@@ -537,13 +1058,21 @@ class _RaggedAttention(torch.autograd.Function):
         output = qkv.new_empty((queries, qkv.shape[1] // 3))
         lse = torch.empty((queries, heads), dtype=torch.float32, device=qkv.device)
         dimension = output.shape[1] // heads
-        threads = queries * heads * dimension
         suffix = "_half" if qkv.dtype == torch.float16 else "_bfloat" if qkv.dtype == torch.bfloat16 else ""
-        kernel = getattr(library, f"attention_forward{suffix}")
-        kernel(
-            qkv, offsets, sequence, selected, output, lse, heads, dimension, sparse,
-            threads=threads, group_size=32,
-        )
+        tiled = bool(suffix) and dimension == 32
+        threads = ((queries * heads + 3) // 4 * 32 if tiled
+                   else queries * heads * dimension)
+        kernel = getattr(library, f"attention_forward{suffix}{'_x4' if tiled else ''}")
+        arguments = qkv, offsets, sequence, selected, output, lse
+        if tiled:
+            kernel(
+                *arguments, queries, heads, dimension, sparse,
+                threads=threads, group_size=32,
+            )
+        else:
+            kernel(
+                *arguments, heads, dimension, sparse, threads=threads, group_size=32,
+            )
         ctx.save_for_backward(qkv, offsets, sequence, selected, query_offsets, output, lse)
         ctx.heads = heads
         ctx.dimension = dimension
@@ -555,21 +1084,254 @@ class _RaggedAttention(torch.autograd.Function):
         qkv, offsets, sequence, selected, query_offsets, output, lse = ctx.saved_tensors
         grad_qkv = torch.empty_like(qkv)
         delta = torch.empty_like(lse)
-        query_threads = len(output) * ctx.heads * ctx.dimension
-        key_threads = len(qkv) * ctx.heads * ctx.dimension
+        tiled = bool(ctx.suffix) and ctx.dimension == 32
+        query_threads = ((len(output) * ctx.heads + 3) // 4 * 32 if tiled
+                         else len(output) * ctx.heads * ctx.dimension)
+        key_threads = ((len(qkv) * ctx.heads + 3) // 4 * 32 if tiled
+                       else len(qkv) * ctx.heads * ctx.dimension)
         args = qkv, offsets, sequence, selected, output, lse, grad_output.contiguous()
-        query = getattr(ctx.library, f"attention_backward_query{ctx.suffix}") if ctx.suffix else ctx.library.backward_query
-        key_value = getattr(ctx.library, f"attention_backward_key_value{ctx.suffix}") if ctx.suffix else ctx.library.backward_key_value
-        query(
-            *args, grad_qkv, delta, ctx.heads, ctx.dimension, ctx.sparse,
-            threads=query_threads, group_size=32,
-        )
-        key_value(
+        query = getattr(
+            ctx.library, f"attention_backward_query{ctx.suffix}{'_x4' if tiled else ''}",
+        ) if ctx.suffix else ctx.library.backward_query
+        key_value = getattr(
+            ctx.library,
+            f"attention_backward_key_value{ctx.suffix}{'_x4' if tiled else ''}",
+        ) if ctx.suffix else ctx.library.backward_key_value
+        if tiled:
+            query(
+                *args, grad_qkv, delta, len(output), ctx.heads, ctx.dimension, ctx.sparse,
+                threads=query_threads, group_size=32,
+            )
+        else:
+            query(
+                *args, grad_qkv, delta, ctx.heads, ctx.dimension, ctx.sparse,
+                threads=query_threads, group_size=32,
+            )
+        arguments = (
             qkv, offsets, sequence, selected, query_offsets, output, lse,
-            grad_output.contiguous(), delta, grad_qkv, ctx.heads, ctx.dimension, ctx.sparse,
-            threads=key_threads, group_size=32,
+            grad_output.contiguous(), delta, grad_qkv,
         )
+        if tiled:
+            key_value(
+                *arguments, len(qkv), ctx.heads, ctx.dimension, ctx.sparse,
+                threads=key_threads, group_size=32,
+            )
+        else:
+            key_value(
+                *arguments, ctx.heads, ctx.dimension, ctx.sparse,
+                threads=key_threads, group_size=32,
+            )
         return grad_qkv, None, None, None, None, None, None
+
+
+class _FlashAttention(torch.autograd.Function):
+    library = None
+
+    @staticmethod
+    def forward(ctx, qkv, offsets, lengths, block_rows, block_starts):
+        if _FlashAttention.library is None:
+            _FlashAttention.library = torch.mps.compile_shader(
+                Path(__file__).with_name("attention.metal").read_text()
+            )
+        output = qkv.new_empty((len(qkv), qkv.shape[1] // 3))
+        lse = torch.empty((len(qkv), 4), dtype=torch.float32, device=qkv.device)
+        threads = len(block_rows) * 4 * 64
+        _FlashAttention.library.flash_forward(
+            qkv, qkv, qkv, output, lse, offsets, lengths, block_rows, block_starts,
+            threads=threads, group_size=64,
+        )
+        ctx.save_for_backward(qkv, output, lse, offsets, lengths, block_rows, block_starts)
+        ctx.threads = threads
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        qkv, output, lse, offsets, lengths, block_rows, block_starts = ctx.saved_tensors
+        grad_output = grad_output.contiguous()
+        grad_qkv = torch.empty_like(qkv)
+        delta = torch.empty_like(lse)
+        _FlashAttention.library.flash_backward_query(
+            qkv, qkv, qkv, output, lse, delta, grad_output, grad_qkv,
+            offsets, lengths, block_rows, block_starts,
+            threads=ctx.threads, group_size=64,
+        )
+        _FlashAttention.library.flash_backward_key_value(
+            qkv, qkv, qkv, lse, delta, grad_output, grad_qkv, grad_qkv,
+            offsets, lengths, block_rows, block_starts,
+            threads=ctx.threads, group_size=64,
+        )
+        return grad_qkv, None, None, None, None
+
+
+def _linear_forward(value_bfloat, weight, bias, residual=None):
+    if _FastLinear.libraries is None:
+        sources = Path(__file__).with_name("linear.metal").read_text().split(
+            "// SPIREFYSH_KERNEL"
+        )
+        _FastLinear.libraries = [torch.mps.compile_shader(source) for source in sources]
+    weight_bfloat = weight.to(torch.bfloat16)
+    output = value_bfloat.new_empty(
+        (len(value_bfloat), len(weight)), dtype=residual.dtype if residual is not None else None,
+    )
+    name = "linear_residual_128_128" if residual is not None else \
+        f"linear_{value_bfloat.shape[1]}_{len(weight)}"
+    arguments = (value_bfloat, weight_bfloat, output, bias.to(torch.bfloat16))
+    getattr(_FastLinear.libraries[2 if residual is not None else len(weight) != 128], name)(
+        *arguments, *((residual,) if residual is not None else ()), len(value_bfloat),
+        threads=((len(weight) + 31) // 32 * 32, (len(value_bfloat) + 31) // 32),
+        group_size=(32, 1),
+    )
+    return output, weight_bfloat
+
+
+class _FastLinear(torch.autograd.Function):
+    libraries = None
+
+    @staticmethod
+    def forward(ctx, value, weight, bias):
+        value_bfloat = value.to(torch.bfloat16)
+        output, weight_bfloat = _linear_forward(value_bfloat, weight, bias)
+        ctx.save_for_backward(value_bfloat, weight_bfloat)
+        ctx.value_dtype = value.dtype
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        value, weight = ctx.saved_tensors
+        grad_value, grad_weight, grad_bias = torch.ops.aten.linear_backward(
+            value, grad_output.to(torch.bfloat16), weight, [True, True, True],
+        )
+        return grad_value.to(ctx.value_dtype), grad_weight.float(), grad_bias.float()
+
+
+class _LinearResidual(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, value, weight, bias, residual):
+        value_bfloat = value.to(torch.bfloat16)
+        output, weight_bfloat = _linear_forward(value_bfloat, weight, bias, residual)
+        ctx.save_for_backward(value_bfloat, weight_bfloat)
+        ctx.value_dtype = value.dtype
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        value, weight = ctx.saved_tensors
+        grad_value, grad_weight, grad_bias = torch.ops.aten.linear_backward(
+            value, grad_output.to(torch.bfloat16), weight, [True, True, True],
+        )
+        return grad_value.to(ctx.value_dtype), grad_weight.float(), grad_bias.float(), grad_output
+
+
+class _NormLinear(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, value, gamma, beta, weight, bias):
+        if _RaggedAttention.library is None:
+            _RaggedAttention.library = torch.mps.compile_shader(_TRAINING_METAL)
+        normalized = torch.empty_like(value, dtype=torch.bfloat16)
+        stats = value.new_empty((len(value), 2))
+        _RaggedAttention.library.layer_norm_forward_bfloat(
+            value, gamma, beta, normalized, stats, len(value), value.shape[1],
+            threads=len(value) * 32, group_size=32,
+        )
+        output, weight_bfloat = _linear_forward(normalized, weight, bias)
+        ctx.save_for_backward(value, gamma, normalized, stats, weight_bfloat)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        value, gamma, normalized, stats, weight = ctx.saved_tensors
+        grad_normalized, grad_weight, grad_bias = torch.ops.aten.linear_backward(
+            normalized, grad_output.to(torch.bfloat16), weight, [True, True, True],
+        )
+        width = value.shape[1]
+        grad_value = torch.empty_like(value)
+        _RaggedAttention.library.layer_norm_backward_input_bfloat(
+            value, gamma, stats, grad_normalized, grad_value, width,
+            threads=len(value) * 32, group_size=32,
+        )
+        blocks = (len(value) + 127) // 128
+        partial = value.new_empty((blocks, 2, width))
+        grad_gamma, grad_beta = torch.empty_like(gamma), torch.empty_like(gamma)
+        _RaggedAttention.library.layer_norm_backward_partial_bfloat(
+            value, stats, grad_normalized, partial, len(value), 128, width,
+            threads=blocks * width, group_size=128,
+        )
+        _RaggedAttention.library.token_backward_norm_reduce(
+            partial, grad_gamma, grad_beta, blocks, width,
+            threads=width * 128, group_size=128,
+        )
+        return grad_value, grad_gamma, grad_beta, grad_weight.float(), grad_bias.float()
+
+
+class _NormHead(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, value, gamma, beta, weight, bias):
+        if _RaggedAttention.library is None:
+            _RaggedAttention.library = torch.mps.compile_shader(_TRAINING_METAL)
+        normalized = torch.empty_like(value, dtype=torch.bfloat16)
+        output = torch.empty(len(value), dtype=torch.bfloat16, device=value.device)
+        stats = value.new_empty((len(value), 2))
+        _RaggedAttention.library.norm_head_forward(
+            value, gamma, beta, weight, bias, normalized, output, stats, value.shape[1],
+            threads=len(value) * 32, group_size=32,
+        )
+        ctx.save_for_backward(value, gamma, normalized, stats, weight.to(torch.bfloat16))
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        value, gamma, normalized, stats, weight = ctx.saved_tensors
+        grad_normalized, grad_weight, grad_bias = torch.ops.aten.linear_backward(
+            normalized, grad_output[:, None].to(torch.bfloat16), weight, [True, True, True],
+        )
+        width = value.shape[1]
+        grad_value = torch.empty_like(value)
+        _RaggedAttention.library.layer_norm_backward_input_bfloat(
+            value, gamma, stats, grad_normalized, grad_value, width,
+            threads=len(value) * 32, group_size=32,
+        )
+        blocks = (len(value) + 127) // 128
+        partial = value.new_empty((blocks, 2, width))
+        grad_gamma, grad_beta = torch.empty_like(gamma), torch.empty_like(gamma)
+        _RaggedAttention.library.layer_norm_backward_partial_bfloat(
+            value, stats, grad_normalized, partial, len(value), 128, width,
+            threads=blocks * width, group_size=128,
+        )
+        _RaggedAttention.library.token_backward_norm_reduce(
+            partial, grad_gamma, grad_beta, blocks, width,
+            threads=width * 128, group_size=128,
+        )
+        return grad_value, grad_gamma, grad_beta, grad_weight.float(), grad_bias.float()
+
+
+def _linear(value, layer, residual=None):
+    if (value.device.type == "mps" and torch.is_autocast_enabled("mps")
+            and value.shape[1] == 128 and len(layer.weight) in (128, 384)
+            and len(value) >= 4096):
+        return (_FastLinear if residual is None else _LinearResidual).apply(
+            value, layer.weight, layer.bias, *(() if residual is None else (residual,))
+        )
+    output = layer(value)
+    return output if residual is None else residual + output
+
+
+def _residual_linear(value, layer, residual):
+    return _linear(value, layer, residual)
+
+
+def _norm_linear(value, norm, weight, bias):
+    if (value.device.type == "mps" and value.dtype == torch.float32
+            and torch.is_autocast_enabled("mps") and value.shape[1] == 128
+            and len(weight) in (128, 384) and len(value) >= 4096):
+        return _NormLinear.apply(value, norm.weight, norm.bias, weight, bias)
+    return nn.functional.linear(norm(value), weight, bias)
+
+
+def _norm_head(value, norm, head):
+    if (value.device.type == "mps" and value.dtype == torch.float32
+            and torch.is_autocast_enabled("mps") and value.shape[1] == 128):
+        return _NormHead.apply(value, norm.weight, norm.bias, head.weight, head.bias)
+    return head(norm(value)).squeeze(-1)
 
 
 class _RaggedSummaryAttention(torch.autograd.Function):
@@ -634,6 +1396,214 @@ class _RaggedLogSoftmax(torch.autograd.Function):
         return grad_score, None
 
 
+class _FusedSemantic(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, semantic, numeric, embedding, gamma, beta):
+        if _RaggedAttention.library is None:
+            _RaggedAttention.library = torch.mps.compile_shader(_TRAINING_METAL)
+        rows, fields = semantic.shape
+        width = embedding.shape[1]
+        input = embedding.new_empty((rows, width))
+        output = torch.empty_like(input)
+        stats = embedding.new_empty((rows, 2))
+        _RaggedAttention.library.semantic_forward_bfloat(
+            semantic, numeric, embedding, gamma, beta, input, output, stats, rows, fields, width,
+            threads=rows * 32, group_size=32,
+        )
+        ctx.save_for_backward(semantic, embedding, gamma, input, stats)
+        ctx.width = width
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        semantic, embedding, gamma, input, stats = ctx.saved_tensors
+        grad_output = grad_output.contiguous()
+        grad_input = torch.empty_like(input)
+        _RaggedAttention.library.semantic_backward_input(
+            input, gamma, stats, grad_output, grad_input,
+            ctx.width, threads=len(input) * 32, group_size=32,
+        )
+        blocks = (len(input) + 127) // 128
+        partial = torch.empty((blocks, 2, ctx.width), dtype=torch.float32, device=input.device)
+        grad_gamma = torch.empty_like(gamma)
+        grad_beta = torch.empty_like(gamma)
+        _RaggedAttention.library.semantic_backward_norm_partial(
+            input, stats, grad_output, partial, len(input), 128, ctx.width,
+            threads=blocks * ctx.width, group_size=ctx.width,
+        )
+        _RaggedAttention.library.token_backward_norm_reduce(
+            partial, grad_gamma, grad_beta, blocks, ctx.width,
+            threads=ctx.width * 128, group_size=128,
+        )
+        grad_embedding = torch.zeros_like(embedding)
+        _RaggedAttention.library.semantic_backward_embedding(
+            semantic, grad_input, grad_embedding, len(input), semantic.shape[1], ctx.width,
+            threads=len(input) * ctx.width, group_size=256,
+        )
+        return None, grad_input.to(torch.bfloat16), grad_embedding, grad_gamma, grad_beta
+
+
+class _FusedDomains(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, embedding, *arguments):
+        if _RaggedAttention.library is None:
+            _RaggedAttention.library = torch.mps.compile_shader(_TRAINING_METAL)
+        outputs, saved = [], [embedding]
+        for categorical, numeric, weight, gamma, beta in zip(*[iter(arguments)] * 5):
+            if not len(categorical):
+                outputs.append(gamma.new_empty((0, len(gamma))))
+                saved.extend((categorical, numeric, weight, gamma,
+                              gamma.new_empty((0, len(gamma))), gamma.new_empty((0, 2))))
+                continue
+            numeric_input = numeric.to(torch.bfloat16)
+            numeric = nn.functional.linear(
+                numeric_input, weight.to(torch.bfloat16),
+            )
+            rows, fields = categorical.shape
+            input = embedding.new_empty((rows, len(gamma)))
+            output = torch.empty_like(input)
+            stats = embedding.new_empty((rows, 2))
+            _RaggedAttention.library.semantic_forward_bfloat(
+                categorical, numeric, embedding, gamma, beta, input, output, stats,
+                rows, fields, len(gamma), threads=rows * 32, group_size=32,
+            )
+            outputs.append(output)
+            saved.extend((categorical, numeric_input, weight.to(torch.bfloat16), gamma,
+                          input, stats))
+        ctx.save_for_backward(*saved)
+        return tuple(outputs)
+
+    @staticmethod
+    def backward(ctx, *grad_outputs):
+        embedding, *saved = ctx.saved_tensors
+        grad_embedding = torch.zeros_like(embedding)
+        gradients = [grad_embedding]
+        for grad_output, values in zip(grad_outputs, zip(*[iter(saved)] * 6)):
+            semantic, numeric_input, weight, gamma, input, stats = values
+            if not len(semantic):
+                gradients.extend((None, None, torch.zeros_like(weight),
+                                  torch.zeros_like(gamma), torch.zeros_like(gamma)))
+                continue
+            grad_output = grad_output.contiguous()
+            grad_input = torch.empty_like(input)
+            width = input.shape[1]
+            _RaggedAttention.library.semantic_backward_input(
+                input, gamma, stats, grad_output, grad_input, width,
+                threads=len(input) * 32, group_size=32,
+            )
+            blocks = (len(input) + 127) // 128
+            partial = input.new_empty((blocks, 2, width))
+            grad_gamma, grad_beta = torch.empty_like(gamma), torch.empty_like(gamma)
+            _RaggedAttention.library.semantic_backward_norm_partial(
+                input, stats, grad_output, partial, len(input), 128, width,
+                threads=blocks * width, group_size=width,
+            )
+            _RaggedAttention.library.token_backward_norm_reduce(
+                partial, grad_gamma, grad_beta, blocks, width,
+                threads=width * 128, group_size=128,
+            )
+            _RaggedAttention.library.semantic_backward_embedding(
+                semantic, grad_input, grad_embedding, len(input), semantic.shape[1], width,
+                threads=len(input) * width, group_size=256,
+            )
+            grad_weight = torch.ops.aten.linear_backward(
+                numeric_input, grad_input.to(torch.bfloat16), weight, [False, True, False],
+            )[1]
+            gradients.extend((None, None, grad_weight.float(), grad_gamma, grad_beta))
+        return tuple(gradients)
+
+
+class _GroupSum(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, values, group, groups):
+        if _RaggedAttention.library is None:
+            _RaggedAttention.library = torch.mps.compile_shader(_TRAINING_METAL)
+        output = values.new_zeros((groups, values.shape[1]))
+        _RaggedAttention.library.group_sum_forward(
+            values, group, output, values.shape[1], threads=values.numel(), group_size=256,
+        )
+        ctx.save_for_backward(group)
+        ctx.shape = values.shape
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        group, = ctx.saved_tensors
+        grad_input = grad_output.new_empty(ctx.shape)
+        _RaggedAttention.library.group_sum_backward(
+            grad_output.contiguous(), group, grad_input, ctx.shape[1],
+            threads=grad_input.numel(), group_size=256,
+        )
+        return grad_input, None, None
+
+
+class _IndexedGroupSum(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, values, source, group, groups):
+        if _RaggedAttention.library is None:
+            _RaggedAttention.library = torch.mps.compile_shader(_TRAINING_METAL)
+        output = values.new_zeros((groups, values.shape[1]))
+        _RaggedAttention.library.indexed_group_sum_forward(
+            values, source, group, output, values.shape[1],
+            threads=len(source) * values.shape[1], group_size=256,
+        )
+        ctx.save_for_backward(source, group)
+        ctx.shape = values.shape
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        source, group = ctx.saved_tensors
+        grad_input = grad_output.new_zeros(ctx.shape)
+        _RaggedAttention.library.indexed_group_sum_backward(
+            grad_output.contiguous(), source, group, grad_input, ctx.shape[1],
+            threads=len(source) * ctx.shape[1], group_size=256,
+        )
+        return grad_input, None, None, None
+
+
+class _ActionAttachments(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, nodes, path, target, *arguments):
+        if _RaggedAttention.library is None:
+            _RaggedAttention.library = torch.mps.compile_shader(_TRAINING_METAL)
+        output = nodes.new_zeros((len(path), nodes.shape[1]))
+        offset = 0
+        for values, source in zip(*[iter(arguments)] * 2):
+            _RaggedAttention.library.indexed_scatter_add(
+                values, source, target, output, offset, nodes.shape[1],
+                threads=len(source) * nodes.shape[1], group_size=256,
+            )
+            offset += len(source)
+        _RaggedAttention.library.action_nodes_forward(
+            nodes, path, output, nodes.shape[1], threads=output.numel(), group_size=256,
+        )
+        ctx.save_for_backward(path, target, *arguments[1::2])
+        ctx.node_shape = nodes.shape
+        ctx.value_shapes = [values.shape for values in arguments[::2]]
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        path, target, *sources = ctx.saved_tensors
+        width = grad_output.shape[1]
+        grad_nodes = grad_output.new_zeros(ctx.node_shape)
+        _RaggedAttention.library.action_nodes_backward(
+            grad_output.contiguous(), path, grad_nodes, width,
+            threads=grad_output.numel(), group_size=256,
+        )
+        gradients, offset = [grad_nodes, None, None], 0
+        for source, shape in zip(sources, ctx.value_shapes):
+            grad_values = grad_output.new_zeros(shape)
+            _RaggedAttention.library.indexed_scatter_backward(
+                grad_output, source, target, grad_values, offset, width,
+                threads=len(source) * width, group_size=256,
+            )
+            gradients.extend((grad_values, None))
+            offset += len(source)
+        return tuple(gradients)
+
+
 
 def device():
     global _ACCELERATOR_LOCK
@@ -695,8 +1665,13 @@ class TokenEncoder(nn.Module):
     def forward(self, categorical, numeric, embeddings):
         if not len(categorical):
             return self.norm.weight.new_empty((0, len(self.norm.weight)))
-        return self.norm(nn.functional.embedding(categorical.long(), embeddings).sum(1)
-                         + self.numeric(numeric))
+        numeric = self.numeric(numeric)
+        if (categorical.device.type == "mps" and numeric.dtype == torch.bfloat16
+                and len(self.norm.weight) % 32 == 0 and len(self.norm.weight) <= 128):
+            return _FusedSemantic.apply(
+                categorical, numeric, embeddings, self.norm.weight, self.norm.bias,
+            )
+        return self.norm(nn.functional.embedding(categorical.long(), embeddings).sum(1) + numeric)
 
 
 class Agent(nn.Module):
@@ -787,6 +1762,9 @@ class Agent(nn.Module):
         self.policy = nn.Linear(width, 1)
         self.critic = nn.Linear(width, 1)
         self._graph_cache = {}
+        self._sequence_layouts = []
+        self._reuse_sequence_layouts = False
+        self._sequence_layout_index = 0
         self.cache_stats = {"graph_hit": 0, "graph_miss": 0}
         nn.init.normal_(self.policy.weight, std=.01)
         nn.init.zeros_(self.policy.bias)
@@ -879,6 +1857,15 @@ class Agent(nn.Module):
         return selected[current_inverse], nodes
 
     def encode_domains(self, domains, concepts):
+        if (concepts.device.type == "mps" and torch.is_autocast_enabled("mps")
+                and self.width == 128):
+            arguments = tuple(value for domain, (name, *_), values in zip(
+                self.encoders.values(), TOKEN_SPECS, domains,
+            ) for value in (*values[:2], domain.numeric.weight,
+                            domain.norm.weight, domain.norm.bias))
+            return tuple(output[:values[2]] for output, values in zip(
+                _FusedDomains.apply(concepts, *arguments), domains,
+            ))
         return tuple(self.encoders[name](*values[:2], concepts)[:values[2]]
                      for (name, *_), values in zip(TOKEN_SPECS, domains))
 
@@ -888,74 +1875,83 @@ class Agent(nn.Module):
             tagged + self.concepts.local("collection", collection).to(values.dtype)
 
     @staticmethod
-    def _domain_rows(domains, encoded, domain, predicate=None, scope_value=-1):
-        _semantic, _numeric, _count, u, row, scope, inverse = domains[domain]
-        selected = scope == scope_value
+    def _domain_rows(domains, encoded, domain, predicate=None, scope_value=-1, source=None):
+        _semantic, _numeric, _count, u, row, _scope, inverse, root, phase, _action = domains[domain]
+        source = (root if scope_value == -1 else phase) if source is None else source
         if predicate is not None:
-            selected &= predicate(u)
-        source = selected.nonzero().squeeze(1)
+            source = source[predicate(u[source])]
         return encoded[domain][inverse[source]], row[source], u[source]
 
-    @staticmethod
-    def _ordered(values, group):
-        if len(group) < 2:
-            return values, group
-        order = torch.argsort(group, stable=True)
-        return values[order], group[order]
-
     def _sequence(self, values, group, groups, seed, transformer, selected=None):
-        order = torch.argsort(group, stable=True)
-        inverse = torch.empty_like(order)
-        inverse[order] = torch.arange(len(order), device=order.device)
-        values, group = values[order], group[order]
         selected_count = selected
-        selected = (torch.arange(len(values), device=values.device) >= len(values) - selected)[order] \
-            if selected is not None else None
-        counts = torch.bincount(group, minlength=groups)
-        if values.device.type == "mps" and self.width // self.heads in (16, 32):
+        flash = values.device.type == "mps" and self.width == 128 and self.heads == 4 \
+            and torch.is_autocast_enabled("mps") \
+            and torch.get_autocast_dtype("mps") == torch.bfloat16
+        reuse = flash and getattr(self, "_reuse_sequence_layouts", False)
+        if reuse:
+            layout = self._sequence_layouts[self._sequence_layout_index]
+            self._sequence_layout_index += 1
+            order, inverse, selected, counts, lengths, offsets, destination, sequence, \
+                block_rows, block_starts, metal_offsets, metal_lengths, sparse = layout
+        else:
+            order = torch.argsort(group, stable=True)
+            inverse = torch.empty_like(order)
+            inverse[order] = torch.arange(len(order), device=order.device)
+            group = group[order]
+            counts = torch.bincount(group, minlength=groups)
+        if values.device.type == "mps" and self.width // self.heads in (16, 32) and not reuse:
             lengths = counts + 1
             padded_groups = (groups // 256 + 1) * 256
             lengths = nn.functional.pad(lengths, (0, padded_groups - groups), value=1)
             total = len(values) + padded_groups
-            query_size = 0 if not selected_count else min(
-                size for power in range(max(1, (selected_count - 1).bit_length()), 64)
-                for size in (3 * (1 << power) // 4, 1 << power) if size >= selected_count
-            )
-            query_extra = query_size - (selected_count or 0)
-            quantum = 65_536 if groups >= 4096 else 4096
-            extra = (-total) % quantum
-            if extra < query_extra:
-                extra += quantum
+            extra = (-total) % 65_536
             lengths[groups:] += extra // (padded_groups - groups)
             lengths[groups:groups + extra % (padded_groups - groups)] += 1
-            total += extra
             offsets = torch.cat((counts.new_zeros(1), lengths.cumsum(0)))
             starts = torch.repeat_interleave(offsets[:groups], counts)
             position = torch.arange(len(values), device=values.device) \
                 - torch.repeat_interleave(counts.cumsum(0) - counts, counts) + 1
-            destination = starts + position
-            current = values.new_zeros((total, self.width))
-            current[offsets[:groups]] = seed.to(values.dtype)
-            current[destination] = values
+            destination = (starts + position)[inverse]
             sequence = torch.repeat_interleave(
                 torch.arange(len(lengths), device=values.device), lengths,
             )
+            if flash:
+                blocks = (lengths + 15) // 16
+                block_rows = torch.repeat_interleave(
+                    torch.arange(len(lengths), device=values.device), blocks,
+                ).to(torch.int32)
+                block_starts = torch.cat((counts.new_zeros(1), blocks.cumsum(0)[:-1])).to(
+                    torch.int32
+                )
+                metal_offsets = offsets.to(torch.int32)
+                metal_lengths = lengths.to(torch.int32)
+            sparse = None
+            if selected_count is not None:
+                positions, query_order = torch.cat((
+                    offsets[:-1], destination[-selected_count:],
+                )).sort()
+                real = (query_order >= len(lengths)) & \
+                    (query_order < len(lengths) + selected_count)
+                query_counts = torch.bincount(sequence[positions], minlength=len(lengths))
+                query_offsets = torch.cat((query_counts.new_zeros(1), query_counts.cumsum(0)))
+                sparse = positions, real, query_offsets, torch.argsort(query_order[real])
+            if flash and self.training and torch.is_grad_enabled():
+                self._sequence_layouts.append((
+                    order, inverse, selected, counts, lengths, offsets, destination, sequence,
+                    block_rows, block_starts, metal_offsets, metal_lengths, sparse,
+                ))
+        if values.device.type == "mps" and self.width // self.heads in (16, 32):
+            total = len(sequence)
+            current = values.new_zeros((total, self.width))
+            current[offsets[:groups]] = seed.to(current.dtype)
+            current[destination] = values.to(current.dtype)
             for layer_index, layer in enumerate(transformer.layers):
-                if selected is not None and layer_index == len(transformer.layers) - 1:
-                    parts = [offsets[:-1], destination[selected]]
-                    if query_extra:
-                        dummy_counts = lengths[groups:] - 1
-                        starts = torch.repeat_interleave(offsets[groups:-1] + 1, dummy_counts)
-                        position = torch.arange(extra, device=values.device) \
-                            - torch.repeat_interleave(dummy_counts.cumsum(0) - dummy_counts,
-                                                     dummy_counts)
-                        parts.append((starts + position)[:query_extra])
-                    positions, query_order = torch.cat(parts).sort()
-                    real = (query_order >= len(lengths)) & \
-                        (query_order < len(lengths) + selected_count)
-                    query_counts = torch.bincount(sequence[positions], minlength=len(lengths))
-                    query_offsets = torch.cat((query_counts.new_zeros(1), query_counts.cumsum(0)))
-                    qkv = nn.functional.linear(
+                if selected_count is not None and layer_index == len(transformer.layers) - 1:
+                    positions, real, query_offsets, item_order = sparse
+                    qkv = _norm_linear(
+                        current, layer.norm1, layer.self_attn.in_proj_weight,
+                        layer.self_attn.in_proj_bias,
+                    ) if flash else nn.functional.linear(
                         layer.norm1(current), layer.self_attn.in_proj_weight,
                         layer.self_attn.in_proj_bias,
                     )
@@ -964,24 +1960,44 @@ class Agent(nn.Module):
                         layer.self_attn.num_heads, positions.to(torch.int32),
                         query_offsets.to(torch.int32), True,
                     )
-                    current = current[positions] + layer.self_attn.out_proj(attended)
-                    current = current + layer.linear2(layer.activation(layer.linear1(layer.norm2(current))))
+                    current = _residual_linear(
+                        attended, layer.self_attn.out_proj, current[positions],
+                    )
+                    current = _residual_linear(
+                        layer.activation(_norm_linear(
+                            current, layer.norm2, layer.linear1.weight, layer.linear1.bias,
+                        )),
+                        layer.linear2, current,
+                    )
                     state = current[query_offsets[:groups]]
-                    items = current[real][torch.argsort(order[selected])]
+                    items = current[real][item_order]
                     return state, items
-                qkv = nn.functional.linear(
+                qkv = _norm_linear(
+                    current, layer.norm1, layer.self_attn.in_proj_weight,
+                    layer.self_attn.in_proj_bias,
+                ) if flash else nn.functional.linear(
                     layer.norm1(current), layer.self_attn.in_proj_weight,
                     layer.self_attn.in_proj_bias,
                 )
-                attended = _RaggedAttention.apply(
+                attended = _FlashAttention.apply(
+                    qkv, metal_offsets, metal_lengths, block_rows, block_starts,
+                ) if flash else _RaggedAttention.apply(
                     qkv, offsets.to(torch.int32), sequence.to(torch.int32),
                     layer.self_attn.num_heads, sequence.to(torch.int32), offsets.to(torch.int32),
                     False,
                 )
-                current = current + layer.self_attn.out_proj(attended)
-                current = current + layer.linear2(layer.activation(layer.linear1(layer.norm2(current))))
-            items = current[destination][inverse] if len(values) else values
+                current = _residual_linear(attended, layer.self_attn.out_proj, current)
+                current = _residual_linear(
+                    layer.activation(_norm_linear(
+                        current, layer.norm2, layer.linear1.weight, layer.linear1.bias,
+                    )),
+                    layer.linear2, current,
+                )
+            items = current[destination] if len(values) else values
             return current[offsets[:groups]], items
+        values = values[order]
+        selected = (torch.arange(len(values), device=values.device)
+                    >= len(values) - selected_count)[order] if selected_count is not None else None
         maximum = int(counts.max().item()) if len(counts) else 0
         sequence = values.new_zeros((groups, maximum + 1, self.width))
         sequence[:, 0] = seed.to(values.dtype)
@@ -999,25 +2015,11 @@ class Agent(nn.Module):
     def _summarize(self, values, group, groups, name, mode, transformer_name=None):
         seed = self.summary_seed[name]
         if mode == "sum":
-            summary = values.new_zeros((groups, self.width))
-            if len(values):
-                summary.index_add_(0, group, values.to(summary.dtype))
-        elif mode == "gru":
-            values, group = self._ordered(values, group)
-            counts = torch.bincount(group, minlength=groups)
-            maximum = int(counts.max().item()) if len(counts) else 0
-            padded = values.new_zeros((groups, maximum, self.width))
-            if len(values):
-                starts = torch.repeat_interleave(counts.cumsum(0) - counts, counts)
-                position = torch.arange(len(values), device=values.device) - starts
-                padded[group, position] = values
-                output, _ = self.continuation_gru(padded)
-                present = (counts > 0).nonzero().squeeze(1)
-                summary = values.new_zeros((groups, self.width)).index_copy(
-                    0, present, output[present, counts[present] - 1],
+            summary = _GroupSum.apply(values, group, groups) \
+                if values.device.type == "mps" and len(values) else \
+                values.new_zeros((groups, self.width)).index_add_(
+                    0, group, values.to(torch.float32),
                 )
-            else:
-                summary = values.new_zeros((groups, self.width))
         else:
             summary, _ = self._sequence(values, group, groups, seed,
                                         self.pool_transformers[transformer_name or name])
@@ -1032,72 +2034,55 @@ class Agent(nn.Module):
                                   name, mode)
         return self._tag(summary[active], 14, collection), active
 
-    def _actors(self, domains, encoded, batch, concepts):
+    def _actors(self, domains, encoded, batch, concepts, plan):
+        order, player_source, player_group, move_raw, move_order, move_packed_order, \
+            move_present, move_batch_sizes, effect_plans, families = plan
         actors, rows, u = self._domain_rows(domains, encoded, DOMAIN["actor"])
         if not len(actors):
             return actors, rows, u, [], []
-        order = torch.argsort(rows * (1 << 20) + u[:, 0], stable=True)
         actors, rows, u = actors[order], rows[order], u[order]
-        keys = rows * (1 << 20) + u[:, 0]
 
-        history, history_rows, history_u = self._domain_rows(domains, encoded, DOMAIN["history"])
+        history, _history_rows, _history_u = self._domain_rows(
+            domains, encoded, DOMAIN["history"],
+        )
         if len(history):
-            history_keys = history_rows * (1 << 20) + history_u[:, 0]
-            group = torch.searchsorted(keys, history_keys)
-            valid = group < len(keys)
-            valid &= keys[group.clamp_max(len(keys) - 1)] == history_keys
-            player = valid & (history_u[:, 1] == 0)
-            if player.any():
-                actors = actors.index_add(0, group[player], history[player].to(actors.dtype))
-            moves = valid & (history_u[:, 1] == 1)
-            if moves.any():
-                history_semantic, _numeric, _count, _u, _row, _scope, history_inverse = \
+            if len(player_source):
+                actors = actors.index_add(
+                    0, player_group, history[player_source].to(actors.dtype),
+                )
+            if len(move_raw):
+                history_semantic, _numeric, _count, _u, _row, _scope, history_inverse, *_ = \
                     domains[DOMAIN["history"]]
-                raw = (domains[DOMAIN["history"]][5] == -1).nonzero().squeeze(1)[moves]
                 move_values = nn.functional.embedding(
-                    history_semantic[history_inverse[raw], :1].long(), concepts,
-                ).squeeze(1)
-                move_values, move_group = self._ordered(move_values, group[moves])
-                counts = torch.bincount(move_group, minlength=len(actors))
-                maximum = int(counts.max().item())
-                padded = move_values.new_zeros((len(actors), maximum, self.width))
-                starts = torch.repeat_interleave(counts.cumsum(0) - counts, counts)
-                position = torch.arange(len(move_values), device=move_values.device) - starts
-                padded[move_group, position] = move_values
-                output, _ = self.move_gru(padded)
-                present = (counts > 0).nonzero().squeeze(1)
+                    history_semantic[history_inverse[move_raw], :1].long(), concepts,
+                ).squeeze(1)[move_order]
+                packed = nn.utils.rnn.PackedSequence(
+                    move_values[move_packed_order], torch.tensor(move_batch_sizes),
+                )
+                _, output = self.move_gru(packed)
                 move = move_values.new_zeros((len(actors), self.width)).index_copy(
-                    0, present, output[present, counts[present] - 1],
+                    0, move_present, output[0],
                 )
                 actors = actors + move
 
-        effect_values, effect_groups = [], []
-        for domain in (DOMAIN["power"], DOMAIN["status"]):
-            values, effect_rows, effect_u = self._domain_rows(domains, encoded, domain)
-            if not len(values):
-                continue
-            effect_keys = effect_rows * (1 << 20) + effect_u[:, 0]
-            group = torch.searchsorted(keys, effect_keys)
-            valid = group < len(keys)
-            valid &= keys[group.clamp_max(len(keys) - 1)] == effect_keys
-            effect_values.append(values[valid])
-            effect_groups.append(group[valid])
+        effect_values = []
+        for domain, source in zip(
+            (DOMAIN["power"], DOMAIN["status"]), effect_plans,
+        ):
+            values, _effect_rows, _effect_u = self._domain_rows(domains, encoded, domain)
+            effect_values.append(values[source])
         effects = torch.cat(effect_values) if effect_values else actors.new_empty((0, self.width))
-        effect_group = torch.cat(effect_groups) if effect_groups else rows.new_empty(0)
         extra_values, extra_rows = [], []
-        for name, family in (("friendly_effect", u[:, 1] < 2), ("enemy_effect", u[:, 1] == 2)):
-            actor_index = family.nonzero().squeeze(1)
+        for name, (actor_index, effect_source, effect_actor, local_group) in zip(
+            ("friendly_effect", "enemy_effect"), families,
+        ):
             if not len(actor_index):
                 continue
-            lookup = rows.new_full((len(actors),), -1)
-            lookup[actor_index] = torch.arange(len(actor_index), device=rows.device)
-            selected = lookup[effect_group] >= 0 if len(effect_group) else effect_group.bool()
-            values = effects[selected]
-            local_group = lookup[effect_group[selected]]
+            values = effects[effect_source]
             mode = self.pooling[name]
             if mode == "global_tokens":
                 extra_values.append(self._tag(values, 10, 8 + (name == "enemy_effect")))
-                extra_rows.append(rows[effect_group[selected]])
+                extra_rows.append(rows[effect_actor])
                 continue
             pooled_mode = "transformer" if mode.startswith("transformer") else "sum"
             summary = self._summarize(values, local_group, len(actor_index), name, pooled_mode)
@@ -1111,40 +2096,46 @@ class Agent(nn.Module):
 
     def _actions(self, domains, encoded, values, index, nodes, concepts):
         semantic, numeric = values
-        action_row, action_flat, _legal, policy_sequence, actions, path, action_count = index
+        action_row, action_flat, _legal, policy_sequence, actions, path, action_count, \
+            attachment_rows, *_ = index
         action = self.action_encoder(semantic, numeric, concepts)[:action_count]
-        attached = action.new_zeros(action.shape)
-        for domain in range(len(TOKEN_SPECS)):
-            _semantic, _numeric, _count, _u, _row, scope, inverse = domains[domain]
-            selected = (scope >= 0).nonzero().squeeze(1)
-            if len(selected):
-                attached.index_add_(0, scope[selected], encoded[domain][inverse[selected]].to(attached.dtype))
-        present = path[:action_count] >= 0
-        if present.any():
-            attached[present] += nodes[path[:action_count][present]]
+        if action.device.type == "mps":
+            arguments = tuple(value for domain, row in zip(encoded, domains) if len(row[9])
+                              for value in (domain, row[6][row[9]]))
+            attached = _ActionAttachments.apply(
+                nodes, path[:action_count], attachment_rows, *arguments,
+            )
+        else:
+            attached = action.new_zeros(action.shape)
+            values = [encoded[domain][row[6][row[9]]] for domain, row in enumerate(domains)
+                      if len(row[9])]
+            if values:
+                attached.index_add_(0, attachment_rows, torch.cat(values).to(attached.dtype))
+            present = path[:action_count] >= 0
+            if present.any():
+                attached[present] += nodes[path[:action_count][present]]
         action = self.action_norm(self._tag(action + attached, 13))
         return action, action_row[:action_count], action_flat[:action_count], actions, policy_sequence
 
-    def _continuations(self, domains, encoded):
+    def _continuations(self, domains, encoded, plan):
         values, rows, u = self._domain_rows(domains, encoded, DOMAIN["continuation"])
         if not len(values):
-            return values, rows
-        order = torch.argsort(rows * (1 << 32) + u[:, 8], stable=True)
-        values, rows, u = values[order], rows[order], u[order]
-        keys = rows * (1 << 32) + u[:, 2]
-        first = torch.ones(len(keys), dtype=torch.bool, device=keys.device)
-        first[1:] = keys[1:] != keys[:-1]
-        group = first.cumsum(0) - 1
-        items = values.new_zeros((int(group[-1]) + 1, self.width))
-        items.index_add_(0, group, values)
-        return items, rows[first]
+            return values, rows, plan[3:]
+        order, group, item_rows, groups, *_ = plan
+        items = values.new_zeros((groups, self.width))
+        items.index_add_(0, group, values[order])
+        return items, item_rows, plan[3:]
 
-    def encode_state(self, domains, encoded, index, action_values, action_index, concepts):
-        batch = int(domains[DOMAIN["run"]][4].max().item()) + 1
+    def encode_state(self, domains, encoded, index, action_values, action_index, concepts, batch):
+        synchronize = torch.mps.synchronize if concepts.device.type == "mps" \
+            and self.training and torch.is_grad_enabled() else lambda: None
+        filters, actor_plan, continuation_plan = action_index[8:]
         current, nodes = self.encode_map(encoded, index)
+        synchronize()
         action, action_rows, action_flat, actions, policy_sequence = self._actions(
             domains, encoded, action_values, action_index, nodes, concepts,
         )
+        synchronize()
         values, rows = [], []
         add = lambda value, row: (values.append(value), rows.append(row))
 
@@ -1162,40 +2153,55 @@ class Agent(nn.Module):
                                 "phase", self.pooling["phase"])
         add(self._tag(phase, 2), torch.arange(batch, device=phase.device))
         add(self._tag(current, 3), torch.arange(batch, device=current.device))
+        synchronize()
 
         pool_specs = (
-            ("card_pool", DOMAIN["card"], lambda u: u[:, 0] == 13),
-            ("relic_pool", DOMAIN["relic"], lambda u: (u[:, 0] == 1) | (u[:, 0] == 2)),
-            ("encounter_pool", DOMAIN["encounter"], lambda u: u[:, 0] <= 2),
-            ("event_pool", DOMAIN["event"], lambda u: u[:, 0] == 0),
+            ("card_pool", DOMAIN["card"], 0),
+            ("relic_pool", DOMAIN["relic"], 1),
+            ("encounter_pool", DOMAIN["encounter"], 2),
+            ("event_pool", DOMAIN["event"], 3),
         )
-        for name, domain, predicate in pool_specs:
-            item, item_rows, _ = self._domain_rows(domains, encoded, domain, predicate)
-            summary = self._summarize(
-                item, item_rows, batch, name, self.pooling["generation_pool"],
-                transformer_name="generation_pool",
-            )
+        for name, domain, filtered in pool_specs:
+            source = filters[filtered]
+            if encoded[domain].device.type == "mps" and self.pooling["generation_pool"] == "sum":
+                item_rows = domains[domain][4][source]
+                summary = _IndexedGroupSum.apply(
+                    encoded[domain], domains[domain][6][source], item_rows, batch,
+                )
+            else:
+                item, item_rows, _ = self._domain_rows(
+                    domains, encoded, domain, source=source,
+                )
+                summary = self._summarize(
+                    item, item_rows, batch, name, self.pooling["generation_pool"],
+                    transformer_name="generation_pool",
+                )
             role = ("card_pool", "relic_pool", "encounter_pool", "event_pool").index(name) + 4
             add(self._tag(summary, role), torch.arange(batch, device=summary.device))
+        synchronize()
 
         actors, actor_rows, actor_u, effect_values, effect_rows = self._actors(
-            domains, encoded, batch, concepts,
+            domains, encoded, batch, concepts, actor_plan,
         )
+        synchronize()
         combat_rows = actor_rows[actor_u[:, 1] == 0]
-        for name, domain, predicate, active in (
-            ("deck", DOMAIN["card"], lambda u: u[:, 0] == 0, torch.arange(batch, device=run.device)),
-            ("hand", DOMAIN["card"], lambda u: u[:, 0] == 1, combat_rows),
-            ("draw", DOMAIN["card"], lambda u: u[:, 0] == 2, combat_rows),
-            ("discard", DOMAIN["card"], lambda u: u[:, 0] == 3, combat_rows),
-            ("exhaust", DOMAIN["card"], lambda u: u[:, 0] == 4, combat_rows),
-            ("relic", DOMAIN["relic"], lambda u: u[:, 0] == 0, torch.arange(batch, device=run.device)),
-            ("potion", DOMAIN["potion"], lambda u: u[:, 0] == 0, torch.arange(batch, device=run.device)),
+        for name, domain, filtered, active in (
+            ("deck", DOMAIN["card"], 4, torch.arange(batch, device=run.device)),
+            ("hand", DOMAIN["card"], 5, combat_rows),
+            ("draw", DOMAIN["card"], 6, combat_rows),
+            ("discard", DOMAIN["card"], 7, combat_rows),
+            ("exhaust", DOMAIN["card"], 8, combat_rows),
+            ("relic", DOMAIN["relic"], 9, torch.arange(batch, device=run.device)),
+            ("potion", DOMAIN["potion"], 10, torch.arange(batch, device=run.device)),
             ("orb", DOMAIN["orb"], None, combat_rows),
         ):
-            item, item_rows, item_u = self._domain_rows(domains, encoded, domain, predicate)
+            item, item_rows, item_u = self._domain_rows(
+                domains, encoded, domain,
+                source=None if filtered is None else filters[filtered],
+            )
             if name == "relic" and len(item):
                 stored, stored_rows, _ = self._domain_rows(
-                    domains, encoded, DOMAIN["card"], lambda u: u[:, 0] == 8,
+                    domains, encoded, DOMAIN["card"], source=filters[11],
                 )
                 payload = item.new_zeros((batch, self.width))
                 if len(stored):
@@ -1206,11 +2212,46 @@ class Agent(nn.Module):
             add(item, item_rows)
         add(actors, actor_rows)
         values.extend(effect_values); rows.extend(effect_rows)
+        synchronize()
 
-        continuation, continuation_rows = self._continuations(domains, encoded)
+        continuation, continuation_rows, continuation_gru = self._continuations(
+            domains, encoded, continuation_plan,
+        )
         mode = self.pooling["continuation"]
         if mode == "global_tokens":
             add(self._tag(continuation, 11, 10), continuation_rows)
+        elif mode == "gru":
+            _groups, maximum, position, present, last = continuation_gru
+            padded = continuation.new_zeros((batch, maximum, self.width))
+            if len(continuation):
+                padded[continuation_rows, position] = continuation
+                if maximum == 1 and continuation.device.type == "mps" \
+                        and torch.is_autocast_enabled("mps"):
+                    gates = _FastLinear.apply(
+                        padded[:, 0], self.continuation_gru.weight_ih_l0,
+                        self.continuation_gru.bias_ih_l0,
+                    ).float()
+                    reset, update, candidate = gates.chunk(3, 1)
+                    hidden_reset, hidden_update, hidden_candidate = \
+                        self.continuation_gru.bias_hh_l0.chunk(3)
+                    reset = torch.sigmoid(reset + hidden_reset)
+                    update = torch.sigmoid(update + hidden_update)
+                    output = (1 - update) * torch.tanh(
+                        candidate + reset * hidden_candidate
+                        + self.continuation_gru.weight_hh_l0[0, 0] * 0
+                    )
+                    summary = continuation.new_zeros((batch, self.width)).index_copy(
+                        0, present, output[present],
+                    )
+                else:
+                    output, _ = self.continuation_gru(padded)
+                    summary = continuation.new_zeros((batch, self.width)).index_copy(
+                        0, present, output[present, last],
+                    )
+            else:
+                summary = continuation.new_zeros((batch, self.width))
+            add(self._tag(summary, 14, 10),
+                torch.arange(batch, device=run.device))
         else:
             add(self._tag(self._summarize(
                     continuation, continuation_rows, batch, "continuation", mode), 14, 10),
@@ -1218,6 +2259,7 @@ class Agent(nn.Module):
         crystal, crystal_rows, _ = self._domain_rows(domains, encoded, DOMAIN["crystal"])
         add(self._tag(crystal, 12), crystal_rows)
         add(action, action_rows)
+        synchronize()
 
         values = torch.cat(values)
         rows = torch.cat(rows)
@@ -1226,20 +2268,30 @@ class Agent(nn.Module):
             values, rows, batch, self.concepts.local("token_role", 0), self.global_transformer,
             len(action),
         )
-        transformed = self.global_norm(transformed)
-        action = transformed if len(action) else action
-        return self.global_norm(state), action, action_rows, action_flat, actions, policy_sequence
+        synchronize()
+        return state, transformed if len(action) else action, \
+            action_rows, action_flat, actions, policy_sequence
 
-    def forward(self, _character, _globals, domains, state_index, action_values, action_index,
+    def forward(self, character, _globals, domains, state_index, action_values, action_index,
                 return_state=False, policy_only=False, flat_policy=False, temperature=1):
+        synchronize = torch.mps.synchronize if domains[0][0].device.type == "mps" \
+            and self.training and torch.is_grad_enabled() else lambda: None
+        synchronize()
+        if self.training and torch.is_grad_enabled():
+            self._sequence_layouts.clear()
+        if self._reuse_sequence_layouts:
+            self._sequence_layout_index = 0
         concepts = self.concepts.flattened()
         encoded = self.encode_domains(domains, concepts)
+        synchronize()
         state, action, action_row, action_flat, actions, sequence = self.encode_state(
-            domains, encoded, state_index, action_values, action_index, concepts,
+            domains, encoded, state_index, action_values, action_index, concepts, len(character),
         )
-        scores = self.policy(action).squeeze(-1) / temperature
+        synchronize()
+        scores = _norm_head(action, self.global_norm, self.policy) / temperature
         legal = torch.ones_like(scores, dtype=torch.bool)
         scores = self.group_log_softmax(scores, legal, sequence)
+        synchronize()
         if flat_policy:
             policy = scores
         else:
@@ -1248,8 +2300,9 @@ class Agent(nn.Module):
             ).reshape(len(state), actions)
         if policy_only:
             return policy
-        output = policy, self.critic(state)
-        return (*output, state) if return_state else output
+        output = policy, _norm_head(state, self.global_norm, self.critic)[:, None]
+        synchronize()
+        return (*output, self.global_norm(state)) if return_state else output
 
 
 def architecture(model):
@@ -1335,8 +2388,10 @@ def critic_win_probability(value):
 
 
 def critic_explained_reward_variance(predictions, targets, floors=None):
-    prediction = predictions.float().detach().cpu().numpy()
-    target = targets.float().detach().cpu().numpy()
+    prediction = predictions.float().detach().cpu().numpy() \
+        if torch.is_tensor(predictions) else np.asarray(predictions, np.float32)
+    target = targets.float().detach().cpu().numpy() \
+        if torch.is_tensor(targets) else np.asarray(targets, np.float32)
     def explained(mask=slice(None)):
         variance = target[mask].var()
         value = float(1 - (target[mask] - prediction[mask]).var() / variance) \
@@ -1432,6 +2487,8 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
     globals_ = np.asarray(globals_, np.float32)
     if globals_.shape != (batch, model.layout["globals"]) or not np.isfinite(globals_).all():
         raise ValueError("invalid public globals")
+    unique_rows = [domain[6:] if len(domain) == 8 else None for domain in domains]
+    domains = [domain[:6] for domain in domains]
     pad = model.training and model.global_norm.weight.device.type == "mps"
     bucket = lambda count: 0 if not count else min(
         size for power in range(max(1, (count - 1).bit_length()), 64)
@@ -1440,10 +2497,14 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
     tensor = lambda value: torch.as_tensor(value, dtype=torch.long, device=target)
     domain_tensors = []
     inverse_rows = []
-    for (name, *_), (u, _s, semantic, numeric, row, scope) in zip(TOKEN_SPECS, domains):
+    for (name, *_), (u, _s, semantic, numeric, row, scope), unique in zip(
+        TOKEN_SPECS, domains, unique_rows,
+    ):
         if semantic.max(initial=0) >= model.concepts.num_embeddings:
             raise ValueError(f"invalid {name} semantic id")
-        if len(semantic):
+        if unique is not None:
+            first, inverse = unique
+        elif len(semantic):
             first, inverse = map(np.asarray, sts2_sim.unique_feature_rows(
                 semantic, numeric.view(np.uint32),
             ))
@@ -1462,6 +2523,8 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
             torch.as_tensor(row.astype(np.int64), device=target),
             torch.as_tensor(scope.astype(np.int64), device=target),
             torch.as_tensor(inverse.astype(np.int64), device=target),
+            *(torch.as_tensor(np.flatnonzero(predicate), device=target)
+              for predicate in (scope == -1, scope == -2, scope >= 0)),
         ))
         inverse_rows.append(inverse)
     domain_tensors = tuple(domain_tensors)
@@ -1596,9 +2659,111 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
         raise ValueError("path candidate references missing node")
     action_flat = action_row * actions + action_position
     action_legal = legal[action_row, action_position]
+    def filtered(domain, predicate):
+        u, *_values, scope = domains[domain]
+        return tensor(np.flatnonzero((scope == -1) & predicate(u[:, 0])))
+    filters = (
+        filtered(DOMAIN["card"], lambda value: value == 13),
+        filtered(DOMAIN["relic"], lambda value: (value == 1) | (value == 2)),
+        filtered(DOMAIN["encounter"], lambda value: value <= 2),
+        filtered(DOMAIN["event"], lambda value: value == 0),
+        *(filtered(DOMAIN["card"], lambda value, kind=kind: value == kind)
+          for kind in range(5)),
+        filtered(DOMAIN["relic"], lambda value: value == 0),
+        filtered(DOMAIN["potion"], lambda value: value == 0),
+        filtered(DOMAIN["card"], lambda value: value == 8),
+    )
+    actor_u, _s, _c, _f, actor_row, actor_scope = domains[DOMAIN["actor"]]
+    actor_source = np.flatnonzero(actor_scope == -1)
+    actor_order = np.argsort(
+        actor_row[actor_source].astype(np.int64) * (1 << 20) + actor_u[actor_source, 0],
+        kind="stable",
+    )
+    actor_source = actor_source[actor_order]
+    actor_keys = actor_row[actor_source].astype(np.int64) * (1 << 20) + actor_u[actor_source, 0]
+    history_u, _s, _c, _f, history_row, history_scope = domains[DOMAIN["history"]]
+    history_source = np.flatnonzero(history_scope == -1)
+    history_keys = history_row[history_source].astype(np.int64) * (1 << 20) \
+        + history_u[history_source, 0]
+    history_group = np.searchsorted(actor_keys, history_keys)
+    history_valid = history_group < len(actor_keys)
+    history_valid &= actor_keys[np.minimum(history_group, max(0, len(actor_keys) - 1))] \
+        == history_keys if len(actor_keys) else False
+    player_source = np.flatnonzero(history_valid & (history_u[history_source, 1] == 0))
+    move_source = np.flatnonzero(history_valid & (history_u[history_source, 1] == 1))
+    move_order = np.argsort(history_group[move_source], kind="stable")
+    move_group = history_group[move_source][move_order]
+    move_counts = np.bincount(move_group, minlength=len(actor_source))
+    move_present = np.flatnonzero(move_counts)
+    compact_move_group = np.repeat(np.arange(len(move_present)), move_counts[move_present])
+    move_position = np.arange(len(compact_move_group)) \
+        - np.repeat(np.cumsum(move_counts) - move_counts, move_counts)
+    length_order = np.argsort(-move_counts[move_present], kind="stable")
+    length_inverse = np.empty_like(length_order)
+    length_inverse[length_order] = np.arange(len(length_order))
+    compact_move_group = length_inverse[compact_move_group]
+    move_present = move_present[length_order]
+    move_packed_order = np.lexsort((compact_move_group, move_position))
+    move_batch_sizes = tuple(int((move_counts[move_present] > index).sum())
+                             for index in range(move_counts.max(initial=0)))
+    effect_plans = []
+    effect_groups = []
+    for domain in (DOMAIN["power"], DOMAIN["status"]):
+        effect_u, _s, _c, _f, effect_row, effect_scope = domains[domain]
+        effect_source = np.flatnonzero(effect_scope == -1)
+        effect_keys = effect_row[effect_source].astype(np.int64) * (1 << 20) \
+            + effect_u[effect_source, 0]
+        group = np.searchsorted(actor_keys, effect_keys)
+        valid = group < len(actor_keys)
+        valid &= actor_keys[np.minimum(group, max(0, len(actor_keys) - 1))] == effect_keys \
+            if len(actor_keys) else False
+        source = np.flatnonzero(valid)
+        effect_plans.append(tensor(source))
+        effect_groups.append(group[source])
+    effect_groups = np.concatenate(effect_groups)
+    families = []
+    for family in (actor_u[actor_source, 1] < 2, actor_u[actor_source, 1] == 2):
+        actor_index = np.flatnonzero(family)
+        lookup = np.full(len(actor_source), -1, np.int64)
+        lookup[actor_index] = np.arange(len(actor_index))
+        selected = lookup[effect_groups] >= 0
+        effect_source = np.flatnonzero(selected)
+        effect_actor = effect_groups[selected]
+        families.append((
+            tensor(actor_index), tensor(effect_source), tensor(effect_actor),
+            tensor(lookup[effect_actor]),
+        ))
+    actor_plan = (
+        tensor(actor_order), tensor(player_source), tensor(history_group[player_source]),
+        tensor(history_source[move_source]), tensor(move_order), tensor(move_packed_order),
+        tensor(move_present), move_batch_sizes, tuple(effect_plans), tuple(families),
+    )
+    continuation_u, _s, _c, _f, continuation_row, continuation_scope = \
+        domains[DOMAIN["continuation"]]
+    continuation_source = np.flatnonzero(continuation_scope == -1)
+    continuation_order = np.argsort(
+        continuation_row[continuation_source].astype(np.int64) * (1 << 32)
+        + continuation_u[continuation_source, 8], kind="stable",
+    )
+    ordered_rows = continuation_row[continuation_source][continuation_order]
+    ordered_u = continuation_u[continuation_source][continuation_order]
+    keys = ordered_rows.astype(np.int64) * (1 << 32) + ordered_u[:, 2]
+    first = np.r_[True, keys[1:] != keys[:-1]] if len(keys) else np.empty(0, bool)
+    group = np.cumsum(first) - 1
+    item_rows = ordered_rows[first]
+    counts = np.bincount(item_rows, minlength=batch)
+    present = np.flatnonzero(counts)
+    position = np.arange(len(item_rows)) - np.repeat(np.cumsum(counts) - counts, counts)
+    continuation_plan = (
+        tensor(continuation_order), tensor(group), tensor(item_rows), int(first.sum()),
+        int(counts.max(initial=0)), tensor(position), tensor(present),
+        tensor(counts[present] - 1),
+    )
     action_index = (
         tensor(action_row), tensor(action_flat), torch.as_tensor(action_legal, device=target),
         candidate_index(action_row, batch, target, True), actions, tensor(path), action_count,
+        tensor(np.concatenate([scope[scope >= 0] for *_values, scope in domains])),
+        filters, actor_plan, continuation_plan,
     )
     return (
         torch.as_tensor(character, dtype=torch.long, device=target),
