@@ -249,8 +249,7 @@ class RolloutCollector:
             }, "WARNING", role=f"sampler-{self.worker}")
 
     def collect(self, model, target, precision, deadline, steps, version,
-                stop=None,
-                heartbeat=None, progress=None):
+                stop=None, heartbeat=None, progress=None, sampling=None, paused=None):
         args = self.args
         native = model is None
         cache_start = dict.fromkeys(("card_hit", "card_miss", "graph_hit", "graph_miss"), 0) \
@@ -271,6 +270,14 @@ class RolloutCollector:
         expert_rows = []
         collect_seconds = 0.0
         for _ in range(steps):
+            while sampling is not None and not sampling.is_set():
+                paused[self.worker] = True
+                if heartbeat is not None:
+                    heartbeat[self.worker] = time.monotonic()
+                if stop.wait(.01):
+                    break
+            if paused is not None:
+                paused[self.worker] = False
             if time.monotonic() >= deadline or stop and stop.is_set():
                 break
             if heartbeat is not None:
@@ -490,7 +497,7 @@ class RolloutCollector:
 
     def run(self, model, models, samples, stop, deadline, budget, worker=0,
             heartbeat=None, progress=None, version=0, actor_revision=0, target=None,
-            precision="fp32"):
+            precision="fp32", sampling=None, paused=None):
         target = target or torch.device("cpu")
         produced = 0
         def empty():
@@ -535,7 +542,7 @@ class RolloutCollector:
                 break
             result = self.collect(
                 model, target, precision, deadline, steps, version, stop,
-                heartbeat, progress,
+                heartbeat, progress, sampling, paused,
             )
             if self.args.log_level == "DEBUG":
                 self.event(
@@ -614,7 +621,7 @@ class RolloutCollector:
 
 def collect_worker(model, args, sampler_session, stage, capacity, pending_capacity, iteration,
                    worker, generation, actor_revision, policy_revision, models, samples, stop,
-                   deadline, budget, results, heartbeat, progress, parent_pid):
+                   deadline, budget, results, heartbeat, progress, sampling, paused, parent_pid):
     if args.sampler_backend == "process":
         prctl = getattr(ctypes.CDLL(None), "prctl", None)
         if prctl is not None and prctl(1, signal.SIGKILL) == 0:
@@ -662,7 +669,7 @@ def collect_worker(model, args, sampler_session, stage, capacity, pending_capaci
     try:
         result = collector.run(
             model, models, samples, stop, deadline, budget, worker, heartbeat, progress,
-            policy_revision, actor_revision, target, precision,
+            policy_revision, actor_revision, target, precision, sampling, paused,
         )
         collector.event(
             "sampler_stop", policy_revision=result[2], iteration=result[3]["iteration"],

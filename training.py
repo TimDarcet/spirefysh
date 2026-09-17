@@ -15,6 +15,9 @@ from itertools import islice
 from pathlib import Path
 from queue import Empty, Full, Queue
 
+os.environ.setdefault("PYTORCH_MPS_PREFER_METAL", "1")
+os.environ.setdefault("PYTORCH_MPS_FAST_MATH", "1")
+
 import numpy as np
 import torch
 from torch import nn
@@ -79,7 +82,6 @@ def trust_region_step(model, optimizer, inputs, action, old, fresh, denominator,
         optimizer._trust_region_saved = cache
     else:
         torch._foreach_copy_(saved, parameters)
-
     def restore():
         with torch.no_grad():
             torch._foreach_copy_(parameters, saved)
@@ -97,6 +99,7 @@ def trust_region_step(model, optimizer, inputs, action, old, fresh, denominator,
                     state["step"].sub_(1)
 
     proposals = []
+    model._reuse_sequence_layouts = bool(model._sequence_layouts)
     try:
         optimizer.step()
         for attempt in range(attempts):
@@ -124,6 +127,9 @@ def trust_region_step(model, optimizer, inputs, action, old, fresh, denominator,
     except Exception:
         restore()
         raise
+    finally:
+        model._reuse_sequence_layouts = False
+        model._sequence_layouts.clear()
 
 
 def critic_only_step(model, optimizer, parameters=None):
@@ -530,6 +536,9 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
     results = queue_type(); stop = threading.Event() if threaded else context.Event()
     heartbeat = [started] * args.samplers if threaded else context.Array("d", [started] * args.samplers)
     progress = [0] * args.samplers if threaded else context.Array("q", [0] * args.samplers)
+    sampling = threading.Event() if threaded else context.Event()
+    paused = [False] * args.samplers if threaded else context.Array("b", args.samplers)
+    sampling.set()
     packer = ThreadPoolExecutor(max_workers=1)
     workers = [None] * args.samplers
     watchdog_terminated = set()
@@ -572,7 +581,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             actor, collector_args, sampler_session, stage,
             reservoir.capacity, pending_capacity, sampler_iterations[worker], worker,
             sampler_generations[worker], actor_revision, policy_version, models[worker], sample_source,
-            stop, deadline, budget, results, heartbeat, progress, os.getpid(),
+            stop, deadline, budget, results, heartbeat, progress, sampling, paused, os.getpid(),
         ), name=f"sampler-{worker}", daemon=True)
         workers[worker] = process
         process.start()
@@ -709,7 +718,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
 
     def prepare(rows):
         prepared = time.monotonic()
-        return unpack(rows, torch.device("cpu"), model, False), time.monotonic() - prepared
+        value = unpack(rows, torch.device("cpu"), model, False)
+        return value, time.monotonic() - prepared
 
     def prepare_cached(features):
         prepared = time.monotonic()
@@ -782,6 +792,37 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         )
     pending = []
     refill_ids = np.empty(0, np.int64)
+
+    def release_mps_cache(force=False):
+        if target.type != "mps":
+            return
+        periodic = args.mps_empty_cache_updates \
+            and revisions["weights_revision"] % args.mps_empty_cache_updates == 0
+        if force or periodic \
+                or torch.mps.driver_allocated_memory() > torch.mps.recommended_max_memory() * .75:
+            torch.mps.empty_cache()
+
+    def prefetch():
+        drain_samples()
+        if not pending and len(dataset) >= args.batch \
+                and base_decisions + handled < min(next_report, next_save):
+            pending.append(reserve_batch(args.batch))
+
+    def pause_samplers():
+        if target.type != "mps":
+            return
+        sampling.clear()
+        while not all(paused[worker] or sampler_exhausted[worker]
+                      or not workers[worker].is_alive() for worker in range(args.samplers)):
+            time.sleep(.001)
+
+    def resume_samplers():
+        if target.type == "mps":
+            torch.mps.synchronize()
+            sampling.set()
+            while any(paused):
+                time.sleep(.001)
+
     def drain_results():
         while True:
             try:
@@ -1014,6 +1055,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             assert len(rows) == args.batch
             revisions["update_attempt"] += 1
             unpack_started = time.monotonic()
+            pause_samplers()
             cpu_inputs, _ = packed.result()
             inputs = upload(cpu_inputs, target)
             unpack_seconds = time.monotonic() - unpack_started
@@ -1048,12 +1090,13 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 raise RuntimeError("forced action entered the dataset")
             fresh = torch.ones_like(log_ratio, dtype=torch.bool) if args.critic_only \
                 else log_ratio.abs() <= args.max_log_ratio
-            invalid = ~fresh.detach().cpu().numpy()
-            if invalid.any():
+            if not bool(fresh.all()):
+                invalid = ~fresh.detach().cpu().numpy()
                 invalid = np.isin(values["trajectory"], values["trajectory"][invalid])
                 refill_ids = values["id"][~invalid]
                 ratio_rejected = dataset.discard_trajectories(values["trajectory"][invalid])
                 handled += ratio_rejected
+                prefetch()
                 update_elapsed = time.monotonic() - update_started
                 training_batch_event(
                     "ratio_rejected", "none", attempted_rows=len(rows),
@@ -1063,6 +1106,12 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     forward_seconds=forward_seconds, backward_seconds=0.,
                     total_seconds=update_elapsed,
                 )
+                all_logits = all_critic_logits = logits = expert_logits = critic_logits = None
+                log_ratio = fresh = None
+                inputs = None
+                model._sequence_layouts.clear()
+                release_mps_cache(True)
+                resume_samplers()
                 continue
             refill_ids = np.empty(0, np.int64)
             selected = np.asarray(selected, np.int64)
@@ -1070,26 +1119,18 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             dataset.discard(expired)
             ratio_rejected = 0
             handled += len(expired)
-            batch_policy_lags = (
-                revisions["policy_revision"] - values["version"][~invalid]
-            ).tolist()
+            batch_policy_lags = (revisions["policy_revision"] - values["version"]).tolist()
             lag_values, lag_counts = np.unique(batch_policy_lags, return_counts=True)
             policy_lag_counts = dict(zip(map(int, lag_values), map(int, lag_counts)))
-            mask = fresh.to(log_ratio.dtype)
-            fresh_count = mask.sum()
-            denominator = fresh_count.clamp_min(1)
-            safe_log_ratio = torch.where(fresh, log_ratio, torch.zeros_like(log_ratio))
-            ratio = safe_log_ratio.exp()
-            kl = ((ratio - 1 - safe_log_ratio) * mask).sum().div(denominator).detach()
-            clip_fraction = (((ratio - 1).abs() > args.clip).to(mask.dtype) * mask).sum() \
-                .div(denominator).detach()
-            fresh_cpu = fresh.detach().cpu().numpy()
-            fresh_rows = int(fresh_count)
+            denominator = fresh_rows = len(rows)
+            ratio = log_ratio.exp()
+            kl = (ratio - 1 - log_ratio).mean().detach()
+            clip_fraction = ((ratio - 1).abs() > args.clip).float().mean().detach()
+            fresh_cpu = slice(None)
             kl_value = float(kl)
             _, entropy_weight, _ = curriculum_weights(
                 stage, stage_decisions + handled, auxiliary_decisions + handled, args, progress_active
             )
-            assert fresh_rows == args.batch
             batch_target = torch.as_tensor(values["critic_target"][fresh_cpu], device=target)
             critic_weights = critic_balance.weights(
                 values["character"][fresh_cpu], values["phase"][fresh_cpu],
@@ -1100,9 +1141,11 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             squared_error = (prediction - batch_target).square()
             value_loss = (squared_error * critic_weights).mean()
             critic_loss = args.value_weight * value_loss
+            prediction_cpu = prediction.detach().cpu().numpy()
             explained_reward_variance, floor_conditioned_explained_reward_variance, \
                 explained_reward_variance_by_floor = critic_explained_reward_variance(
-                    prediction.detach(), batch_target, values["canonical"][fresh_cpu]
+                    prediction_cpu, values["critic_target"][fresh_cpu],
+                    values["canonical"][fresh_cpu],
                 )
             critic_parameters = tuple(model.critic.parameters())
             set_learning_rate(
@@ -1111,13 +1154,12 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             )
             if not args.critic_only and kl_value > args.target_kl:
                 handled += dataset.discard_trajectories(values["trajectory"][fresh_cpu])
+                prefetch()
                 backward_started = time.monotonic()
                 optimizer.zero_grad(set_to_none=True); critic_loss.backward(inputs=critic_parameters)
                 gradient_norm = critic_only_step(model, optimizer, critic_parameters)
                 revisions["weights_revision"] += 1
-                if (target.type == "mps" and args.mps_empty_cache_updates
-                        and revisions["weights_revision"] % args.mps_empty_cache_updates == 0):
-                    torch.mps.empty_cache()
+                release_mps_cache()
                 backward_seconds = time.monotonic() - backward_started
                 update_elapsed = time.monotonic() - update_started
                 training_batch_event(
@@ -1138,6 +1180,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     total_seconds=update_elapsed,
                 )
                 publish()
+                resume_samplers()
                 continue
             advantages = torch.as_tensor(values["advantage"], device=target)
             characters = torch.as_tensor(values["character"], device=target)
@@ -1151,10 +1194,10 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 batch_advantage = torch.where(
                     member, (advantages - mean) / (std + 1e-8), batch_advantage,
                 )
-            policy_loss = -(torch.minimum(
+            policy_loss = -torch.minimum(
                 ratio * batch_advantage,
                 ratio.clamp(1 - args.clip, 1 + args.clip) * batch_advantage,
-            ) * mask).sum() / denominator
+            ).mean()
             if flat_policy:
                 action_row = inputs[3] if cached else inputs[5][0][:len(logits)]
                 action_legal = 1 if cached else inputs[5][2][:len(logits)]
@@ -1163,7 +1206,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 )
             else:
                 entropy_by_row = -(logits.exp() * logits * legal).sum(1)
-            entropy = (entropy_by_row * mask).sum() / denominator
+            entropy = entropy_by_row.mean()
             expert_loss = logits.sum() * 0
             expert_count = len(expert_rows)
             if expert_count and args.expert_weight:
@@ -1219,6 +1262,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             replay_valid = valid_cpu = None
             replay_rejected_count = replay_count = 0
             winning_drift = 0.
+            winning_loss = replay_kl_mean = None
             if replay:
                 replay_start = len(rows) + len(expert_rows)
                 replay_logits = all_logits[replay_start:]
@@ -1232,7 +1276,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 replay_distribution = torch.distributions.Categorical(logits=replay_masked)
                 reference_distribution = torch.distributions.Categorical(logits=reference)
                 replay_kl = torch.distributions.kl_divergence(reference_distribution, replay_distribution)
-                replay_capacity = fresh_count.to(torch.int64) // 9
+                replay_capacity = fresh_rows // 9
                 replay_eligible = torch.arange(len(replay), device=target) < replay_capacity
                 replay_valid = replay_eligible & (replay_kl <= args.target_kl)
                 eligible = replay_eligible.cpu().numpy()
@@ -1256,9 +1300,11 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 winning_loss = -args.winning_loss_weight * (torch.minimum(
                     replay_ratio * replay_advantage,
                     replay_ratio.clamp(1 - args.clip, 1 + args.clip) * replay_advantage,
-                ) * replay_weight).sum() / replay_capacity.clamp_min(1)
+                ) * replay_weight).sum() / max(1, replay_capacity)
                 loss = loss + winning_loss
             backward_started = time.monotonic()
+            if args.critic_only or args.disable_post_kl_check or args.target_kl >= 1:
+                prefetch()
             optimizer.zero_grad(set_to_none=True); loss.backward()
             if args.critic_only:
                 gradient_norm = critic_only_step(model, optimizer)
@@ -1293,9 +1339,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 retry_critic_loss.backward(inputs=critic_parameters)
                 gradient_norm = critic_only_step(model, optimizer, critic_parameters)
                 revisions["weights_revision"] += 1
-                if (target.type == "mps" and args.mps_empty_cache_updates
-                        and revisions["weights_revision"] % args.mps_empty_cache_updates == 0):
-                    torch.mps.empty_cache()
+                release_mps_cache()
                 update_elapsed = time.monotonic() - update_started
                 backward_seconds = time.monotonic() - backward_started
                 training_batch_event(
@@ -1319,11 +1363,15 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     total_seconds=update_elapsed,
                 )
                 publish()
+                resume_samplers()
                 continue
             post_kl = proposals[-1] if proposals else kl_value
-            base_prediction = prediction.detach() + torch.as_tensor(
-                values["potential"][fresh_cpu], device=target
-            )
+            base_prediction = prediction_cpu + values["potential"][fresh_cpu]
+            expected = float(base_prediction.mean())
+            win_probability = float(np.clip(
+                (base_prediction - MAX_PROGRESS / (CATEGORIES - 1))
+                / (1 - MAX_PROGRESS / (CATEGORIES - 1)), 0, 1,
+            ).mean())
             trained += fresh_rows; updates += 1
             revisions["weights_revision"] += 1
             if not args.critic_only:
@@ -1337,9 +1385,6 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     winning_drift = float((
                         replay_log_probability.detach()[replay_valid] - behavior[replay_valid]
                     ).abs().mean())
-            if (target.type == "mps" and args.mps_empty_cache_updates
-                    and revisions["weights_revision"] % args.mps_empty_cache_updates == 0):
-                torch.mps.empty_cache()
             backward_seconds = time.monotonic() - backward_started
             update_elapsed = time.monotonic() - update_started
             training_batch_event(
@@ -1366,8 +1411,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 floor_conditioned_explained_reward_variance,
                 critic_explained_reward_variance_by_floor=explained_reward_variance_by_floor,
                 search_consistency_loss=float(search_consistency_loss.detach()),
-                critic_expected=float(base_prediction.mean()),
-                critic_win_probability=float(critic_win_probability(base_prediction).mean()),
+                critic_expected=expected, critic_win_probability=win_probability,
                 advantage_mean=float(np.mean(values["advantage"][fresh_cpu])),
                 advantage_stddev=float(np.std(values["advantage"][fresh_cpu])),
                 policy_lag_counts=policy_lag_counts,
@@ -1381,6 +1425,15 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             )
             if updates % args.publish_updates == 0:
                 publish()
+            loss = policy_loss = critic_loss = value_loss = prediction = squared_error = None
+            entropy = entropy_by_row = expert_loss = search_consistency_loss = None
+            ppo_head_grad = expert_head_grad = expert_ppo_grad_cosine = None
+            winning_loss = replay_kl_mean = None
+            logits = expert_logits = critic_logits = all_logits = all_critic_logits = None
+            log_ratio = ratio = batch_advantage = inputs = None
+            model._sequence_layouts.clear()
+            release_mps_cache()
+            resume_samplers()
             if update_elapsed > 5:
                 packed = rows + expert_rows + [sample[0] for sample in replay]
                 represented_actions = max(packed_action_count(row) for row in packed)
@@ -1405,6 +1458,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 if promotion_ready:
                     stop.set()
     finally:
+        sampling.set()
         stop.set()
         if watchdog.ident is not None:
             watchdog.join()
