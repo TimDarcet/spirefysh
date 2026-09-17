@@ -27,6 +27,7 @@ class TelemetryTest(unittest.TestCase):
         ])
         self.assertTrue(args.disable_post_kl_check)
         self.assertEqual(args.mps_empty_cache_updates, 8)
+        self.assertEqual(args.dataset_capacity, 131_072)
 
     def test_learning_rate_warmup_uses_global_weights_revision(self):
         optimizer = Namespace(param_groups=[
@@ -84,7 +85,8 @@ class TelemetryTest(unittest.TestCase):
                 {"event": "sample_packet", "time": 2, "step": 40, "stage": 0,
                  "packet_sampled_decisions": 80, "admitted_rows": 30,
                  "discarded_decisions": 5, "forced_rows": 3,
-                 "budget_excess_rows": 2, "collect_seconds": 2,
+                 "budget_excess_rows": 2, "capacity_dropped_rows": 4,
+                 "collect_seconds": 2,
                  "episodes": [{"character": 2, "floor": 12, "won": True,
                                "step_cap": False, "combat_cap": False,
                                "empty_actions": False, "length": 20,
@@ -135,6 +137,7 @@ class TelemetryTest(unittest.TestCase):
             self.assertEqual(metrics["dataset_rollout_dropped"], 3)
             self.assertEqual(metrics["dataset_budget_dropped"], 2)
             self.assertEqual(metrics["dataset_forced_dropped"], 3)
+            self.assertEqual(metrics["dataset_capacity_dropped"], 4)
             self.assertEqual(metrics["dataset_retired"], 4)
 
     def test_projector_tracks_policy_rejections(self):
@@ -261,6 +264,8 @@ class TelemetryTest(unittest.TestCase):
             self.assertIn("function clipComparison", html)
             self.assertIn("setFullRange([primary])", html)
             self.assertIn("compareSelect.onchange=()=>showVersion()", html)
+            self.assertIn("lineages=[...new Set(", html)
+            self.assertIn(".localeCompare(", html)
             self.assertIn("id=legend class=legend", html)
             self.assertIn("plotly_relayout", html)
             self.assertIn("showlegend:false", html)
@@ -399,7 +404,7 @@ class TelemetryTest(unittest.TestCase):
         self.assertEqual(limited.rows, [rows[1]])
         np.testing.assert_array_equal(limited.data["id"][:1], [1])
 
-    def test_policy_rejection_discards_trajectory(self):
+    def test_fifo_capacity_uses_arrival_order(self):
         def trajectory(versions):
             length = len(versions)
             return {
@@ -413,12 +418,24 @@ class TelemetryTest(unittest.TestCase):
             }
 
         dataset = train.ExperienceDataset()
-        dataset.add({"trajectories": [trajectory([0, 2, 2]), trajectory([2, 2])]},
+        dataset.add({"trajectories": [trajectory([9, 9, 9]), trajectory([0, 0])]},
                     Namespace(gae_gamma=1, gae_lambda=1))
         np.testing.assert_array_equal(dataset.data["trajectory"][:5], [0, 0, 0, 1, 1])
 
-        self.assertEqual(dataset.prune(2, 1), 3)
+        self.assertEqual(dataset.discard_ids([1]), 1)
+        self.assertEqual(dataset.trim(2), 2)
+        self.assertEqual(dataset.capacity_dropped, 2)
+        self.assertEqual(list(dataset.index), [3, 4])
         np.testing.assert_array_equal(dataset.data["trajectory"][:2], [1, 1])
+        np.testing.assert_array_equal(dataset.data["version"][:2], [0, 0])
+        np.testing.assert_array_equal(np.sort(dataset.data["id"][:2]), [3, 4])
+        np.testing.assert_array_equal(
+            np.sort(dataset.sample(2, np.random.default_rng(1), candidates=[0, 1])),
+            [0, 1],
+        )
+        np.testing.assert_array_equal(
+            dataset.sample(1, np.random.default_rng(1), True, candidates=[1]), [1],
+        )
         self.assertEqual(dataset.discard_trajectories([1]), 2)
         self.assertEqual(len(dataset), 0)
 

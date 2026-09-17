@@ -11,6 +11,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from itertools import islice
 from pathlib import Path
 from queue import Empty, Full, Queue
 
@@ -209,8 +210,10 @@ class ExperienceDataset:
             "trajectory": np.empty(0, np.int64),
         }
         self.next_id = self.next_trajectory = 0
+        self.index = {}
         self.capacity = 0
         self.seen = self.admitted = self.uses = self.retired = self.forced_dropped = 0
+        self.capacity_dropped = self.incomplete_dropped = 0
         self.stale_dropped = self.ratio_dropped = self.kl_dropped = self.post_kl_dropped = 0
 
     def __len__(self):
@@ -332,29 +335,34 @@ class ExperienceDataset:
             self.features.extend(row for row, keep in zip(features, selected) if keep)
         for key, value in data.items():
             self.data[key][size:required] = value[selected]
+        for index, row_id in enumerate(data["id"][selected], size):
+            self.index[int(row_id)] = index
         self.seen += accepted
         self.admitted += required - size
         forced = accepted - required + size
         self.forced_dropped += forced
         return accepted, forced, total - accepted
 
-    def prune(self, version, lag, limit=None):
-        stale = np.flatnonzero(self.data["version"][:len(self)] < version - lag)
-        if limit is not None:
-            stale = stale[:max(0, limit)]
-        dropped = self.discard_trajectories(self.data["trajectory"][stale])
-        self.stale_dropped += dropped
-        return dropped
+    def trim(self, capacity):
+        excess = max(0, len(self) - capacity)
+        if excess:
+            self.discard_ids(islice(self.index, excess))
+            self.capacity_dropped += excess
+        return excess
 
     def discard(self, indices):
         if not len(indices):
             return
         indices = np.unique(indices)
+        removed = self.data["id"][indices].copy()
         end = len(self) - len(indices)
         holes = indices[indices < end]
         sources = np.setdiff1d(np.arange(end, len(self)), indices, assume_unique=True)
+        for row_id in removed:
+            self.index.pop(int(row_id))
         for target, source in zip(holes, sources):
             self.rows[target] = self.rows[source]
+            self.index[int(self.data["id"][source])] = int(target)
         del self.rows[end:]
         if self.features:
             for target, source in zip(holes, sources):
@@ -364,7 +372,10 @@ class ExperienceDataset:
             values[holes] = values[sources]
 
     def discard_ids(self, ids):
-        indices = np.flatnonzero(np.isin(self.data["id"][:len(self)], ids))
+        indices = np.fromiter(
+            (self.index[int(row_id)] for row_id in ids if int(row_id) in self.index),
+            np.int64,
+        )
         self.discard(indices)
         return len(indices)
 
@@ -373,19 +384,21 @@ class ExperienceDataset:
         self.discard(indices)
         return len(indices)
 
-    def sample(self, size, rng, balanced=False):
-        size = min(size, len(self))
+    def sample(self, size, rng, balanced=False, candidates=None):
+        candidates = np.arange(len(self)) if candidates is None else np.asarray(candidates)
+        size = min(size, len(candidates))
         if balanced:
             pools = [list(rng.permutation(np.flatnonzero(
-                self.data["character"][:len(self)] == character)))
+                self.data["character"][candidates] == character)))
                      for character in range(5)]
+            pools = [[int(candidates[index]) for index in pool] for pool in pools]
             selected = []
             while len(selected) < size and any(pools):
                 for pool in pools:
                     if pool and len(selected) < size:
                         selected.append(pool.pop())
             return np.asarray(selected, np.int64)
-        return rng.choice(len(self), size, replace=False)
+        return rng.choice(candidates, size, replace=False)
 
     def use(self, indices, decay=3):
         self.uses += len(indices)
@@ -559,10 +572,11 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         f"{args.samplers} continuous CPU actor{'s' if args.samplers > 1 else ''} → "
         + (f"{args.segment_steps}-decision bootstrapped segments" if args.segment_steps
            else "complete terminal trajectories"),
-        "Bounded queue → trajectory-level policy-lag and action-ratio freshness filters",
+        "Bounded queue → trajectory-level action-ratio freshness filter",
         f"{'Character-balanced' if args.character_balanced else 'Uniform'} reusable rows; "
-        f"prefilter forced; stale/ratio-invalid rows reject their trajectory; "
-        f"priority -{args.priority_decay:g} per use",
+        f"prefilter forced; FIFO capacity {args.dataset_capacity} by arrival ID; "
+        f"ratio-invalid rows reject their trajectory; "
+        f"rejected batches refill to {args.batch} rows; priority -{args.priority_decay:g} per use",
         f"{model.layers}-layer global Transformer over state, entity, and action tokens → heads",
         f"Terminal progress shaped by phi=current floor + resource potential → "
         f"GAE γ={args.gae_gamma:g}, λ={args.gae_lambda:g}; "
@@ -732,9 +746,10 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         latest_sampler_version = min(sampler_versions)
         latest_sampler_iteration = max(sampler_iterations)
         added, excluded, excess = dataset.add(result, args, budget - decisions)
+        capacity_dropped = dataset.trim(args.dataset_capacity)
         expert_dataset.add(result.get("expert_rows", []))
         decisions += added
-        handled += excluded
+        handled += excluded + capacity_dropped
         forced += excluded
         if decisions >= budget:
             stop.set()
@@ -826,6 +841,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             "trajectory_rows": sum(len(row["rows"]) for row in result["trajectories"]),
             "accepted_rows": added, "admitted_rows": added - excluded,
             "forced_rows": excluded, "budget_excess_rows": excess,
+            "capacity_dropped_rows": capacity_dropped,
             "discarded_decisions": result["discarded_steps"] + excess,
             "expert_rows": len(result.get("expert_rows", ())),
             "winning_candidates": len(update["rows"]),
@@ -869,7 +885,16 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         return cached_tensors(features, model.width), time.monotonic() - prepared
 
     def reserve_batch(size):
-        selected = dataset.sample(size, rng, args.character_balanced)
+        if len(refill_ids):
+            ids = dataset.data["id"][:len(dataset)]
+            retained = np.isin(ids, refill_ids)
+            kept = np.flatnonzero(retained)
+            selected = np.concatenate((kept, dataset.sample(
+                size - len(kept), rng, args.character_balanced,
+                np.flatnonzero(~retained),
+            )))
+        else:
+            selected = dataset.sample(size, rng, args.character_balanced)
         rows = [dataset.rows[index] for index in selected]
         expert_selected = expert_dataset.sample(args.expert_batch, rng) \
             if args.expert_weight or args.search_consistency_weight else np.empty(0, np.int64)
@@ -1025,6 +1050,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             "dataset_seen": dataset.seen, "dataset_admitted": dataset.admitted,
             "dataset_uses": dataset.uses, "dataset_retired": dataset.retired,
             "dataset_forced_dropped": dataset.forced_dropped,
+            "dataset_capacity_dropped": dataset.capacity_dropped,
+            "dataset_incomplete_dropped": dataset.incomplete_dropped,
             "dataset_priority_mean": float(dataset.data["priority"][:len(dataset)].mean()) if len(dataset) else 0,
             "dataset_priority_max": float(dataset.data["priority"][:len(dataset)].max()) if len(dataset) else 0,
             "dataset_attempted": attempted, "dataset_trained": trained,
@@ -1105,6 +1132,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             promotion_episodes, args.promotion_window, args.promote_win_rate,
         )
     pending = []
+    refill_ids = np.empty(0, np.int64)
     def drain_results():
         while True:
             try:
@@ -1266,17 +1294,14 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                         continue
                     sampler_done = (stop.is_set() or all(not worker.is_alive() for worker in workers)) and samples.empty()
                 absolute = base_decisions + handled
-                boundary = min(next_report, next_save) - absolute
-                stale = dataset.prune(revisions["policy_revision"], args.max_policy_lag, boundary)
                 expert_stale = len(expert_dataset)
                 expert_dataset.prune(revisions["policy_revision"], args.expert_max_lag)
                 expert_stale -= len(expert_dataset)
-                handled += stale
-                if stale or expert_stale:
+                if expert_stale:
                     emit_event({
                         "event": "dataset_pruned", "step": base_decisions + handled,
                         "resolved_decisions_total": base_decisions + handled,
-                        "stage": stage, "stale_rows": stale,
+                        "stage": stage, "stale_rows": 0,
                         "expert_stale_rows": expert_stale,
                         "weights_revision": revisions["weights_revision"],
                         "policy_revision": revisions["policy_revision"],
@@ -1294,11 +1319,13 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     if promotion_ready:
                         stop.set()
                     continue
-                if not len(dataset):
+                if len(dataset) < args.batch:
                     if sampler_done:
+                        remaining = len(dataset)
+                        dataset.discard(np.arange(remaining))
+                        dataset.incomplete_dropped += remaining
+                        handled += remaining
                         break
-                    continue
-                if len(dataset) < args.batch and not sampler_done:
                     continue
             while len(pending) < 1:
                 ingested = False
@@ -1308,14 +1335,14 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     ingested = decisions != before
                     sampler_done = (stop.is_set() or all(not worker.is_alive() for worker in workers)) and samples.empty()
                 boundary = min(next_report, next_save) - (base_decisions + handled)
-                enough = len(dataset) >= args.batch or sampler_done and len(dataset)
+                enough = len(dataset) >= args.batch
                 if boundary <= 0:
                     break
                 if not enough:
                     if sampler_done or not ingested:
                         break
                     continue
-                pending.append(reserve_batch(min(args.batch, len(dataset)) if sampler_done else args.batch))
+                pending.append(reserve_batch(args.batch))
             if not pending:
                 if sampler_done and not len(dataset):
                     break
@@ -1326,6 +1353,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
              cached, packed) = pending.pop(0)
             if not rows:
                 continue
+            assert len(rows) == args.batch
             revisions["update_attempt"] += 1
             screen_started = time.monotonic()
             unpack_started = time.monotonic()
@@ -1371,14 +1399,30 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             invalid = ~fresh.detach().cpu().numpy()
             if invalid.any():
                 invalid = np.isin(values["trajectory"], values["trajectory"][invalid])
-                fresh = torch.as_tensor(~invalid, device=target)
-            rejected_trajectories = values["trajectory"][invalid]
-            selected = np.asarray(selected, np.int64)[~invalid]
+                refill_ids = values["id"][~invalid]
+                ratio_rejected = dataset.discard_trajectories(values["trajectory"][invalid])
+                dataset.ratio_dropped += ratio_rejected
+                handled += ratio_rejected
+                attempted += len(rows)
+                update_elapsed = time.monotonic() - update_started
+                update_seconds += update_elapsed
+                update_durations.append(update_elapsed)
+                backward_durations.append(0.)
+                training_batch_event(
+                    "ratio_rejected", "none", attempted_rows=len(rows),
+                    fresh_rows=int((~invalid).sum()), policy_trained_rows=0,
+                    critic_trained_rows=0, ratio_rejected_rows=ratio_rejected,
+                    retired_rows=0, unpack_seconds=unpack_seconds,
+                    forward_seconds=forward_seconds, backward_seconds=0.,
+                    total_seconds=update_elapsed,
+                )
+                continue
+            refill_ids = np.empty(0, np.int64)
+            selected = np.asarray(selected, np.int64)
             expired = dataset.use(selected, args.priority_decay)
             dataset.discard(expired)
-            ratio_rejected = dataset.discard_trajectories(rejected_trajectories)
-            dataset.ratio_dropped += ratio_rejected
-            handled += len(expired) + ratio_rejected
+            ratio_rejected = 0
+            handled += len(expired)
             batch_policy_lags = (
                 revisions["policy_revision"] - values["version"][~invalid]
             ).tolist()
@@ -1398,20 +1442,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             _, entropy_weight, _ = curriculum_weights(
                 stage, stage_decisions + handled, auxiliary_decisions + handled, args, progress_active
             )
-            if not fresh_rows:
-                update_elapsed = time.monotonic() - update_started
-                update_seconds += update_elapsed
-                update_durations.append(update_elapsed)
-                backward_durations.append(0.)
-                training_batch_event(
-                    "no_fresh_rows", "none", attempted_rows=len(rows), fresh_rows=0,
-                    policy_trained_rows=0, critic_trained_rows=0,
-                    ratio_rejected_rows=ratio_rejected, retired_rows=len(expired),
-                    pre_kl=kl_value, unpack_seconds=unpack_seconds,
-                    forward_seconds=forward_seconds, backward_seconds=0.,
-                    total_seconds=update_elapsed,
-                )
-                continue
+            assert fresh_rows == args.batch
             batch_target = torch.as_tensor(values["critic_target"][fresh_cpu], device=target)
             critic_weights = critic_balance.weights(
                 values["character"][fresh_cpu], values["phase"][fresh_cpu],
@@ -1926,6 +1957,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         "dataset_seen": dataset.seen, "dataset_admitted": dataset.admitted,
         "dataset_uses": dataset.uses, "dataset_retired": dataset.retired,
         "dataset_forced_dropped": dataset.forced_dropped,
+        "dataset_capacity_dropped": dataset.capacity_dropped,
+        "dataset_incomplete_dropped": dataset.incomplete_dropped,
         "dataset_priority_mean": float(dataset.data["priority"][:len(dataset)].mean()) if len(dataset) else 0,
         "dataset_priority_max": float(dataset.data["priority"][:len(dataset)].max()) if len(dataset) else 0,
         "dataset_attempted": attempted, "dataset_trained": trained,
@@ -2447,9 +2480,11 @@ def train(args):
            args.publish_updates,
            args.report_decisions,
            args.save_decisions, args.promotion_window, args.promotion_runs,
-           args.development_runs, args.progress_decisions,
+           args.development_runs, args.progress_decisions, args.dataset_capacity,
            args.max_policy_lag + 1) < 1 or min(args.max_log_ratio, args.policy_temperature) <= 0:
         raise ValueError("invalid asynchronous replay settings")
+    if args.dataset_capacity < args.batch:
+        raise ValueError("dataset capacity must cover one batch")
     if args.sampler_timeout <= 0 or args.sampler_restarts < 0:
         raise ValueError("invalid sampler watchdog")
     if args.mps_empty_cache_updates < 0 or args.learning_rate_warmup_steps < 0:
