@@ -274,7 +274,7 @@ class RolloutCollector:
                 paused[self.worker] = True
                 if heartbeat is not None:
                     heartbeat[self.worker] = time.monotonic()
-                if stop.wait(.01):
+                if time.monotonic() >= deadline or stop.wait(.01):
                     break
             if paused is not None:
                 paused[self.worker] = False

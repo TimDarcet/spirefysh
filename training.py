@@ -1066,8 +1066,13 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             if not args.critic_only:
                 known = np.isin(values["id"], refill_ids) if len(refill_ids) \
                     else np.zeros(len(rows), bool)
-                screen_positions = np.flatnonzero(~known) if len(refill_ids) \
-                    else np.arange(min(512, len(rows)))
+                if len(refill_ids):
+                    screen_positions = np.flatnonzero(~known)
+                else:
+                    screen_size = min(384, len(rows))
+                    screen_positions = np.lexsort((
+                        values["old"], values["version"],
+                    ))[:screen_size]
                 screen_rows = [rows[index] for index in screen_positions]
                 screen_cpu = unpack(screen_rows, torch.device("cpu"), model, False)
                 screen_inputs = upload(screen_cpu, target)
@@ -1085,7 +1090,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     )
                     screen_ratio = screened[screen_choice] \
                         - torch.as_tensor(values["old"][screen_positions], device=target)
-                    screen_fresh = screen_ratio.abs() <= args.max_log_ratio
+                    screen_fresh = screen_ratio.abs() <= args.max_log_ratio / 2
                 forward_seconds = time.monotonic() - screen_forward_started
             else:
                 screen_positions = np.empty(0, np.int64)
