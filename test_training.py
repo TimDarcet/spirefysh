@@ -171,6 +171,15 @@ print('restored')
                  "attempted_rows": 20, "fresh_rows": 20,
                  "policy_trained_rows": 20, "critic_trained_rows": 20,
                  "policy_outcome": "accepted", "commit_kind": "full",
+                 "accepted_trajectories": {
+                     "count": 2, "sampled_rows": 20,
+                     "floor_counts": {"12": 1, "20": 1},
+                     "length_mean": 30, "length_max": 40,
+                     "actionable_length_mean": 20, "actionable_length_max": 25,
+                     "policy_span_mean": 2, "policy_span_max": 3,
+                     "policy_age_mean": 3, "policy_age_max": 4,
+                     "character_counts": [1, 0, 1, 0, 0],
+                 },
                  "retired_rows": 4, "policy_lag_counts": {"0": 10, "1": 10},
                  "advantage_mean": 2, "advantage_stddev": 3,
                  "policy_loss": 2, "critic_loss": 3,
@@ -281,6 +290,14 @@ print('restored')
                 {"event": "training_batch", "time": 1, "step": 40, "stage": 0,
                  "policy_outcome": "pre_kl_rejected", "commit_kind": "critic_only",
                  "fresh_rows": 5, "critic_trained_rows": 5,
+                 "rejected_trajectories": {
+                     "count": 1, "sampled_rows": 5, "floor_counts": {"10": 1},
+                     "length_mean": 20, "length_max": 20,
+                     "actionable_length_mean": 15, "actionable_length_max": 15,
+                     "policy_span_mean": 2, "policy_span_max": 2,
+                     "policy_age_mean": 3, "policy_age_max": 3,
+                     "character_counts": [1, 0, 0, 0, 0],
+                 },
                  "critic_explained_reward_variance": .2,
                  "critic_explained_reward_variance_by_floor": {
                      "10": {"value": .2, "target_variance": .25, "rows": 5}},
@@ -288,6 +305,14 @@ print('restored')
                 {"event": "training_batch", "time": 2, "step": 40, "stage": 0,
                  "policy_outcome": "post_kl_rejected", "commit_kind": "critic_only",
                  "fresh_rows": 7, "critic_trained_rows": 7,
+                 "rejected_trajectories": {
+                     "count": 1, "sampled_rows": 7, "floor_counts": {"20": 1},
+                     "length_mean": 40, "length_max": 40,
+                     "actionable_length_mean": 25, "actionable_length_max": 25,
+                     "policy_span_mean": 4, "policy_span_max": 4,
+                     "policy_age_mean": 5, "policy_age_max": 5,
+                     "character_counts": [0, 0, 1, 0, 0],
+                 },
                  "critic_explained_reward_variance": .8,
                  "critic_explained_reward_variance_by_floor": {
                      "10": {"value": .8, "target_variance": .5, "rows": 7}},
@@ -306,6 +331,14 @@ print('restored')
             self.assertAlmostEqual(
                 metrics["critic_floor_conditioned_explained_reward_variance"], 3.05 / 4.75
             )
+            self.assertEqual(metrics["rejected_trajectories"], 2)
+            self.assertEqual(metrics["rejected_trajectory_sampled_rows"], 12)
+            self.assertEqual(metrics["rejected_trajectory_floor_mean"], 15)
+            self.assertEqual(metrics["rejected_trajectory_length_mean"], 30)
+            self.assertEqual(metrics["rejected_trajectory_length_max"], 40)
+            self.assertEqual(metrics["rejected_trajectory_policy_span_mean"], 3)
+            self.assertEqual(metrics["rejected_trajectory_policy_age_mean"], 4)
+            self.assertEqual(metrics["rejected_trajectory_character_counts"], [1, 0, 1, 0, 0])
 
     def test_projector_combines_distributions_instead_of_batch_statistics(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -566,13 +599,19 @@ print('restored')
                 "win_rewards": [0] * length,
                 "terminals": [False] * (length - 1) + [True],
                 "characters": [0] * length, "versions": versions,
-                "potentials": [0] * length,
+                "potentials": [0] * length, "terminal_floor": versions[0],
             }
 
         dataset = train.ExperienceDataset()
         dataset.add({"trajectories": [trajectory([9, 9, 9]), trajectory([0, 0])]},
                     Namespace(gae_gamma=1, gae_lambda=1))
         np.testing.assert_array_equal(dataset.data["trajectory"][:5], [0, 0, 0, 1, 1])
+        values = {key: value[:len(dataset)] for key, value in dataset.data.items()}
+        stats = dataset.trajectory_stats(values, 10, values["trajectory"] == 0)
+        self.assertEqual(
+            (stats["count"], stats["sampled_rows"], stats["floor_mean"]), (1, 3, 9),
+        )
+        self.assertEqual((stats["length_mean"], stats["policy_age_mean"]), (3, 1))
 
         self.assertEqual(dataset.discard_ids([1]), 1)
         self.assertEqual(dataset.trim(2), 2)
@@ -597,6 +636,7 @@ print('restored')
             "canonical_progress": [0, 4, 7], "phases": [0] * 3,
             "win_rewards": [0] * 3, "terminals": [False, False, True],
             "characters": [0] * 3, "versions": [0] * 3, "potentials": [0] * 3,
+            "terminal_floor": 15,
         }
         dataset = train.ExperienceDataset()
         counts = dataset.add({"trajectories": [trajectory]}, Namespace(
@@ -607,9 +647,24 @@ print('restored')
         self.assertEqual(counts, (3, 2, 0))
         self.assertEqual(len(dataset), 1)
         self.assertEqual(dataset.data["terminal"][0], 7)
+        self.assertEqual(dataset.data["trajectory_floor"][0], 15)
+        self.assertEqual(dataset.data["trajectory_length"][0], 3)
+        self.assertEqual(dataset.data["trajectory_actionable_length"][0], 1)
         self.assertAlmostEqual(dataset.data["advantage"][0], expected)
         self.assertAlmostEqual(dataset.data["critic_target"][0], expected)
         self.assertAlmostEqual(dataset.data["priority"][0], 5 + expected)
+        stats = dataset.trajectory_stats(
+            {key: value[:len(dataset)] for key, value in dataset.data.items()}, 2,
+        )
+        self.assertEqual(stats, {
+            "count": 1, "sampled_rows": 1, "floor_counts": {"15": 1},
+            "floor_mean": 15., "floor_median": 15., "floor_p90": 15., "floor_max": 15,
+            "length_mean": 3., "length_max": 3,
+            "actionable_length_mean": 1., "actionable_length_max": 1,
+            "policy_span_mean": 0., "policy_span_max": 0,
+            "policy_age_mean": 2., "policy_age_max": 2,
+            "character_counts": [1, 0, 0, 0, 0],
+        })
 
 
 if __name__ == "__main__":

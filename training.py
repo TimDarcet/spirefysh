@@ -214,6 +214,11 @@ class ExperienceDataset:
             "priority": np.empty(0, np.float32),
             "version": np.empty(0, np.int64), "id": np.empty(0, np.int64),
             "trajectory": np.empty(0, np.int64),
+            "trajectory_floor": np.empty(0, np.int8),
+            "trajectory_length": np.empty(0, np.int32),
+            "trajectory_actionable_length": np.empty(0, np.int32),
+            "trajectory_version_min": np.empty(0, np.int64),
+            "trajectory_version_max": np.empty(0, np.int64),
         }
         self.next_id = self.next_trajectory = 0
         self.index = {}
@@ -231,6 +236,11 @@ class ExperienceDataset:
             "phases", "win_rewards", "terminals", "characters", "versions", "potentials",
         )
         trajectories = []
+        trajectory_floors = []
+        trajectory_lengths = []
+        trajectory_actionable_lengths = []
+        trajectory_version_mins = []
+        trajectory_version_maxes = []
         positions = []
         total = 0
         cached = any("features" in trajectory for trajectory in source)
@@ -255,7 +265,13 @@ class ExperienceDataset:
             if len(indices):
                 category = CATEGORIES - 1 if trajectory["win_rewards"][-1] > .5 \
                     else int(canonical.max())
+                versions = np.asarray(trajectory["versions"], np.int64)[indices]
                 trajectories.append((trajectory, indices, category, trajectory_id))
+                trajectory_floors.append(int(trajectory.get("terminal_floor", canonical.max())))
+                trajectory_lengths.append(length)
+                trajectory_actionable_lengths.append(len(indices))
+                trajectory_version_mins.append(int(versions.min()))
+                trajectory_version_maxes.append(int(versions.max()))
                 positions.extend(total + indices)
             total += length
         self.next_trajectory += len(source)
@@ -277,6 +293,12 @@ class ExperienceDataset:
                      for trajectory, indices, _category, _trajectory_id in trajectories
                      for index in indices]
                     if cached else [])
+        def repeated(values, dtype):
+            return np.concatenate([
+                np.full(len(indices), value, dtype)
+                for (_trajectory, indices, _category, _trajectory_id), value
+                in zip(trajectories, values)
+            ])
         advantage = np.empty(len(rows), np.float32)
         targets = np.empty(len(rows), np.float32)
         terminal_categories = np.empty(len(rows), np.int8)
@@ -321,6 +343,13 @@ class ExperienceDataset:
                 np.full(len(indices), trajectory_id, np.int64)
                 for _trajectory, indices, _category, trajectory_id in trajectories
             ]),
+            "trajectory_floor": repeated(trajectory_floors, np.int8),
+            "trajectory_length": repeated(trajectory_lengths, np.int32),
+            "trajectory_actionable_length": repeated(
+                trajectory_actionable_lengths, np.int32,
+            ),
+            "trajectory_version_min": repeated(trajectory_version_mins, np.int64),
+            "trajectory_version_max": repeated(trajectory_version_maxes, np.int64),
         }
         size = len(self)
         required = size + int(selected.sum())
@@ -400,6 +429,35 @@ class ExperienceDataset:
     def use(self, indices, decay=3):
         self.data["priority"][indices] -= decay
         return indices[self.data["priority"][indices] < 0]
+
+    @staticmethod
+    def trajectory_stats(values, policy_revision, mask=None):
+        positions = np.arange(len(values["trajectory"])) if mask is None else np.flatnonzero(mask)
+        if not len(positions):
+            return None
+        _, first = np.unique(values["trajectory"][positions], return_index=True)
+        selected = positions[first]
+        floors = values["trajectory_floor"][selected]
+        lengths = values["trajectory_length"][selected]
+        actionable = values["trajectory_actionable_length"][selected]
+        spans = values["trajectory_version_max"][selected] \
+            - values["trajectory_version_min"][selected]
+        ages = policy_revision - values["trajectory_version_min"][selected]
+        floor, counts = np.unique(floors, return_counts=True)
+        return {
+            "count": len(selected), "sampled_rows": len(positions),
+            "floor_counts": dict(zip(map(str, floor), map(int, counts))),
+            "floor_mean": float(floors.mean()), "floor_median": float(np.median(floors)),
+            "floor_p90": float(np.quantile(floors, .9)), "floor_max": int(floors.max()),
+            "length_mean": float(lengths.mean()), "length_max": int(lengths.max()),
+            "actionable_length_mean": float(actionable.mean()),
+            "actionable_length_max": int(actionable.max()),
+            "policy_span_mean": float(spans.mean()), "policy_span_max": int(spans.max()),
+            "policy_age_mean": float(ages.mean()), "policy_age_max": int(ages.max()),
+            "character_counts": np.bincount(
+                values["character"][selected], minlength=5,
+            ).tolist(),
+        }
 
 
 class CriticBalance:
@@ -1063,79 +1121,20 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             flat_policy = not replay
             policy_actions = int(lengths.sum())
             expert_actions = int(expert_lengths.sum())
-            if not args.critic_only:
-                known = np.isin(values["id"], refill_ids) if len(refill_ids) \
-                    else np.zeros(len(rows), bool)
-                if len(refill_ids):
-                    screen_positions = np.flatnonzero(~known)
-                else:
-                    screen_size = min(384, len(rows))
-                    screen_positions = np.lexsort((
-                        values["old"], values["version"],
-                    ))[:screen_size]
-                screen_rows = [rows[index] for index in screen_positions]
-                screen_cpu = unpack(screen_rows, torch.device("cpu"), model, False)
-                screen_inputs = upload(screen_cpu, target)
-                screen_lengths = lengths[screen_positions]
-                screen_choice = torch.as_tensor(
-                    np.cumsum(screen_lengths) - screen_lengths + values["action"][screen_positions],
-                    device=target,
-                )
-                unpack_seconds = time.monotonic() - unpack_started
-                screen_forward_started = time.monotonic()
-                with torch.no_grad():
-                    screened = predict(
-                        model, screen_inputs, args.precision, args.policy_temperature,
-                        policy_only=True, flat_policy=True,
-                    )
-                    screen_ratio = screened[screen_choice] \
-                        - torch.as_tensor(values["old"][screen_positions], device=target)
-                    screen_fresh = screen_ratio.abs() <= args.max_log_ratio / 2
-                forward_seconds = time.monotonic() - screen_forward_started
-            else:
-                screen_positions = np.empty(0, np.int64)
-                unpack_seconds = time.monotonic() - unpack_started
-                forward_seconds = 0.
-                screen_fresh = torch.ones(0, dtype=torch.bool, device=target)
-            if len(screen_positions) and not bool(screen_fresh.all()):
-                invalid_trajectories = values["trajectory"][screen_positions][
-                    ~screen_fresh.cpu().numpy()
-                ]
-                invalid = np.isin(values["trajectory"], invalid_trajectories)
-                refill_ids = values["id"][~invalid]
-                ratio_rejected = dataset.discard_trajectories(values["trajectory"][invalid])
-                handled += ratio_rejected
-                prefetch()
-                update_elapsed = time.monotonic() - update_started
-                training_batch_event(
-                    "ratio_rejected", "none", attempted_rows=len(rows),
-                    fresh_rows=int((~invalid).sum()), policy_trained_rows=0,
-                    critic_trained_rows=0, ratio_rejected_rows=ratio_rejected,
-                    retired_rows=0, unpack_seconds=unpack_seconds,
-                    forward_seconds=forward_seconds, backward_seconds=0.,
-                    total_seconds=update_elapsed,
-                )
-                screened = screen_ratio = screen_fresh = screen_inputs = None
-                model._sequence_layouts.clear()
-                release_mps_cache(True)
-                resume_samplers()
-                continue
-            screened = screen_ratio = screen_fresh = screen_inputs = None
-            full_unpack_started = time.monotonic()
             cpu_inputs, _ = packed.result()
             inputs = upload(cpu_inputs, target)
-            unpack_seconds += time.monotonic() - full_unpack_started
+            unpack_seconds = time.monotonic() - unpack_started
             action = torch.as_tensor(values["action"], device=target)
             old = torch.as_tensor(values["old"], device=target)
             choice_index = torch.as_tensor(
                 np.cumsum(lengths) - lengths + values["action"], device=target,
             )
-            full_forward_started = time.monotonic()
+            forward_started = time.monotonic()
             all_logits, all_critic_logits = (
                 predict_cached(model, inputs, args.precision, args.policy_temperature) if cached else
                 predict(model, inputs, args.precision, args.policy_temperature, flat_policy=flat_policy)
             )
-            forward_seconds += time.monotonic() - full_forward_started
+            forward_seconds = time.monotonic() - forward_started
             backward_seconds = 0.0
             critic_logits = all_critic_logits[:len(rows)]
             logits = all_logits[:policy_actions] if flat_policy else all_logits[:len(rows)]
@@ -1152,6 +1151,9 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             if not bool(fresh.all()):
                 invalid = ~fresh.detach().cpu().numpy()
                 invalid = np.isin(values["trajectory"], values["trajectory"][invalid])
+                rejected_trajectories = dataset.trajectory_stats(
+                    values, revisions["policy_revision"], invalid,
+                )
                 refill_ids = values["id"][~invalid]
                 ratio_rejected = dataset.discard_trajectories(values["trajectory"][invalid])
                 handled += ratio_rejected
@@ -1161,6 +1163,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     "ratio_rejected", "none", attempted_rows=len(rows),
                     fresh_rows=int((~invalid).sum()), policy_trained_rows=0,
                     critic_trained_rows=0, ratio_rejected_rows=ratio_rejected,
+                    rejected_trajectories=rejected_trajectories,
                     retired_rows=0, unpack_seconds=unpack_seconds,
                     forward_seconds=forward_seconds, backward_seconds=0.,
                     total_seconds=update_elapsed,
@@ -1172,6 +1175,9 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 resume_samplers()
                 continue
             refill_ids = np.empty(0, np.int64)
+            batch_trajectories = dataset.trajectory_stats(
+                values, revisions["policy_revision"],
+            )
             selected = np.asarray(selected, np.int64)
             expired = dataset.use(selected, args.priority_decay)
             dataset.discard(expired)
@@ -1224,6 +1230,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     "pre_kl_rejected", "critic_only", attempted_rows=len(rows),
                     fresh_rows=fresh_rows, policy_trained_rows=0,
                     critic_trained_rows=fresh_rows, ratio_rejected_rows=ratio_rejected,
+                    rejected_trajectories=batch_trajectories,
                     retired_rows=len(expired), critic_loss=float(value_loss.detach()),
                     critic_explained_reward_variance=float(explained_reward_variance),
                     critic_floor_conditioned_explained_reward_variance=
@@ -1404,6 +1411,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     "post_kl_rejected", "critic_only", attempted_rows=len(rows),
                     fresh_rows=fresh_rows, policy_trained_rows=0,
                     critic_trained_rows=fresh_rows, ratio_rejected_rows=ratio_rejected,
+                    rejected_trajectories=batch_trajectories,
                     retired_rows=len(expired), critic_loss=float(retry_value_loss.detach()),
                     critic_explained_reward_variance=float(retry_explained_reward_variance),
                     critic_floor_conditioned_explained_reward_variance=
@@ -1451,6 +1459,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 attempted_rows=len(rows), fresh_rows=fresh_rows,
                 policy_trained_rows=0 if args.critic_only else fresh_rows,
                 critic_trained_rows=fresh_rows, ratio_rejected_rows=ratio_rejected,
+                accepted_trajectories=batch_trajectories,
                 retired_rows=len(expired),
                 expert_rows=expert_count, replay_rows=len(replay),
                 winning_replayed_rows=replay_count,

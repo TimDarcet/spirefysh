@@ -407,12 +407,13 @@ class RolloutCollector:
                 for index, won in zip(reset, wins):
                     history = (self.native_steps[self.native_starts[index]:] if native
                                else self.trajectories[index]["samples"])
+                    terminal_floor = int((stats[index][0] - 1) * 17 + stats[index][1])
                     completion_seconds = (time.monotonic() - self.native_started[index] if native
                                           else time.monotonic() - self.trajectories[index]["started"])
                     policy_versions = [row[9] for row in history]
                     completions.append({
                         "character": int(characters[index]),
-                        "floor": int((stats[index][0] - 1) * 17 + stats[index][1]),
+                        "floor": terminal_floor,
                         "terminal": bool(done[index]), "won": won,
                         "step_cap": bool(step_truncated[index] and truncated[index]),
                         "combat_cap": bool(combat_truncated[index] and truncated[index]),
@@ -440,12 +441,14 @@ class RolloutCollector:
                             for column, key in enumerate(sample_keys)
                         }
                         trajectory["completion_seconds"] = completion_seconds
+                        trajectory["terminal_floor"] = terminal_floor
                         finished.append(trajectory)
                     elif native:
                         discarded_steps += len(self.native_steps) - int(self.native_starts[index])
                     elif done[index]:
                         trajectory = self.trajectories[index]
                         trajectory["completion_seconds"] = completion_seconds
+                        trajectory["terminal_floor"] = terminal_floor
                         trajectory.pop("started")
                         finished.append(materialize(trajectory))
                     else:

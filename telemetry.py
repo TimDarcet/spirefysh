@@ -537,6 +537,32 @@ class MetricsProjector:
             window["_outcomes"][outcome] = window["_outcomes"].get(outcome, 0) + 1
         if commit:
             window["_commits"][commit] = window["_commits"].get(commit, 0) + 1
+        outcomes = window.setdefault("_trajectory_outcomes", {})
+        for outcome in ("accepted", "rejected"):
+            source = event.get(f"{outcome}_trajectories")
+            if not source:
+                continue
+            target = outcomes.setdefault(outcome, {
+                "count": 0, "rows": 0, "floor_counts": {},
+                "character_counts": [0] * 5,
+            })
+            count = source["count"]
+            target["count"] += count
+            target["rows"] += source.get("sampled_rows", source.get("rows", 0))
+            for floor, value in source.get("floor_counts", {}).items():
+                target["floor_counts"][int(floor)] = \
+                    target["floor_counts"].get(int(floor), 0) + value
+            for index, value in enumerate(source.get("character_counts", ())):
+                target["character_counts"][index] += value
+            for metric in ("length", "actionable_length", "policy_span", "policy_age"):
+                value = source.get(f"{metric}_mean")
+                if value is not None:
+                    target[f"{metric}_sum"] = target.get(f"{metric}_sum", 0.) \
+                        + value * count
+                    target[f"{metric}_count"] = target.get(f"{metric}_count", 0) + count
+                value = source.get(f"{metric}_max")
+                if value is not None:
+                    target[f"{metric}_max"] = max(value, target.get(f"{metric}_max", value))
         for metric, denominator in self.means.items():
             value = event.get(metric)
             weight = event.get(denominator, 1) if denominator else 1
@@ -789,6 +815,24 @@ class MetricsProjector:
         }
         if window["_stale"]:
             metrics["dataset_stale_dropped"] = window["_stale"]
+        for outcome, summary in window.get("_trajectory_outcomes", {}).items():
+            prefix = f"{outcome}_trajectory_"
+            metrics[f"{outcome}_trajectories"] = summary["count"]
+            metrics[prefix + "sampled_rows"] = summary["rows"]
+            metrics[prefix + "character_counts"] = summary["character_counts"]
+            floor_counts = summary["floor_counts"]
+            if floor_counts:
+                histogram = [0] * (max(floor_counts) + 1)
+                for floor, count in floor_counts.items():
+                    histogram[floor] = count
+                distribution = floor_bands(histogram)
+                for metric in ("mean", "median", "p90", "max"):
+                    metrics[prefix + "floor_" + metric] = distribution[metric]
+            for metric in ("length", "actionable_length", "policy_span", "policy_age"):
+                count = summary.get(f"{metric}_count", 0)
+                if count:
+                    metrics[prefix + metric + "_mean"] = summary[f"{metric}_sum"] / count
+                    metrics[prefix + metric + "_max"] = summary[f"{metric}_max"]
         if window["_policy_episodes"]:
             metrics |= {
                 "trajectory_policy_span_mean":
@@ -963,7 +1007,7 @@ def _cached_projection(root, run, manifest, session_id):
     if not segments:
         segments = [(run / manifest["sessions"][-1]["log"], None)]
     signature = {
-        "version": 1,
+        "version": 3,
         "window": manifest.get("telemetry_window_decisions", 32_768),
         "manifest": [(run / "run.json").stat().st_size,
                      (run / "run.json").stat().st_mtime_ns],
