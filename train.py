@@ -41,6 +41,7 @@ def parser():
     run.add_argument("--sampler-threads", type=int, default=4)
     run.add_argument("--sampler-backend", choices=("process", "thread"), default="process")
     run.add_argument("--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"), default="INFO")
+    run.add_argument("--capture-trajectories", action="store_true")
     run.add_argument("--sampler-steps", type=int, default=4)
     run.add_argument("--sampler-timeout", type=float, default=120)
     run.add_argument("--sampler-restarts", type=int, default=3)

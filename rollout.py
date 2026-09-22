@@ -153,7 +153,8 @@ class WinningReservoir:
         return [self.rows[index] for index in selected]
 
 
-def act(model, observation, target, sample, precision, generator=None, temperature=1):
+def act(model, observation, target, sample, precision, generator=None, temperature=1,
+        trace_indices=()):
     with torch.inference_mode():
         inputs = tensors(observation, torch.device("cpu") if target.type == "mps" else target, model)
         if target.type == "mps":
@@ -178,9 +179,17 @@ def act(model, observation, target, sample, precision, generator=None, temperatu
             selected = (masked == maximum[action_row]).nonzero().squeeze(1)
         choice = action_flat[selected] % inputs[5][4]
         assert len(choice) == len(observation[0]) and legal[selected].all()
+    values = critic_value(critic_logits)
     policy = None
+    details = {
+        int(index): (
+            torch.log_softmax(masked[action_row == index], 0).cpu().tolist(),
+            float(values[index]),
+        )
+        for index in trace_indices
+    }
     return (choice.cpu().numpy(), masked[selected].cpu().numpy(),
-            policy, critic_value(critic_logits).cpu().numpy())
+            policy, values.cpu().numpy(), details)
 
 
 def cuts(done, episode_steps, combat_steps, still_combat, legal, max_steps, max_combat_steps):
@@ -230,12 +239,55 @@ class RolloutCollector:
         self.worker, self.generation = worker, generation
         self.trajectories = [None] * args.envs
         self.action_history = [[] for _ in range(args.envs)]
+        self.traces = [None] * args.envs
         self.native_steps = []
         self.native_starts = np.zeros(args.envs, np.int64)
         self.native_started = np.full(args.envs, time.monotonic())
 
     def event(self, event, **values):
         emit_event({"event": event, **values}, role=f"sampler-{self.worker}")
+
+    def trace_indices(self):
+        if not getattr(self.args, "capture_trajectories", False):
+            return []
+        characters, seeds = self.env.characters(), self.env.seeds()
+        active = {trace["character"] for trace in self.traces if trace is not None}
+        for character in range(5):
+            if character in active:
+                continue
+            index = next((index for index, current in enumerate(characters)
+                          if current == character and not self.episode_steps[index]
+                          and self.traces[index] is None), None)
+            if index is not None:
+                self.traces[index] = {
+                    "trajectory_schema": 1,
+                    "id": (f"{self.sampler_session}:{self.worker}:{self.generation}:"
+                           f"{self.iteration}:{seeds[index]}"),
+                    "sampler_session": self.sampler_session,
+                    "worker": self.worker, "generation": self.generation,
+                    "started_iteration": self.iteration,
+                    "seed": int(seeds[index]), "character": character,
+                    "stage": self.stage, "ascension": STAGES[self.stage][0],
+                    "bonus": STAGES[self.stage][1],
+                    "temperature": self.args.policy_temperature, "sampled": True,
+                    "fingerprint": self.env.fingerprint(),
+                    "choices": [], "log_policies": [], "critic_values": [],
+                    "canonical_progress": [], "phases": [], "policy_revisions": [],
+                    "started": time.monotonic(),
+                }
+        return [index for index, trace in enumerate(self.traces) if trace is not None]
+
+    def finish_trace(self, index, outcome, terminal_floor, terminal):
+        trace = self.traces[index]
+        if trace is None:
+            return
+        trace["completion_seconds"] = time.monotonic() - trace.pop("started")
+        trace["terminal_floor"] = terminal_floor
+        trace["terminal"] = bool(terminal)
+        trace["outcome"] = outcome
+        trace["completed_iteration"] = self.iteration
+        self.event("trajectory", **trace)
+        self.traces[index] = None
 
     def trace_empty(self, kind, indices, characters, stats):
         seeds = self.env.seeds()
@@ -287,10 +339,15 @@ class RolloutCollector:
             if empty.any():
                 reset = np.flatnonzero(empty).tolist()
                 stale_characters = np.asarray(self.observation[0], np.uint8)
-                self.trace_empty("orphan", reset, stale_characters, self.env.stats())
+                stale_stats = self.env.stats()
+                self.trace_empty("orphan", reset, stale_characters, stale_stats)
                 orphan_empty_actions += len(reset)
                 self.reservoir.discard(reset)
                 for index in reset:
+                    stats = stale_stats[index]
+                    self.finish_trace(
+                        index, "empty_actions", int((stats[0] - 1) * 17 + stats[1]), False,
+                    )
                     if self.trajectories[index] is not None:
                         discarded_steps += len(self.trajectories[index]["samples"])
                     self.trajectories[index] = None
@@ -299,8 +356,15 @@ class RolloutCollector:
                 self.episode_steps[reset] = 0
                 self.combat_steps[reset] = 0
                 self.observation = self.env.observe_tokens(flat=True)
+            trace_indices = self.trace_indices()
             step_started = time.monotonic()
             if native:
+                trace_details = ({
+                    index: (policy, value)
+                    for index, policy, value in self.env.policy_details(
+                        trace_indices, args.policy_temperature,
+                    )
+                } if trace_indices else {})
                 result = self.env.policy(
                     args.policy_temperature,
                     advance=True,
@@ -347,14 +411,24 @@ class RolloutCollector:
                 phases = np.asarray([row[4] for row in state_stats], np.uint8)
                 characters = np.asarray(self.observation[0], np.uint8)
                 potentials = np.asarray(self.observation[4], np.float32)
-                choice, log_probability, policy, critic_value = act(
+                choice, log_probability, policy, critic_value, trace_details = act(
                     model, self.observation, target, True, precision, self.torch_rng,
-                    args.policy_temperature,
+                    args.policy_temperature, trace_indices,
                 )
                 step_rows = _pack_batch(self.observation)
             if not native:
                 for index, action in enumerate(choice):
                     self.action_history[index].append(int(action))
+            for index in trace_indices:
+                trace_policy, trace_value = trace_details[index]
+                self.traces[index]["choices"].append(int(choice[index]))
+                self.traces[index]["log_policies"].append([
+                    float(value) for value in trace_policy
+                ])
+                self.traces[index]["critic_values"].append(float(trace_value))
+                self.traces[index]["canonical_progress"].append(int(canonical[index]))
+                self.traces[index]["phases"].append(int(phases[index]))
+                self.traces[index]["policy_revisions"].append(int(version))
             self.reservoir.record(
                 step_rows, choice, log_probability, policy,
                 critic_value + potentials, self.rng,
@@ -431,6 +505,13 @@ class RolloutCollector:
                         int(empty_actions[index]),
                         self.iteration,
                     ))
+                    outcome = (
+                        "won" if won else "dead" if done[index]
+                        else "empty_actions" if empty_actions[index]
+                        else "step_cap" if step_truncated[index]
+                        else "combat_cap"
+                    )
+                    self.finish_trace(index, outcome, terminal_floor, done[index])
                     if native and done[index]:
                         trajectory = {
                             key: ([step[column][index] for step in history]

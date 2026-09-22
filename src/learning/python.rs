@@ -2589,34 +2589,73 @@ struct ExactLeaf {
     state: serde_json::Value,
 }
 
-fn exact_leaf_state(game: &Game, content: &Content) -> serde_json::Value {
+fn phase_name(phase: &Phase) -> &'static str {
+    match phase {
+        Phase::Map => "map",
+        Phase::Combat(_) => "combat",
+        Phase::Rewards(_) => "rewards",
+        Phase::Shop(_) => "shop",
+        Phase::Rest => "rest",
+        Phase::Event(..) => "event",
+        Phase::RemoveCards(..) => "remove_cards",
+        Phase::UpgradeCards(..) => "upgrade_cards",
+        Phase::TransformCards(..) => "transform_cards",
+        Phase::EnchantCards(..) => "enchant_cards",
+        Phase::ChooseCards(..) => "choose_cards",
+        Phase::ChooseBundles(_) => "choose_bundles",
+        Phase::Won => "won",
+        Phase::Dead => "dead",
+    }
+}
+
+fn game_state(game: &Game, content: &Content) -> serde_json::Value {
     let card = |card: &Card| {
-        format!(
-            "{}+{}:{}:{}:{}:{:?}",
-            content.cards[card.id as usize].id,
-            card.upgrades,
-            card.cost_delta,
-            card.value,
-            card.free as u8,
-            card.cost_override,
-        )
+        serde_json::json!({
+            "id": content.cards[card.id as usize].id,
+            "instance": card.instance,
+            "upgrades": card.upgrades,
+            "cost_delta": card.cost_delta,
+            "value": card.value,
+            "free": card.free,
+            "cost_override": card.cost_override,
+        })
     };
     let powers = |creature: &Creature| {
         creature
             .powers
             .iter()
             .map(|power| {
-                format!(
-                    "{}:{}:{}",
-                    content.powers[power.id as usize].id, power.amount, power.value
-                )
+                serde_json::json!({
+                    "id": content.powers[power.id as usize].id,
+                    "amount": power.amount,
+                    "value": power.value,
+                })
             })
             .collect::<Vec<_>>()
     };
+    let creature = |creature: &Creature| {
+        serde_json::json!({
+            "hp": creature.hp,
+            "max_hp": creature.max_hp,
+            "block": creature.block,
+            "powers": powers(creature),
+        })
+    };
     let common = serde_json::json!({
-        "phase": phase_index(&game.phase),
+        "seed": game.seed,
+        "character": content.characters[game.run.character as usize].id,
+        "ascension": game.run.ascension,
+        "act": game.run.act,
+        "floor": game.run.floor,
+        "room": format!("{:?}", game.room),
+        "phase": phase_name(&game.phase),
+        "phase_index": phase_index(&game.phase),
         "actions": game.actions(content).len(),
+        "hp": game.run.hp,
+        "max_hp": game.run.max_hp,
         "gold": game.run.gold,
+        "deck": game.run.deck.iter().map(&card).collect::<Vec<_>>(),
+        "relics": game.run.relics.iter().map(|id| content.relics[*id as usize].id).collect::<Vec<_>>(),
         "potions": game.run.potions.iter().map(|id| id.map(|id| content.potions[id as usize].id)).collect::<Vec<_>>(),
     });
     match &game.phase {
@@ -2624,18 +2663,27 @@ fn exact_leaf_state(game: &Game, content: &Content) -> serde_json::Value {
             "common": common,
             "turn": combat.turn,
             "energy": combat.energy,
+            "max_energy": combat.max_energy,
             "stars": combat.stars,
-            "player_block": combat.player.block,
-            "player_powers": powers(&combat.player),
+            "player": creature(&combat.player),
+            "osty": creature(&combat.osty),
             "hand": combat.hand.iter().map(&card).collect::<Vec<_>>(),
             "draw": combat.draw.iter().map(&card).collect::<Vec<_>>(),
             "discard": combat.discard.iter().map(&card).collect::<Vec<_>>(),
             "exhaust": combat.exhaust.iter().map(&card).collect::<Vec<_>>(),
+            "orbs": combat.orbs.iter().map(|orb| serde_json::json!({
+                "id": content.orbs[orb.id as usize].id,
+                "value": orb.value,
+            })).collect::<Vec<_>>(),
             "enemies": combat.enemies.iter().map(|enemy| serde_json::json!({
+                "instance": enemy.instance,
                 "id": content.enemies[enemy.creature.id as usize].id,
                 "hp": enemy.creature.hp,
+                "max_hp": enemy.creature.max_hp,
                 "block": enemy.creature.block,
                 "move": enemy.move_index,
+                "intent": content.enemies[enemy.creature.id as usize].moves
+                    .get(enemy.move_index).map(|movement| movement.intent),
                 "powers": powers(&enemy.creature),
             })).collect::<Vec<_>>(),
         }),
@@ -2648,6 +2696,28 @@ fn exact_leaf_state(game: &Game, content: &Content) -> serde_json::Value {
             "reward_potions": rewards.potions.iter().map(|id| content.potions[*id as usize].id).collect::<Vec<_>>(),
             "removals": rewards.removals,
         }),
+        Phase::Event(id, options) => {
+            let event = &content.events[*id as usize];
+            serde_json::json!({
+                "common": common,
+                "event": {
+                    "id": event.id,
+                    "page": if options.as_slice() == event.options { "initial" } else { "follow_up" },
+                    "data": game.event_data,
+                    "pending_effects": game.run_queue.iter()
+                        .map(|effect| format!("{effect:?}"))
+                        .collect::<Vec<_>>(),
+                    "resume": game.resume.as_ref().map(phase_name),
+                    "options": options.iter().enumerate().map(|(index, option)| serde_json::json!({
+                        "index": index,
+                        "requirement": format!("{:?}", option.requirement),
+                        "effects": option.effects.iter()
+                            .map(|effect| format!("{effect:?}"))
+                            .collect::<Vec<_>>(),
+                    })).collect::<Vec<_>>(),
+                },
+            })
+        }
         _ => common,
     }
 }
@@ -2744,7 +2814,7 @@ impl ExactSearch<'_> {
                 depth,
                 weight,
                 rng,
-                state: exact_leaf_state(game, self.content),
+                state: game_state(game, self.content),
             });
         }
     }
@@ -3373,6 +3443,48 @@ fn action_descriptor(
                 None,
             )
         }
+        Action::RewardCard(index) => {
+            let model = match &game.phase {
+                Phase::Rewards(rewards) => rewards.cards.get(*index).copied().and_then(card),
+                _ => None,
+            };
+            (
+                "reward_card".into(),
+                Some(format!("reward-card:{index}")),
+                None,
+                model,
+            )
+        }
+        Action::RewardRelic(index) => {
+            let model = match &game.phase {
+                Phase::Rewards(rewards) => rewards
+                    .relics
+                    .get(*index)
+                    .map(|id| content.relics[*id as usize].id.to_owned()),
+                _ => None,
+            };
+            (
+                "reward_relic".into(),
+                Some(format!("reward-relic:{index}")),
+                None,
+                model,
+            )
+        }
+        Action::RewardPotion(index) => {
+            let model = match &game.phase {
+                Phase::Rewards(rewards) => rewards
+                    .potions
+                    .get(*index)
+                    .map(|id| content.potions[*id as usize].id.to_owned()),
+                _ => None,
+            };
+            (
+                "reward_potion".into(),
+                Some(format!("reward-potion:{index}")),
+                None,
+                model,
+            )
+        }
         Action::Buy(index) => {
             let model = match game.phase {
                 Phase::Shop(ref items) => items.get(*index).and_then(|item| match item {
@@ -3399,7 +3511,63 @@ fn action_descriptor(
             game.run.deck.get(*index).copied().and_then(card),
         ),
         Action::Event(index) | Action::EventRelic(index, _) | Action::EventCard(index, _) => {
-            ("event_option".into(), Some(index.to_string()), None, None)
+            let (event, option) = match &game.phase {
+                Phase::Event(id, options) => (
+                    Some(content.events[*id as usize].id.to_owned()),
+                    options.get(*index),
+                ),
+                _ => (None, None),
+            };
+            let detail = match action {
+                Action::EventRelic(_, id) => Some(content.relics[*id as usize].id.to_owned()),
+                Action::EventCard(_, card) => Some(content.cards[card.id as usize].id.to_owned()),
+                Action::Event(index)
+                    if matches!(
+                        event.as_deref(),
+                        Some(
+                            "EVENT.NEOW"
+                                | "EVENT.DARV"
+                                | "EVENT.NONUPEIPE"
+                                | "EVENT.OROBAS"
+                                | "EVENT.TANX"
+                                | "EVENT.TEZCATARA"
+                                | "EVENT.PAEL"
+                                | "EVENT.VAKUU"
+                        )
+                    ) && game.event_data[*index] > 0 =>
+                {
+                    Some(
+                        content.relics[game.event_data[*index] as usize - 1]
+                            .id
+                            .to_owned(),
+                    )
+                }
+                _ => option.map(|option| {
+                    let effects = option
+                        .effects
+                        .iter()
+                        .map(|effect| format!("{effect:?}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    if effects.is_empty() {
+                        game.event_data
+                            .get(*index)
+                            .filter(|value| **value != 0)
+                            .map_or_else(
+                                || "continue".into(),
+                                |value| format!("event data {value}"),
+                            )
+                    } else {
+                        effects
+                    }
+                }),
+            };
+            (
+                "event_option".into(),
+                event,
+                Some(format!("option:{index}")),
+                detail,
+            )
         }
         Action::Choose(index) => {
             let chosen = match &game.phase {
@@ -3420,6 +3588,46 @@ fn action_descriptor(
         }
         _ => (format!("{action:?}"), None, None, None),
     }
+}
+
+fn action_preview(game: &Game, content: &Content, action: &Action) -> Option<String> {
+    let value = match action {
+        Action::RewardCard(index) => {
+            let card = match &game.phase {
+                Phase::Rewards(rewards) => *rewards.cards.get(*index)?,
+                _ => return None,
+            };
+            let def = content.cards[card.id as usize];
+            serde_json::json!({
+                "kind": "card",
+                "id": def.id,
+                "upgrades": card.upgrades,
+                "type": format!("{:?}", def.card_type),
+                "rarity": format!("{:?}", def.rarity),
+                "cost": def.cost[(card.upgrades > 0) as usize],
+                "stars": def.star_cost[(card.upgrades > 0) as usize],
+                "target": format!("{:?}", def.target),
+                "effects": def.effects.iter().map(|effect| format!("{effect:?}"))
+                    .collect::<Vec<_>>(),
+            })
+        }
+        Action::RewardPotion(index) => {
+            let id = match &game.phase {
+                Phase::Rewards(rewards) => *rewards.potions.get(*index)?,
+                _ => return None,
+            };
+            let def = content.potions[id as usize];
+            serde_json::json!({
+                "kind": "potion",
+                "id": def.id,
+                "target": format!("{:?}", def.target),
+                "effects": def.effects.iter().map(|effect| format!("{effect:?}"))
+                    .collect::<Vec<_>>(),
+            })
+        }
+        _ => return None,
+    };
+    Some(value.to_string())
 }
 
 fn card_score(content: &Content, card: Card) -> f32 {
@@ -5277,8 +5485,32 @@ impl Batch {
             .collect())
     }
 
+    fn action_previews(&self) -> PyResult<Vec<Option<String>>> {
+        let game = self
+            .games
+            .first()
+            .ok_or_else(|| PyValueError::new_err("empty environment"))?;
+        Ok(game
+            .actions(&self.content)
+            .iter()
+            .map(|action| action_preview(game, &self.content, action))
+            .collect())
+    }
+
     fn seeds(&self) -> Vec<u32> {
         self.games.iter().map(|game| game.seed).collect()
+    }
+
+    fn characters(&self) -> Vec<Id> {
+        self.games.iter().map(|game| game.run.character).collect()
+    }
+
+    fn state(&self, index: usize) -> PyResult<String> {
+        let game = self
+            .games
+            .get(index)
+            .ok_or_else(|| PyValueError::new_err("invalid environment index"))?;
+        Ok(game_state(game, &self.content).to_string())
     }
 
     fn root_ids(&self) -> Vec<usize> {
@@ -6512,6 +6744,47 @@ impl Batch {
                 .map_err(|error| PyValueError::new_err(error.to_string()))?,
         );
         Ok(())
+    }
+
+    fn policy_details(
+        &self,
+        indices: Vec<usize>,
+        temperature: f32,
+    ) -> PyResult<Vec<(usize, Vec<f32>, f32)>> {
+        if !temperature.is_finite() || temperature <= 0.0 {
+            return Err(PyValueError::new_err("temperature must be positive"));
+        }
+        if indices.is_empty() {
+            return Ok(Vec::new());
+        }
+        let model = self
+            .policy
+            .as_ref()
+            .ok_or_else(|| PyValueError::new_err("policy is not loaded"))?;
+        let rows = indices
+            .iter()
+            .map(|&index| {
+                self.games.get(index).map(|game| {
+                    observation_v56(
+                        game,
+                        &self.content,
+                        self.layout,
+                        (self.training_strength, self.training_dexterity),
+                    )
+                })
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| PyValueError::new_err("invalid environment index"))?;
+        let references = rows.iter().collect::<Vec<_>>();
+        let features = model.state_actions_batch(&references);
+        let outputs = model
+            .evaluate_batch(&references, &features, temperature, None, true)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        Ok(indices
+            .into_iter()
+            .zip(outputs)
+            .map(|(index, (log_policy, _, _, values, _))| (index, log_policy, values[0]))
+            .collect())
     }
 
     #[pyo3(signature = (

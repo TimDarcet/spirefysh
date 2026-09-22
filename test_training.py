@@ -1,6 +1,8 @@
+import gzip
 import io
 import json
 import logging
+import math
 import subprocess
 import sys
 import tempfile
@@ -14,6 +16,8 @@ import torch
 
 import train
 import telemetry
+import trajectories
+from explanations import explain
 
 
 def write_events(path, rows):
@@ -103,6 +107,12 @@ print('restored')
             "critic_win_ema_decay", "critic_blend_power", "promotion_trigger_rate",
             "evaluation_max_steps", "evaluation_max_combat_steps",
         })
+        self.assertFalse(args.capture_trajectories)
+
+    def test_trajectory_capture_flag(self):
+        self.assertTrue(train.parser().parse_args([
+            "train", "--capture-trajectories",
+        ]).capture_trajectories)
 
     def test_learning_rate_warmup_uses_global_weights_revision(self):
         optimizer = Namespace(param_groups=[
@@ -184,6 +194,11 @@ print('restored')
                      "policy_span_mean": 2, "policy_span_max": 3,
                      "policy_age_mean": 3, "policy_age_max": 4,
                      "character_counts": [1, 0, 1, 0, 0],
+                     "log_ratio": {
+                         "count": 20, "mean": .1, "min": -.2, "max": .3,
+                         "abs_mean": .2, "abs_max": .3,
+                         "abs_p50": .2, "abs_p90": .3, "abs_p99": .3,
+                     },
                  },
                  "retired_rows": 4, "policy_lag_counts": {"0": 10, "1": 10},
                  "advantage_mean": 2, "advantage_stddev": 3,
@@ -210,6 +225,11 @@ print('restored')
             self.assertEqual(projector.cursor, log.stat().st_size)
             self.assertEqual(metrics["floor_bands"]["median"], 12)
             self.assertEqual(metrics["characters"][2]["wins"], 1)
+            self.assertEqual(metrics["win_rate"], 1)
+            self.assertEqual(metrics["boss_entries"], 1)
+            self.assertEqual(metrics["boss_entry_rate"], 1)
+            self.assertEqual(metrics["boss_conversion"], 1)
+            self.assertEqual(len(metrics["win_rate_interval"]), 2)
             self.assertEqual(metrics["policy_loss"], 2)
             self.assertEqual(metrics["critic_explained_reward_variance"], .5)
             self.assertEqual(metrics["critic_explained_reward_variance_by_floor"], {
@@ -229,8 +249,23 @@ print('restored')
             self.assertEqual(metrics["dataset_rows"], 7)
             self.assertEqual(metrics["optimizer_steps_per_second"], 1)
             self.assertEqual(metrics["used_rows_per_second"], 20)
+            self.assertEqual(metrics["decisions_trained"], 20)
+            self.assertEqual(metrics["accepted_trajectories"], 2)
+            self.assertEqual(metrics["accepted_trajectory_sampled_rows"], 20)
+            self.assertEqual(metrics["accepted_trajectory_floor_mean"], 16)
+            self.assertEqual(metrics["accepted_trajectory_floor_median"], 16)
+            self.assertEqual(metrics["accepted_trajectory_floor_p90"], 19.2)
+            self.assertEqual(metrics["accepted_trajectory_length_mean"], 30)
+            self.assertEqual(metrics["accepted_trajectory_length_max"], 40)
+            self.assertEqual(metrics["accepted_trajectory_policy_age_mean"], 3)
+            self.assertEqual(metrics["accepted_trajectory_character_counts"], [1, 0, 1, 0, 0])
+            self.assertEqual(metrics["accepted_log_ratio_rows"], 20)
+            self.assertEqual(metrics["accepted_log_ratio_mean"], .1)
+            self.assertEqual(metrics["accepted_abs_log_ratio_mean"], .2)
+            self.assertEqual(metrics["accepted_abs_log_ratio_max"], .3)
             self.assertEqual(metrics["optimizer_steps"], [{
                 "step": 40, "weights_revision": 1, "seconds": 3,
+                "decisions_trained": 20,
                 "optimizer_steps_per_second": 1,
                 "used_rows_per_second": 20, "total_seconds": 1,
             }])
@@ -302,6 +337,14 @@ print('restored')
                      "policy_span_mean": 2, "policy_span_max": 2,
                      "policy_age_mean": 3, "policy_age_max": 3,
                      "character_counts": [1, 0, 0, 0, 0],
+                     "log_ratio": {
+                         "count": 5, "mean": .1, "min": -.2, "max": .3,
+                         "abs_mean": .2, "abs_max": .3,
+                     },
+                     "trigger_log_ratio": {
+                         "count": 1, "mean": .6, "min": .6, "max": .6,
+                         "abs_mean": .6, "abs_max": .6,
+                     },
                  },
                  "critic_explained_reward_variance": .2,
                  "critic_explained_reward_variance_by_floor": {
@@ -317,6 +360,14 @@ print('restored')
                      "policy_span_mean": 4, "policy_span_max": 4,
                      "policy_age_mean": 5, "policy_age_max": 5,
                      "character_counts": [0, 0, 1, 0, 0],
+                     "log_ratio": {
+                         "count": 7, "mean": -.1, "min": -.5, "max": .4,
+                         "abs_mean": .4, "abs_max": .5,
+                     },
+                     "trigger_log_ratio": {
+                         "count": 2, "mean": -.55, "min": -.6, "max": -.5,
+                         "abs_mean": .55, "abs_max": .6,
+                     },
                  },
                  "critic_explained_reward_variance": .8,
                  "critic_explained_reward_variance_by_floor": {
@@ -344,6 +395,16 @@ print('restored')
             self.assertEqual(metrics["rejected_trajectory_policy_span_mean"], 3)
             self.assertEqual(metrics["rejected_trajectory_policy_age_mean"], 4)
             self.assertEqual(metrics["rejected_trajectory_character_counts"], [1, 0, 1, 0, 0])
+            self.assertEqual(metrics["rejected_log_ratio_rows"], 12)
+            self.assertAlmostEqual(metrics["rejected_log_ratio_mean"], -1 / 60)
+            self.assertAlmostEqual(metrics["rejected_abs_log_ratio_mean"], 19 / 60)
+            self.assertEqual(metrics["rejected_log_ratio_min"], -.5)
+            self.assertEqual(metrics["rejected_log_ratio_max"], .4)
+            self.assertEqual(metrics["rejected_abs_log_ratio_max"], .5)
+            self.assertEqual(metrics["rejected_trigger_log_ratio_rows"], 3)
+            self.assertAlmostEqual(metrics["rejected_trigger_log_ratio_mean"], -1 / 6)
+            self.assertAlmostEqual(metrics["rejected_trigger_abs_log_ratio_mean"], 17 / 30)
+            self.assertEqual(metrics["rejected_trigger_abs_log_ratio_max"], .6)
 
     def test_projector_combines_distributions_instead_of_batch_statistics(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -442,13 +503,18 @@ print('restored')
             self.assertIn('"step":0', html)
             self.assertFalse((run / "live.js").exists())
             self.assertTrue(all(label in html for label in (
-                "Lineage", "Branch", "Compare", "Metrics", "Subsample", "Weights revision", "Policy loss", "Gradient norm",
-                "Optimizer steps / second", "Used rows / second", "Optimizer step time",
-                "Policy lag (p95)",
-                "Row outcomes",
+                "Lineage", "Branch", "Compare", "Metrics", "Subsample", "Optimizer updates",
+                "PPO policy loss", "Pre-clip global gradient norm",
+                "Decisions trained on",
+                "Committed optimizer updates/s", "Critic rows processed/s",
+                "Optimizer update time (seconds)",
+                "Training-row policy lag, p95 (revisions)",
+                "Data pipeline counters",
             )))
             self.assertIn("weights_revision??report.metrics.updates", html)
-            self.assertIn("series(reports,'advantage_mean','mean_advantage')", html)
+            self.assertIn("xaxis.value==='decisions'?trained(report)", html)
+            self.assertIn("step.decisions_trained??step.step", html)
+            self.assertIn("advantage_mean:['mean_advantage']", html)
             self.assertIn("optimizerSeries(steps,reports,'used_rows_per_second')", html)
             self.assertIn("function addComparison", html)
             self.assertIn("function clipComparison", html)
@@ -468,8 +534,10 @@ print('restored')
             self.assertIn("id=subsample type=number min=1 step=1 value=3", html)
             self.assertIn("appendReports(run,live.reports,live.optimizer_steps,index)", html)
             self.assertIn("critic_explained_reward_variance", html)
+            self.assertIn("critic_floor_conditioned_explained_reward_variance", html)
+            self.assertIn("availableMetricKeys()", html)
             self.assertIn("metricPicker.onchange", html)
-            self.assertIn("</div><details class=panel open><summary>Metrics", html)
+            self.assertIn("</div><details class=panel><summary>Metrics", html)
             self.assertNotIn("lines+markers", html)
             self.assertIn("Plotly.extendTraces", html)
             self.assertIn("fetch(url", html)
@@ -574,7 +642,6 @@ print('restored')
                    field="critic_target"),
             [-.1, -.2], atol=1e-7,
         )
-
         np.testing.assert_allclose(
             values([25], [0], increments=(20, 21, 30)), [35 / maximum], atol=1e-7,
         )
@@ -632,11 +699,17 @@ print('restored')
                     Namespace(gae_gamma=1, gae_lambda=1))
         np.testing.assert_array_equal(dataset.data["trajectory"][:5], [0, 0, 0, 1, 1])
         values = {key: value[:len(dataset)] for key, value in dataset.data.items()}
-        stats = dataset.trajectory_stats(values, 10, values["trajectory"] == 0)
+        stats = dataset.trajectory_stats(
+            values, 10, values["trajectory"] == 0, [.1, -.2, .3, .4, -.5],
+        )
         self.assertEqual(
             (stats["count"], stats["sampled_rows"], stats["floor_mean"]), (1, 3, 9),
         )
         self.assertEqual((stats["length_mean"], stats["policy_age_mean"]), (3, 1))
+        self.assertEqual(stats["log_ratio"]["count"], 3)
+        self.assertAlmostEqual(stats["log_ratio"]["mean"], .2 / 3)
+        self.assertAlmostEqual(stats["log_ratio"]["abs_mean"], .2)
+        self.assertAlmostEqual(stats["log_ratio"]["abs_p90"], .28)
 
         self.assertEqual(dataset.discard_ids([1]), 1)
         self.assertEqual(dataset.trim(2), 2)
@@ -690,6 +763,162 @@ print('restored')
             "policy_age_mean": 2., "policy_age_max": 2,
             "character_counts": [1, 0, 0, 0, 0],
         })
+
+
+class TrajectoryTest(unittest.TestCase):
+    @staticmethod
+    def trace():
+        env = train.sts2_sim.Batch(1, 7, 0, ascension=0)
+        env.observe_tokens()
+        actions = env.action_descriptors()
+        choice = 0
+        return {
+            "trajectory_schema": 1, "id": "trace", "seed": 7, "character": 0,
+            "stage": 0, "ascension": 0, "bonus": 0,
+            "temperature": .8, "fingerprint": env.fingerprint(),
+            "choices": [choice],
+            "log_policies": [[-math.log(len(actions))] * len(actions)],
+            "critic_values": [.25], "canonical_progress": [0], "phases": [0],
+            "policy_revisions": [3], "terminal_floor": 0, "terminal": False,
+            "outcome": "step_cap",
+        }
+
+    def test_trace_replays_state_and_action_descriptors(self):
+        replay = trajectories.replay_trace(self.trace())
+        self.assertEqual(len(replay["steps"]), 1)
+        self.assertEqual(replay["steps"][0]["choice"], 0)
+        state = replay["steps"][0]["state"]
+        self.assertEqual(state["common"]["character"], "CHARACTER.IRONCLAD")
+        event = state["event"]
+        self.assertEqual((event["id"], event["page"]), ("EVENT.NEOW", "initial"))
+        self.assertTrue(event["options"])
+        action = replay["steps"][0]["actions"][0]
+        self.assertEqual((action["kind"], action["target"]), ("event_option", "option:0"))
+        self.assertIsNotNone(action["label"])
+        self.assertAlmostEqual(sum(
+            action["probability"] for action in replay["steps"][0]["actions"]
+        ), 1)
+        self.assertAlmostEqual(
+            replay["steps"][0]["policy_entropy"], math.log(len(replay["steps"][0]["actions"])),
+        )
+        self.assertAlmostEqual(
+            replay["steps"][0]["effective_actions"], len(replay["steps"][0]["actions"]),
+        )
+
+    def test_native_policy_details_match_selected_probability(self):
+        env = train.sts2_sim.Batch(1, 7, 0, ascension=0)
+        model = train.Agent(
+            dict(env.token_layout(*train.DEFAULT_ARCHITECTURE)), *train.DEFAULT_ARCHITECTURE,
+        )
+        env.load_policy(train.export_value_model(None, model, env.fingerprint(), 1, 0, True))
+        _, policy, critic = env.policy_details([0], .8)[0]
+        result = env.policy(.8, False, False)
+        self.assertAlmostEqual(sum(math.exp(value) for value in policy), 1, places=5)
+        self.assertAlmostEqual(policy[int(result[1][0])], float(result[2][0]), places=5)
+        self.assertTrue(math.isfinite(critic))
+
+    def test_explanation_deletes_tokens_and_captures_attention(self):
+        env = train.sts2_sim.Batch(1, 1, None, ascension=0)
+        model = train.Agent(
+            dict(env.token_layout(*train.DEFAULT_ARCHITECTURE)), *train.DEFAULT_ARCHITECTURE,
+        )
+        model.eval()
+        policy = train.export_value_model(None, model, env.fingerprint(), 1, 0, True)
+        trace = trajectories.TrajectorySource._generate_one(
+            policy, env.fingerprint(), "memory", 0, 123, 0, 0, 0, 0, .8, False, 1, 1,
+        )
+        replay = train.sts2_sim.Batch(1, trace["seed"], 0, ascension=0)
+        observation = replay.observe_tokens(flat=True)
+        result = explain(
+            model, observation, json.loads(replay.state(0)), replay.action_descriptors(), trace, 0,
+        )
+        self.assertTrue(any(row.get("removed_tokens", 0) for row in result["influences"]))
+        self.assertIn("global_transformer", {row["hierarchy"] for row in result["attention"]})
+        self.assertTrue(all(abs(sum(row) - 1) < 1e-5
+                            for record in result["attention"]
+                            for head in record["weights"] for row in head))
+        case = next(row["id"] for row in result["influences"]
+                    if row["status"] != "unavailable")
+        compared = explain(
+            model, observation, json.loads(replay.state(0)), replay.action_descriptors(),
+            trace, 0, case,
+        )
+        self.assertEqual(compared["attention_case"], case)
+        self.assertTrue(compared["case_attention"])
+
+    def test_reward_actions_have_names_and_previews(self):
+        env = train.sts2_sim.Batch(1, 17, 0, teacher_width=8, teacher_turns=1, ascension=0)
+        env.set_training_bonus(24)
+        for _ in range(800):
+            env.observe_tokens()
+            descriptors = env.action_descriptors()
+            if any(row[0] == "reward_card" for row in descriptors):
+                rows = [(descriptor, json.loads(preview) if preview else None)
+                        for descriptor, preview in zip(descriptors, env.action_previews())]
+                card = next(row for row in rows if row[0][0] == "reward_card")
+                potion = next(row for row in rows if row[0][0] == "reward_potion")
+                self.assertTrue(card[0][3].startswith("CARD."))
+                self.assertEqual(card[1]["kind"], "card")
+                self.assertTrue(card[1]["effects"])
+                self.assertTrue(potion[0][3].startswith("POTION."))
+                self.assertEqual(potion[1]["kind"], "potion")
+                break
+            env.step(env.teacher())
+        else:
+            self.fail("teacher did not reach a card reward")
+
+    def test_trace_catalog_reads_gzip_and_ignores_malformed_records(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); run = root / "run"; events = run / "events"
+            events.mkdir(parents=True)
+            (run / "run.json").write_text(json.dumps({
+                "sessions": [{"training": {"policy_temperature": .7}}],
+            }))
+            with gzip.open(events / "000001.jsonl.gz", "wt") as output:
+                output.write("not json\n")
+                output.write(json.dumps({"event": "trajectory"} | self.trace()) + "\n")
+            source = trajectories.TrajectorySource(root)
+            listing = source.list("run")
+            self.assertEqual(listing["defaults"]["temperature"], .7)
+            self.assertEqual([row["id"] for row in listing["traces"]], ["trace"])
+            imported = source.add("run", json.loads(json.dumps(self.trace())))
+            self.assertEqual(imported["trace"]["source"], "imported")
+            self.assertEqual(len(imported["steps"]), 1)
+            with self.assertRaisesRegex(ValueError, "invalid run"):
+                source.list("../run")
+
+    def test_capture_disabled_does_not_inspect_environments(self):
+        collector = train.RolloutCollector.__new__(train.RolloutCollector)
+        collector.args = Namespace(capture_trajectories=False)
+        collector.env = mock.Mock()
+        self.assertEqual(collector.trace_indices(), [])
+        collector.env.characters.assert_not_called()
+
+    def test_capture_slots_are_balanced_by_character(self):
+        collector = train.RolloutCollector.__new__(train.RolloutCollector)
+        collector.args = Namespace(capture_trajectories=True, policy_temperature=.8)
+        collector.env = mock.Mock()
+        collector.env.characters.return_value = [0, 1, 2, 3, 4, 0]
+        collector.env.seeds.return_value = [10, 11, 12, 13, 14, 15]
+        collector.env.fingerprint.return_value = 9
+        collector.episode_steps = np.zeros(6, np.int32)
+        collector.traces = [None] * 6
+        collector.sampler_session = 1; collector.worker = 2
+        collector.generation = 3; collector.iteration = 4; collector.stage = 0
+        self.assertEqual(collector.trace_indices(), [0, 1, 2, 3, 4])
+        self.assertEqual([collector.traces[index]["character"] for index in range(5)],
+                         list(range(5)))
+
+    def test_trajectory_page_has_replay_and_portability_controls(self):
+        page = trajectories.trajectory_page()
+        for text in ("Generate from checkpoint", "Download JSON", "Import", "Legal actions",
+                     "Explain decision", "Causal token deletion"):
+            self.assertIn(text, page)
+        self.assertIn("row==null?'empty'", page)
+        self.assertIn("replaceAll('CARD.','').replaceAll('RELIC.','')", page)
+        self.assertIn("action-name:hover .preview", page)
+        self.assertLess(page.index("id=phase"), page.index("Legal actions"))
+        self.assertGreater(page.index("id=inventory"), page.index("Legal actions"))
 
 
 if __name__ == "__main__":

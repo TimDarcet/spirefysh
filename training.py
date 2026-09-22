@@ -451,7 +451,7 @@ class ExperienceDataset:
         return indices[self.data["priority"][indices] < 0]
 
     @staticmethod
-    def trajectory_stats(values, policy_revision, mask=None):
+    def trajectory_stats(values, policy_revision, mask=None, log_ratios=None):
         positions = np.arange(len(values["trajectory"])) if mask is None else np.flatnonzero(mask)
         if not len(positions):
             return None
@@ -464,7 +464,7 @@ class ExperienceDataset:
             - values["trajectory_version_min"][selected]
         ages = policy_revision - values["trajectory_version_min"][selected]
         floor, counts = np.unique(floors, return_counts=True)
-        return {
+        result = {
             "count": len(selected), "sampled_rows": len(positions),
             "floor_counts": dict(zip(map(str, floor), map(int, counts))),
             "floor_mean": float(floors.mean()), "floor_median": float(np.median(floors)),
@@ -477,6 +477,24 @@ class ExperienceDataset:
             "character_counts": np.bincount(
                 values["character"][selected], minlength=5,
             ).tolist(),
+        }
+        if log_ratios is not None:
+            result["log_ratio"] = ExperienceDataset.log_ratio_stats(
+                np.asarray(log_ratios)[positions],
+            )
+        return result
+
+    @staticmethod
+    def log_ratio_stats(values):
+        values = np.asarray(values, np.float32)
+        absolute = np.abs(values)
+        return {
+            "count": len(values), "mean": float(values.mean()),
+            "min": float(values.min()), "max": float(values.max()),
+            "abs_mean": float(absolute.mean()), "abs_max": float(absolute.max()),
+            "abs_p50": float(np.quantile(absolute, .5)),
+            "abs_p90": float(np.quantile(absolute, .9)),
+            "abs_p99": float(np.quantile(absolute, .99)),
         }
 
 
@@ -1169,10 +1187,14 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             fresh = torch.ones_like(log_ratio, dtype=torch.bool) if args.critic_only \
                 else log_ratio.abs() <= args.max_log_ratio
             if not bool(fresh.all()):
-                invalid = ~fresh.detach().cpu().numpy()
-                invalid = np.isin(values["trajectory"], values["trajectory"][invalid])
+                log_ratio_cpu = log_ratio.detach().cpu().numpy()
+                triggering = ~fresh.cpu().numpy()
+                invalid = np.isin(values["trajectory"], values["trajectory"][triggering])
                 rejected_trajectories = dataset.trajectory_stats(
-                    values, revisions["policy_revision"], invalid,
+                    values, revisions["policy_revision"], invalid, log_ratio_cpu,
+                )
+                rejected_trajectories["trigger_log_ratio"] = dataset.log_ratio_stats(
+                    log_ratio_cpu[triggering],
                 )
                 refill_ids = values["id"][~invalid]
                 ratio_rejected = dataset.discard_trajectories(values["trajectory"][invalid])
@@ -1195,8 +1217,9 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 resume_samplers()
                 continue
             refill_ids = np.empty(0, np.int64)
+            log_ratio_cpu = log_ratio.detach().cpu().numpy()
             batch_trajectories = dataset.trajectory_stats(
-                values, revisions["policy_revision"],
+                values, revisions["policy_revision"], log_ratios=log_ratio_cpu,
             )
             selected = np.asarray(selected, np.int64)
             expired = dataset.use(selected, args.priority_decay)
@@ -2081,6 +2104,10 @@ def train(args):
     if not all(math.isfinite(getattr(args, f"potential_{term}_weight"))
                for term in POTENTIAL_TERMS):
         raise ValueError("invalid potential weights")
+    if not all(math.isfinite(getattr(args, f"boss_{boss}_floor_increment"))
+               and getattr(args, f"boss_{boss}_floor_increment") >= 0
+               for boss in range(1, 4)):
+        raise ValueError("invalid boss floor increments")
     if (not 0 <= args.gae_gamma <= 1 or not 0 <= args.gae_lambda <= 1
             or not 0 <= args.critic_balance_decay < 1
             or args.search_consistency_weight and not args.critic_only):
@@ -2104,10 +2131,6 @@ def train(args):
         raise ValueError("critic-only training requires --checkpoint")
     if not 0 <= args.promote_win_rate <= 1:
         raise ValueError("invalid promotion rates")
-    if not all(math.isfinite(getattr(args, f"boss_{boss}_floor_increment"))
-               and getattr(args, f"boss_{boss}_floor_increment") >= 0
-               for boss in range(1, 4)):
-        raise ValueError("invalid boss floor increments")
     if seed_panel(args.development_seed, args.development_runs)[1] > args.promotion_seed:
         raise ValueError("development and promotion seed panels overlap")
     potential_weights = tuple(

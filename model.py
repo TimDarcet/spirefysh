@@ -2137,10 +2137,14 @@ class Agent(nn.Module):
         )
         synchronize()
         values, rows = [], []
-        add = lambda value, row: (values.append(value), rows.append(row))
+        segments = getattr(self, "_explanation_segments", None)
+        def add(value, row, name):
+            values.append(value); rows.append(row)
+            if segments is not None:
+                segments.append((name, len(value)))
 
         run, run_rows, _ = self._domain_rows(domains, encoded, DOMAIN["run"])
-        add(self._tag(run, 1), run_rows)
+        add(self._tag(run, 1), run_rows, "run")
         phase, phase_rows, _ = self._domain_rows(domains, encoded, DOMAIN["phase"])
         phase_values, phase_groups = [phase], [phase_rows]
         for domain in range(len(TOKEN_SPECS)):
@@ -2151,8 +2155,8 @@ class Agent(nn.Module):
                 phase_values.append(item); phase_groups.append(item_rows)
         phase = self._summarize(torch.cat(phase_values), torch.cat(phase_groups), batch,
                                 "phase", self.pooling["phase"])
-        add(self._tag(phase, 2), torch.arange(batch, device=phase.device))
-        add(self._tag(current, 3), torch.arange(batch, device=current.device))
+        add(self._tag(phase, 2), torch.arange(batch, device=phase.device), "phase")
+        add(self._tag(current, 3), torch.arange(batch, device=current.device), "map")
         synchronize()
 
         pool_specs = (
@@ -2177,7 +2181,7 @@ class Agent(nn.Module):
                     transformer_name="generation_pool",
                 )
             role = ("card_pool", "relic_pool", "encounter_pool", "event_pool").index(name) + 4
-            add(self._tag(summary, role), torch.arange(batch, device=summary.device))
+            add(self._tag(summary, role), torch.arange(batch, device=summary.device), name)
         synchronize()
 
         actors, actor_rows, actor_u, effect_values, effect_rows = self._actors(
@@ -2209,9 +2213,10 @@ class Agent(nn.Module):
                 pael = item_u[:, 9] != 0
                 item = item + pael[:, None] * payload[item_rows]
             item, item_rows = self._collection(item, item_rows, active, name)
-            add(item, item_rows)
-        add(actors, actor_rows)
-        values.extend(effect_values); rows.extend(effect_rows)
+            add(item, item_rows, name)
+        add(actors, actor_rows, "actor")
+        for value, row in zip(effect_values, effect_rows):
+            add(value, row, "effect")
         synchronize()
 
         continuation, continuation_rows, continuation_gru = self._continuations(
@@ -2219,7 +2224,7 @@ class Agent(nn.Module):
         )
         mode = self.pooling["continuation"]
         if mode == "global_tokens":
-            add(self._tag(continuation, 11, 10), continuation_rows)
+            add(self._tag(continuation, 11, 10), continuation_rows, "continuation")
         elif mode == "gru":
             _groups, maximum, position, present, last = continuation_gru
             padded = continuation.new_zeros((batch, maximum, self.width))
@@ -2251,14 +2256,14 @@ class Agent(nn.Module):
             else:
                 summary = continuation.new_zeros((batch, self.width))
             add(self._tag(summary, 14, 10),
-                torch.arange(batch, device=run.device))
+                torch.arange(batch, device=run.device), "continuation")
         else:
             add(self._tag(self._summarize(
                     continuation, continuation_rows, batch, "continuation", mode), 14, 10),
-                torch.arange(batch, device=run.device))
+                torch.arange(batch, device=run.device), "continuation")
         crystal, crystal_rows, _ = self._domain_rows(domains, encoded, DOMAIN["crystal"])
-        add(self._tag(crystal, 12), crystal_rows)
-        add(action, action_rows)
+        add(self._tag(crystal, 12), crystal_rows, "crystal")
+        add(action, action_rows, "action")
         synchronize()
 
         values = torch.cat(values)
