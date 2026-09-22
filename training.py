@@ -28,6 +28,24 @@ from rollout import *
 from telemetry import *
 
 
+BOSS_FLOOR_INCREMENTS = (10., 11., 10.)
+
+
+def terminal_floor(category, won, args):
+    increments = tuple(getattr(
+        args, f"boss_{boss}_floor_increment", default,
+    ) for boss, default in enumerate(BOSS_FLOOR_INCREMENTS, 1))
+    if won:
+        return MAX_PROGRESS - sum(BOSS_FLOOR_INCREMENTS[:2]) + sum(increments)
+    return category + sum(
+        increment - default
+        for threshold, increment, default in zip(
+            (25, 54), increments[:2], BOSS_FLOOR_INCREMENTS[:2],
+        )
+        if category >= threshold
+    )
+
+
 
 
 
@@ -263,8 +281,8 @@ class ExperienceDataset:
                 packed_legal_count(row) > 1 for row in trajectory["rows"]
             ])
             if len(indices):
-                category = CATEGORIES - 1 if trajectory["win_rewards"][-1] > .5 \
-                    else int(canonical.max())
+                won = trajectory["win_rewards"][-1] > .5
+                category = CATEGORIES - 1 if won else int(canonical.max())
                 versions = np.asarray(trajectory["versions"], np.int64)[indices]
                 trajectories.append((trajectory, indices, category, trajectory_id))
                 trajectory_floors.append(int(trajectory.get("terminal_floor", canonical.max())))
@@ -312,7 +330,9 @@ class ExperienceDataset:
             predicted = np.asarray(trajectory["critic_values"], np.float32)[indices]
             canonical = np.asarray(trajectory["canonical_progress"], np.int64)[indices]
             potential = np.asarray(trajectory["potentials"], np.float32)[indices]
-            terminal_value = category / (CATEGORIES - 1)
+            terminal_value = terminal_floor(
+                category, category == CATEGORIES - 1, args,
+            ) / (CATEGORIES - 1)
             terminal_categories[start:end] = category
             wins[start:end] = category == CATEGORIES - 1
             values[start:end] = predicted
@@ -2084,6 +2104,10 @@ def train(args):
         raise ValueError("critic-only training requires --checkpoint")
     if not 0 <= args.promote_win_rate <= 1:
         raise ValueError("invalid promotion rates")
+    if not all(math.isfinite(getattr(args, f"boss_{boss}_floor_increment"))
+               and getattr(args, f"boss_{boss}_floor_increment") >= 0
+               for boss in range(1, 4)):
+        raise ValueError("invalid boss floor increments")
     if seed_panel(args.development_seed, args.development_runs)[1] > args.promotion_seed:
         raise ValueError("development and promotion seed panels overlap")
     potential_weights = tuple(

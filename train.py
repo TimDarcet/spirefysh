@@ -77,6 +77,8 @@ def parser():
     run.add_argument("--freeze-backbone", action="store_true")
     run.add_argument("--gae-gamma", type=float, default=1.0)
     run.add_argument("--gae-lambda", type=float, default=1.0)
+    for boss, default in enumerate(BOSS_FLOOR_INCREMENTS, 1):
+        run.add_argument(f"--boss-{boss}-floor-increment", type=float, default=default)
     for term in POTENTIAL_TERMS:
         run.add_argument(f"--potential-{term.replace('_', '-')}-weight", type=float, default=0.)
     run.add_argument("--critic-balance-decay", type=float, default=.99)

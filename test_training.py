@@ -92,6 +92,11 @@ print('restored')
         self.assertTrue(args.disable_post_kl_check)
         self.assertEqual(args.mps_empty_cache_updates, 8)
         self.assertEqual(args.dataset_capacity, 131_072)
+        self.assertEqual(
+            [args.boss_1_floor_increment, args.boss_2_floor_increment,
+             args.boss_3_floor_increment],
+            [10, 11, 10],
+        )
         self.assertFalse(vars(args).keys() & {
             "max_policy_lag", "segment_steps", "blended_critic",
             "critic_consistency_weight", "critic_consistency_batch",
@@ -511,7 +516,7 @@ print('restored')
 
     def test_potential_gae(self):
         def values(canonical, expected, gamma=1, gae_lambda=1, won=False,
-                   potentials=None, field="advantage"):
+                   potentials=None, field="advantage", increments=None):
             length = len(canonical)
             trajectory = {
                 "rows": [packed_row() for _ in range(length)], "choices": [0] * length,
@@ -524,8 +529,12 @@ print('restored')
                 "potentials": np.zeros(length) if potentials is None else potentials,
             }
             dataset = train.ExperienceDataset()
+            parameters = {} if increments is None else dict(zip(
+                ("boss_1_floor_increment", "boss_2_floor_increment",
+                 "boss_3_floor_increment"), increments,
+            ))
             dataset.add({"trajectories": [trajectory]}, Namespace(
-                critic_only=False, gae_gamma=gamma, gae_lambda=gae_lambda,
+                critic_only=False, gae_gamma=gamma, gae_lambda=gae_lambda, **parameters,
             ))
             return dataset.data[field][:length]
 
@@ -564,6 +573,17 @@ print('restored')
             values([0, 0], [0, 0], gamma=.5, potentials=[.1, .2],
                    field="critic_target"),
             [-.1, -.2], atol=1e-7,
+        )
+
+        np.testing.assert_allclose(
+            values([25], [0], increments=(20, 21, 30)), [35 / maximum], atol=1e-7,
+        )
+        np.testing.assert_allclose(
+            values([54], [0], increments=(20, 21, 30)), [74 / maximum], atol=1e-7,
+        )
+        np.testing.assert_allclose(
+            values([72], [0], won=True, increments=(20, 21, 30)),
+            [122 / maximum], atol=1e-7,
         )
 
     def test_forced_actions_do_not_advance_gae_clock(self):
