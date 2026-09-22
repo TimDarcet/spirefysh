@@ -205,6 +205,7 @@ print('restored')
                  "policy_loss": 2, "critic_loss": 3,
                  "search_consistency_loss": .25, "gradient_clipped": True,
                  "critic_explained_reward_variance": .5, "total_seconds": 1,
+                 "learning_rates": [1e-4, 2e-4, 5e-5],
                  "critic_explained_reward_variance_by_floor": {
                      "12": {"value": .5, "target_variance": .25, "rows": 20}},
                  "training_elapsed_seconds": 3},
@@ -237,6 +238,9 @@ print('restored')
             })
             self.assertEqual(metrics["critic_floor_conditioned_explained_reward_variance"], .5)
             self.assertEqual(metrics["search_consistency_loss"], .25)
+            self.assertEqual(metrics["backbone_learning_rate"], 1e-4)
+            self.assertEqual(metrics["policy_learning_rate"], 2e-4)
+            self.assertEqual(metrics["critic_learning_rate"], 5e-5)
             self.assertEqual(metrics["gradient_clipped"], 1)
             self.assertEqual(metrics["advantage_stddev"], 3)
             self.assertEqual(metrics["policy_lag_mean"], .5)
@@ -268,6 +272,9 @@ print('restored')
                 "decisions_trained": 20,
                 "optimizer_steps_per_second": 1,
                 "used_rows_per_second": 20, "total_seconds": 1,
+                "backbone_learning_rate": 1e-4,
+                "policy_learning_rate": 2e-4,
+                "critic_learning_rate": 5e-5,
             }])
             self.assertEqual(metrics["dataset_rollout_dropped"], 3)
             self.assertEqual(metrics["dataset_budget_dropped"], 2)
@@ -510,6 +517,9 @@ print('restored')
                 "Optimizer update time (seconds)",
                 "Training-row policy lag, p95 (revisions)",
                 "Data pipeline counters",
+                "Outcomes", "Policy learning", "Critic learning", "Performance",
+                "Backbone learning rate", "Policy-head learning rate",
+                "Critic learning rate",
             )))
             self.assertIn("weights_revision??report.metrics.updates", html)
             self.assertIn("xaxis.value==='decisions'?trained(report)", html)

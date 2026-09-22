@@ -927,6 +927,10 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 return
 
     def training_batch_event(policy_outcome, commit_kind, **values):
+        rates = [group["lr"] for group in optimizer.param_groups]
+        rate_names = ("critic_learning_rate",) if args.critic_only else (
+            "backbone_learning_rate", "policy_learning_rate", "critic_learning_rate",
+        )
         emit_event({
             "event": "training_batch", "policy_outcome": policy_outcome,
             "commit_kind": commit_kind, "step": base_decisions + handled,
@@ -935,6 +939,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             "weights_revision": revisions["weights_revision"],
             "policy_revision": revisions["policy_revision"], "stage": stage,
             "training_elapsed_seconds": time.monotonic() - run_started,
+            "learning_rates": rates, **dict(zip(rate_names, rates)),
             **values,
         })
 
@@ -1529,7 +1534,6 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 pre_kl=kl_value, post_kl=post_kl,
                 post_kl_proposals=proposals, clip_fraction=float(clip_fraction),
                 gradient_norm=gradient_norm, gradient_clipped=gradient_norm > .5,
-                learning_rates=[group["lr"] for group in optimizer.param_groups],
                 unpack_seconds=unpack_seconds, forward_seconds=forward_seconds,
                 backward_seconds=backward_seconds, total_seconds=update_elapsed,
             )
