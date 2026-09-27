@@ -432,7 +432,8 @@ class MetricsProjector:
         "clip_fraction": "policy_trained_rows", "gradient_norm": None,
         "gradient_clipped": None,
         "policy_lag_mean": "fresh_rows", "policy_lag_p95": "fresh_rows",
-        "unpack_seconds": None, "forward_seconds": None, "backward_seconds": None,
+        "pause_seconds": None, "unpack_seconds": None,
+        "forward_seconds": None, "backward_seconds": None,
         "total_seconds": None, "backbone_learning_rate": None,
         "policy_learning_rate": None, "critic_learning_rate": None,
     }
@@ -672,6 +673,10 @@ class MetricsProjector:
                 window["_totals"].get("sample_queue_put_seconds", 0.) \
                 + event["queue_put_seconds"]
         for index, episode in enumerate(event.get("episodes", ())):
+            if episode.get("recovery"):
+                window["_totals"]["recovery_episodes"] = \
+                    window["_totals"].get("recovery_episodes", 0) + 1
+                continue
             character = int(episode["character"])
             floor = max(0, min(52, int(episode["floor"])))
             window["_floors"][floor] += 1

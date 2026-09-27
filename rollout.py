@@ -1,4 +1,5 @@
 import ctypes
+import faulthandler
 import os
 import signal
 import threading
@@ -12,6 +13,42 @@ import torch
 import sts2_sim
 from model import *
 from telemetry import *
+
+
+SAMPLER_SEED_BLOCK = 10_000_000
+SAMPLER_PHASES = (
+    "starting", "paused", "preparing", "policy", "environment", "processing", "reset",
+    "queue", "stopped",
+)
+SAMPLER_STATE_FIELDS = (
+    "seed", "character", "act", "floor", "hp", "max_hp", "phase", "turn",
+    "player_hp", "enemy_hp", "canonical_progress",
+)
+
+
+def sampler_seed(args, session, worker, generation, ordinal=0):
+    if not 0 <= worker < args.samplers or not 0 <= generation <= args.sampler_restarts \
+            or ordinal < 0:
+        raise ValueError("invalid sampler seed stream")
+    streams = args.samplers * (args.sampler_restarts + 1)
+    seed = (args.training_seed + session * SAMPLER_SEED_BLOCK
+            + generation * args.samplers + worker + ordinal * streams)
+    limit = min(args.training_seed + (session + 1) * SAMPLER_SEED_BLOCK,
+                args.development_seed, args.promotion_seed, 1 << 32)
+    if not args.training_seed <= seed < limit:
+        raise RuntimeError("training seed namespace exhausted")
+    return seed, streams, limit
+
+
+def sampler_diagnostic(diagnostics, worker, envs):
+    phases, started, iterations, states = diagnostics
+    rows = np.frombuffer(states, np.int64).reshape(-1, envs, len(SAMPLER_STATE_FIELDS))[worker]
+    return {
+        "phase": SAMPLER_PHASES[phases[worker]],
+        "phase_seconds": time.monotonic() - started[worker],
+        "iteration": int(iterations[worker]),
+        "states": [dict(zip(SAMPLER_STATE_FIELDS, map(int, row))) for row in rows if row[0] >= 0],
+    }
 
 
 
@@ -215,14 +252,13 @@ def sampler_wedged(heartbeat, observed_stale, now, timeout):
 
 class RolloutCollector:
     def __init__(self, args, sampler_session, stage, reservoir, iteration=0, worker=0,
-                 generation=0):
+                 generation=0, diagnostics=None):
         ascension, bonus = STAGES[stage]
         self.args = args
-        seed_worker = worker + generation * args.samplers
+        seed, stride, self.seed_limit = sampler_seed(args, sampler_session, worker, generation)
+        sampler_seed(args, sampler_session, worker, generation, args.envs - 1)
         self.env = sts2_sim.Batch(
-            args.envs, args.training_seed + sampler_session * 10_000_000 + seed_worker * args.envs,
-            None,
-            ascension=ascension,
+            args.envs, seed, None, ascension=ascension, seed_stride=stride,
         )
         self.env.set_training_bonus(bonus)
         self.env.set_potential_weights([
@@ -232,20 +268,54 @@ class RolloutCollector:
         self.episode_steps = np.zeros(args.envs, np.int32)
         self.combat_steps = np.zeros(args.envs, np.int32)
         self.reservoir = reservoir
-        seed = args.seed + sampler_session * 10_000_000 + seed_worker
-        self.rng = np.random.default_rng(seed)
-        self.torch_rng = torch.Generator().manual_seed(seed)
+        random_seed = args.seed + sampler_session * SAMPLER_SEED_BLOCK \
+            + worker + generation * args.samplers
+        self.rng = np.random.default_rng(random_seed)
+        self.torch_rng = torch.Generator().manual_seed(random_seed)
         self.iteration, self.sampler_session, self.stage = iteration, sampler_session, stage
         self.worker, self.generation = worker, generation
+        self.seed_start, self.seed_stride, self.started_games = seed, stride, args.envs
+        self.diagnostics = diagnostics
         self.trajectories = [None] * args.envs
         self.action_history = [[] for _ in range(args.envs)]
         self.traces = [None] * args.envs
         self.native_steps = []
         self.native_starts = np.zeros(args.envs, np.int64)
         self.native_started = np.full(args.envs, time.monotonic())
+        self.recovery = np.full(args.envs, generation > 0)
+        self.mark_phase("starting", True)
 
     def event(self, event, **values):
         emit_event({"event": event, **values}, role=f"sampler-{self.worker}")
+
+    def mark_phase(self, phase, snapshot=False):
+        if self.diagnostics is None:
+            return
+        phases, started, iterations, states = self.diagnostics
+        if snapshot:
+            stats = self.env.stats()
+            rows = np.frombuffer(states, np.int64).reshape(
+                self.args.samplers, self.args.envs, len(SAMPLER_STATE_FIELDS),
+            )[self.worker]
+            rows[:] = [
+                (seed, character, *state[:8], state[9])
+                for seed, character, state in zip(
+                    self.env.seeds(), self.env.characters(), stats,
+                )
+            ]
+        started[self.worker] = time.monotonic()
+        iterations[self.worker] = self.iteration
+        phases[self.worker] = SAMPLER_PHASES.index(phase)
+
+    def reset(self, indices):
+        if not indices:
+            return
+        sampler_seed(
+            self.args, self.sampler_session, self.worker, self.generation,
+            self.started_games + len(indices) - 1,
+        )
+        self.started_games += len(indices)
+        self.env.reset(indices, 0.0)
 
     def trace_indices(self):
         if not getattr(self.args, "capture_trajectories", False):
@@ -322,12 +392,23 @@ class RolloutCollector:
         expert_rows = []
         collect_seconds = 0.0
         for _ in range(steps):
-            while sampling is not None and not sampling.is_set():
-                paused[self.worker] = True
-                if heartbeat is not None:
-                    heartbeat[self.worker] = time.monotonic()
-                if time.monotonic() >= deadline or stop.wait(.01):
-                    break
+            if sampling is not None and not sampling.is_set():
+                paused_started = time.monotonic()
+                self.mark_phase("paused")
+                while not sampling.is_set():
+                    paused[self.worker] = True
+                    if heartbeat is not None:
+                        heartbeat[self.worker] = time.monotonic()
+                    if time.monotonic() >= deadline or stop.wait(.01):
+                        break
+                paused_seconds = time.monotonic() - paused_started
+                self.native_started += paused_seconds
+                for trajectory in self.trajectories:
+                    if trajectory is not None:
+                        trajectory["started"] += paused_seconds
+                for trace in self.traces:
+                    if trace is not None:
+                        trace["started"] += paused_seconds
             if paused is not None:
                 paused[self.worker] = False
             if time.monotonic() >= deadline or stop and stop.is_set():
@@ -352,10 +433,13 @@ class RolloutCollector:
                         discarded_steps += len(self.trajectories[index]["samples"])
                     self.trajectories[index] = None
                     self.action_history[index].clear()
-                self.env.reset(reset, 0.0)
+                self.mark_phase("reset", True)
+                self.reset(reset)
+                self.recovery[reset] = False
                 self.episode_steps[reset] = 0
                 self.combat_steps[reset] = 0
                 self.observation = self.env.observe_tokens(flat=True)
+            self.mark_phase("preparing", True)
             trace_indices = self.trace_indices()
             step_started = time.monotonic()
             if native:
@@ -365,6 +449,7 @@ class RolloutCollector:
                         trace_indices, args.policy_temperature,
                     )
                 } if trace_indices else {})
+                self.mark_phase("policy")
                 result = self.env.policy(
                     args.policy_temperature,
                     advance=True,
@@ -411,11 +496,13 @@ class RolloutCollector:
                 phases = np.asarray([row[4] for row in state_stats], np.uint8)
                 characters = np.asarray(self.observation[0], np.uint8)
                 potentials = np.asarray(self.observation[4], np.float32)
+                self.mark_phase("policy")
                 choice, log_probability, policy, critic_value, trace_details = act(
                     model, self.observation, target, True, precision, self.torch_rng,
                     args.policy_temperature, trace_indices,
                 )
                 step_rows = _pack_batch(self.observation)
+            self.mark_phase("processing")
             if not native:
                 for index, action in enumerate(choice):
                     self.action_history[index].append(int(action))
@@ -438,7 +525,9 @@ class RolloutCollector:
             ])
             self.combat_steps = np.where(in_combat, self.combat_steps + 1, 0)
             if not native:
+                self.mark_phase("environment")
                 raw_reward, done, _ = self.env.step(choice.tolist())
+                self.mark_phase("processing")
             raw_reward = np.array(raw_reward, np.float32, copy=True)
             done = np.asarray(done, bool)
             sampled_steps += args.envs
@@ -479,6 +568,7 @@ class RolloutCollector:
                 wins = [bool(done[index] and stats[index][4] == 12) for index in reset]
                 self.reservoir.finish(reset, wins, self.rng)
                 for index, won in zip(reset, wins):
+                    recovering = bool(self.recovery[index])
                     history = (self.native_steps[self.native_starts[index]:] if native
                                else self.trajectories[index]["samples"])
                     terminal_floor = int((stats[index][0] - 1) * 17 + stats[index][1])
@@ -496,15 +586,17 @@ class RolloutCollector:
                         "iteration": self.iteration,
                         "policy_revision_min": min(policy_versions, default=version),
                         "policy_revision_max": max(policy_versions, default=version),
+                        **({"recovery": True} if recovering else {}),
                     })
-                    episodes[characters[index]].append((
-                        int(done[index] and stats[index][4] == 12),
-                        (stats[index][0] - 1) * 17 + stats[index][1],
-                        int(step_truncated[index] and truncated[index]),
-                        int(combat_truncated[index] and truncated[index]),
-                        int(empty_actions[index]),
-                        self.iteration,
-                    ))
+                    if not recovering:
+                        episodes[characters[index]].append((
+                            int(done[index] and stats[index][4] == 12),
+                            (stats[index][0] - 1) * 17 + stats[index][1],
+                            int(step_truncated[index] and truncated[index]),
+                            int(combat_truncated[index] and truncated[index]),
+                            int(empty_actions[index]),
+                            self.iteration,
+                        ))
                     outcome = (
                         "won" if won else "dead" if done[index]
                         else "empty_actions" if empty_actions[index]
@@ -538,7 +630,9 @@ class RolloutCollector:
                     self.action_history[index].clear()
                     self.native_starts[index] = len(self.native_steps)
                     self.native_started[index] = time.monotonic()
-                self.env.reset(reset, 0.0)
+                    self.recovery[index] = False
+                self.mark_phase("reset", True)
+                self.reset(reset)
                 self.episode_steps[reset] = 0
                 self.combat_steps[reset] = 0
                 next_observation = None if native else self.env.observe_tokens(flat=True)
@@ -665,6 +759,7 @@ class RolloutCollector:
             pending["reservoir"] = self.reservoir.drain_candidates()
             pending["queued_at"] = time.monotonic()
             put_started = pending["queued_at"]
+            self.mark_phase("queue")
             while not stop.is_set():
                 try:
                     pending["queue_put_seconds"] = time.monotonic() - put_started
@@ -700,12 +795,14 @@ class RolloutCollector:
         pending["iteration"] = self.iteration
         if heartbeat is not None:
             heartbeat[worker] = time.monotonic()
+        self.mark_phase("stopped")
         return worker, self.generation, version, pending
 
 
 def collect_worker(model, args, sampler_session, stage, capacity, pending_capacity, iteration,
                    worker, generation, actor_revision, policy_revision, models, samples, stop,
-                   deadline, budget, results, heartbeat, progress, sampling, paused, parent_pid):
+                   deadline, budget, results, heartbeat, progress, sampling, paused, diagnostics,
+                   parent_pid):
     if args.sampler_backend == "process":
         prctl = getattr(ctypes.CDLL(None), "prctl", None)
         if prctl is not None and prctl(1, signal.SIGKILL) == 0:
@@ -720,6 +817,11 @@ def collect_worker(model, args, sampler_session, stage, capacity, pending_capaci
         release_accelerator()
         configure_logging(args.output, f"sampler-{worker}", getattr(args, "log_level", "INFO"),
                           args.trainer_session, args.run_id, args.event_log)
+        if hasattr(signal, "SIGUSR2"):
+            try:
+                faulthandler.register(signal.SIGUSR2, all_threads=True)
+            except (OSError, RuntimeError):
+                pass
     qos = getattr(ctypes.CDLL(None), "pthread_set_qos_class_self_np", None)
     if qos is not None:
         qos(int(os.environ.get("ACTOR_QOS", "0x21"), 0), 0)
@@ -730,20 +832,22 @@ def collect_worker(model, args, sampler_session, stage, capacity, pending_capaci
         torch._C._set_default_mobile_cpu_allocator()
     reservoir = WinningReservoir(capacity, args.envs, pending_capacity)
     collector = RolloutCollector(
-        args, sampler_session, stage, reservoir, iteration, worker, generation,
+        args, sampler_session, stage, reservoir, iteration, worker, generation, diagnostics,
     )
     collector.event(
         "sampler_start", worker=worker, generation=generation,
         sampler_session=sampler_session, stage=stage, envs=args.envs,
         threads=args.sampler_threads, actor_revision=actor_revision,
-        policy_revision=policy_revision,
+        policy_revision=policy_revision, seed_start=collector.seed_start,
+        seed_stride=collector.seed_stride, seed_limit=collector.seed_limit,
     )
     target = torch.device("mps") if os.environ.get("ACTOR_MPS") else torch.device("cpu")
     precision = "bf16" if target.type == "mps" else "fp32"
     if target.type == "mps":
         model = model.to(target)
         collector.torch_rng = torch.Generator(device=target).manual_seed(
-            args.seed + sampler_session * 10_000_000 + worker + generation * args.samplers
+            args.seed + sampler_session * SAMPLER_SEED_BLOCK
+            + worker + generation * args.samplers
         )
     if isinstance(model, bytes):
         collector.env.load_policy(model)

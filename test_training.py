@@ -3,6 +3,7 @@ import io
 import json
 import logging
 import math
+import multiprocessing
 import subprocess
 import sys
 import tempfile
@@ -109,6 +110,76 @@ print('restored')
         })
         self.assertFalse(args.capture_trajectories)
 
+    def test_sampler_seed_streams_are_disjoint(self):
+        args = Namespace(
+            training_seed=1_000, development_seed=100_000_000,
+            promotion_seed=200_000_000, samplers=2, sampler_restarts=3,
+        )
+        sessions = []
+        for session in (1, 2):
+            seeds = {
+                train.sampler_seed(args, session, worker, generation, ordinal)[0]
+                for generation in range(args.sampler_restarts + 1)
+                for worker in range(args.samplers)
+                for ordinal in range(100)
+            }
+            self.assertEqual(len(seeds), 800)
+            sessions.append(seeds)
+        self.assertTrue(sessions[0].isdisjoint(sessions[1]))
+        self.assertEqual(train.sampler_seed(args, 1, 0, 0), (10_001_000, 8, 20_001_000))
+
+    def test_sampler_seed_stream_stops_at_namespace_boundary(self):
+        args = Namespace(
+            training_seed=1_000, development_seed=100_000_000,
+            promotion_seed=200_000_000, samplers=2, sampler_restarts=3,
+        )
+        stream = args.sampler_restarts * args.samplers + args.samplers - 1
+        last = (train.SAMPLER_SEED_BLOCK - 1 - stream) // 8
+        train.sampler_seed(args, 1, 1, 3, last)
+        with self.assertRaisesRegex(RuntimeError, "namespace exhausted"):
+            train.sampler_seed(args, 1, 1, 3, last + 1)
+
+    def test_native_batch_honors_seed_stride(self):
+        env = train.sts2_sim.Batch(2, 100, None, ascension=0, seed_stride=4)
+        self.assertEqual(env.seeds(), [100, 104])
+        env.reset([0])
+        self.assertEqual(env.seeds(), [108, 104])
+
+    def test_sampler_session_claim_survives_checkpoint_rollback(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "run.json"
+            manifest = {"sampler_session": 2}
+            self.assertEqual(train.claim_sampler_session(path, manifest, 2), 3)
+            reloaded = json.loads(path.read_text())
+            self.assertEqual(train.claim_sampler_session(path, reloaded, 2), 4)
+
+    def test_sampler_diagnostic_captures_the_stalled_batch(self):
+        context = multiprocessing.get_context("spawn")
+        diagnostics = (
+            context.RawArray("i", 2), context.RawArray("d", 2),
+            context.RawArray("q", 2), context.RawArray(
+                "q", [-1] * (4 * len(train.SAMPLER_STATE_FIELDS)),
+            ),
+        )
+        collector = train.RolloutCollector.__new__(train.RolloutCollector)
+        collector.args = Namespace(samplers=2, envs=2)
+        collector.worker = 1; collector.iteration = 7; collector.diagnostics = diagnostics
+        collector.env = mock.Mock()
+        collector.env.seeds.return_value = [101, 102]
+        collector.env.characters.return_value = [3, 4]
+        collector.env.stats.return_value = [
+            (1, 2, 30, 40, 5, 6, 20, 10, .5, 7),
+            (2, 3, 31, 41, 6, 7, 21, 11, .6, 8),
+        ]
+        collector.mark_phase("policy", True)
+        diagnostic = train.sampler_diagnostic(diagnostics, 1, 2)
+        self.assertEqual((diagnostic["phase"], diagnostic["iteration"]), ("policy", 7))
+        self.assertEqual(diagnostic["states"][0], {
+            "seed": 101, "character": 3, "act": 1, "floor": 2, "hp": 30,
+            "max_hp": 40, "phase": 5, "turn": 6, "player_hp": 20,
+            "enemy_hp": 10, "canonical_progress": 7,
+        })
+
     def test_trajectory_capture_flag(self):
         self.assertTrue(train.parser().parse_args([
             "train", "--capture-trajectories",
@@ -180,7 +251,9 @@ print('restored')
                                "empty_actions": False, "length": 20,
                                "completion_seconds": 1, "iteration": 5,
                                "policy_revision_min": 2,
-                               "policy_revision_max": 4}]},
+                               "policy_revision_max": 4},
+                              {"character": 0, "floor": 1, "won": False,
+                               "recovery": True}]},
                 {"event": "training_batch", "time": 3, "step": 40, "stage": 0,
                  "weights_revision": 1, "policy_revision": 1,
                  "attempted_rows": 20, "fresh_rows": 20,
@@ -205,6 +278,7 @@ print('restored')
                  "policy_loss": 2, "critic_loss": 3,
                  "search_consistency_loss": .25, "gradient_clipped": True,
                  "critic_explained_reward_variance": .5, "total_seconds": 1,
+                 "pause_seconds": .25,
                  "learning_rates": [1e-4, 2e-4, 5e-5],
                  "critic_explained_reward_variance_by_floor": {
                      "12": {"value": .5, "target_variance": .25, "rows": 20}},
@@ -227,6 +301,7 @@ print('restored')
             self.assertEqual(metrics["floor_bands"]["median"], 12)
             self.assertEqual(metrics["characters"][2]["wins"], 1)
             self.assertEqual(metrics["win_rate"], 1)
+            self.assertEqual(metrics["recovery_episodes"], 1)
             self.assertEqual(metrics["boss_entries"], 1)
             self.assertEqual(metrics["boss_entry_rate"], 1)
             self.assertEqual(metrics["boss_conversion"], 1)
@@ -242,6 +317,7 @@ print('restored')
             self.assertEqual(metrics["policy_learning_rate"], 2e-4)
             self.assertEqual(metrics["critic_learning_rate"], 5e-5)
             self.assertEqual(metrics["gradient_clipped"], 1)
+            self.assertEqual(metrics["pause_seconds"], .25)
             self.assertEqual(metrics["advantage_stddev"], 3)
             self.assertEqual(metrics["policy_lag_mean"], .5)
             self.assertEqual(metrics["policy_lag_p95"], 1)

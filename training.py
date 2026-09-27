@@ -5,6 +5,7 @@ import json
 import math
 import multiprocessing
 import os
+import signal
 import struct
 import tempfile
 import threading
@@ -216,6 +217,13 @@ def resume_curriculum(source, stage):
         if not 0 <= stage_decisions <= auxiliary:
             raise ValueError("invalid current-stage decision clock")
     return stage_decisions, source.get("progress_active", stage <= 6)
+
+
+def claim_sampler_session(path, manifest, checkpoint_session):
+    session = max(checkpoint_session, manifest.get("sampler_session", 0)) + 1
+    manifest["sampler_session"] = session
+    atomic_json(path, manifest)
+    return session
 
 
 class ExperienceDataset:
@@ -606,10 +614,10 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
     sampler_generations = [0] * args.samplers
     sampler_restarts = [0] * args.samplers
     sampler_wedges = [0] * args.samplers
-    sampler_restart_streaks = [0] * args.samplers
-    sampler_recovery_packets = [0] * args.samplers
     sampler_stale_since = [None] * args.samplers
+    sampler_stale_heartbeat = [None] * args.samplers
     sampler_exhausted = [False] * args.samplers
+    sampler_finished = [False] * args.samplers
     watchdog_dropped = queue_peak = 0
     latest_sampler_version = revisions["policy_revision"]
     dataset_peak = 0
@@ -634,6 +642,12 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
     progress = [0] * args.samplers if threaded else context.Array("q", [0] * args.samplers)
     sampling = threading.Event() if threaded else context.Event()
     paused = [False] * args.samplers if threaded else context.Array("b", args.samplers)
+    diagnostics = (
+        context.RawArray("i", args.samplers),
+        context.RawArray("d", [started] * args.samplers),
+        context.RawArray("q", [base_decisions // args.envs] * args.samplers),
+        context.RawArray("q", [-1] * (args.envs * len(SAMPLER_STATE_FIELDS))),
+    )
     sampling.set()
     packer = ThreadPoolExecutor(max_workers=1)
     workers = [None] * args.samplers
@@ -671,13 +685,22 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
     def start_worker(worker):
         heartbeat[worker] = time.monotonic()
         progress[worker] = 0
-        sampler_recovery_packets[worker] = 0
+        paused[worker] = False
         sampler_stale_since[worker] = None
+        sampler_stale_heartbeat[worker] = None
+        sampler_finished[worker] = False
+        diagnostics[0][worker] = SAMPLER_PHASES.index("starting")
+        diagnostics[1][worker] = time.monotonic()
+        diagnostics[2][worker] = sampler_iterations[worker]
+        np.frombuffer(diagnostics[3], np.int64).reshape(
+            args.samplers, collector_args.envs, len(SAMPLER_STATE_FIELDS),
+        )[worker].fill(-1)
         process = worker_type(target=collect_worker, args=(
             actor, collector_args, sampler_session, stage,
             reservoir.capacity, pending_capacity, sampler_iterations[worker], worker,
             sampler_generations[worker], actor_revision, policy_version, models[worker], sample_source,
-            stop, deadline, budget, results, heartbeat, progress, sampling, paused, os.getpid(),
+            stop, deadline, budget, results, heartbeat, progress, sampling, paused, diagnostics,
+            os.getpid(),
         ), name=f"sampler-{worker}", daemon=True)
         workers[worker] = process
         process.start()
@@ -712,10 +735,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         worker, generation, version, result = item
         if generation != sampler_generations[worker]:
             return
-        if packet:
-            sampler_recovery_packets[worker] += 1
-            if sampler_recovery_packets[worker] >= 2:
-                sampler_restart_streaks[worker] = 0
+        if not packet:
+            sampler_finished[worker] = True
         sampler_versions[worker] = version
         sampler_iterations[worker] = result["iteration"]
         latest_sampler_version = min(sampler_versions)
@@ -916,7 +937,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         if target.type == "mps":
             torch.mps.synchronize()
             sampling.set()
-            while any(paused):
+            while any(paused[worker] and workers[worker].is_alive()
+                      for worker in range(args.samplers)):
                 time.sleep(.001)
 
     def drain_results():
@@ -943,6 +965,14 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             **values,
         })
 
+    def dump_wedge(process):
+        if hasattr(signal, "SIGUSR2"):
+            try:
+                os.kill(process.pid, signal.SIGUSR2)
+                process.join(.1)
+            except ProcessLookupError:
+                pass
+
     def watch_samplers():
         while not stop.wait(min(1., args.sampler_timeout / 10)):
             now = time.monotonic()
@@ -952,13 +982,16 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 if sampler_exhausted[worker] or watchdog_pending[worker]:
                     continue
                 alive = process.is_alive()
-                stale = alive and now - heartbeat[worker] > args.sampler_timeout
+                observed_heartbeat = heartbeat[worker]
+                stale = alive and now - observed_heartbeat > args.sampler_timeout
                 if not stale:
                     sampler_stale_since[worker] = None
-                elif sampler_stale_since[worker] is None:
+                    sampler_stale_heartbeat[worker] = None
+                elif sampler_stale_heartbeat[worker] != observed_heartbeat:
                     sampler_stale_since[worker] = now
+                    sampler_stale_heartbeat[worker] = observed_heartbeat
                 wedged = alive and sampler_wedged(
-                    heartbeat[worker], sampler_stale_since[worker], now, args.sampler_timeout,
+                    observed_heartbeat, sampler_stale_since[worker], now, args.sampler_timeout,
                 )
                 failed = not alive and (threaded or process.exitcode not in (None, 0))
                 if not wedged and not failed:
@@ -967,6 +1000,12 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 if threaded:
                     stop.set()
                 elif wedged:
+                    dump_wedge(process)
+                    if heartbeat[worker] != observed_heartbeat:
+                        watchdog_pending[worker] = False
+                        sampler_stale_since[worker] = None
+                        sampler_stale_heartbeat[worker] = None
+                        continue
                     watchdog_terminated.add(process)
                     process.terminate(); process.join(5)
                     if process.is_alive():
@@ -1005,14 +1044,15 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 "event": "sampler_failure", "worker": worker,
                 "generation": sampler_generations[worker], "wedged": wedged,
                 "exitcode": exitcode, "dropped": dropped,
+                "last_packet_policy_revision": sampler_versions[worker],
+                "diagnostic": sampler_diagnostic(diagnostics, worker, collector_args.envs),
             }, "WARNING")
-            if (sampler_restart_streaks[worker] >= args.sampler_restarts or stop.is_set()
+            if (sampler_restarts[worker] >= args.sampler_restarts or stop.is_set()
                     or time.monotonic() >= deadline or decisions >= budget):
                 sampler_exhausted[worker] = True
                 watchdog_pending[worker] = False
                 continue
             sampler_restarts[worker] += 1
-            sampler_restart_streaks[worker] += 1
             sampler_generations[worker] += 1
             while True:
                 try:
@@ -1024,8 +1064,15 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             emit_event({
                 "event": "sampler_restart", "worker": worker,
                 "generation": sampler_generations[worker],
-                "restarts": sampler_restarts[worker], "streak": sampler_restart_streaks[worker],
+                "restarts": sampler_restarts[worker],
+                "remaining": args.sampler_restarts - sampler_restarts[worker],
             })
+
+    def samplers_done():
+        return (stop.is_set() or all(
+            sampler_exhausted[worker] or sampler_finished[worker]
+            for worker in range(args.samplers)
+        )) and samples.empty()
 
     watchdog = threading.Thread(target=watch_samplers, name="sampler-watchdog", daemon=True)
     try:
@@ -1067,6 +1114,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     "sampler_policy_revision": latest_sampler_version,
                     "watchdog_dropped_steps": watchdog_dropped,
                     "sampler_age_seconds": [now - value for value in heartbeat[:]],
+                    "sampler_phases": [SAMPLER_PHASES[value] for value in diagnostics[0][:]],
+                    "sampler_phase_seconds": [now - value for value in diagnostics[1][:]],
                     "sampler_generations": sampler_generations,
                     "sampler_restarts": sampler_restarts,
                     "sampler_wedges": sampler_wedges,
@@ -1079,7 +1128,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     "training_elapsed_seconds": time.monotonic() - run_started,
                 })
                 next_heartbeat_log = now + 10
-            sampler_done = (stop.is_set() or all(not worker.is_alive() for worker in workers)) and samples.empty()
+            sampler_done = samplers_done()
             if not pending:
                 if len(dataset) < args.batch and not sampler_done:
                     try:
@@ -1088,7 +1137,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     except (Empty, EOFError, OSError):
                         recover_workers()
                         continue
-                    sampler_done = (stop.is_set() or all(not worker.is_alive() for worker in workers)) and samples.empty()
+                    sampler_done = samplers_done()
                 absolute = base_decisions + handled
                 expert_stale = len(expert_dataset)
                 expert_dataset.prune(revisions["policy_revision"], args.expert_max_lag)
@@ -1133,7 +1182,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     before = decisions
                     drain_samples()
                     ingested = decisions != before
-                    sampler_done = (stop.is_set() or all(not worker.is_alive() for worker in workers)) and samples.empty()
+                    sampler_done = samplers_done()
                 boundary = min(next_report, next_save) - (base_decisions + handled)
                 enough = len(dataset) >= args.batch
                 if boundary <= 0:
@@ -1155,8 +1204,10 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 continue
             assert len(rows) == args.batch
             revisions["update_attempt"] += 1
-            unpack_started = time.monotonic()
+            pause_started = time.monotonic()
             pause_samplers()
+            pause_seconds = time.monotonic() - pause_started
+            unpack_started = time.monotonic()
             lengths = np.asarray([packed_action_count(row) for row in rows], np.int64)
             expert_lengths = np.asarray([
                 packed_action_count(row) for row in expert_rows
@@ -1211,7 +1262,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     fresh_rows=int((~invalid).sum()), policy_trained_rows=0,
                     critic_trained_rows=0, ratio_rejected_rows=ratio_rejected,
                     rejected_trajectories=rejected_trajectories,
-                    retired_rows=0, unpack_seconds=unpack_seconds,
+                    retired_rows=0, pause_seconds=pause_seconds,
+                    unpack_seconds=unpack_seconds,
                     forward_seconds=forward_seconds, backward_seconds=0.,
                     total_seconds=update_elapsed,
                 )
@@ -1288,7 +1340,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     advantage_stddev=float(np.std(values["advantage"][fresh_cpu])),
                     policy_lag_counts=policy_lag_counts, pre_kl=kl_value,
                     gradient_norm=gradient_norm,
-                    gradient_clipped=gradient_norm > .5, unpack_seconds=unpack_seconds,
+                    gradient_clipped=gradient_norm > .5, pause_seconds=pause_seconds,
+                    unpack_seconds=unpack_seconds,
                     forward_seconds=forward_seconds, backward_seconds=backward_seconds,
                     total_seconds=update_elapsed,
                 )
@@ -1472,7 +1525,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     entropy=float(entropy.detach()), entropy_weight=entropy_weight,
                     pre_kl=kl_value, post_kl_proposals=proposals,
                     clip_fraction=float(clip_fraction), gradient_norm=gradient_norm,
-                    gradient_clipped=gradient_norm > .5, unpack_seconds=unpack_seconds,
+                    gradient_clipped=gradient_norm > .5, pause_seconds=pause_seconds,
+                    unpack_seconds=unpack_seconds,
                     forward_seconds=forward_seconds, backward_seconds=backward_seconds,
                     total_seconds=update_elapsed,
                 )
@@ -1534,7 +1588,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 pre_kl=kl_value, post_kl=post_kl,
                 post_kl_proposals=proposals, clip_fraction=float(clip_fraction),
                 gradient_norm=gradient_norm, gradient_clipped=gradient_norm > .5,
-                unpack_seconds=unpack_seconds, forward_seconds=forward_seconds,
+                pause_seconds=pause_seconds, unpack_seconds=unpack_seconds,
+                forward_seconds=forward_seconds,
                 backward_seconds=backward_seconds, total_seconds=update_elapsed,
             )
             if updates % args.publish_updates == 0:
@@ -1558,6 +1613,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     "represented_actions_max": represented_actions,
                     "state_attention_pairs": sum((packed_state_count(row) + 1) ** 2 for row in packed),
                     "legal_actions_max": max(packed_legal_count(row) for row in packed),
+                    "pause_seconds": pause_seconds,
                     "unpack_seconds": unpack_seconds,
                     "forward_seconds": forward_seconds, "backward_seconds": backward_seconds,
                 }}, "WARNING")
@@ -2137,6 +2193,8 @@ def train(args):
         raise ValueError("invalid promotion rates")
     if seed_panel(args.development_seed, args.development_runs)[1] > args.promotion_seed:
         raise ValueError("development and promotion seed panels overlap")
+    if not 0 <= args.training_seed < min(args.development_seed, args.promotion_seed, 1 << 32):
+        raise ValueError("training and evaluation seed panels overlap")
     potential_weights = tuple(
         getattr(args, f"potential_{term}_weight") for term in POTENTIAL_TERMS
     )
@@ -2244,6 +2302,9 @@ def train(args):
     manifest.setdefault("run_id", run_id)
     manifest.setdefault("lineage_id", manifest["run_id"])
     manifest.setdefault("telemetry_window_decisions", args.report_decisions)
+    saved_training_seed = manifest.get("training", {}).get("training_seed")
+    if continuing and saved_training_seed not in (None, args.training_seed):
+        raise ValueError("training seed cannot change within a run")
     if parent and not parent.get("run_id") and continuing:
         parent["run_id"] = manifest["run_id"]
     if continuing and manifest.get("model_version") != model.model_version:
@@ -2341,7 +2402,10 @@ def train(args):
         args.critic_balance_decay,
         source.get("critic_balance") if source else None,
     )
-    sampler_session = source.get("sampler_session", source.get("sampler_index", 0)) if source else 0
+    sampler_session = max(
+        source.get("sampler_session", source.get("sampler_index", 0)) if source else 0,
+        manifest.get("sampler_session", 0),
+    )
     promotion_index = source.get("promotion_index", 0) if source else 0
     if not 0 <= stage < len(STAGES):
         raise ValueError("invalid checkpoint stage")
@@ -2364,7 +2428,7 @@ def train(args):
         )
         event_end = emit_event({
             "event": "checkpoint", "checkpoint_id": checkpoint_id, "kind": kind,
-            "step": step, "stage": stage,
+            "step": step, "stage": stage, "sampler_session": sampler_session,
             "update_attempt": revisions["update_attempt"],
             "weights_revision": revisions["weights_revision"],
             "policy_revision": revisions["policy_revision"],
@@ -2473,7 +2537,11 @@ def train(args):
     if args.promote_now:
         promote()
     while time.monotonic() < deadline and (not args.decisions or decisions < args.decisions):
-        sampler_session += 1
+        sampler_session = claim_sampler_session(output / "run.json", manifest, sampler_session)
+        sampler_seed(
+            args, sampler_session, args.samplers - 1, args.sampler_restarts,
+            args.envs // args.samplers - 1,
+        )
         base = decisions
         budget = args.decisions - decisions if args.decisions else (1 << 62) // args.envs * args.envs
         last_checkpoint = None
