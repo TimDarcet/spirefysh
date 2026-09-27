@@ -647,7 +647,7 @@ class RolloutCollector:
                 self.combat_steps[reset] = 0
                 next_observation = None if native else self.env.observe_tokens(flat=True)
             if native:
-                if len(self.native_steps) > NATIVE_HISTORY_WINDOW:
+                if len(self.native_steps) > NATIVE_HISTORY_WINDOW * 2:
                     cutoff = len(self.native_steps) - NATIVE_HISTORY_WINDOW
                     for index, start in enumerate(self.native_starts):
                         if start < cutoff:

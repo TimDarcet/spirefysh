@@ -1204,7 +1204,9 @@ class TrajectoryTest(unittest.TestCase):
                 results.append(collector.collect(
                     None, None, "fp32", float("inf"), 200, 17,
                 ))
-                self.assertLessEqual(len(collector.native_steps), window)
+                self.assertLessEqual(len(collector.native_steps), window * 2)
+                for prefixes, length in zip(collector.native_prefixes, collector.episode_steps):
+                    self.assertLessEqual(len(prefixes), int(length) // window + 1)
 
         original, compacted = results
         self.assertEqual(len(original["trajectories"]), len(compacted["trajectories"]))
