@@ -109,6 +109,10 @@ print('restored')
             "evaluation_max_steps", "evaluation_max_combat_steps",
         })
         self.assertFalse(args.capture_trajectories)
+        self.assertFalse(args.terminal_potential)
+        self.assertTrue(train.parser().parse_args([
+            "train", "--terminal-potential",
+        ]).terminal_potential)
 
     def test_sampler_seed_streams_are_disjoint(self):
         args = Namespace(
@@ -684,7 +688,7 @@ print('restored')
 
     def test_potential_gae(self):
         def values(canonical, expected, gamma=1, gae_lambda=1, won=False,
-                   potentials=None, field="advantage", increments=None):
+                   potentials=None, terminal_potential=0, field="advantage", increments=None):
             length = len(canonical)
             trajectory = {
                 "rows": [packed_row() for _ in range(length)], "choices": [0] * length,
@@ -695,6 +699,7 @@ print('restored')
                 "terminals": [False] * (length - 1) + [True],
                 "characters": [0] * length, "versions": [0] * length,
                 "potentials": np.zeros(length) if potentials is None else potentials,
+                "terminal_potential": terminal_potential,
             }
             dataset = train.ExperienceDataset()
             parameters = {} if increments is None else dict(zip(
@@ -741,6 +746,11 @@ print('restored')
             values([0, 0], [0, 0], gamma=.5, potentials=[.1, .2],
                    field="critic_target"),
             [-.1, -.2], atol=1e-7,
+        )
+        np.testing.assert_allclose(
+            values([0, 0], [0, 0], gamma=.5, potentials=[.1, .2],
+                   terminal_potential=.4, field="critic_target"),
+            [0, 0], atol=1e-7,
         )
         np.testing.assert_allclose(
             values([25], [0], increments=(20, 21, 30)), [35 / maximum], atol=1e-7,

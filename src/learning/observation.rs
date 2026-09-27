@@ -7464,7 +7464,7 @@ fn observation_v56_with_candidates(
         globals: observation_globals_with_bonuses(game, content, layout, bonuses, true),
         domains,
         candidates,
-        potential: potential(game, content),
+        potential: potential(game, content, false),
     }
 }
 
@@ -7655,8 +7655,8 @@ fn resample_canonical_combat_hidden(game: &mut Game, seed: u64) {
     }
 }
 
-fn potential(game: &Game, content: &Content) -> Potential {
-    if matches!(game.phase, Phase::Won | Phase::Dead) {
+fn potential(game: &Game, content: &Content, include_terminal: bool) -> Potential {
+    if !include_terminal && matches!(game.phase, Phase::Won | Phase::Dead) {
         return Potential::default();
     }
     let hp = game
