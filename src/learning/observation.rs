@@ -14,7 +14,7 @@ use std::{
 const MAGIC: &[u8; 8] = b"STSVALUE";
 const VERSION: u32 = 56;
 const VALUE_MODEL_VERSION: u32 = 75;
-const MIN_VALUE_MODEL_VERSION: u32 = 75;
+const MIN_VALUE_MODEL_VERSION: u32 = 74;
 const TERMINAL_CATEGORIES: usize = 83;
 const POTENTIAL_WEIGHT_COUNT: usize = 13;
 const CARD_ZONES: usize = 5;
