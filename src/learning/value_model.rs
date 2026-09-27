@@ -244,7 +244,7 @@ impl ValueModel {
         let pooling = <[u8; 13]>::try_from(take_bytes(&mut input, 13)?).unwrap();
         let flags = take_bytes(&mut input, 1)?[0];
         let actor = flags & 1 != 0;
-        let potential_health_multiplier = model_version < 75 || flags & 2 == 0;
+        let potential_health_multiplier = flags & 2 == 0;
         let layout = Layout::new(content);
         let (width, layers, heads, feedforward) = (
             width as usize,
