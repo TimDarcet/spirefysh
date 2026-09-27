@@ -5549,6 +5549,21 @@ impl Batch {
         Ok(game_state(game, &self.content).to_string())
     }
 
+    fn potential_components(&self, index: usize) -> PyResult<(f32, Vec<f32>)> {
+        let game = self
+            .games
+            .get(index)
+            .ok_or_else(|| PyValueError::new_err("invalid environment index"))?;
+        let value = potential(game, &self.content, false);
+        let mut resources = value.resources;
+        if self.potential_health_multiplier {
+            resources.iter_mut().for_each(|term| *term *= value.health);
+        } else {
+            resources[0] = value.health;
+        }
+        Ok((value.floor, resources.to_vec()))
+    }
+
     fn root_ids(&self) -> Vec<usize> {
         self.root_ids.clone()
     }

@@ -926,6 +926,142 @@ class TrajectoryTest(unittest.TestCase):
             replay["steps"][0]["effective_actions"], len(replay["steps"][0]["actions"]),
         )
 
+    def test_replay_exposes_potential_components_and_environment_reward(self):
+        weights = [(index - 6) * 1e-7 for index in range(len(train.POTENTIAL_TERMS))]
+        config = trajectories._training_config({
+            "architecture": {"potential_weights": weights},
+        }, self.trace())
+        replay = trajectories.replay_trace(self.trace(), config)
+        step = replay["steps"][0]
+        env = train.sts2_sim.Batch(1, 7, 0, ascension=0)
+        env.set_potential_weights(weights)
+        expected = float(env.observe_tokens()[4][0])
+        self.assertAlmostEqual(step["potential"], expected)
+        self.assertAlmostEqual(
+            step["potential_floor"] + sum(
+                row["contribution"] for row in step["potential_components"]
+            ), expected,
+        )
+        self.assertEqual(len(step["potential_components"]), len(train.POTENTIAL_TERMS))
+        self.assertEqual(step["potential_health"], 80)
+        self.assertEqual(step["potential_components"][0]["feature"], 1)
+        np.testing.assert_allclose(
+            [row["feature"] for row in step["potential_components"][:7]],
+            [1, 80, 0, 1, 0, 99, 10],
+        )
+        np.testing.assert_allclose([
+            row["weighted_feature"] * step["potential_health"]
+            for row in step["potential_components"]
+        ], [row["contribution"] for row in step["potential_components"]], atol=1e-9)
+        self.assertEqual(step["environment_reward"], 0)
+
+    def test_training_signal_matches_actionable_gae_sequence(self):
+        steps = [
+            {"actions": [{}, {}], "critic_value": .1, "potential": .2,
+             "environment_reward": 0., "policy_entropy": .5, "choice": 0,
+             "potential_components": []},
+            {"actions": [{}], "critic_value": .8, "potential": .4,
+             "environment_reward": 0., "policy_entropy": 0., "choice": 0,
+             "potential_components": []},
+            {"actions": [{}, {}], "critic_value": .2, "potential": .3,
+             "environment_reward": 0., "policy_entropy": .4, "choice": 1,
+             "potential_components": []},
+        ]
+        for step in steps:
+            for action in step["actions"]:
+                action["log_probability"] = -math.log(len(step["actions"]))
+        trace = {"terminal": True, "outcome": "dead", "canonical_progress": [10, 11, 12]}
+        config = {"gae_gamma": .9, "gae_lambda": .8,
+                  "boss_floor_increments": list(trajectories.BOSS_FLOOR_INCREMENTS)}
+        trajectories._add_training_signals(trace, steps, config)
+        terminal = 12 / (train.CATEGORIES - 1)
+        last_reward = terminal - .3
+        first_reward = .9 * .3 - .2
+        last_delta = last_reward - .2
+        first_delta = first_reward + .9 * .2 - .1
+        self.assertAlmostEqual(steps[2]["training_signal"]["return"], last_reward)
+        self.assertAlmostEqual(steps[0]["training_signal"]["return"],
+                               first_reward + .9 * last_reward)
+        self.assertAlmostEqual(steps[0]["training_signal"]["advantage"],
+                               first_delta + .9 * .8 * last_delta)
+        self.assertEqual(steps[0]["training_signal"]["next_actionable_index"], 2)
+        self.assertIsNone(steps[2]["training_signal"]["next_actionable_index"])
+        self.assertFalse(steps[1]["training_signal"]["eligible"])
+        self.assertIn("forced choice", steps[1]["training_signal"]["reason"])
+
+    def test_training_signal_terminal_values_match_floor_rewards(self):
+        config = {"boss_floor_increments": [12., 13., 14.]}
+        denominator = train.CATEGORIES - 1
+        args = Namespace(boss_1_floor_increment=12, boss_2_floor_increment=13,
+                         boss_3_floor_increment=14)
+        for outcome, canonical, category, won in (
+            ("dead", [54], 54, False), ("won", [0], train.CATEGORIES - 1, True),
+        ):
+            self.assertAlmostEqual(trajectories._terminal_value({
+                "outcome": outcome, "canonical_progress": canonical,
+            }, config), train.terminal_floor(category, won, args) / denominator)
+
+    def test_training_signal_matches_experience_dataset(self):
+        legal = [2, 1, 3, 2, 1]
+        predicted = [.11, .8, -.2, .3, .9]
+        potentials = [.4, .8, -.1, .2, .7]
+        canonical = [24, 25, 53, 54, 55]
+        trajectory = {
+            "rows": [packed_row(count) for count in legal], "choices": [0] * 5,
+            "old_log": [-math.log(count) for count in legal],
+            "critic_values": predicted, "canonical_progress": canonical,
+            "phases": [0] * 5, "win_rewards": [0] * 5,
+            "terminals": [False] * 4 + [True], "characters": [0] * 5,
+            "versions": [0] * 5, "potentials": potentials,
+        }
+        args = Namespace(critic_only=False, gae_gamma=.9, gae_lambda=.8,
+                         boss_1_floor_increment=12, boss_2_floor_increment=13,
+                         boss_3_floor_increment=14)
+        dataset = train.ExperienceDataset()
+        dataset.add({"trajectories": [trajectory]}, args)
+        steps = [{
+            "actions": [{"log_probability": -math.log(count)} for _ in range(count)],
+            "choice": 0, "critic_value": value, "potential": potential,
+            "potential_components": [], "environment_reward": 0.,
+            "policy_entropy": math.log(count),
+        } for count, value, potential in zip(legal, predicted, potentials)]
+        config = {"gae_gamma": args.gae_gamma, "gae_lambda": args.gae_lambda,
+                  "boss_floor_increments": [12., 13., 14.]}
+        trajectories._add_training_signals({
+            "terminal": True, "outcome": "dead", "canonical_progress": canonical,
+        }, steps, config)
+        signals = [step["training_signal"] for step in steps if len(step["actions"]) > 1]
+        count = len(signals)
+        np.testing.assert_allclose(
+            [row["advantage"] for row in signals], dataset.data["advantage"][:count],
+            atol=1e-7,
+        )
+        np.testing.assert_allclose(
+            [row["return"] for row in signals], dataset.data["critic_target"][:count],
+            atol=1e-7,
+        )
+        np.testing.assert_allclose(
+            [row["critic_value"] for row in signals], dataset.data["value"][:count],
+            atol=1e-7,
+        )
+        targets = dataset.data["critic_target"][:count]
+        rewards = targets - args.gae_gamma * np.append(targets[1:], 0.)
+        np.testing.assert_allclose([row["reward"] for row in signals], rewards, atol=1e-7)
+        np.testing.assert_allclose([
+            row["td_error"] for row in signals
+        ], rewards + args.gae_gamma * np.append(dataset.data["value"][1:count], 0.)
+           - dataset.data["value"][:count], atol=1e-7)
+
+    def test_training_config_uses_matching_session_or_latest(self):
+        manifest = {"sessions": [
+            {"id": 1, "training": {"gae_lambda": .5}},
+            {"id": 2, "training": {"gae_lambda": .25}},
+        ]}
+        self.assertEqual(trajectories._training_config(
+            manifest, {"session_id": 1},
+        )["gae_lambda"], .5)
+        self.assertEqual(trajectories._training_config(manifest, {})["gae_lambda"], .25)
+
     def test_native_policy_details_match_selected_probability(self):
         env = train.sts2_sim.Batch(1, 7, 0, ascension=0)
         model = train.Agent(
@@ -1028,6 +1164,19 @@ class TrajectoryTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "invalid run"):
                 source.list("../run")
 
+    def test_catalog_prefers_compatible_runs_and_disables_old_checkpoints(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name, version in (("old", train.MODEL_VERSION - 1),
+                                  ("current", train.MODEL_VERSION)):
+                run = root / name
+                run.mkdir()
+                (run / "run.json").write_text(json.dumps({"model_version": version}))
+            source = trajectories.TrajectorySource(root)
+            self.assertEqual(source.catalog()[0], "current")
+            self.assertIn("requires model", source.list("old")["checkpoint_error"])
+            self.assertIsNone(source.list("current")["checkpoint_error"])
+
     def test_capture_disabled_does_not_inspect_environments(self):
         collector = train.RolloutCollector.__new__(train.RolloutCollector)
         collector.args = Namespace(capture_trajectories=False)
@@ -1090,13 +1239,69 @@ class TrajectoryTest(unittest.TestCase):
     def test_trajectory_page_has_replay_and_portability_controls(self):
         page = trajectories.trajectory_page()
         for text in ("Generate from checkpoint", "Download JSON", "Import", "Legal actions",
-                     "Explain decision", "Causal token deletion"):
+                     "Explain decision", "Causal token deletion",
+                     "What the training signal would be if this was a training example"):
             self.assertIn(text, page)
-        self.assertIn("row==null?'empty'", page)
-        self.assertIn("replaceAll('CARD.','').replaceAll('RELIC.','')", page)
-        self.assertIn("action-name:hover .preview", page)
+        self.assertIn("katex@0.16.11", page)
+        self.assertIn("aria-expanded", page)
+        self.assertIn("replaceAll('\\\\left','').replaceAll('\\\\right','')", page)
+        self.assertIn("!seen.has(item.id)", page)
+        self.assertIn("function returnTerm(row,offset)", page)
+        self.assertIn("function advantageTerm(row,offset)", page)
+        self.assertIn("\\\\mathrm{HP}(s_{${at}})", page)
+        self.assertIn("item.weighted_feature", page)
+        for formula in ("\\\\ell_t^{PPO}", "c_V\\\\ell_t^V", "\\\\widehat A_t",
+                        "\\\\rho_t", "\\\\operatorname{clip}",
+                        "\\\\delta_{${at}}", "G_{${at}}", "r_{${at}}",
+                        "\\\\sum_k w_kx_k"):
+            self.assertIn(formula, page)
+        self.assertIn("definition:[policy,'+',critic,'-',entropyWeight", page)
+        self.assertIn("typeof node.definition==='function'", page)
+        self.assertIn("toExponential(5)", page)
+        self.assertIn("action.kind==='use_potion'?`Drink ${name}`", page)
+        self.assertIn("action.kind==='discard_potion'?`Discard ${name}`", page)
+        self.assertIn("${actionThing(action)}", page)
+        self.assertIn("text.match(/<p>Message: ([^<]+)/)", page)
+        self.assertIn("id=generationNote", page)
+        self.assertIn("renderTraining(terminal?null:row)", page)
+        self.assertIn("row.id?title(row)", page)
+        self.assertIn("/^(CARD|RELIC|POTION|POWER|ORB)\\./", page)
+        self.assertIn("action-name:hover>.preview,.item:hover>.preview", page)
+        self.assertIn(".preview{display:none", page)
+        self.assertIn("request('/game-assets/assets.json')", page)
+        self.assertIn("request('/game-assets/glossary.json')", page)
+        self.assertIn("background-image:url('/game-assets/", page)
+        self.assertIn("class=card-description", page)
+        self.assertIn("resolved legal choice", page)
+        self.assertNotIn("event data [", page)
         self.assertLess(page.index("id=phase"), page.index("Legal actions"))
         self.assertGreater(page.index("id=inventory"), page.index("Legal actions"))
+
+    def test_trajectory_assets_include_game_card_and_relic_art(self):
+        root = Path(trajectories.__file__).with_name("game-assets")
+        assets = json.loads((root / "assets.json").read_text())
+        self.assertEqual(assets["card/bash"][3:], [250, 190])
+        self.assertEqual(assets["relic/burning_blood"][3:], [71, 81])
+        self.assertEqual(assets["potion/energy_potion"][3:], [80, 80])
+        self.assertEqual(assets["power/vulnerable_power"][3:], [64, 64])
+        glossary = json.loads((root / "glossary.json").read_text())
+        self.assertEqual(glossary["card"]["BASH.title"], "Bash")
+        self.assertIn("end of combat", glossary["relic"]["BURNING_BLOOD.description"])
+        self.assertEqual(
+            glossary["content"]["relics"]["RELIC.LEAFY_POULTICE"]["values"]["MaxHp"],
+            12,
+        )
+        for atlas in {row[0] for row in assets.values()}:
+            data = (root / f"{atlas}.webp").read_bytes()
+            self.assertEqual((data[:4], data[8:12]), (b"RIFF", b"WEBP"))
+
+    def test_game_content_previews_expose_hover_details(self):
+        content = json.loads((Path(trajectories.__file__).with_name(
+            "game-assets"
+        ) / "glossary.json").read_text())["content"]
+        self.assertEqual(content["cards"]["CARD.BASH"]["cost"], [2, 2])
+        self.assertEqual(content["potions"]["POTION.ENERGY_POTION"]["target"], "Player")
+        self.assertTrue(content["powers"]["POWER.VULNERABLE_POWER"]["debuff"])
 
 
 if __name__ == "__main__":
