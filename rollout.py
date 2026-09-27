@@ -264,6 +264,7 @@ class RolloutCollector:
         self.env.set_potential_weights([
             getattr(args, f"potential_{term}_weight") for term in POTENTIAL_TERMS
         ])
+        self.env.set_potential_mode(getattr(args, "potential_mode", "health_multiplier"))
         self.env.set_terminal_potential(getattr(args, "terminal_potential", False))
         self.observation = self.env.observe_tokens(flat=True)
         self.episode_steps = np.zeros(args.envs, np.int32)

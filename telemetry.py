@@ -1222,6 +1222,8 @@ def dashboard(target):
                         (*DEFAULT_ARCHITECTURE, DEFAULT_ARCHITECTURE[0]),
                     )),
                     pooling=saved.get("pooling"), model_version=version,
+                    potential_weights=saved.get("potential_weights"),
+                    potential_mode=saved.get("potential_mode", "health_multiplier"),
                 )
                 version_manifest |= {
                     "architecture": architecture(current),

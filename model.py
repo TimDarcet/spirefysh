@@ -19,7 +19,7 @@ ACTION_FIELDS = tuple(ACTION_FIELDS)
 TOKEN_SPECS = tuple(tuple(row) for row in TOKEN_SPECS)
 SEMANTIC_NAMES = tuple(SEMANTIC_NAMES)
 POSITION_CAPS = dict(POSITION_CAPS)
-COMPATIBLE_MODEL_VERSIONS = (MODEL_VERSION,)
+COMPATIBLE_MODEL_VERSIONS = (MODEL_VERSION - 1, MODEL_VERSION)
 DEFAULT_ARCHITECTURE = (128, 4, 8, 384)
 PRECISIONS = ("fp32", "bf16")
 WINNING_CAPACITY = 0
@@ -41,7 +41,7 @@ STAGES = [(0, bonus) for bonus in (24, 20, 16, 12, 8, 4, 3, 2, 1, 0)] + [
     (ascension, 0) for ascension in range(1, 11)
 ]
 POTENTIAL_TERMS = (
-    "bias", "max_hp", "upgrades", "relics", "potions", "gold", "cards",
+    "health", "max_hp", "upgrades", "relics", "potions", "gold", "cards",
     "uncommon_relics", "rare_relics", "uncommon_potions", "rare_potions",
     "uncommon_cards", "rare_cards",
 )
@@ -1676,7 +1676,8 @@ class TokenEncoder(nn.Module):
 
 class Agent(nn.Module):
     def __init__(self, layout, width=128, layers=4, heads=8, feedforward=384, head_width=None,
-                 pooling=None, model_version=MODEL_VERSION, potential_weights=None):
+                 pooling=None, model_version=MODEL_VERSION, potential_weights=None,
+                 potential_mode="health_multiplier"):
         nn.Module.__init__(self)
         self.layout = dict(layout)
         if self.layout["version"] != FEATURE_VERSION:
@@ -1703,6 +1704,11 @@ class Agent(nn.Module):
         if len(self.potential_weights) != len(POTENTIAL_TERMS) \
                 or not all(map(math.isfinite, self.potential_weights)):
             raise ValueError("invalid potential weights")
+        if potential_mode not in ("health_multiplier", "additive"):
+            raise ValueError("invalid potential mode")
+        if model_version < 75 and potential_mode != "health_multiplier":
+            raise ValueError("additive potential requires model version 75")
+        self.potential_mode = potential_mode
         self.card_zones = 5
         self.entity_collections = 0
         self.pooling = POOLING_DEFAULTS | (pooling or {})
@@ -2338,6 +2344,7 @@ def architecture(model):
         "candidate_numeric": ACTION_FIELDS[3],
         "value_heads": ["shaped_terminal_floor_scalar"],
         "potential_weights": model.potential_weights,
+        "potential_mode": model.potential_mode,
         "winning_reservoir": WINNING_CAPACITY,
     }
 
@@ -3061,9 +3068,11 @@ def load(path, target):
         model = Agent(layout, *(config[key] for key in (
             "width", "layers", "heads", "feedforward", "head_width"
         )), pooling=config["pooling"], model_version=version,
-                      potential_weights=config["potential_weights"]).to(target)
+                      potential_weights=config["potential_weights"],
+                      potential_mode=config.get("potential_mode", "health_multiplier")).to(target)
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError("invalid checkpoint architecture") from error
+    config.setdefault("potential_mode", "health_multiplier")
     if config != architecture(model):
         raise ValueError("incompatible model architecture")
     state = checkpoint["model"]
@@ -3098,7 +3107,7 @@ def export_value_model(path, model, fingerprint, temperature, bias, actor=False)
              ("sum", "transformer").index(mode))
             for index, mode in enumerate(model.pooling.values())
         ]),
-        bytes([actor]),
+        bytes([actor | (model.potential_mode == "additive") << 1]),
         struct.pack("<2f", temperature, bias),
         struct.pack(f"<{len(POTENTIAL_TERMS)}f", *model.potential_weights),
     ]

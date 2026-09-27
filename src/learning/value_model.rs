@@ -190,6 +190,7 @@ pub struct ValueModel {
     temperature: f32,
     bias: f32,
     potential_weights: [f32; POTENTIAL_WEIGHT_COUNT],
+    potential_health_multiplier: bool,
     encode_caches: Vec<Mutex<EncodingCache>>,
 }
 
@@ -241,7 +242,9 @@ impl ValueModel {
             .map(|_| read_u32(&mut input))
             .collect::<io::Result<Vec<_>>>()?;
         let pooling = <[u8; 13]>::try_from(take_bytes(&mut input, 13)?).unwrap();
-        let actor = take_bytes(&mut input, 1)?[0] != 0;
+        let flags = take_bytes(&mut input, 1)?[0];
+        let actor = flags & 1 != 0;
+        let potential_health_multiplier = model_version < 75 || flags & 2 == 0;
         let layout = Layout::new(content);
         let (width, layers, heads, feedforward) = (
             width as usize,
@@ -360,6 +363,7 @@ impl ValueModel {
             temperature,
             bias,
             potential_weights,
+            potential_health_multiplier,
             encode_caches: (0..16).map(|_| Mutex::default()).collect(),
         })
     }
@@ -1160,7 +1164,12 @@ impl ValueModel {
         let normalizer = log_sum_exp(&raw);
         let scores = raw.into_iter().map(|score| score - normalizer).collect();
         let shaped = self.critic.apply(&state)[0];
-        let expected = shaped + potential_value(&observation.potential, &self.potential_weights);
+        let expected = shaped
+            + potential_value(
+                &observation.potential,
+                &self.potential_weights,
+                self.potential_health_multiplier,
+            );
         Ok((
             scores,
             sigmoid(expected / self.temperature + self.bias),
@@ -1200,7 +1209,12 @@ impl ValueModel {
             };
             let shaped = values.then(|| self.critic.apply(state)[0]);
             let expected = shaped.map_or(0.0, |value| {
-                value + potential_value(&observation.potential, &self.potential_weights)
+                value
+                    + potential_value(
+                        &observation.potential,
+                        &self.potential_weights,
+                        self.potential_health_multiplier,
+                    )
             });
             (
                 scores(temperature),
@@ -1225,7 +1239,11 @@ impl ValueModel {
         }
         let observation = observation_v56(game, content, self.layout, (0, 0));
         let value = self.critic.apply(&self.state(&observation))[0]
-            + potential_value(&observation.potential, &self.potential_weights);
+            + potential_value(
+                &observation.potential,
+                &self.potential_weights,
+                self.potential_health_multiplier,
+            );
         sigmoid(value / self.temperature + self.bias)
     }
 }
