@@ -294,27 +294,41 @@ class ExperienceDataset:
         total = 0
         cached = any("features" in trajectory for trajectory in source)
         for trajectory_id, trajectory in enumerate(source, self.next_trajectory):
-            length = len(trajectory["rows"])
-            if not length or any(len(trajectory[key]) != length for key in fields):
+            stored = len(trajectory["rows"])
+            length = int(trajectory.get("sampled_length", stored))
+            if length < stored or any(len(trajectory[key]) != stored for key in fields):
                 raise ValueError("invalid trajectory fields")
+            sampled_positions = np.asarray(
+                trajectory.get("sampled_positions", np.arange(stored)), np.int64,
+            )
+            if sampled_positions.shape != (stored,) or (stored and (
+                    sampled_positions[0] < 0 or sampled_positions[-1] >= length
+                    or np.any(sampled_positions[1:] <= sampled_positions[:-1]))):
+                raise ValueError("invalid trajectory positions")
+            if not stored:
+                total += length
+                continue
             terminal = np.asarray(trajectory["terminals"], bool)
             predicted = np.asarray(trajectory["critic_values"], np.float32)
             canonical = np.asarray(trajectory["canonical_progress"], np.int64)
             potential = np.asarray(trajectory["potentials"], np.float32)
             terminal_potential = float(trajectory.get("terminal_potential", 0.))
-            if (terminal[:-1].any() or not terminal[-1]
-                    or predicted.shape != (length,) or not np.isfinite(predicted).all()
+            ended = bool(trajectory.get("terminal", terminal[-1]))
+            if (terminal[:-1].any() or not ended
+                    or predicted.shape != (stored,) or not np.isfinite(predicted).all()
                     or canonical.min() < 0 or canonical.max() > MAX_PROGRESS
                     or not np.isfinite(potential).all() or not math.isfinite(terminal_potential)):
                 raise ValueError("invalid trajectory terminal")
-            if cached and len(trajectory.get("features", ())) != length:
+            if cached and len(trajectory.get("features", ())) != stored:
                 raise ValueError("invalid cached features")
             indices = np.flatnonzero([
                 packed_legal_count(row) > 1 for row in trajectory["rows"]
             ])
             if len(indices):
-                won = trajectory["win_rewards"][-1] > .5
-                category = CATEGORIES - 1 if won else int(canonical.max())
+                won = bool(trajectory.get("won", trajectory["win_rewards"][-1] > .5))
+                category = CATEGORIES - 1 if won else int(
+                    trajectory.get("terminal_category", canonical.max())
+                )
                 versions = np.asarray(trajectory["versions"], np.int64)[indices]
                 trajectories.append((trajectory, indices, category, trajectory_id))
                 trajectory_floors.append(int(trajectory.get("terminal_floor", canonical.max())))
@@ -322,7 +336,7 @@ class ExperienceDataset:
                 trajectory_actionable_lengths.append(len(indices))
                 trajectory_version_mins.append(int(versions.min()))
                 trajectory_version_maxes.append(int(versions.max()))
-                positions.extend(total + indices)
+                positions.extend(total + sampled_positions[indices])
             total += length
         self.next_trajectory += len(source)
         accepted = total if limit is None else max(0, min(total, limit))
@@ -770,7 +784,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         sampled += result["sampled_steps"]
         worker_accounted[worker] += result["sampled_steps"]
         worker_resolved[worker] += result["discarded_steps"] + sum(
-            len(trajectory["rows"]) for trajectory in result["trajectories"]
+            trajectory.get("sampled_length", len(trajectory["rows"]))
+            for trajectory in result["trajectories"]
         )
         discarded_steps += result["discarded_steps"]
         discarded_steps += excess
@@ -811,7 +826,10 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             "policy_revision": revisions["policy_revision"],
             "packet_policy_revision": version,
             "packet_sampled_decisions": result["sampled_steps"],
-            "trajectory_rows": sum(len(row["rows"]) for row in result["trajectories"]),
+            "trajectory_rows": sum(
+                row.get("sampled_length", len(row["rows"]))
+                for row in result["trajectories"]
+            ),
             "admitted_rows": added - excluded,
             "forced_rows": excluded, "budget_excess_rows": excess,
             "capacity_dropped_rows": capacity_dropped,

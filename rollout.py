@@ -391,12 +391,20 @@ class RolloutCollector:
             samples = trajectory.pop("samples")
             trajectory.update(zip(sample_keys, map(list, zip(*samples))))
             return trajectory
-        def native_columns(history, index):
-            return tuple(
-                [step[column][index] for step in history] if column in (0, 11) else
-                np.asarray([step[column] if column == 9 else step[column][index]
-                            for step in history])
+        def native_columns(history, index, offset):
+            selected = [position for position, step in enumerate(history)
+                        if packed_legal_count(step[0][index]) > 1]
+            columns = tuple(
+                [history[position][column][index] for position in selected]
+                if column in (0, 11) else
+                np.asarray([history[position][column] if column == 9
+                            else history[position][column][index] for position in selected])
                 for column in range(len(sample_keys))
+            )
+            return (
+                len(history), np.asarray(selected, np.int32) + offset, columns,
+                min((step[9] for step in history), default=version),
+                max((step[9] for step in history), default=version),
             )
         discarded_steps = orphan_empty_actions = sampled_steps = 0
         search_stats = np.zeros(17, np.int64)
@@ -564,15 +572,13 @@ class RolloutCollector:
                     history = (self.native_steps[self.native_starts[index]:] if native
                                else self.trajectories[index]["samples"])
                     prefixes = self.native_prefixes[index] if native else ()
-                    length = sum(len(chunk[0]) for chunk in prefixes) + len(history)
+                    length = int(self.episode_steps[index])
                     terminal_floor = int((stats[index][0] - 1) * 17 + stats[index][1])
                     completion_seconds = (time.monotonic() - self.native_started[index] if native
                                           else time.monotonic() - self.trajectories[index]["started"])
-                    policy_versions = ([chunk[9] for chunk in prefixes] +
-                                       [np.asarray([row[9] for row in history])]
-                                       if native else [np.asarray([
-                                           row[9] for row in history
-                                       ])])
+                    policy_versions = ([value for chunk in prefixes for value in chunk[3:]] +
+                                       [row[9] for row in history]
+                                       if native else [row[9] for row in history])
                     completions.append({
                         "character": int(characters[index]),
                         "floor": terminal_floor,
@@ -582,14 +588,8 @@ class RolloutCollector:
                         "empty_actions": bool(empty_actions[index]),
                         "length": length, "completion_seconds": completion_seconds,
                         "iteration": self.iteration,
-                        "policy_revision_min": min(
-                            (int(values.min()) for values in policy_versions if len(values)),
-                            default=version,
-                        ),
-                        "policy_revision_max": max(
-                            (int(values.max()) for values in policy_versions if len(values)),
-                            default=version,
-                        ),
+                        "policy_revision_min": min(policy_versions, default=version),
+                        "policy_revision_max": max(policy_versions, default=version),
                         **({"recovery": True} if recovering else {}),
                     })
                     if not recovering:
@@ -609,12 +609,19 @@ class RolloutCollector:
                     )
                     self.finish_trace(index, outcome, terminal_floor, done[index])
                     if native and done[index]:
-                        suffix = native_columns(history, index)
+                        suffix = native_columns(history, index, length - len(history))
                         trajectory = {key: (
                             [value for chunk in (*prefixes, suffix)
-                             for value in chunk[column]] if column in (0, 11) else
-                            np.concatenate([chunk[column] for chunk in (*prefixes, suffix)])
+                             for value in chunk[2][column]] if column in (0, 11) else
+                            np.concatenate([chunk[2][column] for chunk in (*prefixes, suffix)])
                         ) for column, key in enumerate(sample_keys)}
+                        trajectory["sampled_length"] = length
+                        trajectory["sampled_positions"] = np.concatenate([
+                            chunk[1] for chunk in (*prefixes, suffix)
+                        ])
+                        trajectory["terminal"] = True
+                        trajectory["won"] = won
+                        trajectory["terminal_category"] = int(canonical[index])
                         trajectory["completion_seconds"] = completion_seconds
                         trajectory["terminal_floor"] = terminal_floor
                         trajectory["terminal_potential"] = float(terminal_potentials[index])
@@ -652,7 +659,11 @@ class RolloutCollector:
                     for index, start in enumerate(self.native_starts):
                         if start < cutoff:
                             history = self.native_steps[start:cutoff]
-                            self.native_prefixes[index].append(native_columns(history, index))
+                            offset = int(self.episode_steps[index]) \
+                                - (len(self.native_steps) - int(start))
+                            self.native_prefixes[index].append(
+                                native_columns(history, index, offset)
+                            )
                             for step in history:
                                 step[0][index] = None
                                 if args.cache_features:
@@ -770,7 +781,8 @@ class RolloutCollector:
             ):
                 pending[key] += result[key]
             pending["iteration"] = result["iteration"]
-            added = sum(len(trajectory["rows"]) for trajectory in result["trajectories"])
+            added = sum(trajectory.get("sampled_length", len(trajectory["rows"]))
+                        for trajectory in result["trajectories"])
             pending_rows += added
             produced += added
             if max(pending_rows, len(pending["completions"])) < self.args.envs * 4 \
@@ -800,9 +812,7 @@ class RolloutCollector:
                         heartbeat[worker] = time.monotonic()
                     time.sleep(.01)
         pending["discarded_steps"] += (
-            sum(sum(len(chunk[0]) for chunk in prefixes)
-                + len(self.native_steps) - int(start)
-                for prefixes, start in zip(self.native_prefixes, self.native_starts))
+            int(self.episode_steps.sum())
             if model is None else
             sum(len(trajectory["samples"]) for trajectory in self.trajectories
                 if trajectory is not None)
