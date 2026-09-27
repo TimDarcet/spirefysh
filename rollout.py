@@ -264,6 +264,7 @@ class RolloutCollector:
         self.env.set_potential_weights([
             getattr(args, f"potential_{term}_weight") for term in POTENTIAL_TERMS
         ])
+        self.env.set_terminal_potential(getattr(args, "terminal_potential", False))
         self.observation = self.env.observe_tokens(flat=True)
         self.episode_steps = np.zeros(args.envs, np.int32)
         self.combat_steps = np.zeros(args.envs, np.int32)
@@ -473,7 +474,7 @@ class RolloutCollector:
                 characters, choice, log_probability, critic_value, step_rows, \
                     step_experts, step_search_stats, *cached = result
                 raw_reward, done, stats, next_legal, in_combat, canonical, phases, potentials, \
-                    *cached = cached
+                    terminal_potentials, *cached = cached
                 step_features = cached[0] if cached else None
                 if heartbeat is not None:
                     heartbeat[self.worker] = time.monotonic()
@@ -526,7 +527,7 @@ class RolloutCollector:
             self.combat_steps = np.where(in_combat, self.combat_steps + 1, 0)
             if not native:
                 self.mark_phase("environment")
-                raw_reward, done, _ = self.env.step(choice.tolist())
+                raw_reward, done, terminal_potentials = self.env.step(choice.tolist())
                 self.mark_phase("processing")
             raw_reward = np.array(raw_reward, np.float32, copy=True)
             done = np.asarray(done, bool)
@@ -615,6 +616,7 @@ class RolloutCollector:
                         }
                         trajectory["completion_seconds"] = completion_seconds
                         trajectory["terminal_floor"] = terminal_floor
+                        trajectory["terminal_potential"] = float(terminal_potentials[index])
                         finished.append(trajectory)
                     elif native:
                         discarded_steps += len(self.native_steps) - int(self.native_starts[index])
@@ -622,6 +624,7 @@ class RolloutCollector:
                         trajectory = self.trajectories[index]
                         trajectory["completion_seconds"] = completion_seconds
                         trajectory["terminal_floor"] = terminal_floor
+                        trajectory["terminal_potential"] = float(terminal_potentials[index])
                         trajectory.pop("started")
                         finished.append(materialize(trajectory))
                     else:

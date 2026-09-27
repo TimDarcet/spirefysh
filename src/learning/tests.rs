@@ -404,9 +404,10 @@ fn potential_has_a_common_terminal_value() {
     let mut game = Game::new_character_ascension(&content, 12, 0, 10).unwrap();
     game.begin_act(&content, 0).unwrap();
     game.phase = Phase::Won;
-    assert_eq!(potential(&game, &content), Potential::default());
+    assert_eq!(potential(&game, &content, false), Potential::default());
+    assert_ne!(potential(&game, &content, true), Potential::default());
     game.phase = Phase::Dead;
-    assert_eq!(potential(&game, &content), Potential::default());
+    assert_eq!(potential(&game, &content, false), Potential::default());
 }
 
 #[test]
@@ -450,7 +451,7 @@ fn potential_is_floor_plus_hp_weighted_run_resources() {
         Some(crate::foundation::RARE_POTIONS[0]),
         None,
     ];
-    let value = potential(&game, &content);
+    let value = potential(&game, &content, false);
     assert_eq!(
         value.floor,
         canonical_progress(&game) as f32 / (TERMINAL_CATEGORIES - 1) as f32

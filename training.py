@@ -301,10 +301,11 @@ class ExperienceDataset:
             predicted = np.asarray(trajectory["critic_values"], np.float32)
             canonical = np.asarray(trajectory["canonical_progress"], np.int64)
             potential = np.asarray(trajectory["potentials"], np.float32)
+            terminal_potential = float(trajectory.get("terminal_potential", 0.))
             if (terminal[:-1].any() or not terminal[-1]
                     or predicted.shape != (length,) or not np.isfinite(predicted).all()
                     or canonical.min() < 0 or canonical.max() > MAX_PROGRESS
-                    or not np.isfinite(potential).all()):
+                    or not np.isfinite(potential).all() or not math.isfinite(terminal_potential)):
                 raise ValueError("invalid trajectory terminal")
             if cached and len(trajectory.get("features", ())) != length:
                 raise ValueError("invalid cached features")
@@ -361,6 +362,7 @@ class ExperienceDataset:
             predicted = np.asarray(trajectory["critic_values"], np.float32)[indices]
             canonical = np.asarray(trajectory["canonical_progress"], np.int64)[indices]
             potential = np.asarray(trajectory["potentials"], np.float32)[indices]
+            terminal_potential = float(trajectory.get("terminal_potential", 0.))
             terminal_value = terminal_floor(
                 category, category == CATEGORIES - 1, args,
             ) / (CATEGORIES - 1)
@@ -368,7 +370,7 @@ class ExperienceDataset:
             wins[start:end] = category == CATEGORIES - 1
             values[start:end] = predicted
             terminal[end - 1] = True
-            reward = args.gae_gamma * np.append(potential[1:], 0.) - potential
+            reward = args.gae_gamma * np.append(potential[1:], terminal_potential) - potential
             reward[-1] += terminal_value
             gae = next_value = discounted_return = 0.
             for index in range(length - 1, -1, -1):

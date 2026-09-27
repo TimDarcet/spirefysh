@@ -1119,6 +1119,7 @@ struct Batch {
     training_strength: i16,
     training_dexterity: i16,
     potential_weights: [f32; POTENTIAL_WEIGHT_COUNT],
+    terminal_potential: bool,
     resample_archive: bool,
     archive_depth: usize,
     policy: Option<ValueModel>,
@@ -1357,6 +1358,7 @@ struct SearchTree {
     max_depth: usize,
     nodes: Vec<SearchNode>,
     potential_weights: [f32; POTENTIAL_WEIGHT_COUNT],
+    terminal_potential: bool,
     lookup: FastMap<(u64, usize), usize>,
     games: Option<Vec<Game>>,
     progress: bool,
@@ -1400,6 +1402,7 @@ impl SearchTree {
         log_policy: &[f32],
         value: f32,
         potential_weights: [f32; POTENTIAL_WEIGHT_COUNT],
+        terminal_potential: bool,
         budget: usize,
         turns: usize,
         max_depth: usize,
@@ -1443,6 +1446,7 @@ impl SearchTree {
             max_depth,
             nodes,
             potential_weights,
+            terminal_potential,
             lookup,
             games,
             progress,
@@ -1459,6 +1463,15 @@ impl SearchTree {
                 && game.combat().is_some_and(|combat| {
                     combat.turn >= self.root_turn.saturating_add(self.turns as u16)
                 })
+    }
+
+    fn terminal_value(&self, game: &Game, content: &Content) -> f32 {
+        search_terminal_value(game, self.progress).unwrap()
+            + if self.terminal_potential {
+                potential_value(&potential(game, content, true), &self.potential_weights)
+            } else {
+                0.0
+            }
     }
 
     fn simulate(
@@ -1525,7 +1538,7 @@ impl SearchTree {
                 let value = if self.heuristic {
                     heuristic_combat_value(&game)
                 } else {
-                    search_terminal_value(&game, self.progress).unwrap()
+                    self.terminal_value(&game, content)
                 };
                 path.steps.push(SearchStep {
                     node,
@@ -2027,7 +2040,7 @@ fn rollout_combat(
                         1.0 + 0.1 * heuristic_combat_value(game)
                     }
                 } else {
-                    search_terminal_value(game, tree.progress).unwrap()
+                    tree.terminal_value(game, content)
                 });
                 stats.rollout_completed += 1;
             } else if game.combat().is_none() {
@@ -2427,6 +2440,7 @@ fn mcts_targets(
     policy_temperature: f32,
     value_consistency: bool,
     heuristic: bool,
+    terminal_potential: bool,
     timeout: f64,
 ) -> Result<(Vec<ExpertTarget>, SearchStats), String> {
     let turn_start_count = observations
@@ -2491,6 +2505,7 @@ fn mcts_targets(
                     &prior,
                     *progress,
                     model.potential_weights,
+                    terminal_potential,
                     budget,
                     turns,
                     max_depth,
@@ -3129,6 +3144,7 @@ fn search_diagnostic(
         &prior,
         value,
         model.potential_weights,
+        false,
         simulations,
         turns,
         max_depth,
@@ -5321,6 +5337,7 @@ impl Batch {
             training_strength: 0,
             training_dexterity: 0,
             potential_weights: [0.0; POTENTIAL_WEIGHT_COUNT],
+            terminal_potential: false,
             resample_archive: true,
             archive_depth: 0,
             policy: None,
@@ -5559,6 +5576,10 @@ impl Batch {
         }
         self.potential_weights = weights.try_into().unwrap();
         Ok(())
+    }
+
+    fn set_terminal_potential(&mut self, enabled: bool) {
+        self.terminal_potential = enabled;
     }
 
     fn set_archive_resampling(&mut self, enabled: bool) {
@@ -7099,12 +7120,13 @@ impl Batch {
         let layout = self.layout;
         let bonuses = (self.training_strength, self.training_dexterity);
         let potential_weights = self.potential_weights;
+        let terminal_potential = self.terminal_potential;
         let skip_forced = (cache_features || skip_forced) && !search_enabled;
         let rows = py.allow_threads(|| {
             self.games
                 .par_iter()
                 .map(|game| {
-                    let potential = potential(game, content);
+                    let potential = potential(game, content, false);
                     let (mut actions, legal) = candidate_actions(game, content);
                     if !skip_forced || actions.len() != 1 {
                         return observation_v56_with_candidates(
@@ -7177,6 +7199,7 @@ impl Batch {
                         temperature,
                         mcts_value_consistency,
                         mcts_heuristic,
+                        terminal_potential,
                         mcts_timeout,
                     )
                 })
@@ -7415,6 +7438,10 @@ impl Batch {
                                 matches!(game.phase, Phase::Won | Phase::Dead),
                                 was_combat,
                                 !was_combat && game.combat().is_some(),
+                                potential_value(
+                                    &potential(game, content, terminal_potential),
+                                    &potential_weights,
+                                ),
                             ))
                         })
                         .collect::<Result<Vec<_>, String>>()
@@ -7441,6 +7468,7 @@ impl Batch {
             let rewards = results.iter().map(|result| result.0).collect::<Vec<_>>();
             let done = results.iter().map(|result| result.1).collect::<Vec<_>>();
             let in_combat = results.iter().map(|result| result.2).collect::<Vec<_>>();
+            let terminal_potentials = results.iter().map(|result| result.4).collect::<Vec<_>>();
             let stats = self.stats();
             let legal = self
                 .games
@@ -7471,6 +7499,9 @@ impl Batch {
                     .into_pyarray(py)
                     .into_any(),
                 ndarray::Array1::from_vec(potentials)
+                    .into_pyarray(py)
+                    .into_any(),
+                ndarray::Array1::from_vec(terminal_potentials)
                     .into_pyarray(py)
                     .into_any(),
             ]);
@@ -7543,6 +7574,7 @@ impl Batch {
             .collect::<Vec<_>>();
         let content = &self.content;
         let potential_weights = self.potential_weights;
+        let terminal_potential = self.terminal_potential;
         let results = py
             .allow_threads(|| {
                 self.games
@@ -7560,7 +7592,10 @@ impl Batch {
                         Ok((
                             reward,
                             done,
-                            potential_value(&potential(game, content), &potential_weights),
+                            potential_value(
+                                &potential(game, content, terminal_potential),
+                                &potential_weights,
+                            ),
                             !was_combat && game.combat().is_some(),
                         ))
                     })
