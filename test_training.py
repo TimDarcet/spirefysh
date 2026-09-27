@@ -153,6 +153,20 @@ print('restored')
             reloaded = json.loads(path.read_text())
             self.assertEqual(train.claim_sampler_session(path, reloaded, 2), 4)
 
+    def test_sampler_session_highwater_includes_failed_legacy_attempts(self):
+        source = {"sampler_session": 7, "session_id": 2}
+        manifest = {"sampler_session": 1, "sessions": [
+            {"id": 1}, {"id": 2}, {"id": 3}, {"id": 4},
+        ]}
+        self.assertEqual(train.sampler_session_highwater(source, manifest, 4), 8)
+        self.assertEqual(train.sampler_session_highwater(
+            {"sampler_session": 0, "session_id": 1},
+            {"sessions": [{"id": 1}, {"id": 2}]}, 2,
+        ), 1)
+        self.assertEqual(train.sampler_session_highwater(
+            source, {"sessions": [{"id": value} for value in range(1, 6)]}, 5,
+        ), 8)
+
     def test_sampler_diagnostic_captures_the_stalled_batch(self):
         context = multiprocessing.get_context("spawn")
         diagnostics = (

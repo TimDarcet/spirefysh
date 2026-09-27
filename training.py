@@ -219,10 +219,33 @@ def resume_curriculum(source, stage):
     return stage_decisions, source.get("progress_active", stage <= 6)
 
 
+def sampler_session_highwater(source, manifest, current_session):
+    checkpoint = source.get("sampler_session", source.get("sampler_index", 0)) if source else 0
+    source_session = source.get("session_id") if source else None
+    previous = [
+        int(row["id"]) for row in manifest.get("sessions", ())
+        if str(row.get("id", "")).isdigit() and int(row["id"]) < current_session
+    ]
+    source_session = int(source_session) if str(source_session).isdigit() else None
+    claimed = manifest.get("sampler_session")
+    missed = int(any(
+        session >= source_session if claimed is None else session > source_session
+        for session in previous
+    )) if source_session is not None else int(bool(previous))
+    return max(checkpoint + missed, claimed or 0)
+
+
 def claim_sampler_session(path, manifest, checkpoint_session):
     session = max(checkpoint_session, manifest.get("sampler_session", 0)) + 1
     manifest["sampler_session"] = session
     atomic_json(path, manifest)
+    with path.open("rb") as output:
+        os.fsync(output.fileno())
+    directory = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
     return session
 
 
@@ -2402,10 +2425,7 @@ def train(args):
         args.critic_balance_decay,
         source.get("critic_balance") if source else None,
     )
-    sampler_session = max(
-        source.get("sampler_session", source.get("sampler_index", 0)) if source else 0,
-        manifest.get("sampler_session", 0),
-    )
+    sampler_session = sampler_session_highwater(source, manifest, args.trainer_session)
     promotion_index = source.get("promotion_index", 0) if source else 0
     if not 0 <= stage < len(STAGES):
         raise ValueError("invalid checkpoint stage")
@@ -2537,11 +2557,12 @@ def train(args):
     if args.promote_now:
         promote()
     while time.monotonic() < deadline and (not args.decisions or decisions < args.decisions):
-        sampler_session = claim_sampler_session(output / "run.json", manifest, sampler_session)
+        next_sampler_session = max(sampler_session, manifest.get("sampler_session", 0)) + 1
         sampler_seed(
-            args, sampler_session, args.samplers - 1, args.sampler_restarts,
+            args, next_sampler_session, args.samplers - 1, args.sampler_restarts,
             args.envs // args.samplers - 1,
         )
+        sampler_session = claim_sampler_session(output / "run.json", manifest, sampler_session)
         base = decisions
         budget = args.decisions - decisions if args.decisions else (1 << 62) // args.envs * args.envs
         last_checkpoint = None
