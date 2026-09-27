@@ -110,9 +110,16 @@ print('restored')
         })
         self.assertFalse(args.capture_trajectories)
         self.assertFalse(args.terminal_potential)
+        self.assertEqual(args.potential_mode, "health_multiplier")
         self.assertTrue(train.parser().parse_args([
-            "train", "--terminal-potential",
+            "train", "--terminal-potential", "--potential-mode", "additive",
+            "--potential-bias-weight", ".01",
         ]).terminal_potential)
+        additive = train.parser().parse_args([
+            "train", "--potential-mode", "additive", "--potential-health-weight", ".01",
+        ])
+        self.assertEqual((additive.potential_mode, additive.potential_health_weight),
+                         ("additive", .01))
 
     def test_sampler_seed_streams_are_disjoint(self):
         args = Namespace(
@@ -926,6 +933,26 @@ class TrajectoryTest(unittest.TestCase):
         self.assertAlmostEqual(sum(math.exp(value) for value in policy), 1, places=5)
         self.assertAlmostEqual(policy[int(result[1][0])], float(result[2][0]), places=5)
         self.assertTrue(math.isfinite(critic))
+
+    def test_potential_modes(self):
+        env = train.sts2_sim.Batch(1, 7, 0, ascension=0)
+        weights = [1e-4] * len(train.POTENTIAL_TERMS)
+        env.set_potential_weights(weights)
+        multiplied = float(env.observe_tokens()[4][0])
+        env.set_potential_mode("additive")
+        additive = float(env.observe_tokens()[4][0])
+        self.assertGreater(multiplied, additive)
+        with self.assertRaises(ValueError):
+            env.set_potential_mode("invalid")
+
+        model = train.Agent(
+            dict(env.token_layout(*train.DEFAULT_ARCHITECTURE)), *train.DEFAULT_ARCHITECTURE,
+            potential_weights=weights, potential_mode="additive",
+        )
+        self.assertEqual(train.architecture(model)["potential_mode"], "additive")
+        env.set_potential_mode("health_multiplier")
+        env.load_policy(train.export_value_model(None, model, env.fingerprint(), 1, 0, True))
+        self.assertAlmostEqual(float(env.observe_tokens()[4][0]), additive)
 
     def test_explanation_deletes_tokens_and_captures_attention(self):
         env = train.sts2_sim.Batch(1, 1, None, ascension=0)

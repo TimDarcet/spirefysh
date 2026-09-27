@@ -1984,6 +1984,7 @@ def critic_diagnostics(args):
             )
             env.set_training_bonus(bonus)
             env.set_potential_weights(model.potential_weights)
+            env.set_potential_mode(model.potential_mode)
             env.load_policy(policy)
             active = np.ones(count, bool)
             histories = [[] for _ in range(count)]
@@ -2240,6 +2241,8 @@ def train(args):
             raise ValueError("checkpoint pooling configuration cannot be changed")
         if model.potential_weights != potential_weights:
             raise ValueError("checkpoint potential weights cannot be changed")
+        if model.potential_mode != args.potential_mode:
+            raise ValueError("checkpoint potential mode cannot be changed")
         args.width, args.layers, args.heads, args.feedforward = loaded
     else:
         config = tuple(value if value is not None else default for value, default in zip(
@@ -2250,7 +2253,8 @@ def train(args):
         pooling = {name: getattr(args, name + "_pooling") or default
                    for name, default in POOLING_DEFAULTS.items()}
         model = Agent(layout, *config, pooling=pooling,
-                      potential_weights=potential_weights).to(target)
+                      potential_weights=potential_weights,
+                      potential_mode=args.potential_mode).to(target)
     late_stage = (source["stage"] if source else args.start_stage) >= 5
     if (late_stage or args.freeze_backbone) and args.samplers == 1 and args.envs % 2 == 0:
         args.samplers, args.sampler_threads = 2, min(args.sampler_threads, 4)
@@ -2797,6 +2801,7 @@ def value_dataset(model, args, target, seed, runs, deadline):
             count = min(args.batch, runs - start)
             env = sts2_sim.Batch(count, seed + character * 1_000_000 + start, character, ascension=10)
             env.set_potential_weights(model.potential_weights)
+            env.set_potential_mode(model.potential_mode)
             active = np.ones(count, bool)
             episode_steps = np.zeros(count, np.int32)
             combat_steps = np.zeros(count, np.int32)
@@ -3006,6 +3011,7 @@ def finalize(args):
     digest = export_value_model(output, model, checkpoint["fingerprint"], temperature, bias)
     parity_env = sts2_sim.Batch(8, args.test_seed + 99_000_000, None, ascension=10)
     parity_env.set_potential_weights(model.potential_weights)
+    parity_env.set_potential_mode(model.potential_mode)
     parity_observation = parity_env.observe_tokens()
     parity_inputs = tensors(parity_observation, target, model)
     with torch.no_grad():
@@ -3195,6 +3201,7 @@ def probe():
     model = Agent(layout, pooling=mixed, potential_weights=(.001,) + (0.,) * 12).eval()
     model.critic.weight.data.normal_(std=.1); model.critic.bias.data.normal_(std=.1)
     env.set_potential_weights(model.potential_weights)
+    env.set_potential_mode(model.potential_mode)
     combat = env.observe_tokens()
     inputs = tensors(combat, target, model)
     with torch.no_grad():
@@ -3253,6 +3260,7 @@ def probe():
         compact = Agent(compact_layout, 64, 2, 4, 128).eval()
         compact.critic.weight.data.normal_(std=.1)
         env.set_potential_weights(compact.potential_weights)
+        env.set_potential_mode(compact.potential_mode)
         compact_observation = env.observe_tokens()
         compact_path = Path(directory) / "compact.bin"
         export_value_model(compact_path, compact, env.fingerprint(), 1, 0)
@@ -3277,7 +3285,7 @@ def probe():
         assert loaded["model_version"] == MODEL_VERSION
         incompatible = torch.load(checkpoint, weights_only=False)
         incompatible["architecture"]["position_caps"]["enemy"] = 32
-        incompatible["model_version"] = MODEL_VERSION - 1
+        incompatible["model_version"] = min(COMPATIBLE_MODEL_VERSIONS) - 1
         torch.save(incompatible, checkpoint)
         try:
             load(checkpoint, target)

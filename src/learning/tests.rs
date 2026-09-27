@@ -456,10 +456,15 @@ fn potential_is_floor_plus_hp_weighted_run_resources() {
         value.floor,
         canonical_progress(&game) as f32 / (TERMINAL_CATEGORIES - 1) as f32
     );
-    assert_eq!(value.resources.iter().sum::<f32>(), 1547.0);
+    assert_eq!(value.health, 7.0);
+    assert_eq!(value.resources.iter().sum::<f32>(), 221.0);
     assert_eq!(
-        potential_value(&value, &[1.0; POTENTIAL_WEIGHT_COUNT]),
+        potential_value(&value, &[1.0; POTENTIAL_WEIGHT_COUNT], true),
         value.floor + 1547.0
+    );
+    assert_eq!(
+        potential_value(&value, &[1.0; POTENTIAL_WEIGHT_COUNT], false),
+        value.floor + 227.0
     );
 }
 
@@ -2155,7 +2160,7 @@ fn v55_action_and_phase_discriminants_are_exhaustive() {
 #[test]
 fn v56_layout_uses_explicit_token_dimensions_and_positions() {
     let layout = Layout::new(&foundation_content());
-    assert_eq!((VERSION, VALUE_MODEL_VERSION), (56, 74));
+    assert_eq!((VERSION, VALUE_MODEL_VERSION), (56, 75));
     assert_eq!(
         (
             DEFAULT_MODEL_WIDTH,

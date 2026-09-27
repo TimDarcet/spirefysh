@@ -1119,6 +1119,7 @@ struct Batch {
     training_strength: i16,
     training_dexterity: i16,
     potential_weights: [f32; POTENTIAL_WEIGHT_COUNT],
+    potential_health_multiplier: bool,
     terminal_potential: bool,
     resample_archive: bool,
     archive_depth: usize,
@@ -1358,6 +1359,7 @@ struct SearchTree {
     max_depth: usize,
     nodes: Vec<SearchNode>,
     potential_weights: [f32; POTENTIAL_WEIGHT_COUNT],
+    potential_health_multiplier: bool,
     terminal_potential: bool,
     lookup: FastMap<(u64, usize), usize>,
     games: Option<Vec<Game>>,
@@ -1402,6 +1404,7 @@ impl SearchTree {
         log_policy: &[f32],
         value: f32,
         potential_weights: [f32; POTENTIAL_WEIGHT_COUNT],
+        potential_health_multiplier: bool,
         terminal_potential: bool,
         budget: usize,
         turns: usize,
@@ -1429,7 +1432,11 @@ impl SearchTree {
             observation.candidates.clone(),
             log_policy,
             value,
-            potential_value(&observation.potential, &potential_weights),
+            potential_value(
+                &observation.potential,
+                &potential_weights,
+                potential_health_multiplier,
+            ),
             0,
             behavior_exponent,
             Some(compact_packed_observation_known(observation, Some(digest))),
@@ -1446,6 +1453,7 @@ impl SearchTree {
             max_depth,
             nodes,
             potential_weights,
+            potential_health_multiplier,
             terminal_potential,
             lookup,
             games,
@@ -1468,7 +1476,11 @@ impl SearchTree {
     fn terminal_value(&self, game: &Game, content: &Content) -> f32 {
         search_terminal_value(game, self.progress).unwrap()
             + if self.terminal_potential {
-                potential_value(&potential(game, content, true), &self.potential_weights)
+                potential_value(
+                    &potential(game, content, true),
+                    &self.potential_weights,
+                    self.potential_health_multiplier,
+                )
             } else {
                 0.0
             }
@@ -1713,7 +1725,11 @@ impl SearchTree {
         }
         let index = self.nodes.len();
         self.lookup.insert(key, index);
-        let potential = potential_value(&observation.potential, &self.potential_weights);
+        let potential = potential_value(
+            &observation.potential,
+            &self.potential_weights,
+            self.potential_health_multiplier,
+        );
         self.nodes.push(SearchNode::new(
             observation.candidates,
             log_policy,
@@ -2505,6 +2521,7 @@ fn mcts_targets(
                     &prior,
                     *progress,
                     model.potential_weights,
+                    model.potential_health_multiplier,
                     terminal_potential,
                     budget,
                     turns,
@@ -3144,6 +3161,7 @@ fn search_diagnostic(
         &prior,
         value,
         model.potential_weights,
+        model.potential_health_multiplier,
         false,
         simulations,
         turns,
@@ -5337,6 +5355,7 @@ impl Batch {
             training_strength: 0,
             training_dexterity: 0,
             potential_weights: [0.0; POTENTIAL_WEIGHT_COUNT],
+            potential_health_multiplier: true,
             terminal_potential: false,
             resample_archive: true,
             archive_depth: 0,
@@ -5575,6 +5594,15 @@ impl Batch {
             ));
         }
         self.potential_weights = weights.try_into().unwrap();
+        Ok(())
+    }
+
+    fn set_potential_mode(&mut self, mode: &str) -> PyResult<()> {
+        self.potential_health_multiplier = match mode {
+            "health_multiplier" => true,
+            "additive" => false,
+            _ => return Err(PyValueError::new_err("invalid potential mode")),
+        };
         Ok(())
     }
 
@@ -6364,6 +6392,7 @@ impl Batch {
         let content = &self.content;
         let bonuses = (self.training_strength, self.training_dexterity);
         let potential_weights = self.potential_weights;
+        let potential_health_multiplier = self.potential_health_multiplier;
         let active = active.unwrap_or_else(|| vec![true; self.games.len()]);
         if active.len() != self.games.len() {
             return Err(PyValueError::new_err("invalid active mask"));
@@ -6409,7 +6438,11 @@ impl Batch {
             characters[batch] = row.character;
             globals[batch * globals_len(layout)..(batch + 1) * globals_len(layout)]
                 .copy_from_slice(&row.globals);
-            potentials[batch] = potential_value(&row.potential, &potential_weights);
+            potentials[batch] = potential_value(
+                &row.potential,
+                &potential_weights,
+                potential_health_multiplier,
+            );
             for (position, candidate) in row.candidates.iter().enumerate() {
                 let base = batch * max_actions + position;
                 if !flat {
@@ -6760,10 +6793,10 @@ impl Batch {
     }
 
     fn load_policy(&mut self, data: &[u8]) -> PyResult<()> {
-        self.policy = Some(
-            ValueModel::from_bytes(data, &self.content)
-                .map_err(|error| PyValueError::new_err(error.to_string()))?,
-        );
+        let policy = ValueModel::from_bytes(data, &self.content)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        self.potential_health_multiplier = policy.potential_health_multiplier;
+        self.policy = Some(policy);
         Ok(())
     }
 
@@ -7120,6 +7153,7 @@ impl Batch {
         let layout = self.layout;
         let bonuses = (self.training_strength, self.training_dexterity);
         let potential_weights = self.potential_weights;
+        let potential_health_multiplier = self.potential_health_multiplier;
         let terminal_potential = self.terminal_potential;
         let skip_forced = (cache_features || skip_forced) && !search_enabled;
         let rows = py.allow_threads(|| {
@@ -7255,7 +7289,13 @@ impl Batch {
         let mut selected_actions = Vec::with_capacity(rows.len());
         let potentials = rows
             .iter()
-            .map(|row| potential_value(&row.potential, &potential_weights))
+            .map(|row| {
+                potential_value(
+                    &row.potential,
+                    &potential_weights,
+                    potential_health_multiplier,
+                )
+            })
             .collect::<Vec<_>>();
         self.actions.clear();
         if advance {
@@ -7441,6 +7481,7 @@ impl Batch {
                                 potential_value(
                                     &potential(game, content, terminal_potential),
                                     &potential_weights,
+                                    potential_health_multiplier,
                                 ),
                             ))
                         })
@@ -7574,6 +7615,7 @@ impl Batch {
             .collect::<Vec<_>>();
         let content = &self.content;
         let potential_weights = self.potential_weights;
+        let potential_health_multiplier = self.potential_health_multiplier;
         let terminal_potential = self.terminal_potential;
         let results = py
             .allow_threads(|| {
@@ -7595,6 +7637,7 @@ impl Batch {
                             potential_value(
                                 &potential(game, content, terminal_potential),
                                 &potential_weights,
+                                potential_health_multiplier,
                             ),
                             !was_combat && game.combat().is_some(),
                         ))

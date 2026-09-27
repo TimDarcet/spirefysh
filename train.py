@@ -79,10 +79,15 @@ def parser():
     run.add_argument("--gae-gamma", type=float, default=1.0)
     run.add_argument("--gae-lambda", type=float, default=1.0)
     run.add_argument("--terminal-potential", action="store_true")
+    run.add_argument("--potential-mode", choices=("health_multiplier", "additive"),
+                     default="health_multiplier")
     for boss, default in enumerate(BOSS_FLOOR_INCREMENTS, 1):
         run.add_argument(f"--boss-{boss}-floor-increment", type=float, default=default)
     for term in POTENTIAL_TERMS:
-        run.add_argument(f"--potential-{term.replace('_', '-')}-weight", type=float, default=0.)
+        flags = [f"--potential-{term.replace('_', '-')}-weight"]
+        if term == "health":
+            flags.append("--potential-bias-weight")
+        run.add_argument(*flags, type=float, default=0.)
     run.add_argument("--critic-balance-decay", type=float, default=.99)
     run.add_argument("--search-consistency-weight", type=float, default=0)
     run.add_argument("--search-consistency-batch", type=int, default=256)

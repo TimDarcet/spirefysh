@@ -13,7 +13,7 @@ use std::{
 
 const MAGIC: &[u8; 8] = b"STSVALUE";
 const VERSION: u32 = 56;
-const VALUE_MODEL_VERSION: u32 = 74;
+const VALUE_MODEL_VERSION: u32 = 75;
 const MIN_VALUE_MODEL_VERSION: u32 = 74;
 const TERMINAL_CATEGORIES: usize = 83;
 const POTENTIAL_WEIGHT_COUNT: usize = 13;
@@ -322,6 +322,7 @@ struct CandidateRow {
 #[derive(Clone, Debug, Default, PartialEq)]
 struct Potential {
     floor: f32,
+    health: f32,
     resources: [f32; POTENTIAL_WEIGHT_COUNT],
 }
 
@@ -7701,22 +7702,31 @@ fn potential(game: &Game, content: &Content, include_terminal: bool) -> Potentia
         deck.iter()
             .filter(|card| content.cards[card.id as usize].rarity == CardRarity::Rare)
             .count() as f32,
-    ]
-    .map(|term| hp * term);
+    ];
     Potential {
         floor: canonical_progress(game) as f32 / (TERMINAL_CATEGORIES - 1) as f32,
+        health: hp,
         resources,
     }
 }
 
-fn potential_value(potential: &Potential, weights: &[f32; POTENTIAL_WEIGHT_COUNT]) -> f32 {
+fn potential_value(
+    potential: &Potential,
+    weights: &[f32; POTENTIAL_WEIGHT_COUNT],
+    health_multiplier: bool,
+) -> f32 {
     let resources = potential
         .resources
         .iter()
         .zip(weights)
         .map(|(term, weight)| term * weight)
         .sum::<f32>();
-    potential.floor + resources
+    potential.floor
+        + if health_multiplier {
+            potential.health * resources
+        } else {
+            potential.health * weights[0] + resources - weights[0]
+        }
 }
 
 struct ContentHasher(u64);
