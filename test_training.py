@@ -1090,6 +1090,17 @@ class TrajectoryTest(unittest.TestCase):
             potential_weights=weights, potential_mode="additive",
         )
         self.assertEqual(train.architecture(model)["potential_mode"], "additive")
+        legacy = train.Agent(
+            dict(env.token_layout(*train.DEFAULT_ARCHITECTURE)), *train.DEFAULT_ARCHITECTURE,
+            model_version=train.MODEL_VERSION - 1, potential_weights=weights,
+        )
+        self.assertEqual(legacy.potential_mode, "health_multiplier")
+        with self.assertRaises(ValueError):
+            train.Agent(
+                dict(env.token_layout(*train.DEFAULT_ARCHITECTURE)),
+                *train.DEFAULT_ARCHITECTURE, model_version=train.MODEL_VERSION - 1,
+                potential_mode="additive",
+            )
         env.set_potential_mode("health_multiplier")
         env.load_policy(train.export_value_model(None, model, env.fingerprint(), 1, 0, True))
         self.assertAlmostEqual(float(env.observe_tokens()[4][0]), additive)
@@ -1167,7 +1178,7 @@ class TrajectoryTest(unittest.TestCase):
     def test_catalog_prefers_compatible_runs_and_disables_old_checkpoints(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            for name, version in (("old", train.MODEL_VERSION - 1),
+            for name, version in (("old", min(train.COMPATIBLE_MODEL_VERSIONS) - 1),
                                   ("current", train.MODEL_VERSION)):
                 run = root / name
                 run.mkdir()
