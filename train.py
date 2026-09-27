@@ -38,7 +38,7 @@ def parser():
     run.add_argument("--envs", type=int, default=512)
     run.add_argument("--samplers", type=int, default=2)
     run.add_argument("--torch-threads", type=int, default=2)
-    run.add_argument("--sampler-threads", type=int, default=4)
+    run.add_argument("--sampler-threads", type=int, default=6)
     run.add_argument("--sampler-backend", choices=("process", "thread"), default="process")
     run.add_argument("--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"), default="INFO")
     run.add_argument("--capture-trajectories", action="store_true")
