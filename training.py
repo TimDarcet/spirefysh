@@ -625,7 +625,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                  prune_checkpoints, save_step, fingerprint, critic_balance, revisions):
     collector_args = copy.copy(args)
     collector_args.cache_features = (
-        args.freeze_backbone and args.target_kl >= 1
+        args.freeze_backbone and (args.disable_post_kl_check or args.target_kl >= 1)
         and not args.winning_capacity
     )
     pending_capacity = max(1, reservoir.capacity // args.envs)
@@ -2251,11 +2251,6 @@ def train(args):
                    for name, default in POOLING_DEFAULTS.items()}
         model = Agent(layout, *config, pooling=pooling,
                       potential_weights=potential_weights).to(target)
-    late_stage = (source["stage"] if source else args.start_stage) >= 5
-    if (late_stage or args.freeze_backbone) and args.samplers == 1 and args.envs % 2 == 0:
-        args.samplers, args.sampler_threads = 2, min(args.sampler_threads, 4)
-    if late_stage or args.freeze_backbone:
-        args.save_decisions = max(args.save_decisions, 262_144)
     if args.freeze_backbone:
         args.publish_updates = max(args.publish_updates, 16)
         model.requires_grad_(False)
