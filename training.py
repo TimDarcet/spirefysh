@@ -665,15 +665,12 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
     results = queue_type(); stop = threading.Event() if threaded else context.Event()
     heartbeat = [started] * args.samplers if threaded else context.Array("d", [started] * args.samplers)
     progress = [0] * args.samplers if threaded else context.Array("q", [0] * args.samplers)
-    sampling = threading.Event() if threaded else context.Event()
-    paused = [False] * args.samplers if threaded else context.Array("b", args.samplers)
     diagnostics = (
         context.RawArray("i", args.samplers),
         context.RawArray("d", [started] * args.samplers),
         context.RawArray("q", [base_decisions // args.envs] * args.samplers),
         context.RawArray("q", [-1] * (args.envs * len(SAMPLER_STATE_FIELDS))),
     )
-    sampling.set()
     packer = ThreadPoolExecutor(max_workers=1)
     workers = [None] * args.samplers
     watchdog_terminated = set()
@@ -710,7 +707,6 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
     def start_worker(worker):
         heartbeat[worker] = time.monotonic()
         progress[worker] = 0
-        paused[worker] = False
         sampler_stale_since[worker] = None
         sampler_stale_heartbeat[worker] = None
         sampler_finished[worker] = False
@@ -724,8 +720,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             actor, collector_args, sampler_session, stage,
             reservoir.capacity, pending_capacity, sampler_iterations[worker], worker,
             sampler_generations[worker], actor_revision, policy_version, models[worker], sample_source,
-            stop, deadline, budget, results, heartbeat, progress, sampling, paused, diagnostics,
-            os.getpid(),
+            stop, deadline, budget, results, heartbeat, progress, diagnostics, os.getpid(),
         ), name=f"sampler-{worker}", daemon=True)
         workers[worker] = process
         process.start()
@@ -949,22 +944,6 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         if not pending and len(dataset) >= args.batch \
                 and base_decisions + handled < min(next_report, next_save):
             pending.append(reserve_batch(args.batch))
-
-    def pause_samplers():
-        if target.type != "mps":
-            return
-        sampling.clear()
-        while not all(paused[worker] or sampler_exhausted[worker]
-                      or not workers[worker].is_alive() for worker in range(args.samplers)):
-            time.sleep(.001)
-
-    def resume_samplers():
-        if target.type == "mps":
-            torch.mps.synchronize()
-            sampling.set()
-            while any(paused[worker] and workers[worker].is_alive()
-                      for worker in range(args.samplers)):
-                time.sleep(.001)
 
     def drain_results():
         while True:
@@ -1229,9 +1208,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 continue
             assert len(rows) == args.batch
             revisions["update_attempt"] += 1
-            pause_started = time.monotonic()
-            pause_samplers()
-            pause_seconds = time.monotonic() - pause_started
+            pause_seconds = 0.
             unpack_started = time.monotonic()
             lengths = np.asarray([packed_action_count(row) for row in rows], np.int64)
             expert_lengths = np.asarray([
@@ -1296,7 +1273,6 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 log_ratio = fresh = inputs = None
                 model._sequence_layouts.clear()
                 release_mps_cache(True)
-                resume_samplers()
                 continue
             refill_ids = np.empty(0, np.int64)
             log_ratio_cpu = log_ratio.detach().cpu().numpy()
@@ -1371,7 +1347,6 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     total_seconds=update_elapsed,
                 )
                 publish()
-                resume_samplers()
                 continue
             advantages = torch.as_tensor(values["advantage"], device=target)
             characters = torch.as_tensor(values["character"], device=target)
@@ -1556,7 +1531,6 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     total_seconds=update_elapsed,
                 )
                 publish()
-                resume_samplers()
                 continue
             post_kl = proposals[-1] if proposals else kl_value
             base_prediction = prediction_cpu + values["potential"][fresh_cpu]
@@ -1627,7 +1601,6 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             log_ratio = ratio = batch_advantage = inputs = None
             model._sequence_layouts.clear()
             release_mps_cache()
-            resume_samplers()
             if update_elapsed > 5:
                 packed = rows + expert_rows + [sample[0] for sample in replay]
                 represented_actions = max(packed_action_count(row) for row in packed)
@@ -1653,7 +1626,6 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 if promotion_ready:
                     stop.set()
     finally:
-        sampling.set()
         stop.set()
         if watchdog.ident is not None:
             watchdog.join()

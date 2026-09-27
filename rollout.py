@@ -16,8 +16,9 @@ from telemetry import *
 
 
 SAMPLER_SEED_BLOCK = 10_000_000
+NATIVE_HISTORY_WINDOW = 2048
 SAMPLER_PHASES = (
-    "starting", "paused", "preparing", "policy", "environment", "processing", "reset",
+    "starting", "preparing", "policy", "environment", "processing", "reset",
     "queue", "stopped",
 )
 SAMPLER_STATE_FIELDS = (
@@ -282,6 +283,7 @@ class RolloutCollector:
         self.action_history = [[] for _ in range(args.envs)]
         self.traces = [None] * args.envs
         self.native_steps = []
+        self.native_prefixes = [[] for _ in range(args.envs)]
         self.native_starts = np.zeros(args.envs, np.int64)
         self.native_started = np.full(args.envs, time.monotonic())
         self.recovery = np.full(args.envs, generation > 0)
@@ -373,7 +375,7 @@ class RolloutCollector:
             }, "WARNING", role=f"sampler-{self.worker}")
 
     def collect(self, model, target, precision, deadline, steps, version,
-                stop=None, heartbeat=None, progress=None, sampling=None, paused=None):
+                stop=None, heartbeat=None, progress=None):
         args = self.args
         native = model is None
         cache_start = dict.fromkeys(("card_hit", "card_miss", "graph_hit", "graph_miss"), 0) \
@@ -389,30 +391,18 @@ class RolloutCollector:
             samples = trajectory.pop("samples")
             trajectory.update(zip(sample_keys, map(list, zip(*samples))))
             return trajectory
+        def native_columns(history, index):
+            return tuple(
+                [step[column][index] for step in history] if column in (0, 11) else
+                np.asarray([step[column] if column == 9 else step[column][index]
+                            for step in history])
+                for column in range(len(sample_keys))
+            )
         discarded_steps = orphan_empty_actions = sampled_steps = 0
         search_stats = np.zeros(17, np.int64)
         expert_rows = []
         collect_seconds = 0.0
         for _ in range(steps):
-            if sampling is not None and not sampling.is_set():
-                paused_started = time.monotonic()
-                self.mark_phase("paused")
-                while not sampling.is_set():
-                    paused[self.worker] = True
-                    if heartbeat is not None:
-                        heartbeat[self.worker] = time.monotonic()
-                    if time.monotonic() >= deadline or stop.wait(.01):
-                        break
-                paused_seconds = time.monotonic() - paused_started
-                self.native_started += paused_seconds
-                for trajectory in self.trajectories:
-                    if trajectory is not None:
-                        trajectory["started"] += paused_seconds
-                for trace in self.traces:
-                    if trace is not None:
-                        trace["started"] += paused_seconds
-            if paused is not None:
-                paused[self.worker] = False
             if time.monotonic() >= deadline or stop and stop.is_set():
                 break
             if heartbeat is not None:
@@ -551,9 +541,9 @@ class RolloutCollector:
                 self.trace_empty("post_step", reset, characters, stats)
             if native:
                 self.native_steps.append((
-                    step_rows, choice, log_probability, critic_value, canonical, phases,
+                    list(step_rows), choice, log_probability, critic_value, canonical, phases,
                     raw_reward, done, characters, version, potentials,
-                ) + ((step_features,) if args.cache_features else ()))
+                ) + ((list(step_features),) if args.cache_features else ()))
             else:
                 for index, row in enumerate(step_rows):
                     trajectory = self.trajectories[index]
@@ -573,10 +563,16 @@ class RolloutCollector:
                     recovering = bool(self.recovery[index])
                     history = (self.native_steps[self.native_starts[index]:] if native
                                else self.trajectories[index]["samples"])
+                    prefixes = self.native_prefixes[index] if native else ()
+                    length = sum(len(chunk[0]) for chunk in prefixes) + len(history)
                     terminal_floor = int((stats[index][0] - 1) * 17 + stats[index][1])
                     completion_seconds = (time.monotonic() - self.native_started[index] if native
                                           else time.monotonic() - self.trajectories[index]["started"])
-                    policy_versions = [row[9] for row in history]
+                    policy_versions = ([chunk[9] for chunk in prefixes] +
+                                       [np.asarray([row[9] for row in history])]
+                                       if native else [np.asarray([
+                                           row[9] for row in history
+                                       ])])
                     completions.append({
                         "character": int(characters[index]),
                         "floor": terminal_floor,
@@ -584,10 +580,16 @@ class RolloutCollector:
                         "step_cap": bool(step_truncated[index] and truncated[index]),
                         "combat_cap": bool(combat_truncated[index] and truncated[index]),
                         "empty_actions": bool(empty_actions[index]),
-                        "length": len(history), "completion_seconds": completion_seconds,
+                        "length": length, "completion_seconds": completion_seconds,
                         "iteration": self.iteration,
-                        "policy_revision_min": min(policy_versions, default=version),
-                        "policy_revision_max": max(policy_versions, default=version),
+                        "policy_revision_min": min(
+                            (int(values.min()) for values in policy_versions if len(values)),
+                            default=version,
+                        ),
+                        "policy_revision_max": max(
+                            (int(values.max()) for values in policy_versions if len(values)),
+                            default=version,
+                        ),
                         **({"recovery": True} if recovering else {}),
                     })
                     if not recovering:
@@ -607,20 +609,18 @@ class RolloutCollector:
                     )
                     self.finish_trace(index, outcome, terminal_floor, done[index])
                     if native and done[index]:
-                        trajectory = {
-                            key: ([step[column][index] for step in history]
-                                  if column in (0, 11) else np.asarray([
-                                      step[column] if column == 9 else step[column][index]
-                                      for step in history
-                                  ]))
-                            for column, key in enumerate(sample_keys)
-                        }
+                        suffix = native_columns(history, index)
+                        trajectory = {key: (
+                            [value for chunk in (*prefixes, suffix)
+                             for value in chunk[column]] if column in (0, 11) else
+                            np.concatenate([chunk[column] for chunk in (*prefixes, suffix)])
+                        ) for column, key in enumerate(sample_keys)}
                         trajectory["completion_seconds"] = completion_seconds
                         trajectory["terminal_floor"] = terminal_floor
                         trajectory["terminal_potential"] = float(terminal_potentials[index])
                         finished.append(trajectory)
                     elif native:
-                        discarded_steps += len(self.native_steps) - int(self.native_starts[index])
+                        discarded_steps += length
                     elif done[index]:
                         trajectory = self.trajectories[index]
                         trajectory["completion_seconds"] = completion_seconds
@@ -630,6 +630,12 @@ class RolloutCollector:
                         finished.append(materialize(trajectory))
                     else:
                         discarded_steps += len(self.trajectories[index]["samples"])
+                    if native:
+                        for step in history:
+                            step[0][index] = None
+                            if args.cache_features:
+                                step[11][index] = None
+                        self.native_prefixes[index].clear()
                     self.trajectories[index] = None
                     self.action_history[index].clear()
                     self.native_starts[index] = len(self.native_steps)
@@ -640,11 +646,22 @@ class RolloutCollector:
                 self.episode_steps[reset] = 0
                 self.combat_steps[reset] = 0
                 next_observation = None if native else self.env.observe_tokens(flat=True)
-                if native:
-                    drop = int(self.native_starts.min())
-                    if drop:
-                        del self.native_steps[:drop]
-                        self.native_starts -= drop
+            if native:
+                if len(self.native_steps) > NATIVE_HISTORY_WINDOW:
+                    cutoff = len(self.native_steps) - NATIVE_HISTORY_WINDOW
+                    for index, start in enumerate(self.native_starts):
+                        if start < cutoff:
+                            history = self.native_steps[start:cutoff]
+                            self.native_prefixes[index].append(native_columns(history, index))
+                            for step in history:
+                                step[0][index] = None
+                                if args.cache_features:
+                                    step[11][index] = None
+                            self.native_starts[index] = cutoff
+                drop = int(self.native_starts.min())
+                if drop:
+                    del self.native_steps[:drop]
+                    self.native_starts -= drop
             self.observation = next_observation
             collect_seconds += time.monotonic() - step_started
             if finished and not native:
@@ -679,7 +696,7 @@ class RolloutCollector:
 
     def run(self, model, models, samples, stop, deadline, budget, worker=0,
             heartbeat=None, progress=None, version=0, actor_revision=0, target=None,
-            precision="fp32", sampling=None, paused=None):
+            precision="fp32"):
         target = target or torch.device("cpu")
         produced = 0
         def empty():
@@ -724,7 +741,7 @@ class RolloutCollector:
                 break
             result = self.collect(
                 model, target, precision, deadline, steps, version, stop,
-                heartbeat, progress, sampling, paused,
+                heartbeat, progress,
             )
             if self.args.log_level == "DEBUG":
                 self.event(
@@ -783,7 +800,9 @@ class RolloutCollector:
                         heartbeat[worker] = time.monotonic()
                     time.sleep(.01)
         pending["discarded_steps"] += (
-            sum(len(self.native_steps) - int(start) for start in self.native_starts)
+            sum(sum(len(chunk[0]) for chunk in prefixes)
+                + len(self.native_steps) - int(start)
+                for prefixes, start in zip(self.native_prefixes, self.native_starts))
             if model is None else
             sum(len(trajectory["samples"]) for trajectory in self.trajectories
                 if trajectory is not None)
@@ -805,8 +824,7 @@ class RolloutCollector:
 
 def collect_worker(model, args, sampler_session, stage, capacity, pending_capacity, iteration,
                    worker, generation, actor_revision, policy_revision, models, samples, stop,
-                   deadline, budget, results, heartbeat, progress, sampling, paused, diagnostics,
-                   parent_pid):
+                   deadline, budget, results, heartbeat, progress, diagnostics, parent_pid):
     if args.sampler_backend == "process":
         prctl = getattr(ctypes.CDLL(None), "prctl", None)
         if prctl is not None and prctl(1, signal.SIGKILL) == 0:
@@ -861,7 +879,7 @@ def collect_worker(model, args, sampler_session, stage, capacity, pending_capaci
     try:
         result = collector.run(
             model, models, samples, stop, deadline, budget, worker, heartbeat, progress,
-            policy_revision, actor_revision, target, precision, sampling, paused,
+            policy_revision, actor_revision, target, precision,
         )
         collector.event(
             "sampler_stop", policy_revision=result[2], iteration=result[3]["iteration"],

@@ -16,6 +16,7 @@ import numpy as np
 import torch
 
 import train
+import rollout
 import telemetry
 import trajectories
 from explanations import explain
@@ -1030,6 +1031,43 @@ class TrajectoryTest(unittest.TestCase):
         collector.env = mock.Mock()
         self.assertEqual(collector.trace_indices(), [])
         collector.env.characters.assert_not_called()
+
+    def test_native_long_trajectory_compaction_preserves_samples(self):
+        args = train.parser().parse_args(["train"])
+        args.envs = 16
+        args.samplers = 1
+        args.cache_features = False
+        env = train.sts2_sim.Batch(1, 0, None, ascension=0)
+        shape = (64, 2, 4, 128)
+        model = train.Agent(dict(env.token_layout(*shape)), *shape)
+        actor = train.export_value_model(None, model, env.fingerprint(), 1, 0, True)
+
+        results = []
+        for window in (10 ** 9, 4):
+            with mock.patch.object(rollout, "NATIVE_HISTORY_WINDOW", window):
+                collector = train.RolloutCollector(
+                    args, 1, 0, train.WinningReservoir(0, args.envs),
+                )
+                collector.env.load_policy(actor)
+                results.append(collector.collect(
+                    None, None, "fp32", float("inf"), 200, 17,
+                ))
+                self.assertLessEqual(len(collector.native_steps), window)
+
+        original, compacted = results
+        self.assertEqual(len(original["trajectories"]), len(compacted["trajectories"]))
+        self.assertGreater(len(original["trajectories"]), 0)
+        for left, right in zip(original["trajectories"], compacted["trajectories"]):
+            for key in left:
+                if key == "completion_seconds":
+                    continue
+                if key == "rows":
+                    self.assertEqual(left[key], right[key])
+                else:
+                    np.testing.assert_array_equal(left[key], right[key], err_msg=key)
+        for left, right in zip(original["completions"], compacted["completions"]):
+            self.assertEqual(left | {"completion_seconds": 0},
+                             right | {"completion_seconds": 0})
 
     def test_capture_slots_are_balanced_by_character(self):
         collector = train.RolloutCollector.__new__(train.RolloutCollector)
