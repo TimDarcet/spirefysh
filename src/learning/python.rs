@@ -1101,6 +1101,7 @@ struct Batch {
     content: Content,
     layout: Layout,
     games: Vec<Game>,
+    map_caches: Vec<Option<CanonicalMapCache>>,
     actions: Vec<Vec<Action>>,
     plans: Vec<Vec<Action>>,
     starts: Vec<Game>,
@@ -5344,6 +5345,7 @@ impl Batch {
             starts: vec![],
             root_ids: vec![usize::MAX; size],
             games: Vec::with_capacity(size),
+            map_caches: (0..size).map(|_| None).collect(),
             random: seed.max(1),
             next_seed: seed,
             seed_stride: seed_stride.max(1),
@@ -6412,18 +6414,22 @@ impl Batch {
         if active.len() != self.games.len() {
             return Err(PyValueError::new_err("invalid active mask"));
         }
+        self.map_caches.resize_with(self.games.len(), || None);
         let rows = py.allow_threads(|| {
             self.games
                 .par_iter()
+                .zip(self.map_caches.par_iter_mut())
                 .zip(&active)
-                .map(|(game, &active)| {
+                .map(|((game, map_cache), &active)| {
                     if !active {
                         return None;
                     }
                     debug_assert!(game.combat().is_none_or(|combat| {
                         combat.queue.is_empty() || combat.choice.is_some()
                     }));
-                    Some(observation_v56(game, content, layout, bonuses))
+                    Some(observation_v56_cached(
+                        game, content, layout, bonuses, map_cache,
+                    ))
                 })
                 .collect::<Vec<_>>()
         });
@@ -7171,15 +7177,24 @@ impl Batch {
         let potential_health_multiplier = self.potential_health_multiplier;
         let terminal_potential = self.terminal_potential;
         let skip_forced = (cache_features || skip_forced) && !search_enabled;
+        self.map_caches.resize_with(self.games.len(), || None);
         let rows = py.allow_threads(|| {
             self.games
                 .par_iter()
-                .map(|game| {
+                .zip(self.map_caches.par_iter_mut())
+                .map(|(game, map_cache)| {
                     let potential = potential(game, content, false);
                     let (mut actions, legal) = candidate_actions(game, content);
                     if !skip_forced || actions.len() != 1 {
+                        let map = cached_canonical_map(game, content, layout, map_cache);
                         return observation_v56_with_candidates(
-                            game, content, layout, bonuses, None, actions, legal,
+                            game,
+                            content,
+                            layout,
+                            bonuses,
+                            Some(&map),
+                            actions,
+                            legal,
                         );
                     }
                     ObservationV56 {

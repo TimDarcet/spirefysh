@@ -1248,8 +1248,58 @@ def _linear_forward(value_bfloat, weight, bias, residual=None):
     return output, weight_bfloat
 
 
+def _linear_backward(value, weight, grad_output):
+    grad_output = grad_output.to(torch.bfloat16).contiguous()
+    if value.device.type != "mps" or len(value) < 4096 or len(weight) not in (128, 384):
+        return torch.ops.aten.linear_backward(
+            value, grad_output, weight, [True, True, True],
+        )
+    if _FastLinear.backward_libraries is None:
+        source_128, source_384, _ = Path(__file__).with_name("linear.metal").read_text().split(
+            "// SPIREFYSH_KERNEL"
+        )
+        source_128 = source_128.replace(
+            "constant bool B_trans = true;", "constant bool B_trans = false;",
+        ).replace("linear_128_128", "linear_backward_128_128").replace(
+            "C->store_bfloat(", "C->store(",
+        )
+        source_384 = source_384.replace(
+            "constant uint N = 384;", "constant uint N = 128;",
+        ).replace(
+            "constant uint K = 128;", "constant uint K = 384;",
+        ).replace(
+            "constant uint A_leading_dimension = 128;",
+            "constant uint A_leading_dimension = 384;",
+        ).replace(
+            "constant uint C_leading_dimension = 384;",
+            "constant uint C_leading_dimension = 128;",
+        ).replace(
+            "constant bool B_trans = true;", "constant bool B_trans = false;",
+        ).replace("linear_128_384", "linear_backward_384_128").replace(
+            "C->store_bfloat(", "C->store(",
+        )
+        _FastLinear.backward_libraries = [
+            torch.mps.compile_shader(source_128), torch.mps.compile_shader(source_384),
+        ]
+        _FastLinear.zero = value.new_zeros(128)
+    grad_value = torch.empty_like(value)
+    getattr(
+        _FastLinear.backward_libraries[len(weight) != 128],
+        f"linear_backward_{len(weight)}_128",
+    )(
+        grad_output, weight, grad_value, _FastLinear.zero, len(value),
+        threads=(128, (len(value) + 31) // 32), group_size=(32, 1),
+    )
+    _, grad_weight, grad_bias = torch.ops.aten.linear_backward(
+        value, grad_output, weight, [False, True, True],
+    )
+    return grad_value, grad_weight, grad_bias
+
+
 class _FastLinear(torch.autograd.Function):
     libraries = None
+    backward_libraries = None
+    zero = None
 
     @staticmethod
     def forward(ctx, value, weight, bias):
@@ -1262,9 +1312,7 @@ class _FastLinear(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         value, weight = ctx.saved_tensors
-        grad_value, grad_weight, grad_bias = torch.ops.aten.linear_backward(
-            value, grad_output.to(torch.bfloat16), weight, [True, True, True],
-        )
+        grad_value, grad_weight, grad_bias = _linear_backward(value, weight, grad_output)
         return grad_value.to(ctx.value_dtype), grad_weight.float(), grad_bias.float()
 
 
@@ -1280,9 +1328,7 @@ class _LinearResidual(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         value, weight = ctx.saved_tensors
-        grad_value, grad_weight, grad_bias = torch.ops.aten.linear_backward(
-            value, grad_output.to(torch.bfloat16), weight, [True, True, True],
-        )
+        grad_value, grad_weight, grad_bias = _linear_backward(value, weight, grad_output)
         return grad_value.to(ctx.value_dtype), grad_weight.float(), grad_bias.float(), grad_output
 
 
@@ -1304,8 +1350,8 @@ class _NormLinear(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         value, gamma, normalized, stats, weight = ctx.saved_tensors
-        grad_normalized, grad_weight, grad_bias = torch.ops.aten.linear_backward(
-            normalized, grad_output.to(torch.bfloat16), weight, [True, True, True],
+        grad_normalized, grad_weight, grad_bias = _linear_backward(
+            normalized, weight, grad_output,
         )
         width = value.shape[1]
         grad_value = torch.empty_like(value)
@@ -1953,14 +1999,17 @@ class Agent(nn.Module):
             source = source[predicate(u[source])]
         return encoded[domain][inverse[source]], row[source], u[source]
 
-    def _sequence(self, values, group, groups, seed, transformer, selected=None):
+    def _sequence(self, values, group, groups, seed, transformer, selected=None, layout=None):
         selected_count = selected
         real_tokens = len(values) + groups
         flash = values.device.type == "mps" and self.width == 128 and self.heads == 4 \
             and torch.is_autocast_enabled("mps") \
             and torch.get_autocast_dtype("mps") == torch.bfloat16
         reuse = flash and getattr(self, "_reuse_sequence_layouts", False)
-        if reuse:
+        if layout is not None:
+            offsets, destination, sequence, block_rows, block_starts, metal_offsets, \
+                metal_lengths, sparse = layout
+        elif reuse:
             layout = self._sequence_layouts[self._sequence_layout_index]
             self._sequence_layout_index += 1
             order, inverse, selected, counts, lengths, offsets, destination, sequence, \
@@ -1971,7 +2020,8 @@ class Agent(nn.Module):
             inverse[order] = torch.arange(len(order), device=order.device)
             group = group[order]
             counts = torch.bincount(group, minlength=groups)
-        if values.device.type == "mps" and self.width // self.heads in (16, 32) and not reuse:
+        if values.device.type == "mps" and self.width // self.heads in (16, 32) \
+                and layout is None and not reuse:
             lengths = counts + 1
             padded_groups = (groups // 256 + 1) * 256
             lengths = nn.functional.pad(lengths, (0, padded_groups - groups), value=1)
@@ -2002,10 +2052,11 @@ class Agent(nn.Module):
                 positions, query_order = torch.cat((
                     offsets[:groups], destination[-selected_count:],
                 )).sort()
-                real = query_order >= groups
                 query_counts = torch.bincount(sequence[positions], minlength=len(lengths))
                 query_offsets = torch.cat((query_counts.new_zeros(1), query_counts.cumsum(0)))
-                sparse = positions, real, query_offsets, torch.argsort(query_order[real])
+                item_positions = torch.empty_like(query_order)
+                item_positions[query_order] = torch.arange(len(query_order), device=values.device)
+                sparse = positions, item_positions[groups:], query_offsets
             if flash and self.training and torch.is_grad_enabled():
                 self._sequence_layouts.append((
                     order, inverse, selected, counts, lengths, offsets, destination, sequence,
@@ -2018,7 +2069,7 @@ class Agent(nn.Module):
             current[destination] = values.to(current.dtype)
             for layer_index, layer in enumerate(transformer.layers):
                 if selected_count is not None and layer_index == len(transformer.layers) - 1:
-                    positions, real, query_offsets, item_order = sparse
+                    positions, item_positions, query_offsets = sparse
                     qkv = _norm_linear(
                         current, layer.norm1, layer.self_attn.in_proj_weight,
                         layer.self_attn.in_proj_bias,
@@ -2041,7 +2092,7 @@ class Agent(nn.Module):
                         layer.linear2, current,
                     )
                     state = current[query_offsets[:groups]]
-                    items = current[real][item_order]
+                    items = current[item_positions]
                     return state, items
                 qkv = _norm_linear(
                     current, layer.norm1, layer.self_attn.in_proj_weight,
@@ -2219,7 +2270,7 @@ class Agent(nn.Module):
     def encode_state(self, domains, encoded, index, action_values, action_index, concepts, batch):
         synchronize = torch.mps.synchronize if concepts.device.type == "mps" \
             and self.training and torch.is_grad_enabled() else lambda: None
-        filters, actor_plan, continuation_plan = action_index[8:]
+        filters, actor_plan, continuation_plan, global_layout = action_index[8:]
         current, nodes = self.encode_map(encoded, index)
         synchronize()
         action, action_rows, action_flat, actions, policy_sequence = self._actions(
@@ -2347,11 +2398,14 @@ class Agent(nn.Module):
         synchronize()
 
         values = torch.cat(values)
-        rows = torch.cat(rows)
-        self._sequence_lengths = torch.bincount(rows, minlength=batch) + 1
+        if global_layout is not None and len(global_layout[1]) != len(values):
+            raise RuntimeError("invalid precomputed sequence layout")
+        rows = None if global_layout is not None else torch.cat(rows)
+        self._sequence_lengths = global_layout[6][:batch] if global_layout is not None else \
+            torch.bincount(rows, minlength=batch) + 1
         state, transformed = self._sequence(
             values, rows, batch, self.concepts.local("token_role", 0), self.global_transformer,
-            len(action),
+            len(action), global_layout,
         )
         synchronize()
         return state, transformed if len(action) else action, \
@@ -2529,6 +2583,45 @@ def candidate_index(row, batch, target, allow_empty=False):
     return tuple(torch.as_tensor(value, device=target) for value in (
         offsets, row, position,
     )) + (int(lengths.max(initial=0)),)
+
+
+def sequence_layout(group, groups, selected, target):
+    group = np.asarray(group, np.int64)
+    order = np.argsort(group, kind="stable")
+    inverse = np.empty_like(order)
+    inverse[order] = np.arange(len(order))
+    counts = np.bincount(group, minlength=groups)
+    lengths = counts + 1
+    padded_groups = (groups // 256 + 1) * 256
+    lengths = np.pad(lengths, (0, padded_groups - groups), constant_values=1)
+    total = len(group) + padded_groups
+    extra = (-total) % 65_536
+    lengths[groups:] += extra // (padded_groups - groups)
+    lengths[groups:groups + extra % (padded_groups - groups)] += 1
+    offsets = np.r_[0, np.cumsum(lengths)]
+    starts = np.repeat(offsets[:groups], counts)
+    position = np.arange(len(group)) - np.repeat(np.cumsum(counts) - counts, counts) + 1
+    destination = (starts + position)[inverse]
+    sequence = np.repeat(np.arange(len(lengths)), lengths)
+    blocks = (lengths[:groups] + 7) // 8
+    block_rows = np.repeat(np.arange(groups), blocks).astype(np.int32)
+    block_starts = np.r_[0, np.cumsum(blocks)[:-1]].astype(np.int32)
+    sparse = None
+    if selected is not None:
+        queries = np.r_[offsets[:groups], destination[-selected:]]
+        query_order = np.argsort(queries, kind="stable")
+        positions = queries[query_order]
+        query_counts = np.bincount(sequence[positions], minlength=len(lengths))
+        query_offsets = np.r_[0, np.cumsum(query_counts)]
+        item_positions = np.empty_like(query_order)
+        item_positions[query_order] = np.arange(len(query_order))
+        sparse = positions, item_positions[groups:], query_offsets
+    tensor = lambda value, dtype=None: torch.as_tensor(value, dtype=dtype, device=target)
+    return (
+        tensor(offsets), tensor(destination), tensor(sequence), tensor(block_rows),
+        tensor(block_starts), tensor(offsets, torch.int32), tensor(lengths, torch.int32),
+        None if sparse is None else tuple(tensor(value) for value in sparse),
+    )
 
 
 def observation_legal(observation):
@@ -2843,7 +2936,12 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
         effect_groups.append(group[source])
     effect_groups = np.concatenate(effect_groups)
     families = []
-    for family in (actor_u[actor_source, 1] < 2, actor_u[actor_source, 1] == 2):
+    effect_output_rows = []
+    actor_rows = actor_row[actor_source]
+    for name, family in zip(
+        ("friendly_effect", "enemy_effect"),
+        (actor_u[actor_source, 1] < 2, actor_u[actor_source, 1] == 2),
+    ):
         actor_index = np.flatnonzero(family)
         lookup = np.full(len(actor_source), -1, np.int64)
         lookup[actor_index] = np.arange(len(actor_index))
@@ -2854,6 +2952,10 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
             tensor(actor_index), tensor(effect_source), tensor(effect_actor),
             tensor(lookup[effect_actor]),
         ))
+        if len(actor_index) and model.pooling[name] == "global_tokens":
+            effect_output_rows.append(actor_rows[effect_actor])
+        elif len(actor_index) and not model.pooling[name].endswith("into_actor"):
+            effect_output_rows.append(actor_rows[actor_index])
     actor_plan = (
         tensor(actor_order), tensor(player_source), tensor(history_group[player_source]),
         tensor(history_source[move_source]), tensor(move_order), tensor(move_packed_order),
@@ -2891,11 +2993,35 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
         continuation_plan += tensor(packed_order), tensor(present[length_order]), batch_sizes
     else:
         continuation_plan += tensor(np.empty(0, np.int64)), tensor(present), ()
+    all_rows = np.arange(batch)
+    combat_rows = actor_rows[actor_u[actor_source, 1] == 0]
+    global_rows = [run_row[run_source], *([all_rows] * 6)]
+    for name, domain, zone, active in (
+        ("deck", DOMAIN["card"], 0, all_rows),
+        ("hand", DOMAIN["card"], 1, combat_rows),
+        ("draw", DOMAIN["card"], 2, combat_rows),
+        ("discard", DOMAIN["card"], 3, combat_rows),
+        ("exhaust", DOMAIN["card"], 4, combat_rows),
+        ("relic", DOMAIN["relic"], 0, all_rows),
+        ("potion", DOMAIN["potion"], 0, all_rows),
+        ("orb", DOMAIN["orb"], None, combat_rows),
+    ):
+        u, _s, _c, _f, row, scope = domains[domain]
+        source = np.flatnonzero((scope == -1) & (True if zone is None else u[:, 0] == zone))
+        global_rows.append(row[source] if model.pooling[name] == "global_tokens" else active)
+    global_rows.extend((actor_rows, *effect_output_rows))
+    global_rows.append(item_rows if model.pooling["continuation"] == "global_tokens" else all_rows)
+    crystal = domains[DOMAIN["crystal"]]
+    global_rows.append(crystal[4][crystal[5] == -1])
+    global_rows.append(action_row)
+    global_layout = sequence_layout(
+        np.concatenate(global_rows), batch, action_count, target,
+    ) if pad else None
     action_index = (
         tensor(action_row), tensor(action_flat), torch.as_tensor(action_legal, device=target),
         candidate_index(action_row, batch, target, True), actions, tensor(path), action_count,
         tensor(np.concatenate([scope[scope >= 0] for *_values, scope in domains])),
-        filters, actor_plan, continuation_plan,
+        filters, actor_plan, continuation_plan, global_layout,
     )
     return (
         torch.as_tensor(character, dtype=torch.long, device=target),

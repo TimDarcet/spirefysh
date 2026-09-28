@@ -15,6 +15,7 @@ from unittest import mock
 import numpy as np
 import torch
 
+import model
 import train
 import rollout
 import telemetry
@@ -944,6 +945,34 @@ print('restored')
             "policy_age_mean": 2., "policy_age_max": 2,
             "character_counts": [1, 0, 0, 0, 0],
         })
+
+
+class ModelKernelTest(unittest.TestCase):
+    def test_precomputed_sequence_layout(self):
+        groups = np.array([2, 0, 2, 1, 0, 2, 1])
+        offsets, destination, sequence, _block_rows, _block_starts, \
+            _metal_offsets, lengths, sparse = model.sequence_layout(
+                groups, 3, 3, torch.device("cpu"),
+            )
+        positions, items, query_offsets = sparse
+        np.testing.assert_array_equal(sequence[destination], groups)
+        np.testing.assert_array_equal(lengths[:3], np.bincount(groups) + 1)
+        np.testing.assert_array_equal(positions[query_offsets[:3]], offsets[:3])
+        np.testing.assert_array_equal(positions[items], destination[-3:])
+
+    @unittest.skipUnless(torch.backends.mps.is_available(), "MPS unavailable")
+    def test_mps_linear_backward_input_matches_aten(self):
+        torch.manual_seed(0)
+        for output in (128, 384):
+            value = torch.randn(4097, 128, dtype=torch.bfloat16, device="mps")
+            weight = torch.randn(output, 128, dtype=torch.bfloat16, device="mps")
+            grad = torch.randn(4097, output, dtype=torch.bfloat16, device="mps")
+            expected = torch.ops.aten.linear_backward(
+                value, grad, weight, [True, True, True],
+            )
+            actual = model._linear_backward(value, weight, grad)
+            self.assertTrue(all(torch.equal(left, right)
+                                for left, right in zip(actual, expected)))
 
 
 class TrajectoryTest(unittest.TestCase):
