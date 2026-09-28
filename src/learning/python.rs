@@ -590,17 +590,97 @@ fn unique_feature_rows<'py>(
 }
 
 #[pyfunction]
+fn deduplicate_sequences<'py>(
+    py: Python<'py>,
+    values: PyReadonlyArray1<'py, i64>,
+    source: PyReadonlyArray1<'py, i64>,
+    offsets: PyReadonlyArray1<'py, i64>,
+) -> PyResult<(
+    Bound<'py, PyArray1<i64>>,
+    Bound<'py, PyArray1<i64>>,
+    Bound<'py, PyArray1<i64>>,
+)> {
+    let values = values.as_slice()?;
+    let source = source.as_slice()?;
+    let offsets = offsets.as_slice()?;
+    if offsets.first() != Some(&0)
+        || offsets.last().copied() != Some(source.len() as i64)
+        || offsets.windows(2).any(|pair| pair[0] > pair[1])
+        || source
+            .iter()
+            .any(|&index| index < 0 || index as usize >= values.len())
+    {
+        return Err(PyValueError::new_err("invalid sequence layout"));
+    }
+    let rows = offsets.len().saturating_sub(1);
+    let hashes = py.allow_threads(|| {
+        (0..rows)
+            .into_par_iter()
+            .map(|row| {
+                let mut hash = FastHasher::default();
+                for &index in &source[offsets[row] as usize..offsets[row + 1] as usize] {
+                    hash.write_i64(values[index as usize]);
+                }
+                hash.finish()
+            })
+            .collect::<Vec<_>>()
+    });
+    let equal = |left: usize, right: usize| {
+        let left = &source[offsets[left] as usize..offsets[left + 1] as usize];
+        let right = &source[offsets[right] as usize..offsets[right + 1] as usize];
+        left.len() == right.len()
+            && left
+                .iter()
+                .zip(right)
+                .all(|(&a, &b)| values[a as usize] == values[b as usize])
+    };
+    let mut unique = FastMap::<u64, Vec<(usize, usize)>>::with_capacity_and_hasher(
+        rows,
+        BuildHasherDefault::default(),
+    );
+    let mut representatives = Vec::new();
+    let mut inverse = Vec::with_capacity(rows);
+    for (row, hash) in hashes.into_iter().enumerate() {
+        let entries = unique.entry(hash).or_default();
+        let value = entries
+            .iter()
+            .find_map(|&(candidate, value)| equal(row, candidate).then_some(value))
+            .unwrap_or_else(|| {
+                let value = representatives.len();
+                representatives.push(row);
+                entries.push((row, value));
+                value
+            });
+        inverse.push(value as i64);
+    }
+    let mut selected = Vec::new();
+    let mut groups = Vec::new();
+    for (group, &row) in representatives.iter().enumerate() {
+        let range = offsets[row] as usize..offsets[row + 1] as usize;
+        selected.extend_from_slice(&source[range.clone()]);
+        groups.resize(groups.len() + range.len(), group as i64);
+    }
+    Ok((
+        selected.into_pyarray(py),
+        groups.into_pyarray(py),
+        inverse.into_pyarray(py),
+    ))
+}
+
+#[pyfunction]
 #[allow(clippy::too_many_arguments)]
 fn unique_graphs<'py>(
     py: Python<'py>,
     node_u: PyReadonlyArray2<'py, u32>,
     node_c: PyReadonlyArray2<'py, u32>,
     node_f: PyReadonlyArray2<'py, f32>,
+    node_inverse: PyReadonlyArray1<'py, i64>,
     node_source: PyReadonlyArray1<'py, i32>,
     node_offsets: PyReadonlyArray1<'py, i64>,
     edge_u: PyReadonlyArray2<'py, u32>,
     edge_c: PyReadonlyArray2<'py, u32>,
     edge_f: PyReadonlyArray2<'py, f32>,
+    edge_inverse: PyReadonlyArray1<'py, i64>,
     edge_source: PyReadonlyArray1<'py, i32>,
     edge_offsets: PyReadonlyArray1<'py, i64>,
 ) -> PyResult<(
@@ -609,6 +689,8 @@ fn unique_graphs<'py>(
 )> {
     let (node_u, node_c, node_f) = (node_u.as_array(), node_c.as_array(), node_f.as_array());
     let (edge_u, edge_c, edge_f) = (edge_u.as_array(), edge_c.as_array(), edge_f.as_array());
+    let node_inverse = node_inverse.as_slice()?;
+    let edge_inverse = edge_inverse.as_slice()?;
     let node_source = node_source.as_slice()?;
     let edge_source = edge_source.as_slice()?;
     let node_offsets = node_offsets.as_slice()?;
@@ -631,15 +713,25 @@ fn unique_graphs<'py>(
                 for &source in &node_source[node_range] {
                     let source = source as usize;
                     key.extend(node_u.row(source));
-                    key.extend(node_c.row(source));
-                    key.extend(node_f.row(source).iter().map(|value| value.to_bits()));
+                    key.extend(node_c.row(node_inverse[source] as usize));
+                    key.extend(
+                        node_f
+                            .row(node_inverse[source] as usize)
+                            .iter()
+                            .map(|value| value.to_bits()),
+                    );
                 }
                 key.push(edge_range.len() as u32);
                 for &source in &edge_source[edge_range] {
                     let source = source as usize;
                     key.extend(edge_u.row(source));
-                    key.extend(edge_c.row(source));
-                    key.extend(edge_f.row(source).iter().map(|value| value.to_bits()));
+                    key.extend(edge_c.row(edge_inverse[source] as usize));
+                    key.extend(
+                        edge_f
+                            .row(edge_inverse[source] as usize)
+                            .iter()
+                            .map(|value| value.to_bits()),
+                    );
                 }
                 let mut hash = FastHasher::default();
                 hash_words(&mut hash, &key);
@@ -862,13 +954,14 @@ fn unpack_domain(
     action_offsets: &[usize],
     domain: usize,
     rows: usize,
+    compact_features: bool,
 ) -> DomainVectors {
     let (u, s, c, f) = DOMAIN_WIDTHS[domain];
     let width = u + s + c + f + 1;
     let mut unsigned = Vec::with_capacity(rows * u);
-    let mut signed = Vec::with_capacity(rows * s);
-    let mut semantic = Vec::with_capacity(rows * c);
-    let mut numeric = Vec::<f32>::with_capacity(rows * f);
+    let mut signed = Vec::with_capacity(if compact_features { 0 } else { rows * s });
+    let mut semantic = Vec::with_capacity(if compact_features { 0 } else { rows * c });
+    let mut numeric = Vec::<f32>::with_capacity(if compact_features { 0 } else { rows * f });
     let mut row_index = Vec::with_capacity(rows);
     let mut scope = Vec::with_capacity(rows);
     let mut first = Vec::new();
@@ -877,22 +970,39 @@ fn unpack_domain(
         rows,
         BuildHasherDefault::default(),
     );
-    for (batch, row) in packed.iter().enumerate() {
-        let offset = row
-            .counts
-            .iter()
-            .zip(DOMAIN_WIDTHS)
-            .take(domain)
-            .map(|(&count, (u, s, c, f))| count as usize * (u + s + c + f + 1))
-            .sum::<usize>();
+    let offsets = packed
+        .iter()
+        .map(|row| {
+            row.counts
+                .iter()
+                .zip(DOMAIN_WIDTHS)
+                .take(domain)
+                .map(|(&count, (u, s, c, f))| count as usize * (u + s + c + f + 1))
+                .sum::<usize>()
+        })
+        .collect::<Vec<_>>();
+    let hashes = packed
+        .par_iter()
+        .zip(&offsets)
+        .map(|(row, &offset)| {
+            let end = offset + row.counts[domain] as usize * width;
+            row.exact[offset..end]
+                .chunks_exact(width)
+                .map(|record| {
+                    let mut hash = FastHasher::default();
+                    hash_words(&mut hash, &record[u + s..u + s + c]);
+                    hash_words(&mut hash, &record[u + s + c..u + s + c + f]);
+                    hash.finish()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    for (batch, (row, &offset)) in packed.iter().zip(&offsets).enumerate() {
         let end = offset + row.counts[domain] as usize * width;
-        for record in row.exact[offset..end].chunks_exact(width) {
+        for (record_index, record) in row.exact[offset..end].chunks_exact(width).enumerate() {
             let semantic_words = &record[u + s..u + s + c];
             let numeric_words = &record[u + s + c..u + s + c + f];
-            let mut hash = FastHasher::default();
-            hash_words(&mut hash, semantic_words);
-            hash_words(&mut hash, numeric_words);
-            let entries = unique.entry(hash.finish()).or_default();
+            let entries = unique.entry(hashes[batch][record_index]).or_default();
             let value = entries
                 .iter()
                 .find_map(|&(source, value)| {
@@ -907,15 +1017,26 @@ fn unpack_domain(
                 })
                 .unwrap_or_else(|| {
                     let value = first.len();
-                    first.push(row_index.len() as i64);
-                    entries.push((row_index.len(), value));
+                    let source = if compact_features {
+                        semantic.len() / c.max(1)
+                    } else {
+                        row_index.len()
+                    };
+                    first.push(source as i64);
+                    entries.push((source, value));
+                    if compact_features {
+                        semantic.extend_from_slice(semantic_words);
+                        numeric.extend(numeric_words.iter().map(|&value| f32::from_bits(value)));
+                    }
                     value
                 });
             inverse.push(value as i64);
             unsigned.extend_from_slice(&record[..u]);
-            signed.extend(record[u..u + s].iter().map(|&value| value as i32));
-            semantic.extend_from_slice(semantic_words);
-            numeric.extend(numeric_words.iter().map(|&value| f32::from_bits(value)));
+            if !compact_features {
+                signed.extend(record[u..u + s].iter().map(|&value| value as i32));
+                semantic.extend_from_slice(semantic_words);
+                numeric.extend(numeric_words.iter().map(|&value| f32::from_bits(value)));
+            }
             row_index.push(batch as i32);
             let value = record[width - 1] as i32;
             scope.push(if value < 0 {
@@ -931,9 +1052,11 @@ fn unpack_domain(
 }
 
 #[pyfunction]
+#[pyo3(signature = (rows, compact_features=false))]
 fn unpack_packed_observations<'py>(
     py: Python<'py>,
     rows: &Bound<'py, PyList>,
+    compact_features: bool,
 ) -> PyResult<(
     Bound<'py, PyArray1<u8>>,
     Bound<'py, PyArray2<f32>>,
@@ -1009,7 +1132,15 @@ fn unpack_packed_observations<'py>(
     let mut domains = py.allow_threads(|| {
         (0..DOMAIN_WIDTHS.len())
             .into_par_iter()
-            .map(|domain| unpack_domain(&packed, &action_offsets, domain, domain_rows[domain]))
+            .map(|domain| {
+                unpack_domain(
+                    &packed,
+                    &action_offsets,
+                    domain,
+                    domain_rows[domain],
+                    compact_features,
+                )
+            })
             .collect::<Vec<_>>()
     });
     let mut action_u = Vec::with_capacity(total_actions * ACTION_U);
@@ -1048,17 +1179,21 @@ fn unpack_packed_observations<'py>(
             let (unsigned, signed, semantic, numeric, row_index, scope, first, inverse) =
                 std::mem::take(&mut domains[domain]);
             let rows = row_index.len();
+            let feature_rows = if compact_features { first.len() } else { rows };
             (
                 ndarray::Array2::from_shape_vec((rows, u), unsigned)
                     .unwrap()
                     .into_pyarray(py),
-                ndarray::Array2::from_shape_vec((rows, s), signed)
+                ndarray::Array2::from_shape_vec(
+                    (rows, if compact_features { 0 } else { s }),
+                    signed,
+                )
+                .unwrap()
+                .into_pyarray(py),
+                ndarray::Array2::from_shape_vec((feature_rows, c), semantic)
                     .unwrap()
                     .into_pyarray(py),
-                ndarray::Array2::from_shape_vec((rows, c), semantic)
-                    .unwrap()
-                    .into_pyarray(py),
-                ndarray::Array2::from_shape_vec((rows, f), numeric)
+                ndarray::Array2::from_shape_vec((feature_rows, f), numeric)
                     .unwrap()
                     .into_pyarray(py),
                 row_index.into_pyarray(py),
@@ -7851,6 +7986,7 @@ fn sts2_sim(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(configure_logging, module)?)?;
     module.add_function(wrap_pyfunction!(unique_rows, module)?)?;
     module.add_function(wrap_pyfunction!(unique_feature_rows, module)?)?;
+    module.add_function(wrap_pyfunction!(deduplicate_sequences, module)?)?;
     module.add_function(wrap_pyfunction!(unique_graphs, module)?)?;
     module.add_function(wrap_pyfunction!(validate_action_features, module)?)?;
     module.add_function(wrap_pyfunction!(compress_packed_observations, module)?)?;

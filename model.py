@@ -2026,7 +2026,7 @@ class Agent(nn.Module):
             padded_groups = (groups // 256 + 1) * 256
             lengths = nn.functional.pad(lengths, (0, padded_groups - groups), value=1)
             total = len(values) + padded_groups
-            extra = (-total) % 65_536
+            extra = (-total) % 16_384
             lengths[groups:] += extra // (padded_groups - groups)
             lengths[groups:groups + extra % (padded_groups - groups)] += 1
             offsets = torch.cat((counts.new_zeros(1), lengths.cumsum(0)))
@@ -2158,7 +2158,7 @@ class Agent(nn.Module):
 
     def _actors(self, domains, encoded, batch, concepts, plan):
         order, player_source, player_group, move_raw, move_order, move_packed_order, \
-            move_present, move_batch_sizes, effect_plans, families = plan
+            move_present, move_batch_sizes, move_terminal, effect_plans, families = plan
         actors, rows, u = self._domain_rows(domains, encoded, DOMAIN["actor"])
         if not len(actors):
             return actors, rows, u, [], []
@@ -2177,10 +2177,16 @@ class Agent(nn.Module):
                     domains[DOMAIN["history"]]
                 move_values = nn.functional.embedding(
                     history_semantic[history_inverse[move_raw], :1].long(), concepts,
-                ).squeeze(1)[move_order]
-                move_values = move_values[move_packed_order]
+                ).squeeze(1)
+                move_values = move_values[move_order][move_packed_order] \
+                    if move_terminal is None else move_values
                 if move_values.device.type == "mps" and torch.is_autocast_enabled("mps"):
-                    output = self._packed_gru(move_values, move_batch_sizes, self.move_gru)[None]
+                    output = self._packed_gru(
+                        move_values, move_batch_sizes, self.move_gru,
+                        None if move_terminal is None else move_packed_order,
+                    )[None]
+                    if move_terminal is not None:
+                        output = output[:, move_terminal]
                 else:
                     packed = nn.utils.rnn.PackedSequence(
                         move_values, torch.tensor(move_batch_sizes),
@@ -2256,8 +2262,18 @@ class Agent(nn.Module):
         items.index_add_(0, group, values[order])
         return items, item_rows, plan[3:]
 
-    def _packed_gru(self, values, batch_sizes, gru):
+    def _packed_gru(self, values, batch_sizes, gru, parents=None):
         gates = _FastLinear.apply(values, gru.weight_ih_l0, gru.bias_ih_l0)
+        if parents is not None:
+            levels = []
+            offset = 0
+            for size in batch_sizes:
+                previous = values.new_zeros((size, self.width)) if not levels \
+                    else levels[-1][parents[offset:offset + size]]
+                hidden = _FastLinear.apply(previous, gru.weight_hh_l0, gru.bias_hh_l0)
+                levels.append(_GruStep.apply(gates[offset:offset + size], hidden, previous))
+                offset += size
+            return torch.cat(levels)
         state = torch.zeros((batch_sizes[0], self.width), device=gates.device)
         offset = 0
         for size in batch_sizes:
@@ -2329,7 +2345,7 @@ class Agent(nn.Module):
             domains, encoded, batch, concepts, actor_plan,
         )
         synchronize()
-        combat_rows = actor_rows[actor_u[:, 1] == 0]
+        combat_rows = actor_rows[actor_u[:, 0] == 0]
         for name, domain, filtered, active in (
             ("deck", DOMAIN["card"], 4, torch.arange(batch, device=run.device)),
             ("hand", DOMAIN["card"], 5, combat_rows),
@@ -2351,7 +2367,7 @@ class Agent(nn.Module):
                 payload = item.new_zeros((batch, self.width))
                 if len(stored):
                     payload.index_add_(0, stored_rows, stored.to(payload.dtype))
-                pael = item_u[:, 9] != 0
+                pael = item_u[:, 0] != 0
                 item = item + pael[:, None] * payload[item_rows]
             item, item_rows = self._collection(item, item_rows, active, name)
             add(item, item_rows, name)
@@ -2595,7 +2611,7 @@ def sequence_layout(group, groups, selected, target):
     padded_groups = (groups // 256 + 1) * 256
     lengths = np.pad(lengths, (0, padded_groups - groups), constant_values=1)
     total = len(group) + padded_groups
-    extra = (-total) % 65_536
+    extra = (-total) % 16_384
     lengths[groups:] += extra // (padded_groups - groups)
     lengths[groups:groups + extra % (padded_groups - groups)] += 1
     offsets = np.r_[0, np.cumsum(lengths)]
@@ -2678,6 +2694,30 @@ def ordered(source, *keys):
     return source
 
 
+def prefix_tree(tokens, counts):
+    present = np.flatnonzero(counts)
+    starts = np.cumsum(counts) - counts
+    previous = np.zeros(len(counts), np.int64)
+    sources, parents, sizes = [], [], []
+    terminal = np.empty(len(present), np.int64)
+    offset = 0
+    radix = int(tokens.max(initial=0)) + 1
+    for position in range(counts.max(initial=0)):
+        active = present[counts[present] > position]
+        source = starts[active] + position
+        keys = previous[active] * radix + tokens[source]
+        _unique, first, inverse = np.unique(keys, return_index=True, return_inverse=True)
+        sources.extend(source[first]); parents.extend(previous[active][first])
+        previous[active] = inverse
+        terminal[counts[present] == position + 1] = offset + inverse[
+            counts[active] == position + 1
+        ]
+        sizes.append(len(first)); offset += len(first)
+    return tuple(map(lambda value: np.asarray(value, np.int64), (
+        sources, parents, terminal,
+    ))), tuple(sizes)
+
+
 def model_inputs(character, globals_, domains, action, action_row, action_position, legal, target, model):
     batch, actions = len(character), legal.shape[1]
     globals_ = np.asarray(globals_, np.float32)
@@ -2708,6 +2748,8 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
             first = inverse = np.empty(0, np.intp)
         count = len(first)
         size = bucket(count) if pad else count
+        metadata = u[:, 1:2] if name == "actor" else u[:, 9:10] \
+            if name == "relic" else np.empty((len(u), 0), np.uint32)
         domain_tensors.append((
             torch.as_tensor(np.pad(
                 semantic[first], ((0, size - count), (0, 0)),
@@ -2715,15 +2757,19 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
             torch.as_tensor(np.pad(
                 numeric[first], ((0, size - count), (0, 0)),
             ), device=target), count,
-            torch.as_tensor(u.astype(np.int64), device=target),
+            torch.as_tensor(metadata.astype(np.int64), device=target),
             torch.as_tensor(row.astype(np.int64), device=target),
-            torch.as_tensor(scope.astype(np.int64), device=target),
+            None,
             torch.as_tensor(inverse.astype(np.int64), device=target),
             *(torch.as_tensor(np.flatnonzero(predicate), device=target)
               for predicate in (scope == -1, scope == -2, scope >= 0)),
         ))
         inverse_rows.append(inverse)
     domain_tensors = tuple(domain_tensors)
+    feature_index = [
+        inverse if len(domain[2]) != len(domain[0]) else np.arange(len(domain[0]))
+        for domain, inverse in zip(domains, inverse_rows)
+    ]
 
     node_u, _node_s, node_c, node_f, node_row, node_scope = domains[DOMAIN["map_node"]]
     edge_u, _edge_s, edge_c, edge_f, edge_row, edge_scope = domains[DOMAIN["map_edge"]]
@@ -2736,8 +2782,10 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
     edge_groups = [edge_source[edge_offsets[row]:edge_offsets[row + 1]] for row in range(batch)]
     if model.training:
         representatives, inverse = map(np.asarray, sts2_sim.unique_graphs(
-            node_u, node_c, node_f, node_source, node_offsets,
-            edge_u, edge_c, edge_f, edge_source, edge_offsets,
+            node_u, node_c, node_f, feature_index[DOMAIN["map_node"]],
+            node_source, node_offsets,
+            edge_u, edge_c, edge_f, feature_index[DOMAIN["map_edge"]],
+            edge_source, edge_offsets,
         ))
         representatives = representatives.astype(np.int32)
         inverse = inverse.astype(np.int32)
@@ -2862,19 +2910,12 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
             return tensor(source)
         row = domains[domain][4][source]
         offsets = np.r_[0, np.cumsum(np.bincount(row, minlength=batch))]
-        representatives, inverse, unique = [], np.empty(batch, np.int64), {}
-        for index in range(batch):
-            key = inverse_rows[domain][source[offsets[index]:offsets[index + 1]]].tobytes()
-            inverse[index] = unique.setdefault(key, len(unique))
-            if inverse[index] == len(representatives):
-                representatives.append(index)
-        pooled = np.concatenate([
-            source[offsets[index]:offsets[index + 1]] for index in representatives
-        ])
-        counts = np.diff(offsets)[representatives]
+        pooled, item_rows, inverse = map(np.asarray, sts2_sim.deduplicate_sequences(
+            inverse_rows[domain], source, offsets,
+        ))
+        groups = int(inverse.max(initial=-1)) + 1
         return None if pad and model.pooling["generation_pool"] == "sum" else tensor(source), (
-            tensor(pooled), tensor(np.repeat(np.arange(len(counts)), counts)),
-            tensor(inverse), len(counts),
+            tensor(pooled), tensor(item_rows), tensor(inverse), groups,
         )
     filters = (
         filtered(DOMAIN["card"], lambda value: value == 13, True),
@@ -2895,7 +2936,7 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
     )
     actor_source = actor_source[actor_order]
     actor_keys = actor_row[actor_source].astype(np.int64) * (1 << 20) + actor_u[actor_source, 0]
-    history_u, _s, _c, _f, history_row, history_scope = domains[DOMAIN["history"]]
+    history_u, _s, history_c, _f, history_row, history_scope = domains[DOMAIN["history"]]
     history_source = np.flatnonzero(history_scope == -1)
     history_keys = history_row[history_source].astype(np.int64) * (1 << 20) \
         + history_u[history_source, 0]
@@ -2906,20 +2947,30 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
     player_source = np.flatnonzero(history_valid & (history_u[history_source, 1] == 0))
     move_source = np.flatnonzero(history_valid & (history_u[history_source, 1] == 1))
     move_order = np.argsort(history_group[move_source], kind="stable")
+    move_raw = history_source[move_source]
     move_group = history_group[move_source][move_order]
     move_counts = np.bincount(move_group, minlength=len(actor_source))
     move_present = np.flatnonzero(move_counts)
-    compact_move_group = np.repeat(np.arange(len(move_present)), move_counts[move_present])
-    move_position = np.arange(len(compact_move_group)) \
-        - np.repeat(np.cumsum(move_counts) - move_counts, move_counts)
-    length_order = np.argsort(-move_counts[move_present], kind="stable")
-    length_inverse = np.empty_like(length_order)
-    length_inverse[length_order] = np.arange(len(length_order))
-    compact_move_group = length_inverse[compact_move_group]
-    move_present = move_present[length_order]
-    move_packed_order = np.lexsort((compact_move_group, move_position))
-    move_batch_sizes = tuple(int((move_counts[move_present] > index).sum())
-                             for index in range(move_counts.max(initial=0)))
+    move_terminal = None
+    if pad and len(move_present):
+        move_raw = move_raw[move_order]
+        tokens = history_c[feature_index[DOMAIN["history"]][move_raw], 0].astype(np.int64)
+        (sources, parents, move_terminal), move_batch_sizes = prefix_tree(tokens, move_counts)
+        move_raw = move_raw[sources]
+        move_order = None
+        move_packed_order = parents
+    else:
+        compact_move_group = np.repeat(np.arange(len(move_present)), move_counts[move_present])
+        move_position = np.arange(len(compact_move_group)) \
+            - np.repeat(np.cumsum(move_counts) - move_counts, move_counts)
+        length_order = np.argsort(-move_counts[move_present], kind="stable")
+        length_inverse = np.empty_like(length_order)
+        length_inverse[length_order] = np.arange(len(length_order))
+        compact_move_group = length_inverse[compact_move_group]
+        move_present = move_present[length_order]
+        move_packed_order = np.lexsort((compact_move_group, move_position))
+        move_batch_sizes = tuple(int((move_counts[move_present] > index).sum())
+                                 for index in range(move_counts.max(initial=0)))
     effect_plans = []
     effect_groups = []
     for domain in (DOMAIN["power"], DOMAIN["status"]):
@@ -2958,8 +3009,10 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
             effect_output_rows.append(actor_rows[actor_index])
     actor_plan = (
         tensor(actor_order), tensor(player_source), tensor(history_group[player_source]),
-        tensor(history_source[move_source]), tensor(move_order), tensor(move_packed_order),
-        tensor(move_present), move_batch_sizes, tuple(effect_plans), tuple(families),
+        tensor(move_raw), None if move_order is None else tensor(move_order),
+        tensor(move_packed_order), tensor(move_present), move_batch_sizes,
+        None if move_terminal is None else tensor(move_terminal),
+        tuple(effect_plans), tuple(families),
     )
     continuation_u, _s, _c, _f, continuation_row, continuation_scope = \
         domains[DOMAIN["continuation"]]
@@ -3188,7 +3241,7 @@ def unpack(rows, target, model, validate=True):
         for row in rows:
             validate_packed(row)
     character, globals_, domains, action, action_row, action_position, legal = \
-        sts2_sim.unpack_packed_observations(rows)
+        sts2_sim.unpack_packed_observations(rows, True)
     return model_inputs(
         np.asarray(character), np.asarray(globals_),
         [tuple(map(np.asarray, domain)) for domain in domains],
