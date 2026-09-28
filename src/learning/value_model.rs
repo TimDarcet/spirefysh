@@ -123,6 +123,7 @@ struct MapEncoding {
 struct EncodingCache {
     rows: HashMap<(u64, u64), Vec<f32>>,
     maps: HashMap<Vec<u8>, Arc<MapEncoding>>,
+    shared_maps: HashMap<(usize, usize), (Arc<[DomainRow]>, Arc<[DomainRow]>, Arc<MapEncoding>)>,
     summaries: HashMap<(u64, u64), Vec<f32>>,
     move_gru: GruCache,
 }
@@ -887,112 +888,147 @@ impl ValueModel {
             .iter()
             .filter(|row| row.scope == STATE_SCOPE)
             .collect::<Vec<_>>();
-        let mut key = Vec::new();
-        for domain in [MAP_NODE_DOMAIN, MAP_EDGE_DOMAIN] {
-            key.extend((domain as u32).to_le_bytes());
-            for row in observation.domains[domain]
-                .iter()
-                .filter(|row| row.scope == STATE_SCOPE)
-            {
-                row.u
-                    .iter()
-                    .for_each(|value| key.extend(value.to_le_bytes()));
-                row.s
-                    .iter()
-                    .for_each(|value| key.extend(value.to_le_bytes()));
-                row.c
-                    .iter()
-                    .for_each(|value| key.extend(value.to_le_bytes()));
-                row.f
-                    .iter()
-                    .for_each(|value| key.extend(value.to_le_bytes()));
-            }
-        }
-        let encoded = cache.maps.get(&key).cloned().unwrap_or_else(|| {
-            let edges = observation.domains[MAP_EDGE_DOMAIN]
-                .iter()
-                .filter(|row| row.scope == STATE_SCOPE)
-                .map(|row| (row, self.encode(cache, MAP_EDGE_DOMAIN, row)))
-                .collect::<Vec<_>>();
-            let mut encoded = nodes
-                .iter()
-                .map(|row| (row.u[0], self.encode(cache, MAP_NODE_DOMAIN, row)))
-                .collect::<std::collections::BTreeMap<_, _>>();
-            let mut levels = nodes.iter().map(|row| row.u[8]).collect::<Vec<_>>();
-            levels.sort_unstable();
-            levels.dedup();
-            for level in levels.into_iter().rev() {
-                let normalized_nodes = encoded
-                    .iter()
-                    .map(|(&id, value)| {
-                        (
-                            id,
-                            normalized(value, &self.graph_norm_w, &self.graph_norm_b),
-                        )
+        let shared = match (
+            &observation.domains[MAP_NODE_DOMAIN],
+            &observation.domains[MAP_EDGE_DOMAIN],
+        ) {
+            (DomainRows::Shared(nodes), DomainRows::Shared(edges)) => Some((nodes, edges)),
+            _ => None,
+        };
+        let encoded = shared
+            .and_then(|(nodes, edges)| {
+                cache
+                    .shared_maps
+                    .get(&(nodes.as_ptr() as usize, edges.as_ptr() as usize))
+                    .and_then(|(cached_nodes, cached_edges, encoded)| {
+                        (Arc::ptr_eq(nodes, cached_nodes) && Arc::ptr_eq(edges, cached_edges))
+                            .then(|| Arc::clone(encoded))
                     })
-                    .collect::<std::collections::BTreeMap<_, _>>();
-                let updates = nodes
-                    .iter()
-                    .filter(|row| row.u[8] == level && row.u[9] > 0)
-                    .map(|row| {
-                        let id = row.u[0];
-                        let query = self.graph_query.apply(&normalized_nodes[&id]);
-                        let children = edges
+            })
+            .unwrap_or_else(|| {
+                let mut key = Vec::new();
+                for domain in [MAP_NODE_DOMAIN, MAP_EDGE_DOMAIN] {
+                    key.extend((domain as u32).to_le_bytes());
+                    for row in observation.domains[domain]
+                        .iter()
+                        .filter(|row| row.scope == STATE_SCOPE)
+                    {
+                        row.u
                             .iter()
-                            .filter(|(edge, _)| edge.u[0] == id)
-                            .map(|(edge, value)| {
-                                self.graph_key_value
-                                    .apply(&normalized_nodes[&edge.u[1]])
-                                    .into_iter()
-                                    .zip(self.graph_edge.apply(value))
-                                    .map(|(left, right)| left + right)
-                                    .collect::<Vec<_>>()
+                            .for_each(|value| key.extend(value.to_le_bytes()));
+                        row.s
+                            .iter()
+                            .for_each(|value| key.extend(value.to_le_bytes()));
+                        row.c
+                            .iter()
+                            .for_each(|value| key.extend(value.to_le_bytes()));
+                        row.f
+                            .iter()
+                            .for_each(|value| key.extend(value.to_le_bytes()));
+                    }
+                }
+                let encoded = cache.maps.get(&key).cloned().unwrap_or_else(|| {
+                    let edges = observation.domains[MAP_EDGE_DOMAIN]
+                        .iter()
+                        .filter(|row| row.scope == STATE_SCOPE)
+                        .map(|row| (row, self.encode(cache, MAP_EDGE_DOMAIN, row)))
+                        .collect::<Vec<_>>();
+                    let mut encoded = nodes
+                        .iter()
+                        .map(|row| (row.u[0], self.encode(cache, MAP_NODE_DOMAIN, row)))
+                        .collect::<std::collections::BTreeMap<_, _>>();
+                    let mut levels = nodes.iter().map(|row| row.u[8]).collect::<Vec<_>>();
+                    levels.sort_unstable();
+                    levels.dedup();
+                    for level in levels.into_iter().rev() {
+                        let normalized_nodes = encoded
+                            .iter()
+                            .map(|(&id, value)| {
+                                (
+                                    id,
+                                    normalized(value, &self.graph_norm_w, &self.graph_norm_b),
+                                )
+                            })
+                            .collect::<std::collections::BTreeMap<_, _>>();
+                        let updates = nodes
+                            .iter()
+                            .filter(|row| row.u[8] == level && row.u[9] > 0)
+                            .map(|row| {
+                                let id = row.u[0];
+                                let query = self.graph_query.apply(&normalized_nodes[&id]);
+                                let children = edges
+                                    .iter()
+                                    .filter(|(edge, _)| edge.u[0] == id)
+                                    .map(|(edge, value)| {
+                                        self.graph_key_value
+                                            .apply(&normalized_nodes[&edge.u[1]])
+                                            .into_iter()
+                                            .zip(self.graph_edge.apply(value))
+                                            .map(|(left, right)| left + right)
+                                            .collect::<Vec<_>>()
+                                    })
+                                    .collect::<Vec<_>>();
+                                let mut value = encoded[&id].clone();
+                                let attention =
+                                    self.graph_out.apply(&self.attention(&query, &children, 0));
+                                let degree = self.graph_degree.apply(&[
+                                    row.u[9] as f32 / 8.0,
+                                    (row.u[9] as f32).ln_1p() / 3.0,
+                                ]);
+                                for column in 0..self.width {
+                                    value[column] += attention[column] + degree[column];
+                                }
+                                let hidden = dense_gelu(
+                                    &normalized(
+                                        &value,
+                                        &self.graph_ff_norm_w,
+                                        &self.graph_ff_norm_b,
+                                    ),
+                                    &self.graph_ff1.w,
+                                    &self.graph_ff1.b,
+                                );
+                                for (left, right) in
+                                    value.iter_mut().zip(self.graph_ff2.apply(&hidden))
+                                {
+                                    *left += right;
+                                }
+                                (id, value)
                             })
                             .collect::<Vec<_>>();
-                        let mut value = encoded[&id].clone();
-                        let attention = self.graph_out.apply(&self.attention(&query, &children, 0));
-                        let degree = self
-                            .graph_degree
-                            .apply(&[row.u[9] as f32 / 8.0, (row.u[9] as f32).ln_1p() / 3.0]);
-                        for column in 0..self.width {
-                            value[column] += attention[column] + degree[column];
+                        for (id, value) in updates {
+                            encoded.insert(id, value);
                         }
-                        let hidden = dense_gelu(
-                            &normalized(&value, &self.graph_ff_norm_w, &self.graph_ff_norm_b),
-                            &self.graph_ff1.w,
-                            &self.graph_ff1.b,
-                        );
-                        for (left, right) in value.iter_mut().zip(self.graph_ff2.apply(&hidden)) {
-                            *left += right;
-                        }
-                        (id, value)
-                    })
-                    .collect::<Vec<_>>();
-                for (id, value) in updates {
-                    encoded.insert(id, value);
+                    }
+                    if cache.maps.len() == 1024 || cache.shared_maps.len() == 1024 {
+                        cache.maps.clear();
+                        cache.shared_maps.clear();
+                    }
+                    let key_values = encoded
+                        .values()
+                        .map(|value| {
+                            self.graph_key_value.apply(&normalized(
+                                value,
+                                &self.graph_norm_w,
+                                &self.graph_norm_b,
+                            ))
+                        })
+                        .collect();
+                    let encoded = Arc::new(MapEncoding {
+                        nodes: encoded,
+                        key_values,
+                        current: Mutex::default(),
+                    });
+                    cache.maps.insert(key, Arc::clone(&encoded));
+                    encoded
+                });
+                if let Some((nodes, edges)) = shared {
+                    cache.shared_maps.insert(
+                        (nodes.as_ptr() as usize, edges.as_ptr() as usize),
+                        (Arc::clone(nodes), Arc::clone(edges), Arc::clone(&encoded)),
+                    );
                 }
-            }
-            if cache.maps.len() == 1024 {
-                cache.maps.clear();
-            }
-            let key_values = encoded
-                .values()
-                .map(|value| {
-                    self.graph_key_value.apply(&normalized(
-                        value,
-                        &self.graph_norm_w,
-                        &self.graph_norm_b,
-                    ))
-                })
-                .collect();
-            let encoded = Arc::new(MapEncoding {
-                nodes: encoded,
-                key_values,
-                current: Mutex::default(),
+                encoded
             });
-            cache.maps.insert(key, Arc::clone(&encoded));
-            encoded
-        });
         let cached = encoded.current.lock().unwrap().get(&current).cloned();
         if let Some(selected) = cached {
             return (selected, encoded);
@@ -1378,7 +1414,7 @@ impl ValueModel {
         observations: &[&ObservationV56],
     ) -> Vec<(Vec<f32>, Vec<Vec<f32>>)> {
         observations
-            .par_chunks(2)
+            .par_chunks(8)
             .flat_map_iter(|observations| {
                 let index = rayon::current_thread_index().unwrap_or(0) % self.encode_caches.len();
                 let mut cache = self.encode_caches[index].lock().unwrap();

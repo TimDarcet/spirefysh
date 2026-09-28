@@ -1240,6 +1240,52 @@ fn v53_map_is_relabel_invariant_and_edge_sensitive() {
 }
 
 #[test]
+fn canonical_map_cache_is_exact_and_tracks_dynamic_geometry() {
+    let content = foundation_content();
+    let layout = Layout::new(&content);
+    let mut game = Game::new_character_ascension(&content, 409, 0, 10).unwrap();
+    game.begin_act(&content, 0).unwrap();
+    let mut cache = None;
+    let exact = |game: &Game, cache: &mut Option<CanonicalMapCache>| {
+        assert_eq!(
+            v56_bytes(&observation_v56_cached(
+                game,
+                &content,
+                layout,
+                (3, 2),
+                cache,
+            )),
+            v56_bytes(&observation_v56(game, &content, layout, (3, 2)))
+        );
+    };
+    exact(&game, &mut cache);
+    let nodes = cache.as_ref().unwrap().map.0.clone();
+
+    game.map.current = Some(0);
+    exact(&game, &mut cache);
+    assert!(Arc::ptr_eq(&nodes, &cache.as_ref().unwrap().map.0));
+
+    let position = (game.map.nodes[0].lane, game.map.nodes[0].floor);
+    game.spoils = Some(position);
+    exact(&game, &mut cache);
+    assert!(!Arc::ptr_eq(&nodes, &cache.as_ref().unwrap().map.0));
+
+    game.fur_coat_act = Some(game.run.act);
+    game.fur_coat.push(position);
+    exact(&game, &mut cache);
+
+    let nodes = cache.as_ref().unwrap().map.0.clone();
+    let source = Arc::make_mut(&mut game.map.nodes);
+    source[0].room = if source[0].room == Room::Combat {
+        Room::Shop
+    } else {
+        Room::Combat
+    };
+    exact(&game, &mut cache);
+    assert!(!Arc::ptr_eq(&nodes, &cache.as_ref().unwrap().map.0));
+}
+
+#[test]
 fn v53_sparse_map_matches_an_independent_scalar_dag() {
     fn node_value(row: &DomainRow) -> i64 {
         row.u[1..8]

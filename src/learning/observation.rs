@@ -335,7 +335,7 @@ struct ObservationV56 {
     potential: Potential,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 struct Layout {
     characters: usize,
     semantic_offsets: [u32; Semantic::Count as usize],
@@ -4917,6 +4917,14 @@ fn phase_domain_row(game: &Game, content: &Content) -> DomainRow {
 
 type CanonicalMap = (Arc<[DomainRow]>, Arc<[DomainRow]>, Arc<[u32]>, u32);
 
+struct CanonicalMapCache {
+    source: Arc<[MapNode]>,
+    fur_coat: Option<Vec<(u8, u8)>>,
+    spoils: Option<(u8, u8)>,
+    layout: Layout,
+    map: CanonicalMap,
+}
+
 fn canonical_map(game: &Game, content: &Content, layout: Layout) -> CanonicalMap {
     let mut order = (0..game.map.nodes.len()).collect::<Vec<_>>();
     order.sort_by_key(|&index| {
@@ -5018,6 +5026,33 @@ fn canonical_map(game: &Game, content: &Content, layout: Layout) -> CanonicalMap
     }
     let current = game.map.current.map_or(0, |index| ids[index]);
     (nodes.into(), edges.into(), ids.into(), current)
+}
+
+fn cached_canonical_map(
+    game: &Game,
+    content: &Content,
+    layout: Layout,
+    cache: &mut Option<CanonicalMapCache>,
+) -> CanonicalMap {
+    let fur_coat = (game.fur_coat_act == Some(game.run.act)).then_some(game.fur_coat.as_slice());
+    if cache.as_ref().is_none_or(|cache| {
+        !Arc::ptr_eq(&cache.source, &game.map.nodes)
+            || cache.fur_coat.as_deref() != fur_coat
+            || cache.spoils != game.spoils
+            || cache.layout != layout
+    }) {
+        *cache = Some(CanonicalMapCache {
+            source: game.map.nodes.clone(),
+            fur_coat: fur_coat.map(<[_]>::to_vec),
+            spoils: game.spoils,
+            layout,
+            map: canonical_map(game, content, layout),
+        });
+    }
+    let cache = cache.as_ref().unwrap();
+    let mut map = cache.map.clone();
+    map.3 = game.map.current.map_or(0, |index| map.2[index]);
+    map
 }
 
 fn run_domain_row(game: &Game, bonuses: (i16, i16), current: u32) -> DomainRow {
@@ -7343,6 +7378,17 @@ fn observation_v56(
     bonuses: (i16, i16),
 ) -> ObservationV56 {
     observation_v56_with_map(game, content, layout, bonuses, None)
+}
+
+fn observation_v56_cached(
+    game: &Game,
+    content: &Content,
+    layout: Layout,
+    bonuses: (i16, i16),
+    cache: &mut Option<CanonicalMapCache>,
+) -> ObservationV56 {
+    let map = cached_canonical_map(game, content, layout, cache);
+    observation_v56_with_map(game, content, layout, bonuses, Some(&map))
 }
 
 fn candidate_signature(
