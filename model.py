@@ -54,6 +54,39 @@ using namespace metal;
 constant uint SIMD_WIDTH = 32;
 constant uint TOKEN_REDUCTION = 128;
 
+kernel void gru_step_forward(
+    device const bfloat *input, device const bfloat *hidden, device const float *previous,
+    device float *output, constant uint& width, uint index [[thread_position_in_grid]]) {
+    uint row = index / width, column = index % width, offset = row * 3 * width + column;
+    float reset = 1.0f / (1.0f + exp(-float(input[offset]) - float(hidden[offset])));
+    float update = 1.0f / (1.0f + exp(-float(input[offset + width]) - float(hidden[offset + width])));
+    float candidate = tanh(float(input[offset + 2 * width])
+        + reset * float(hidden[offset + 2 * width]));
+    output[index] = (1.0f - update) * candidate + update * previous[index];
+}
+
+kernel void gru_step_backward(
+    device const bfloat *input, device const bfloat *hidden, device const float *previous,
+    device const float *grad_output, device bfloat *grad_input, device bfloat *grad_hidden,
+    device float *grad_previous, constant uint& width, uint index [[thread_position_in_grid]]) {
+    uint row = index / width, column = index % width, offset = row * 3 * width + column;
+    float hidden_candidate = float(hidden[offset + 2 * width]);
+    float reset = 1.0f / (1.0f + exp(-float(input[offset]) - float(hidden[offset])));
+    float update = 1.0f / (1.0f + exp(-float(input[offset + width]) - float(hidden[offset + width])));
+    float candidate = tanh(float(input[offset + 2 * width]) + reset * hidden_candidate);
+    float grad = grad_output[index];
+    float candidate_grad = grad * (1.0f - update) * (1.0f - candidate * candidate);
+    float reset_grad = candidate_grad * hidden_candidate * reset * (1.0f - reset);
+    float update_grad = grad * (previous[index] - candidate) * update * (1.0f - update);
+    grad_input[offset] = bfloat(reset_grad);
+    grad_input[offset + width] = bfloat(update_grad);
+    grad_input[offset + 2 * width] = bfloat(candidate_grad);
+    grad_hidden[offset] = bfloat(reset_grad);
+    grad_hidden[offset + width] = bfloat(update_grad);
+    grad_hidden[offset + 2 * width] = bfloat(candidate_grad * reset);
+    grad_previous[index] = grad * update;
+}
+
 inline float head_sum(float value, uint dimension, uint lane) {
     if (dimension == SIMD_WIDTH) return simd_sum(value);
     float prefix = simd_prefix_inclusive_sum(value);
@@ -1165,6 +1198,33 @@ class _FlashAttention(torch.autograd.Function):
         return grad_qkv, None, None, None, None, None
 
 
+class _GruStep(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input_gates, hidden_gates, previous):
+        if _RaggedAttention.library is None:
+            _RaggedAttention.library = torch.mps.compile_shader(_TRAINING_METAL)
+        output = torch.empty_like(previous)
+        _RaggedAttention.library.gru_step_forward(
+            input_gates, hidden_gates, previous, output, previous.shape[1],
+            threads=previous.numel(), group_size=128,
+        )
+        ctx.save_for_backward(input_gates, hidden_gates, previous)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input_gates, hidden_gates, previous = ctx.saved_tensors
+        grad_input = torch.empty_like(input_gates)
+        grad_hidden = torch.empty_like(hidden_gates)
+        grad_previous = torch.empty_like(previous)
+        _RaggedAttention.library.gru_step_backward(
+            input_gates, hidden_gates, previous, grad_output.contiguous(),
+            grad_input, grad_hidden, grad_previous, previous.shape[1],
+            threads=previous.numel(), group_size=128,
+        )
+        return grad_input, grad_hidden, grad_previous
+
+
 def _linear_forward(value_bfloat, weight, bias, residual=None):
     if _FastLinear.libraries is None:
         sources = Path(__file__).with_name("linear.metal").read_text().split(
@@ -2064,10 +2124,14 @@ class Agent(nn.Module):
                 move_values = nn.functional.embedding(
                     history_semantic[history_inverse[move_raw], :1].long(), concepts,
                 ).squeeze(1)[move_order]
-                packed = nn.utils.rnn.PackedSequence(
-                    move_values[move_packed_order], torch.tensor(move_batch_sizes),
-                )
-                _, output = self.move_gru(packed)
+                move_values = move_values[move_packed_order]
+                if move_values.device.type == "mps" and torch.is_autocast_enabled("mps"):
+                    output = self._packed_gru(move_values, move_batch_sizes, self.move_gru)[None]
+                else:
+                    packed = nn.utils.rnn.PackedSequence(
+                        move_values, torch.tensor(move_batch_sizes),
+                    )
+                    _, output = self.move_gru(packed)
                 move = move_values.new_zeros((len(actors), self.width)).index_copy(
                     0, move_present, output[0],
                 )
@@ -2133,6 +2197,17 @@ class Agent(nn.Module):
         items = values.new_zeros((groups, self.width))
         items.index_add_(0, group, values[order])
         return items, item_rows, plan[3:]
+
+    def _packed_gru(self, values, batch_sizes, gru):
+        gates = _FastLinear.apply(values, gru.weight_ih_l0, gru.bias_ih_l0)
+        state = torch.zeros((batch_sizes[0], self.width), device=gates.device)
+        offset = 0
+        for size in batch_sizes:
+            hidden = _FastLinear.apply(state[:size], gru.weight_hh_l0, gru.bias_hh_l0)
+            current = _GruStep.apply(gates[offset:offset + size], hidden, state[:size])
+            state = torch.cat((current, state[size:])) if size < len(state) else current
+            offset += size
+        return state
 
     def encode_state(self, domains, encoded, index, action_values, action_index, concepts, batch):
         synchronize = torch.mps.synchronize if concepts.device.type == "mps" \
@@ -2234,29 +2309,19 @@ class Agent(nn.Module):
         if mode == "global_tokens":
             add(self._tag(continuation, 11, 10), continuation_rows, "continuation")
         elif mode == "gru":
-            _groups, maximum, position, present, last = continuation_gru
-            padded = continuation.new_zeros((batch, maximum, self.width))
+            _groups, maximum, position, present, last, packed_order, packed_present, \
+                batch_sizes = continuation_gru
             if len(continuation):
-                padded[continuation_rows, position] = continuation
-                if maximum == 1 and continuation.device.type == "mps" \
-                        and torch.is_autocast_enabled("mps"):
-                    gates = _FastLinear.apply(
-                        padded[:, 0], self.continuation_gru.weight_ih_l0,
-                        self.continuation_gru.bias_ih_l0,
-                    ).float()
-                    reset, update, candidate = gates.chunk(3, 1)
-                    hidden_reset, hidden_update, hidden_candidate = \
-                        self.continuation_gru.bias_hh_l0.chunk(3)
-                    reset = torch.sigmoid(reset + hidden_reset)
-                    update = torch.sigmoid(update + hidden_update)
-                    output = (1 - update) * torch.tanh(
-                        candidate + reset * hidden_candidate
-                        + self.continuation_gru.weight_hh_l0[0, 0] * 0
+                if continuation.device.type == "mps" and torch.is_autocast_enabled("mps"):
+                    state = self._packed_gru(
+                        continuation[packed_order], batch_sizes, self.continuation_gru,
                     )
                     summary = continuation.new_zeros((batch, self.width)).index_copy(
-                        0, present, output[present],
+                        0, packed_present, state,
                     )
                 else:
+                    padded = continuation.new_zeros((batch, maximum, self.width))
+                    padded[continuation_rows, position] = continuation
                     output, _ = self.continuation_gru(padded)
                     summary = continuation.new_zeros((batch, self.width)).index_copy(
                         0, present, output[present, last],
@@ -2789,6 +2854,17 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
         int(counts.max(initial=0)), tensor(position), tensor(present),
         tensor(counts[present] - 1),
     )
+    if len(present):
+        length_order = np.argsort(-counts[present], kind="stable")
+        length_inverse = np.empty_like(length_order)
+        length_inverse[length_order] = np.arange(len(length_order))
+        packed_group = length_inverse[np.repeat(np.arange(len(present)), counts[present])]
+        packed_order = np.lexsort((packed_group, position))
+        batch_sizes = tuple(int((counts[present][length_order] > index).sum())
+                            for index in range(counts.max()))
+        continuation_plan += tensor(packed_order), tensor(present[length_order]), batch_sizes
+    else:
+        continuation_plan += tensor(np.empty(0, np.int64)), tensor(present), ()
     action_index = (
         tensor(action_row), tensor(action_flat), torch.as_tensor(action_legal, device=target),
         candidate_index(action_row, batch, target, True), actions, tensor(path), action_count,

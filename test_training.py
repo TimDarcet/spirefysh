@@ -97,7 +97,7 @@ print('restored')
         ])
         self.assertTrue(args.disable_post_kl_check)
         self.assertEqual(args.mps_empty_cache_updates, 8)
-        self.assertEqual(args.sampler_threads, 6)
+        self.assertEqual(args.sampler_threads, 5)
         self.assertEqual(args.dataset_capacity, 131_072)
         self.assertEqual(
             [args.boss_1_floor_increment, args.boss_2_floor_increment,

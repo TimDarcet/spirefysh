@@ -470,7 +470,7 @@ impl ValueModel {
         {
             #[link(name = "Accelerate", kind = "framework")]
             unsafe extern "C" {
-                fn cblas_sgemm(
+                fn cblas_sgemm_singlecore(
                     order: i32,
                     transpose_a: i32,
                     transpose_b: i32,
@@ -488,13 +488,14 @@ impl ValueModel {
                 );
             }
             let dense = selected_len == rows && selected.clone().eq(0..rows);
-            let mut query = vec![0.0; selected_len * dimension];
+            let mut query = Vec::new();
             let mut scores = vec![0.0; selected_len * rows];
             for head in 0..self.heads {
                 let column = head * dimension;
                 let (query, stride) = if dense {
                     (&qkv[column..], 3 * self.width)
                 } else {
+                    query.resize(selected_len * dimension, 0.0);
                     for (target, source) in query.chunks_exact_mut(dimension).zip(selected.clone())
                     {
                         target
@@ -503,7 +504,7 @@ impl ValueModel {
                     (&query[..], dimension)
                 };
                 unsafe {
-                    cblas_sgemm(
+                    cblas_sgemm_singlecore(
                         101,
                         111,
                         112,
@@ -530,7 +531,7 @@ impl ValueModel {
                     score.iter_mut().for_each(|value| *value /= total);
                 }
                 unsafe {
-                    cblas_sgemm(
+                    cblas_sgemm_singlecore(
                         101,
                         111,
                         111,
@@ -573,10 +574,10 @@ impl ValueModel {
         layer: &TransformerLayer,
         selected: impl Iterator<Item = usize> + Clone,
     ) -> Vec<Vec<f32>> {
-        let normalized_rows = sequence
-            .iter()
-            .flat_map(|row| normalized(row, &layer.norm1_w, &layer.norm1_b))
-            .collect::<Vec<_>>();
+        let mut normalized_rows = sequence.iter().flatten().copied().collect::<Vec<_>>();
+        for row in normalized_rows.chunks_exact_mut(self.width) {
+            layer_norm(row, &layer.norm1_w, &layer.norm1_b);
+        }
         let qkv = linear_batch(&normalized_rows, sequence.len(), &layer.qkv_w, &layer.qkv_b);
         let rows = selected.clone().count();
         let attention = self.attention_batch(&qkv, selected.clone());
@@ -592,10 +593,10 @@ impl ValueModel {
                 row
             })
             .collect::<Vec<_>>();
-        let normalized_rows = rows
-            .iter()
-            .flat_map(|row| normalized(row, &layer.norm2_w, &layer.norm2_b))
-            .collect::<Vec<_>>();
+        let mut normalized_rows = rows.iter().flatten().copied().collect::<Vec<_>>();
+        for row in normalized_rows.chunks_exact_mut(self.width) {
+            layer_norm(row, &layer.norm2_w, &layer.norm2_b);
+        }
         let mut hidden = linear_batch(
             &normalized_rows,
             rows.len(),
@@ -613,10 +614,10 @@ impl ValueModel {
     }
 
     fn transform(&self, sequence: &mut [Vec<f32>], layer: &TransformerLayer) {
-        let normalized_rows = sequence
-            .iter()
-            .flat_map(|row| normalized(row, &layer.norm1_w, &layer.norm1_b))
-            .collect::<Vec<_>>();
+        let mut normalized_rows = sequence.iter().flatten().copied().collect::<Vec<_>>();
+        for row in normalized_rows.chunks_exact_mut(self.width) {
+            layer_norm(row, &layer.norm1_w, &layer.norm1_b);
+        }
         let qkv = linear_batch(&normalized_rows, sequence.len(), &layer.qkv_w, &layer.qkv_b);
         let attention = self.attention_batch(&qkv, 0..sequence.len());
         let projected = linear_batch(&attention, sequence.len(), &layer.out_w, &layer.out_b);
@@ -625,10 +626,10 @@ impl ValueModel {
                 .zip(projected)
                 .for_each(|(left, right)| *left += right);
         }
-        let normalized_rows = sequence
-            .iter()
-            .flat_map(|row| normalized(row, &layer.norm2_w, &layer.norm2_b))
-            .collect::<Vec<_>>();
+        let mut normalized_rows = sequence.iter().flatten().copied().collect::<Vec<_>>();
+        for row in normalized_rows.chunks_exact_mut(self.width) {
+            layer_norm(row, &layer.norm2_w, &layer.norm2_b);
+        }
         let mut hidden = linear_batch(
             &normalized_rows,
             sequence.len(),
@@ -646,11 +647,15 @@ impl ValueModel {
 
     #[cfg(feature = "python")]
     fn transform_group(&self, sequences: &mut [(Vec<Vec<f32>>, usize)], layer: &TransformerLayer) {
-        let normalized_rows = sequences
+        let mut normalized_rows = sequences
             .iter()
             .flat_map(|(sequence, _)| sequence)
-            .flat_map(|row| normalized(row, &layer.norm1_w, &layer.norm1_b))
+            .flatten()
+            .copied()
             .collect::<Vec<_>>();
+        for row in normalized_rows.chunks_exact_mut(self.width) {
+            layer_norm(row, &layer.norm1_w, &layer.norm1_b);
+        }
         let qkv = linear_batch(
             &normalized_rows,
             normalized_rows.len() / self.width,
@@ -682,11 +687,15 @@ impl ValueModel {
                 .zip(projected)
                 .for_each(|(left, right)| *left += right);
         }
-        let normalized_rows = sequences
+        let mut normalized_rows = sequences
             .iter()
             .flat_map(|(sequence, _)| sequence)
-            .flat_map(|row| normalized(row, &layer.norm2_w, &layer.norm2_b))
+            .flatten()
+            .copied()
             .collect::<Vec<_>>();
+        for row in normalized_rows.chunks_exact_mut(self.width) {
+            layer_norm(row, &layer.norm2_w, &layer.norm2_b);
+        }
         let mut hidden = linear_batch(
             &normalized_rows,
             normalized_rows.len() / self.width,
@@ -717,11 +726,15 @@ impl ValueModel {
         sequences: Vec<(Vec<Vec<f32>>, usize)>,
         layer: &TransformerLayer,
     ) -> Vec<(Vec<f32>, Vec<Vec<f32>>)> {
-        let normalized_rows = sequences
+        let mut normalized_rows = sequences
             .iter()
             .flat_map(|(sequence, _)| sequence)
-            .flat_map(|row| normalized(row, &layer.norm1_w, &layer.norm1_b))
+            .flatten()
+            .copied()
             .collect::<Vec<_>>();
+        for row in normalized_rows.chunks_exact_mut(self.width) {
+            layer_norm(row, &layer.norm1_w, &layer.norm1_b);
+        }
         let qkv = linear_batch(
             &normalized_rows,
             normalized_rows.len() / self.width,
@@ -760,11 +773,10 @@ impl ValueModel {
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
-        let normalized_rows = rows
-            .iter()
-            .flatten()
-            .flat_map(|row| normalized(row, &layer.norm2_w, &layer.norm2_b))
-            .collect::<Vec<_>>();
+        let mut normalized_rows = rows.iter().flatten().flatten().copied().collect::<Vec<_>>();
+        for row in normalized_rows.chunks_exact_mut(self.width) {
+            layer_norm(row, &layer.norm2_w, &layer.norm2_b);
+        }
         let mut hidden = linear_batch(
             &normalized_rows,
             normalized_rows.len() / self.width,
@@ -1002,10 +1014,10 @@ impl ValueModel {
             .collect::<Vec<_>>();
         let mut key = (0xcbf2_9ce4_8422_2325, 0x9e37_79b9_7f4a_7c15);
         for value in std::iter::once(name as u32).chain(rows.iter().flat_map(|row| {
-            row.c
+            row.u
                 .iter()
                 .copied()
-                .chain(row.f.iter().map(|value| value.to_bits()))
+                .chain(row.s.iter().map(|&value| value as u32))
         })) {
             key.0 = (key.0 ^ value as u64).wrapping_mul(0x100_0000_01b3);
             key.1 = (key.1 ^ value as u64).wrapping_mul(0x9e37_79b1_85eb_ca87);
@@ -1481,7 +1493,7 @@ fn linear(input: &[f32], weights: &[f32], bias: &[f32]) -> Vec<f32> {
     {
         #[link(name = "Accelerate", kind = "framework")]
         unsafe extern "C" {
-            fn cblas_sgemv(
+            fn cblas_sgemv_singlecore(
                 order: i32,
                 transpose: i32,
                 rows: i32,
@@ -1498,7 +1510,7 @@ fn linear(input: &[f32], weights: &[f32], bias: &[f32]) -> Vec<f32> {
         }
         let mut output = bias.to_vec();
         unsafe {
-            cblas_sgemv(
+            cblas_sgemv_singlecore(
                 101,
                 111,
                 bias.len() as i32,
@@ -1535,7 +1547,7 @@ fn linear_batch(input: &[f32], rows: usize, weights: &[f32], bias: &[f32]) -> Ve
     {
         #[link(name = "Accelerate", kind = "framework")]
         unsafe extern "C" {
-            fn cblas_sgemm(
+            fn cblas_sgemm_singlecore(
                 order: i32,
                 transpose_a: i32,
                 transpose_b: i32,
@@ -1556,7 +1568,7 @@ fn linear_batch(input: &[f32], rows: usize, weights: &[f32], bias: &[f32]) -> Ve
         let columns = bias.len();
         let mut output = bias.repeat(rows);
         unsafe {
-            cblas_sgemm(
+            cblas_sgemm_singlecore(
                 101,
                 111,
                 112,
@@ -1640,22 +1652,95 @@ fn normalized(input: &[f32], weight: &[f32], bias: &[f32]) -> Vec<f32> {
 
 fn layer_norm(input: &mut [f32], weight: &[f32], bias: &[f32]) {
     normalize_block(input);
+    #[cfg(target_os = "macos")]
+    {
+        #[link(name = "Accelerate", kind = "framework")]
+        unsafe extern "C" {
+            fn vDSP_vma(
+                left: *const f32,
+                left_stride: isize,
+                right: *const f32,
+                right_stride: isize,
+                add: *const f32,
+                add_stride: isize,
+                output: *mut f32,
+                output_stride: isize,
+                count: usize,
+            );
+        }
+        unsafe {
+            vDSP_vma(
+                input.as_ptr(),
+                1,
+                weight.as_ptr(),
+                1,
+                bias.as_ptr(),
+                1,
+                input.as_mut_ptr(),
+                1,
+                input.len(),
+            )
+        };
+    }
+    #[cfg(not(target_os = "macos"))]
     for ((value, weight), bias) in input.iter_mut().zip(weight).zip(bias) {
         *value = *value * weight + bias;
     }
 }
 
 fn normalize_block(input: &mut [f32]) {
-    let mean = input.iter().sum::<f32>() / input.len() as f32;
-    let variance = input
-        .iter()
-        .map(|value| (value - mean).powi(2))
-        .sum::<f32>()
-        / input.len() as f32;
-    let scale = (variance + 1e-5).sqrt().recip();
-    input
-        .iter_mut()
-        .for_each(|value| *value = (*value - mean) * scale);
+    #[cfg(target_os = "macos")]
+    {
+        #[link(name = "Accelerate", kind = "framework")]
+        unsafe extern "C" {
+            fn vDSP_sve_svesq(
+                input: *const f32,
+                stride: isize,
+                sum: *mut f32,
+                squares: *mut f32,
+                count: usize,
+            );
+            fn vDSP_vsmsa(
+                input: *const f32,
+                input_stride: isize,
+                scale: *const f32,
+                shift: *const f32,
+                output: *mut f32,
+                output_stride: isize,
+                count: usize,
+            );
+        }
+        let (mut sum, mut squares) = (0., 0.);
+        unsafe { vDSP_sve_svesq(input.as_ptr(), 1, &mut sum, &mut squares, input.len()) };
+        let mean = sum / input.len() as f32;
+        let variance = (squares / input.len() as f32 - mean * mean).max(0.);
+        let scale = (variance + 1e-5).sqrt().recip();
+        let shift = -mean * scale;
+        unsafe {
+            vDSP_vsmsa(
+                input.as_ptr(),
+                1,
+                &scale,
+                &shift,
+                input.as_mut_ptr(),
+                1,
+                input.len(),
+            )
+        };
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mean = input.iter().sum::<f32>() / input.len() as f32;
+        let variance = input
+            .iter()
+            .map(|value| (value - mean).powi(2))
+            .sum::<f32>()
+            / input.len() as f32;
+        let scale = (variance + 1e-5).sqrt().recip();
+        input
+            .iter_mut()
+            .for_each(|value| *value = (*value - mean) * scale);
+    }
 }
 
 fn sigmoid(value: f32) -> f32 {
