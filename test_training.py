@@ -948,6 +948,26 @@ print('restored')
 
 
 class ModelKernelTest(unittest.TestCase):
+    def test_native_sequence_deduplication_preserves_empty_groups(self):
+        selected, groups, inverse = train.sts2_sim.deduplicate_sequences(
+            np.array([5, 7, 5, 8]), np.array([0, 1, 0, 1, 2, 3]),
+            np.array([0, 2, 4, 4, 6]),
+        )
+        np.testing.assert_array_equal(selected, [0, 1, 2, 3])
+        np.testing.assert_array_equal(groups, [0, 0, 2, 2])
+        np.testing.assert_array_equal(inverse, [0, 0, 1, 2])
+
+    def test_compact_training_unpack_preserves_features(self):
+        env = train.sts2_sim.Batch(4, 7, None, ascension=0)
+        rows = list(model._pack_batch(env.observe_tokens(flat=True)))
+        normal = train.sts2_sim.unpack_packed_observations(rows)
+        compact = train.sts2_sim.unpack_packed_observations(rows, True)
+        for full, reduced in zip(normal[2], compact[2]):
+            for index in (0, 4, 5, 7):
+                np.testing.assert_array_equal(full[index], reduced[index])
+            np.testing.assert_array_equal(full[2][full[6]], reduced[2])
+            np.testing.assert_array_equal(full[3][full[6]], reduced[3])
+
     def test_precomputed_sequence_layout(self):
         groups = np.array([2, 0, 2, 1, 0, 2, 1])
         offsets, destination, sequence, _block_rows, _block_starts, \
@@ -956,9 +976,45 @@ class ModelKernelTest(unittest.TestCase):
             )
         positions, items, query_offsets = sparse
         np.testing.assert_array_equal(sequence[destination], groups)
+        self.assertEqual(len(sequence) % 16_384, 0)
         np.testing.assert_array_equal(lengths[:3], np.bincount(groups) + 1)
         np.testing.assert_array_equal(positions[query_offsets[:3]], offsets[:3])
         np.testing.assert_array_equal(positions[items], destination[-3:])
+
+    def test_shared_prefix_gru_preserves_outputs_and_gradients(self):
+        tokens = np.array([1, 2, 3, 1, 2, 4, 1, 2], np.int64)
+        counts = np.array([3, 3, 2, 0])
+        (sources, parents, terminal), sizes = model.prefix_tree(tokens, counts)
+        torch.manual_seed(0)
+        embedding = torch.nn.Embedding(5, 4).double()
+        gru = torch.nn.GRU(4, 4, batch_first=True).double()
+        tree_embedding = torch.nn.Embedding(5, 4).double()
+        cell = torch.nn.GRUCell(4, 4).double()
+        tree_embedding.load_state_dict(embedding.state_dict())
+        cell.load_state_dict({
+            name: value for name, value in gru.state_dict().items()
+            for name in (name.removesuffix("_l0"),)
+        })
+        sequences = np.split(tokens, np.cumsum(counts)[:-1])
+        expected = torch.cat([
+            gru(embedding(torch.as_tensor(sequence))[None])[1]
+            for sequence in sequences if len(sequence)
+        ], 1)[0]
+        values = tree_embedding(torch.as_tensor(tokens[sources]))
+        levels = []
+        offset = 0
+        for size in sizes:
+            previous = values.new_zeros((size, 4)) if not levels \
+                else levels[-1][torch.as_tensor(parents[offset:offset + size])]
+            levels.append(cell(values[offset:offset + size], previous))
+            offset += size
+        actual = torch.cat(levels)[torch.as_tensor(terminal)]
+        weight = torch.arange(actual.numel(), dtype=torch.double).view_as(actual)
+        (expected * weight).sum().backward(); (actual * weight).sum().backward()
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(tree_embedding.weight.grad, embedding.weight.grad)
+        for name, parameter in cell.named_parameters():
+            torch.testing.assert_close(parameter.grad, getattr(gru, name + "_l0").grad)
 
     @unittest.skipUnless(torch.backends.mps.is_available(), "MPS unavailable")
     def test_mps_linear_backward_input_matches_aten(self):
