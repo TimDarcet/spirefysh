@@ -871,14 +871,18 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             except (Empty, EOFError, OSError):
                 break
 
-    def prepare(rows):
+    def prepare(rows, training):
         prepared = time.monotonic()
         value = unpack(rows, torch.device("cpu"), model, False)
+        value = (value, training)
+        value = upload(value, target) if target.type != "cpu" else value
         return value, time.monotonic() - prepared
 
-    def prepare_cached(features):
+    def prepare_cached(features, training):
         prepared = time.monotonic()
-        return cached_tensors(features, model.width), time.monotonic() - prepared
+        value = (cached_tensors(features, model.width), training)
+        value = upload(value, target) if target.type != "cpu" else value
+        return value, time.monotonic() - prepared
 
     def reserve_batch(size):
         if len(refill_ids):
@@ -914,14 +918,28 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                                   self_weight, terminal_value))
             search_children.extend(children)
         values = {key: dataset.data[key][selected].copy() for key in dataset.data}
+        normalized = values["advantage"].copy()
+        for character in range(5):
+            member = values["character"] == character
+            if member.any():
+                centered = normalized[member] - normalized[member].mean()
+                normalized[member] = centered / (np.sqrt(np.mean(np.square(centered))) + 1e-8)
+        values["normalized_advantage"] = normalized
+        lengths = np.asarray([packed_action_count(row) for row in rows], np.int64)
+        training = tuple(torch.from_numpy(np.asarray(value)) for value in (
+            values["action"], values["old"],
+            np.cumsum(lengths) - lengths + values["action"],
+            values["normalized_advantage"], values["critic_target"],
+        ))
         replay = reservoir.sample(len(selected) // 9, rng)
         cached = bool(dataset.features) and not expert_rows and not replay and not search_children
         return selected, rows, expert_ids, expert_rows, expert_targets, \
             values, replay, search_groups, \
-            search_children, cached, packer.submit(
-            prepare_cached, [dataset.features[index] for index in selected]
+            search_children, cached, lengths, packer.submit(
+            prepare_cached, [dataset.features[index] for index in selected], training,
         ) if cached else packer.submit(
-            prepare, rows + expert_rows + [sample[0] for sample in replay] + search_children
+            prepare, rows + expert_rows + [sample[0] for sample in replay] + search_children,
+            training,
         )
 
     def finish_window():
@@ -1221,28 +1239,22 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             update_started = time.monotonic()
             (selected, rows, expert_ids, expert_rows, expert_targets,
              values, replay, search_groups, search_children,
-             cached, packed) = pending.pop(0)
+             cached, lengths, packed) = pending.pop(0)
             if not rows:
                 continue
             assert len(rows) == args.batch
             revisions["update_attempt"] += 1
             pause_seconds = 0.
             unpack_started = time.monotonic()
-            lengths = np.asarray([packed_action_count(row) for row in rows], np.int64)
             expert_lengths = np.asarray([
                 packed_action_count(row) for row in expert_rows
             ], np.int64)
             flat_policy = not replay
             policy_actions = int(lengths.sum())
             expert_actions = int(expert_lengths.sum())
-            cpu_inputs, _ = packed.result()
-            inputs = upload(cpu_inputs, target)
+            (inputs, training_tensors), _ = packed.result()
+            action, old, choice_index, batch_advantage, batch_target = training_tensors
             unpack_seconds = time.monotonic() - unpack_started
-            action = torch.as_tensor(values["action"], device=target)
-            old = torch.as_tensor(values["old"], device=target)
-            choice_index = torch.as_tensor(
-                np.cumsum(lengths) - lengths + values["action"], device=target,
-            )
             forward_started = time.monotonic()
             all_logits, all_critic_logits = (
                 predict_cached(model, inputs, args.precision, args.policy_temperature) if cached else
@@ -1258,13 +1270,18 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             log_ratio = (logits[choice_index] if flat_policy else
                          logits.gather(1, action[:, None]).squeeze(1)) - old
             legal = None if cached else inputs[6][:len(rows)]
-            if not cached and not args.critic_only and not (legal.sum(1) > 1).all():
+            if not cached and not args.critic_only \
+                    and any(packed_legal_count(row) <= 1 for row in rows):
                 raise RuntimeError("forced action entered the dataset")
-            fresh = torch.ones_like(log_ratio, dtype=torch.bool) if args.critic_only \
-                else log_ratio.abs() <= args.max_log_ratio
-            if not bool(fresh.all()):
-                log_ratio_cpu = log_ratio.detach().cpu().numpy()
-                triggering = ~fresh.cpu().numpy()
+            ratio = log_ratio.exp()
+            kl = (ratio - 1 - log_ratio).mean().detach()
+            prediction = critic_value(critic_logits)
+            log_ratio_cpu, prediction_cpu = torch.stack((
+                log_ratio.detach(), prediction.detach(),
+            )).cpu().numpy()
+            triggering = ~(np.abs(log_ratio_cpu) <= args.max_log_ratio)
+            clip_fraction = float(np.mean(np.abs(np.exp(log_ratio_cpu) - 1) > args.clip))
+            if not args.critic_only and triggering.any():
                 invalid = np.isin(values["trajectory"], values["trajectory"][triggering])
                 rejected_trajectories = dataset.trajectory_stats(
                     values, revisions["policy_revision"], invalid, log_ratio_cpu,
@@ -1293,7 +1310,6 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 release_mps_cache(True)
                 continue
             refill_ids = np.empty(0, np.int64)
-            log_ratio_cpu = log_ratio.detach().cpu().numpy()
             batch_trajectories = dataset.trajectory_stats(
                 values, revisions["policy_revision"], log_ratios=log_ratio_cpu,
             )
@@ -1306,25 +1322,20 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             lag_values, lag_counts = np.unique(batch_policy_lags, return_counts=True)
             policy_lag_counts = dict(zip(map(int, lag_values), map(int, lag_counts)))
             denominator = fresh_rows = len(rows)
-            ratio = log_ratio.exp()
-            kl = (ratio - 1 - log_ratio).mean().detach()
-            clip_fraction = ((ratio - 1).abs() > args.clip).float().mean().detach()
+            fresh = torch.ones_like(log_ratio, dtype=torch.bool)
             fresh_cpu = slice(None)
             kl_value = float(kl)
             _, entropy_weight, _ = curriculum_weights(
                 stage, stage_decisions + handled, auxiliary_decisions + handled, args, progress_active
             )
-            batch_target = torch.as_tensor(values["critic_target"][fresh_cpu], device=target)
             critic_weights = critic_balance.weights(
                 values["character"][fresh_cpu], values["phase"][fresh_cpu],
                 values["canonical"][fresh_cpu],
             )
             critic_weights = torch.as_tensor(critic_weights, device=target)
-            prediction = critic_value(critic_logits[fresh])
             squared_error = (prediction - batch_target).square()
             value_loss = (squared_error * critic_weights).mean()
             critic_loss = args.value_weight * value_loss
-            prediction_cpu = prediction.detach().cpu().numpy()
             explained_reward_variance, floor_conditioned_explained_reward_variance, \
                 explained_reward_variance_by_floor = critic_explained_reward_variance(
                     prediction_cpu, values["critic_target"][fresh_cpu],
@@ -1366,18 +1377,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 )
                 publish()
                 continue
-            advantages = torch.as_tensor(values["advantage"], device=target)
-            characters = torch.as_tensor(values["character"], device=target)
-            batch_advantage = advantages
-            for character in range(5):
-                member = fresh & (characters == character)
-                member_float = member.to(advantages.dtype)
-                count = member_float.sum().clamp_min(1)
-                mean = (advantages * member_float).sum() / count
-                std = (((advantages - mean).square() * member_float).sum() / count).sqrt()
-                batch_advantage = torch.where(
-                    member, (advantages - mean) / (std + 1e-8), batch_advantage,
-                )
+            if args.critic_only or args.disable_post_kl_check or args.target_kl >= 1:
+                prefetch()
             policy_loss = -torch.minimum(
                 ratio * batch_advantage,
                 ratio.clamp(1 - args.clip, 1 + args.clip) * batch_advantage,
@@ -1487,8 +1488,6 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 ) * replay_weight).sum() / max(1, replay_capacity)
                 loss = loss + winning_loss
             backward_started = time.monotonic()
-            if args.critic_only or args.disable_post_kl_check or args.target_kl >= 1:
-                prefetch()
             optimizer.zero_grad(set_to_none=True); loss.backward()
             if args.critic_only:
                 gradient_norm = critic_only_step(model, optimizer)

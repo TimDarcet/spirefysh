@@ -1084,13 +1084,16 @@ class TrajectoryTest(unittest.TestCase):
         self.assertEqual(trajectories._training_config(manifest, {})["gae_lambda"], .25)
 
     def test_native_policy_details_match_selected_probability(self):
-        env = train.sts2_sim.Batch(1, 7, 0, ascension=0)
+        env = train.sts2_sim.Batch(2, 7, 0, ascension=0)
         model = train.Agent(
             dict(env.token_layout(*train.DEFAULT_ARCHITECTURE)), *train.DEFAULT_ARCHITECTURE,
         )
         env.load_policy(train.export_value_model(None, model, env.fingerprint(), 1, 0, True))
         _, policy, critic = env.policy_details([0], .8)[0]
         result = env.policy(.8, False, False)
+        repeated = env.policy(.8, False, False)
+        for left, right in zip(result[:4], repeated[:4]):
+            np.testing.assert_array_equal(left, right)
         self.assertAlmostEqual(sum(math.exp(value) for value in policy), 1, places=5)
         self.assertAlmostEqual(policy[int(result[1][0])], float(result[2][0]), places=5)
         self.assertTrue(math.isfinite(critic))
