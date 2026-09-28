@@ -803,6 +803,26 @@ print('restored')
         self.assertEqual(limited.rows, [rows[1]])
         np.testing.assert_array_equal(limited.data["id"][:1], [1])
 
+        compressed = {
+            key: [trajectory[key][index] for index in (1, 3)]
+            for key in (
+                "rows", "choices", "old_log", "critic_values", "canonical_progress",
+                "phases", "win_rewards", "terminals", "characters", "versions", "potentials",
+            )
+        } | {
+            "sampled_length": 5, "sampled_positions": [1, 3],
+            "terminal": True, "won": True,
+        }
+        compact = train.ExperienceDataset()
+        self.assertEqual(compact.add({"trajectories": [compressed]}, Namespace(
+            critic_only=True, gae_gamma=.5, gae_lambda=.5,
+        )), counts)
+        self.assertEqual(compact.rows, dataset.rows)
+        for key in dataset.data:
+            np.testing.assert_array_equal(
+                compact.data[key][:len(compact)], dataset.data[key][:len(dataset)], err_msg=key,
+            )
+
     def test_fifo_capacity_uses_arrival_order(self):
         def trajectory(versions):
             length = len(versions)
@@ -1224,6 +1244,9 @@ class TrajectoryTest(unittest.TestCase):
         self.assertEqual(len(original["trajectories"]), len(compacted["trajectories"]))
         self.assertGreater(len(original["trajectories"]), 0)
         for left, right in zip(original["trajectories"], compacted["trajectories"]):
+            self.assertGreaterEqual(left["sampled_length"], len(left["rows"]))
+            self.assertEqual(len(left["sampled_positions"]), len(left["rows"]))
+            self.assertTrue(all(train.packed_legal_count(row) > 1 for row in left["rows"]))
             for key in left:
                 if key == "completion_seconds":
                     continue
