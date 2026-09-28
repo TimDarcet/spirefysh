@@ -948,6 +948,18 @@ print('restored')
 
 
 class ModelKernelTest(unittest.TestCase):
+    def test_precomputed_sequence_layout(self):
+        groups = np.array([2, 0, 2, 1, 0, 2, 1])
+        offsets, destination, sequence, _block_rows, _block_starts, \
+            _metal_offsets, lengths, sparse = model.sequence_layout(
+                groups, 3, 3, torch.device("cpu"),
+            )
+        positions, items, query_offsets = sparse
+        np.testing.assert_array_equal(sequence[destination], groups)
+        np.testing.assert_array_equal(lengths[:3], np.bincount(groups) + 1)
+        np.testing.assert_array_equal(positions[query_offsets[:3]], offsets[:3])
+        np.testing.assert_array_equal(positions[items], destination[-3:])
+
     @unittest.skipUnless(torch.backends.mps.is_available(), "MPS unavailable")
     def test_mps_linear_backward_input_matches_aten(self):
         torch.manual_seed(0)
