@@ -1128,20 +1128,21 @@ class _FlashAttention(torch.autograd.Function):
     library = None
 
     @staticmethod
-    def forward(ctx, qkv, offsets, lengths, block_rows, block_starts):
+    def forward(ctx, qkv, offsets, lengths, block_rows, block_starts, real_tokens):
         if _FlashAttention.library is None:
             _FlashAttention.library = torch.mps.compile_shader(
                 Path(__file__).with_name("attention.metal").read_text()
             )
         output = qkv.new_empty((len(qkv), qkv.shape[1] // 3))
+        output[real_tokens:] = 0
         lse = torch.empty((len(qkv), 4), dtype=torch.float32, device=qkv.device)
-        threads = len(block_rows) * 4 * 64
+        threads = len(block_rows) * 4 * 32
         _FlashAttention.library.flash_forward(
             qkv, qkv, qkv, output, lse, offsets, lengths, block_rows, block_starts,
-            threads=threads, group_size=64,
+            threads=threads, group_size=32,
         )
         ctx.save_for_backward(qkv, output, lse, offsets, lengths, block_rows, block_starts)
-        ctx.threads = threads
+        ctx.threads, ctx.real_tokens = threads, real_tokens
         return output
 
     @staticmethod
@@ -1149,18 +1150,19 @@ class _FlashAttention(torch.autograd.Function):
         qkv, output, lse, offsets, lengths, block_rows, block_starts = ctx.saved_tensors
         grad_output = grad_output.contiguous()
         grad_qkv = torch.empty_like(qkv)
+        grad_qkv[ctx.real_tokens:] = 0
         delta = torch.empty_like(lse)
         _FlashAttention.library.flash_backward_query(
             qkv, qkv, qkv, output, lse, delta, grad_output, grad_qkv,
             offsets, lengths, block_rows, block_starts,
-            threads=ctx.threads, group_size=64,
+            threads=ctx.threads, group_size=32,
         )
         _FlashAttention.library.flash_backward_key_value(
             qkv, qkv, qkv, lse, delta, grad_output, grad_qkv, grad_qkv,
             offsets, lengths, block_rows, block_starts,
-            threads=ctx.threads, group_size=64,
+            threads=ctx.threads, group_size=32,
         )
-        return grad_qkv, None, None, None, None
+        return grad_qkv, None, None, None, None, None
 
 
 def _linear_forward(value_bfloat, weight, bias, residual=None):
@@ -1890,6 +1892,7 @@ class Agent(nn.Module):
 
     def _sequence(self, values, group, groups, seed, transformer, selected=None):
         selected_count = selected
+        real_tokens = len(values) + groups
         flash = values.device.type == "mps" and self.width == 128 and self.heads == 4 \
             and torch.is_autocast_enabled("mps") \
             and torch.get_autocast_dtype("mps") == torch.bfloat16
@@ -1922,9 +1925,9 @@ class Agent(nn.Module):
                 torch.arange(len(lengths), device=values.device), lengths,
             )
             if flash:
-                blocks = (lengths + 15) // 16
+                blocks = (lengths[:groups] + 7) // 8
                 block_rows = torch.repeat_interleave(
-                    torch.arange(len(lengths), device=values.device), blocks,
+                    torch.arange(groups, device=values.device), blocks,
                 ).to(torch.int32)
                 block_starts = torch.cat((counts.new_zeros(1), blocks.cumsum(0)[:-1])).to(
                     torch.int32
@@ -1934,10 +1937,9 @@ class Agent(nn.Module):
             sparse = None
             if selected_count is not None:
                 positions, query_order = torch.cat((
-                    offsets[:-1], destination[-selected_count:],
+                    offsets[:groups], destination[-selected_count:],
                 )).sort()
-                real = (query_order >= len(lengths)) & \
-                    (query_order < len(lengths) + selected_count)
+                real = query_order >= groups
                 query_counts = torch.bincount(sequence[positions], minlength=len(lengths))
                 query_offsets = torch.cat((query_counts.new_zeros(1), query_counts.cumsum(0)))
                 sparse = positions, real, query_offsets, torch.argsort(query_order[real])
@@ -1986,7 +1988,7 @@ class Agent(nn.Module):
                     layer.self_attn.in_proj_bias,
                 )
                 attended = _FlashAttention.apply(
-                    qkv, metal_offsets, metal_lengths, block_rows, block_starts,
+                    qkv, metal_offsets, metal_lengths, block_rows, block_starts, real_tokens,
                 ) if flash else _RaggedAttention.apply(
                     qkv, offsets.to(torch.int32), sequence.to(torch.int32),
                     layer.self_attn.num_heads, sequence.to(torch.int32), offsets.to(torch.int32),
@@ -2172,12 +2174,12 @@ class Agent(nn.Module):
             ("event_pool", DOMAIN["event"], 3),
         )
         for name, domain, filtered in pool_specs:
-            source = filters[filtered]
+            source, pooled = filters[filtered]
             if encoded[domain].device.type == "mps" and self.pooling["generation_pool"] == "sum":
-                item_rows = domains[domain][4][source]
+                pooled_source, item_rows, inverse, groups = pooled
                 summary = _IndexedGroupSum.apply(
-                    encoded[domain], domains[domain][6][source], item_rows, batch,
-                )
+                    encoded[domain], domains[domain][6][pooled_source], item_rows, groups,
+                )[inverse]
             else:
                 item, item_rows, _ = self._domain_rows(
                     domains, encoded, domain, source=source,
@@ -2298,7 +2300,6 @@ class Agent(nn.Module):
         state, action, action_row, action_flat, actions, sequence = self.encode_state(
             domains, encoded, state_index, action_values, action_index, concepts, len(character),
         )
-        synchronize()
         scores = _norm_head(action, self.global_norm, self.policy) / temperature
         legal = torch.ones_like(scores, dtype=torch.bool)
         scores = self.group_log_softmax(scores, legal, sequence)
@@ -2312,7 +2313,6 @@ class Agent(nn.Module):
         if policy_only:
             return policy
         output = policy, _norm_head(state, self.global_norm, self.critic)[:, None]
-        synchronize()
         return (*output, self.global_norm(state)) if return_state else output
 
 
@@ -2671,14 +2671,32 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
         raise ValueError("path candidate references missing node")
     action_flat = action_row * actions + action_position
     action_legal = legal[action_row, action_position]
-    def filtered(domain, predicate):
+    def filtered(domain, predicate, pooled=False):
         u, *_values, scope = domains[domain]
-        return tensor(np.flatnonzero((scope == -1) & predicate(u[:, 0])))
+        source = np.flatnonzero((scope == -1) & predicate(u[:, 0]))
+        if not pooled:
+            return tensor(source)
+        row = domains[domain][4][source]
+        offsets = np.r_[0, np.cumsum(np.bincount(row, minlength=batch))]
+        representatives, inverse, unique = [], np.empty(batch, np.int64), {}
+        for index in range(batch):
+            key = inverse_rows[domain][source[offsets[index]:offsets[index + 1]]].tobytes()
+            inverse[index] = unique.setdefault(key, len(unique))
+            if inverse[index] == len(representatives):
+                representatives.append(index)
+        pooled = np.concatenate([
+            source[offsets[index]:offsets[index + 1]] for index in representatives
+        ])
+        counts = np.diff(offsets)[representatives]
+        return None if pad and model.pooling["generation_pool"] == "sum" else tensor(source), (
+            tensor(pooled), tensor(np.repeat(np.arange(len(counts)), counts)),
+            tensor(inverse), len(counts),
+        )
     filters = (
-        filtered(DOMAIN["card"], lambda value: value == 13),
-        filtered(DOMAIN["relic"], lambda value: (value == 1) | (value == 2)),
-        filtered(DOMAIN["encounter"], lambda value: value <= 2),
-        filtered(DOMAIN["event"], lambda value: value == 0),
+        filtered(DOMAIN["card"], lambda value: value == 13, True),
+        filtered(DOMAIN["relic"], lambda value: (value == 1) | (value == 2), True),
+        filtered(DOMAIN["encounter"], lambda value: value <= 2, True),
+        filtered(DOMAIN["event"], lambda value: value == 0, True),
         *(filtered(DOMAIN["card"], lambda value, kind=kind: value == kind)
           for kind in range(5)),
         filtered(DOMAIN["relic"], lambda value: value == 0),

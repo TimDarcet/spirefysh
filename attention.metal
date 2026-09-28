@@ -344,7 +344,7 @@ kernel void flash_forward(
   L += base * 4 + head;
   ushort2 morton_offset = morton_order(lane_id);
   uint parallelization_group_offset = gid;
-  parallelization_group_offset *= 16;
+  parallelization_group_offset *= 8;
 
   // Return early if the entire SIMD is out of bounds.
   if (parallelization_group_offset >= R) {
@@ -411,7 +411,7 @@ if (sidx == 0) {
     ushort(8),
     ushort(32 - d_outer));
   ushort R_dimension = min(
-    uint(16),
+    uint(8),
     uint(R - parallelization_group_offset));
   ushort2 tile_src(D_src_dimension, R_dimension);
   ushort2 tile_dst(D_dst_dimension, R_dimension);
@@ -1345,7 +1345,7 @@ if (sidx == 0) {
     ushort(8),
     ushort(32 - d_outer));
   ushort R_dimension = min(
-    uint(16),
+    uint(8),
     uint(R - parallelization_group_offset));
   ushort2 tile(D_dimension, R_dimension);
 
@@ -1419,7 +1419,7 @@ kernel void flash_backward_query(
   dQ += base * 384 + head * 32;
   ushort2 morton_offset = morton_order(lane_id);
   uint parallelization_group_offset = gid;
-  parallelization_group_offset *= 16;
+  parallelization_group_offset *= 8;
 
   // Return early if the entire SIMD is out of bounds.
   if (parallelization_group_offset >= R) {
@@ -1486,7 +1486,7 @@ if (sidx == 0) {
     ushort(16),
     ushort(32 - d_outer));
   ushort R_dimension = min(
-    uint(16),
+    uint(8),
     uint(R - parallelization_group_offset));
   ushort2 tile_src(D_src_dimension, R_dimension);
   ushort2 tile_dst(D_dst_dimension, R_dimension);
@@ -2021,7 +2021,7 @@ if (sidx == 0) {
     ushort(32 - d_outer));
   ushort D_dst_dimension = 16;
   ushort R_dimension = min(
-    uint(16),
+    uint(8),
     uint(R - parallelization_group_offset));
   ushort2 tile_src(D_src_dimension, R_dimension);
   ushort2 tile_dst(D_dst_dimension, R_dimension);
@@ -2226,7 +2226,7 @@ if (sidx == 0) {
     ushort(32 - d_outer));
   ushort D_dst_dimension = 16;
   ushort R_dimension = min(
-    uint(16),
+    uint(8),
     uint(R - parallelization_group_offset));
   ushort2 tile_src(D_src_dimension, R_dimension);
   ushort2 tile_dst(D_dst_dimension, R_dimension);
@@ -2814,7 +2814,7 @@ if (sidx == 0) {
     ushort(16),
     ushort(32 - d_outer));
   ushort R_dimension = min(
-    uint(16),
+    uint(8),
     uint(R - parallelization_group_offset));
   ushort2 tile(D_dimension, R_dimension);
 
@@ -2888,7 +2888,7 @@ kernel void flash_backward_key_value(
   dK += base * 384 + 128 + head * 32;
   ushort2 morton_offset = morton_order(lane_id);
   uint parallelization_group_offset = gid;
-  parallelization_group_offset *= 16;
+  parallelization_group_offset *= 8;
 
   // Return early if the entire SIMD is out of bounds.
   if (parallelization_group_offset >= C) {
@@ -2955,7 +2955,7 @@ if (sidx == 0) {
     ushort(16),
     ushort(32 - d_outer));
   ushort R_dimension = min(
-    uint(16),
+    uint(8),
     uint(C - parallelization_group_offset));
   ushort2 tile_src(D_src_dimension, R_dimension);
   ushort2 tile_dst(D_dst_dimension, R_dimension);
@@ -3067,7 +3067,7 @@ if (sidx == 0) {
     ushort(16),
     ushort(32 - d_outer));
   ushort R_dimension = min(
-    uint(16),
+    uint(8),
     uint(C - parallelization_group_offset));
   ushort2 tile_src(D_src_dimension, R_dimension);
   ushort2 tile_dst(D_dst_dimension, R_dimension);
@@ -4668,7 +4668,7 @@ if (sidx == 0) {
     ushort(16),
     ushort(32 - d_outer));
   ushort R_dimension = min(
-    uint(16),
+    uint(8),
     uint(C - parallelization_group_offset));
   ushort2 tile(D_dimension, R_dimension);
 
@@ -4774,7 +4774,7 @@ if (sidx == 0) {
     ushort(16),
     ushort(32 - d_outer));
   ushort R_dimension = min(
-    uint(16),
+    uint(8),
     uint(C - parallelization_group_offset));
   ushort2 tile(D_dimension, R_dimension);
 

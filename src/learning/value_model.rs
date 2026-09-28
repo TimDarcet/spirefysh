@@ -123,6 +123,7 @@ struct MapEncoding {
 struct EncodingCache {
     rows: HashMap<(u64, u64), Vec<f32>>,
     maps: HashMap<Vec<u8>, Arc<MapEncoding>>,
+    summaries: HashMap<(u64, u64), Vec<f32>>,
 }
 
 struct GruWeights {
@@ -643,6 +644,155 @@ impl ValueModel {
         }
     }
 
+    #[cfg(feature = "python")]
+    fn transform_group(&self, sequences: &mut [(Vec<Vec<f32>>, usize)], layer: &TransformerLayer) {
+        let normalized_rows = sequences
+            .iter()
+            .flat_map(|(sequence, _)| sequence)
+            .flat_map(|row| normalized(row, &layer.norm1_w, &layer.norm1_b))
+            .collect::<Vec<_>>();
+        let qkv = linear_batch(
+            &normalized_rows,
+            normalized_rows.len() / self.width,
+            &layer.qkv_w,
+            &layer.qkv_b,
+        );
+        let mut offset = 0;
+        let mut attention = Vec::new();
+        for (sequence, _) in sequences.iter() {
+            let end = offset + sequence.len();
+            attention.extend(self.attention_batch(
+                &qkv[offset * 3 * self.width..end * 3 * self.width],
+                0..sequence.len(),
+            ));
+            offset = end;
+        }
+        let projected = linear_batch(
+            &attention,
+            attention.len() / self.width,
+            &layer.out_w,
+            &layer.out_b,
+        );
+        for (row, projected) in sequences
+            .iter_mut()
+            .flat_map(|(sequence, _)| sequence)
+            .zip(projected.chunks_exact(self.width))
+        {
+            row.iter_mut()
+                .zip(projected)
+                .for_each(|(left, right)| *left += right);
+        }
+        let normalized_rows = sequences
+            .iter()
+            .flat_map(|(sequence, _)| sequence)
+            .flat_map(|row| normalized(row, &layer.norm2_w, &layer.norm2_b))
+            .collect::<Vec<_>>();
+        let mut hidden = linear_batch(
+            &normalized_rows,
+            normalized_rows.len() / self.width,
+            &layer.linear1_w,
+            &layer.linear1_b,
+        );
+        gelu_in_place(&mut hidden);
+        let projected = linear_batch(
+            &hidden,
+            hidden.len() / layer.linear1_b.len(),
+            &layer.linear2_w,
+            &layer.linear2_b,
+        );
+        for (row, projected) in sequences
+            .iter_mut()
+            .flat_map(|(sequence, _)| sequence)
+            .zip(projected.chunks_exact(self.width))
+        {
+            row.iter_mut()
+                .zip(projected)
+                .for_each(|(left, right)| *left += right);
+        }
+    }
+
+    #[cfg(feature = "python")]
+    fn transformed_group(
+        &self,
+        sequences: Vec<(Vec<Vec<f32>>, usize)>,
+        layer: &TransformerLayer,
+    ) -> Vec<(Vec<f32>, Vec<Vec<f32>>)> {
+        let normalized_rows = sequences
+            .iter()
+            .flat_map(|(sequence, _)| sequence)
+            .flat_map(|row| normalized(row, &layer.norm1_w, &layer.norm1_b))
+            .collect::<Vec<_>>();
+        let qkv = linear_batch(
+            &normalized_rows,
+            normalized_rows.len() / self.width,
+            &layer.qkv_w,
+            &layer.qkv_b,
+        );
+        let mut offset = 0;
+        let mut attention = Vec::new();
+        for (sequence, action_start) in &sequences {
+            let end = offset + sequence.len();
+            attention.extend(self.attention_batch(
+                &qkv[offset * 3 * self.width..end * 3 * self.width],
+                std::iter::once(0).chain(*action_start..sequence.len()),
+            ));
+            offset = end;
+        }
+        let projected = linear_batch(
+            &attention,
+            attention.len() / self.width,
+            &layer.out_w,
+            &layer.out_b,
+        );
+        let mut projected = projected.chunks_exact(self.width);
+        let mut rows = sequences
+            .into_iter()
+            .map(|(sequence, action_start)| {
+                std::iter::once(&sequence[0])
+                    .chain(&sequence[action_start..])
+                    .map(|source| {
+                        let mut row = source.clone();
+                        row.iter_mut()
+                            .zip(projected.next().unwrap())
+                            .for_each(|(left, right)| *left += right);
+                        row
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let normalized_rows = rows
+            .iter()
+            .flatten()
+            .flat_map(|row| normalized(row, &layer.norm2_w, &layer.norm2_b))
+            .collect::<Vec<_>>();
+        let mut hidden = linear_batch(
+            &normalized_rows,
+            normalized_rows.len() / self.width,
+            &layer.linear1_w,
+            &layer.linear1_b,
+        );
+        gelu_in_place(&mut hidden);
+        let projected = linear_batch(
+            &hidden,
+            hidden.len() / layer.linear1_b.len(),
+            &layer.linear2_w,
+            &layer.linear2_b,
+        );
+        for (row, projected) in rows
+            .iter_mut()
+            .flatten()
+            .zip(projected.chunks_exact(self.width))
+        {
+            row.iter_mut()
+                .zip(projected)
+                .for_each(|(left, right)| *left += right);
+            layer_norm(row, &self.global_norm_w, &self.global_norm_b);
+        }
+        rows.into_iter()
+            .map(|mut sequence| (sequence.remove(0), sequence))
+            .collect()
+    }
+
     fn summarize(&self, name: usize, mode: u8, values: Vec<Vec<f32>>) -> Vec<f32> {
         match mode {
             0 => values
@@ -837,6 +987,41 @@ impl ValueModel {
         )]
     }
 
+    fn generation(
+        &self,
+        observation: &ObservationV56,
+        cache: &mut EncodingCache,
+        domain: usize,
+        zone: impl Fn(u32) -> bool,
+        name: usize,
+        role: u32,
+    ) -> Vec<f32> {
+        let rows = observation.domains[domain]
+            .iter()
+            .filter(|row| row.scope == STATE_SCOPE && zone(row.u[0]))
+            .collect::<Vec<_>>();
+        let mut key = (0xcbf2_9ce4_8422_2325, 0x9e37_79b9_7f4a_7c15);
+        for value in std::iter::once(name as u32).chain(rows.iter().flat_map(|row| {
+            row.c
+                .iter()
+                .copied()
+                .chain(row.f.iter().map(|value| value.to_bits()))
+        })) {
+            key.0 = (key.0 ^ value as u64).wrapping_mul(0x100_0000_01b3);
+            key.1 = (key.1 ^ value as u64).wrapping_mul(0x9e37_79b1_85eb_ca87);
+        }
+        if let Some(value) = cache.summaries.get(&key) {
+            return value.clone();
+        }
+        let values = rows
+            .into_iter()
+            .map(|row| self.encode(cache, domain, row))
+            .collect();
+        let value = self.tag(self.summarize(name, self.pooling[12], values), role, None);
+        cache.summaries.insert(key, value.clone());
+        value
+    }
+
     fn actors(
         &self,
         observation: &ObservationV56,
@@ -941,11 +1126,11 @@ impl ValueModel {
         items.into_iter().map(|(_, value)| value).collect()
     }
 
-    fn state_actions(
+    fn state_tokens(
         &self,
         observation: &ObservationV56,
         cache: &mut EncodingCache,
-    ) -> (Vec<f32>, Vec<Vec<f32>>) {
+    ) -> (Vec<Vec<f32>>, usize) {
         let state_rows = |domain: usize| {
             observation.domains[domain]
                 .iter()
@@ -968,25 +1153,32 @@ impl ValueModel {
             );
         }
         let generation = [
-            (CARD_DOMAIN, 13, 4),
-            (RELIC_DOMAIN, 14, 5),
-            (ENCOUNTER_DOMAIN, 15, 6),
-            (EVENT_DOMAIN, 16, 7),
-        ]
-        .map(|(domain, seed, role)| {
-            let values = state_rows(domain)
-                .into_iter()
-                .filter(|row| match domain {
-                    CARD_DOMAIN => row.u[0] == CARD_POOL_ZONE as u32,
-                    RELIC_DOMAIN => matches!(row.u[0], 1 | 2),
-                    ENCOUNTER_DOMAIN => row.u[0] <= 2,
-                    EVENT_DOMAIN => row.u[0] == 0,
-                    _ => false,
-                })
-                .map(|row| self.encode(cache, domain, row))
-                .collect();
-            self.tag(self.summarize(seed, self.pooling[12], values), role, None)
-        });
+            self.generation(
+                observation,
+                cache,
+                CARD_DOMAIN,
+                |zone| zone == CARD_POOL_ZONE as u32,
+                13,
+                4,
+            ),
+            self.generation(
+                observation,
+                cache,
+                RELIC_DOMAIN,
+                |zone| matches!(zone, 1 | 2),
+                14,
+                5,
+            ),
+            self.generation(
+                observation,
+                cache,
+                ENCOUNTER_DOMAIN,
+                |zone| zone <= 2,
+                15,
+                6,
+            ),
+            self.generation(observation, cache, EVENT_DOMAIN, |zone| zone == 0, 16, 7),
+        ];
         let mut tokens = vec![
             self.tag(self.encode(cache, RUN_DOMAIN, run[0]), 1, None),
             self.tag(self.summarize(11, self.pooling[11], phase), 2, None),
@@ -1105,6 +1297,15 @@ impl ValueModel {
         let action_start = tokens.len() - action_count + 1;
         let mut sequence = vec![self.embedding(Semantic::TokenRole, 0).to_vec()];
         sequence.extend(tokens);
+        (sequence, action_start)
+    }
+
+    fn state_actions(
+        &self,
+        observation: &ObservationV56,
+        cache: &mut EncodingCache,
+    ) -> (Vec<f32>, Vec<Vec<f32>>) {
+        let (mut sequence, action_start) = self.state_tokens(observation, cache);
         let (last, layers) = self.global_layers.split_last().unwrap();
         for layer in layers {
             self.transform(&mut sequence, layer);
@@ -1126,14 +1327,22 @@ impl ValueModel {
         observations: &[&ObservationV56],
     ) -> Vec<(Vec<f32>, Vec<Vec<f32>>)> {
         observations
-            .par_iter()
-            .map(|observation| {
+            .par_chunks(2)
+            .flat_map_iter(|observations| {
                 let index = rayon::current_thread_index().unwrap_or(0) % self.encode_caches.len();
                 let mut cache = self.encode_caches[index].lock().unwrap();
                 if cache.rows.len() > 65_536 {
                     cache.rows.clear();
                 }
-                self.state_actions(observation, &mut cache)
+                let mut sequences = observations
+                    .iter()
+                    .map(|observation| self.state_tokens(observation, &mut cache))
+                    .collect::<Vec<_>>();
+                let (last, layers) = self.global_layers.split_last().unwrap();
+                for layer in layers {
+                    self.transform_group(&mut sequences, layer);
+                }
+                self.transformed_group(sequences, last).into_iter()
             })
             .collect()
     }
