@@ -2156,6 +2156,9 @@ def train(args):
         raise ValueError("invalid start stage")
     if args.precision not in PRECISIONS:
         raise ValueError("precision must be fp32 or bf16")
+    fp32_parts = tuple(part for part in FP32_PARTS if getattr(args, f"fp32_{part}", False))
+    if len(fp32_parts) == len(FP32_PARTS):
+        args.precision = "fp32"
     if args.precision != "fp32" and target.type not in ("mps", "cuda"):
         raise ValueError(f"{args.precision} requires MPS or CUDA")
     if min(
@@ -2244,6 +2247,7 @@ def train(args):
         model = Agent(layout, *config, pooling=pooling,
                       potential_weights=potential_weights,
                       potential_mode=args.potential_mode).to(target)
+    model.fp32_parts = fp32_parts
     if args.freeze_backbone:
         args.publish_updates = max(args.publish_updates, 16)
         model.requires_grad_(False)

@@ -99,6 +99,11 @@ print('restored')
         self.assertEqual(args.mps_empty_cache_updates, 8)
         self.assertEqual(args.sampler_threads, 5)
         self.assertEqual(args.dataset_capacity, 131_072)
+        self.assertFalse(any(getattr(args, f"fp32_{part}") for part in train.FP32_PARTS))
+        fp32 = train.parser().parse_args([
+            "train", *(f"--fp32-{part}" for part in train.FP32_PARTS),
+        ])
+        self.assertTrue(all(getattr(fp32, f"fp32_{part}") for part in train.FP32_PARTS))
         self.assertEqual(
             [args.boss_1_floor_increment, args.boss_2_floor_increment,
              args.boss_3_floor_increment],
@@ -122,6 +127,40 @@ print('restored')
         ])
         self.assertEqual((additive.potential_mode, additive.potential_health_weight),
                          ("additive", .01))
+
+    def test_all_fp32_parts_disable_bf16_autocast(self):
+        class Model:
+            fp32_parts = train.FP32_PARTS
+
+            def __call__(self, value, *_args, **_kwargs):
+                self.autocast = torch.is_autocast_enabled(value.device.type)
+                return value, value
+
+        model = Model()
+        result = train.predict(model, (torch.ones(1),) * 6, "bf16")
+        self.assertFalse(model.autocast)
+        self.assertTrue(all(value.dtype == torch.float32 for value in result))
+
+    def test_fp32_parts_cover_each_model_section(self):
+        env = train.sts2_sim.Batch(2, 84, 0)
+        model = train.Agent(dict(env.token_layout())).eval()
+        inputs = train.tensors(env.observe_tokens(), torch.device("cpu"), model)
+        sections = (
+            (next(iter(model.encoders.values())), model.action_encoder),
+            (model.global_transformer,),
+            (model.policy, model.critic),
+        )
+        for part, modules in zip(train.FP32_PARTS, sections):
+            dtypes = []
+            hooks = [module.register_forward_hook(
+                lambda _module, _inputs, output: dtypes.append(output.dtype)
+            ) for module in modules]
+            model.fp32_parts = (part,)
+            with torch.autocast("cpu", dtype=torch.bfloat16):
+                model(*inputs[:6])
+            for hook in hooks:
+                hook.remove()
+            self.assertTrue(dtypes and all(dtype == torch.float32 for dtype in dtypes), part)
 
     def test_sampler_seed_streams_are_disjoint(self):
         args = Namespace(

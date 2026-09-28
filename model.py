@@ -5,6 +5,7 @@ import math
 import os
 import struct
 import tempfile
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -22,6 +23,7 @@ POSITION_CAPS = dict(POSITION_CAPS)
 COMPATIBLE_MODEL_VERSIONS = (MODEL_VERSION - 1, MODEL_VERSION)
 DEFAULT_ARCHITECTURE = (128, 4, 8, 384)
 PRECISIONS = ("fp32", "bf16")
+FP32_PARTS = ("encoders", "backbone", "heads")
 WINNING_CAPACITY = 0
 CHANGE = "Current-floor plus resource-potential residual critic."
 COLLECTION_POOLING = ("sum", "transformer", "global_tokens")
@@ -1834,6 +1836,7 @@ class Agent(nn.Module):
         self._reuse_sequence_layouts = False
         self._sequence_layout_index = 0
         self.cache_stats = {"graph_hit": 0, "graph_miss": 0}
+        self.fp32_parts = ()
         nn.init.normal_(self.policy.weight, std=.01)
         nn.init.zeros_(self.policy.bias)
         nn.init.zeros_(self.critic.weight)
@@ -2170,7 +2173,11 @@ class Agent(nn.Module):
         semantic, numeric = values
         action_row, action_flat, _legal, policy_sequence, actions, path, action_count, \
             attachment_rows, *_ = index
-        action = self.action_encoder(semantic, numeric, concepts)[:action_count]
+        with torch.autocast(numeric.device.type, enabled=False) \
+                if "encoders" in self.fp32_parts else nullcontext():
+            action = self.action_encoder(
+                semantic, numeric.float(), concepts.float(),
+            )[:action_count]
         if action.device.type == "mps":
             arguments = tuple(value for domain, row in zip(encoded, domains) if len(row[9])
                               for value in (domain, row[6][row[9]]))
@@ -2360,25 +2367,36 @@ class Agent(nn.Module):
         if self._reuse_sequence_layouts:
             self._sequence_layout_index = 0
         concepts = self.concepts.flattened()
-        encoded = self.encode_domains(domains, concepts)
+        with torch.autocast(concepts.device.type, enabled=False) \
+                if "encoders" in self.fp32_parts else nullcontext():
+            encoded = self.encode_domains(domains, concepts)
         synchronize()
-        state, action, action_row, action_flat, actions, sequence = self.encode_state(
-            domains, encoded, state_index, action_values, action_index, concepts, len(character),
-        )
-        scores = _norm_head(action, self.global_norm, self.policy) / temperature
-        legal = torch.ones_like(scores, dtype=torch.bool)
-        scores = self.group_log_softmax(scores, legal, sequence)
-        synchronize()
-        if flat_policy:
-            policy = scores
-        else:
-            policy = scores.new_zeros(len(state) * actions).scatter(
-                0, action_flat, scores,
-            ).reshape(len(state), actions)
-        if policy_only:
-            return policy
-        output = policy, _norm_head(state, self.global_norm, self.critic)[:, None]
-        return (*output, self.global_norm(state)) if return_state else output
+        with torch.autocast(concepts.device.type, enabled=False) \
+                if "backbone" in self.fp32_parts else nullcontext():
+            if "backbone" in self.fp32_parts:
+                encoded = tuple(value.float() for value in encoded)
+            state, action, action_row, action_flat, actions, sequence = self.encode_state(
+                domains, encoded, state_index, action_values, action_index, concepts,
+                len(character),
+            )
+        with torch.autocast(concepts.device.type, enabled=False) \
+                if "heads" in self.fp32_parts else nullcontext():
+            if "heads" in self.fp32_parts:
+                state, action = state.float(), action.float()
+            scores = _norm_head(action, self.global_norm, self.policy) / temperature
+            legal = torch.ones_like(scores, dtype=torch.bool)
+            scores = self.group_log_softmax(scores, legal, sequence)
+            synchronize()
+            if flat_policy:
+                policy = scores
+            else:
+                policy = scores.new_zeros(len(state) * actions).scatter(
+                    0, action_flat, scores,
+                ).reshape(len(state), actions)
+            if policy_only:
+                return policy
+            output = policy, _norm_head(state, self.global_norm, self.critic)[:, None]
+            return (*output, self.global_norm(state)) if return_state else output
 
 
 def architecture(model):
@@ -2417,6 +2435,8 @@ def architecture(model):
 def predict(model, inputs, precision, temperature=1, policy_only=False, flat_policy=False):
     if precision not in PRECISIONS:
         raise ValueError("precision must be fp32 or bf16")
+    if all(part in model.fp32_parts for part in FP32_PARTS):
+        precision = "fp32"
     kind = inputs[0].device.type
     if precision != "fp32" and kind not in ("mps", "cuda"):
         raise ValueError(f"{precision} requires MPS or CUDA")
@@ -2432,14 +2452,20 @@ def predict(model, inputs, precision, temperature=1, policy_only=False, flat_pol
 def predict_cached(model, inputs, precision, temperature=1):
     state, action, offsets, action_rows = inputs
     kind = state.device.type
+    if all(part in model.fp32_parts for part in FP32_PARTS):
+        precision = "fp32"
     dtype = torch.bfloat16 if precision == "bf16" else torch.float16
     with torch.autocast(kind, dtype=dtype, enabled=precision != "fp32"):
-        scores = model.policy(action).squeeze(-1) / temperature
-        policy = model.group_log_softmax(
-            scores, torch.ones_like(scores, dtype=torch.bool),
-            (offsets, action_rows, None, None),
-        )
-        critic = model.critic(state)
+        with torch.autocast(kind, enabled=False) \
+                if "heads" in model.fp32_parts else nullcontext():
+            if "heads" in model.fp32_parts:
+                state, action = state.float(), action.float()
+            scores = model.policy(action).squeeze(-1) / temperature
+            policy = model.group_log_softmax(
+                scores, torch.ones_like(scores, dtype=torch.bool),
+                (offsets, action_rows, None, None),
+            )
+            critic = model.critic(state)
     return policy.float(), critic.float()
 
 
