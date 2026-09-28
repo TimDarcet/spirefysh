@@ -124,6 +124,13 @@ struct EncodingCache {
     rows: HashMap<(u64, u64), Vec<f32>>,
     maps: HashMap<Vec<u8>, Arc<MapEncoding>>,
     summaries: HashMap<(u64, u64), Vec<f32>>,
+    move_gru: GruCache,
+}
+
+#[derive(Default)]
+struct GruCache {
+    states: Vec<f32>,
+    edges: HashMap<(usize, u32), usize>,
 }
 
 struct GruWeights {
@@ -139,20 +146,57 @@ impl GruWeights {
         })
     }
 
-    fn apply(&self, sequence: impl IntoIterator<Item = Vec<f32>>, width: usize) -> Vec<f32> {
+    fn step(&self, input: &[f32], state: &mut [f32], width: usize) {
+        let input = self.input.apply(input);
+        let hidden = self.hidden.apply(state);
+        for column in 0..width {
+            let reset = sigmoid(input[column] + hidden[column]);
+            let update = sigmoid(input[width + column] + hidden[width + column]);
+            let candidate = (input[2 * width + column] + reset * hidden[2 * width + column]).tanh();
+            state[column] = (1.0 - update) * candidate + update * state[column];
+        }
+    }
+
+    fn apply<T: AsRef<[f32]>>(
+        &self,
+        sequence: impl IntoIterator<Item = T>,
+        width: usize,
+    ) -> Vec<f32> {
         let mut state = vec![0.0; width];
         for value in sequence {
-            let input = self.input.apply(&value);
-            let hidden = self.hidden.apply(&state);
-            for column in 0..width {
-                let reset = sigmoid(input[column] + hidden[column]);
-                let update = sigmoid(input[width + column] + hidden[width + column]);
-                let candidate =
-                    (input[2 * width + column] + reset * hidden[2 * width + column]).tanh();
-                state[column] = (1.0 - update) * candidate + update * state[column];
-            }
+            self.step(value.as_ref(), &mut state, width);
         }
         state
+    }
+
+    fn apply_cached(
+        &self,
+        sequence: impl IntoIterator<Item = u32>,
+        embeddings: &[f32],
+        width: usize,
+        cache: &mut GruCache,
+    ) -> Vec<f32> {
+        if cache.states.is_empty() {
+            cache.states.resize(width, 0.0);
+        }
+        let mut node = 0;
+        for code in sequence {
+            if let Some(&next) = cache.edges.get(&(node, code)) {
+                node = next;
+                continue;
+            }
+            let mut state = cache.states[node * width..][..width].to_vec();
+            self.step(
+                &embeddings[code as usize * width..][..width],
+                &mut state,
+                width,
+            );
+            let next = cache.states.len() / width;
+            cache.states.extend(state);
+            cache.edges.insert((node, code), next);
+            node = next;
+        }
+        cache.states[node * width..][..width].to_vec()
     }
 }
 
@@ -1064,12 +1108,11 @@ impl ValueModel {
                 .filter(|row| row.scope == STATE_SCOPE && row.u[0] == owner && row.u[1] == 1)
                 .collect::<Vec<_>>();
             moves.sort_by_key(|row| row.u[2]);
-            let history = self.move_gru.apply(
-                moves.into_iter().map(|row| {
-                    let code = row.c[0] as usize;
-                    self.semantic_embedding[code * self.width..][..self.width].to_vec()
-                }),
+            let history = self.move_gru.apply_cached(
+                moves.into_iter().map(|row| row.c[0]),
+                &self.semantic_embedding,
                 self.width,
+                &mut cache.move_gru,
             );
             value
                 .iter_mut()
@@ -1276,6 +1319,7 @@ impl ValueModel {
             tokens.extend(effects);
         }
         let action_count = observation.candidates.len();
+        let scoped = scoped_rows(&observation.domains, action_count);
         for (index, candidate) in observation.candidates.iter().enumerate() {
             let mut action = self.encode_values(
                 cache,
@@ -1284,17 +1328,12 @@ impl ValueModel {
                 &candidate.f,
                 &self.action_encoder,
             );
-            for domain in 0..DOMAIN_NAMES.len() {
-                for row in observation.domains[domain]
-                    .iter()
-                    .filter(|row| row.scope == index as i32)
-                {
-                    let value = self.encode(cache, domain, row);
-                    action
-                        .iter_mut()
-                        .zip(value)
-                        .for_each(|(left, right)| *left += right);
-                }
+            for &(domain, row) in &scoped[index] {
+                let value = self.encode(cache, domain, row);
+                action
+                    .iter_mut()
+                    .zip(value)
+                    .for_each(|(left, right)| *left += right);
             }
             if candidate.u[4] != NO_NODE {
                 action
@@ -1343,8 +1382,9 @@ impl ValueModel {
             .flat_map_iter(|observations| {
                 let index = rayon::current_thread_index().unwrap_or(0) % self.encode_caches.len();
                 let mut cache = self.encode_caches[index].lock().unwrap();
-                if cache.rows.len() > 65_536 {
+                if cache.rows.len() > 65_536 || cache.move_gru.states.len() > 65_536 * self.width {
                     cache.rows.clear();
+                    cache.move_gru = GruCache::default();
                 }
                 let mut sequences = observations
                     .iter()
@@ -1467,6 +1507,21 @@ impl ValueModel {
             );
         sigmoid(value / self.temperature + self.bias)
     }
+}
+
+fn scoped_rows(
+    domains: &[DomainRows; DOMAIN_NAMES.len()],
+    action_count: usize,
+) -> Vec<Vec<(usize, &DomainRow)>> {
+    let mut scoped = vec![Vec::new(); action_count];
+    for (domain, rows) in domains.iter().enumerate() {
+        for row in rows.iter().filter(|row| row.scope >= 0) {
+            if let Some(scoped) = scoped.get_mut(row.scope as usize) {
+                scoped.push((domain, row));
+            }
+        }
+    }
+    scoped
 }
 
 fn transformer_pool(index: usize, mode: u8) -> bool {
@@ -1804,6 +1859,79 @@ pub(super) fn valid_model_shape(
     feedforward: usize,
 ) -> bool {
     width > 0 && layers > 0 && heads > 0 && feedforward > 0 && width.is_multiple_of(heads)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cached_gru_matches_full_recurrence() {
+        let width = 2;
+        let weights = |offset| LinearWeights {
+            w: (0..12)
+                .map(|index| (index + offset) as f32 / 100.0)
+                .collect(),
+            b: (0..6).map(|index| (index + offset) as f32 / 50.0).collect(),
+        };
+        let gru = GruWeights {
+            input: weights(1),
+            hidden: weights(3),
+        };
+        let embeddings = vec![0.0, 0.0, 0.2, -0.1, -0.3, 0.4, 0.5, 0.6, -0.7, 0.8];
+        let mut cache = GruCache::default();
+        for codes in [
+            vec![],
+            vec![1, 2, 3],
+            vec![1, 2, 3],
+            vec![1, 2, 4],
+            vec![2, 3],
+        ] {
+            let expected = gru.apply(
+                codes
+                    .iter()
+                    .map(|&code| &embeddings[code * width..][..width]),
+                width,
+            );
+            let actual = gru.apply_cached(
+                codes.iter().map(|&code| code as u32),
+                &embeddings,
+                width,
+                &mut cache,
+            );
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(cache.states.len() / width, 7);
+    }
+
+    #[test]
+    fn scoped_rows_keep_domain_and_row_order() {
+        let row = |domain, scope, marker| {
+            let mut row = DomainRow::new(domain, scope);
+            row.u[0] = marker;
+            row
+        };
+        let mut domains = std::array::from_fn(|_| DomainRows::Owned(Vec::new()));
+        domains[0] = DomainRows::Owned(vec![row(0, 1, 1), row(0, -1, 2), row(0, 0, 3)]);
+        domains[2] = DomainRows::Owned(vec![row(2, 0, 4), row(2, 3, 5), row(2, 1, 6)]);
+        let scoped = scoped_rows(&domains, 2);
+        let keys = |rows: &[(usize, &DomainRow)]| {
+            rows.iter()
+                .map(|(domain, row)| (*domain, row.u[0]))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(keys(&scoped[0]), vec![(0, 3), (2, 4)]);
+        assert_eq!(keys(&scoped[1]), vec![(0, 1), (2, 6)]);
+    }
 }
 
 #[cfg(feature = "python")]
