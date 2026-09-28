@@ -874,7 +874,7 @@ def collect_worker(model, args, sampler_session, stage, capacity, pending_capaci
         seed_stride=collector.seed_stride, seed_limit=collector.seed_limit,
     )
     target = torch.device("mps") if os.environ.get("ACTOR_MPS") else torch.device("cpu")
-    precision = "bf16" if target.type == "mps" else "fp32"
+    precision = args.precision if target.type == "mps" else "fp32"
     if target.type == "mps":
         model = model.to(target)
         collector.torch_rng = torch.Generator(device=target).manual_seed(
