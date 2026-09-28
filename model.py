@@ -1248,8 +1248,58 @@ def _linear_forward(value_bfloat, weight, bias, residual=None):
     return output, weight_bfloat
 
 
+def _linear_backward(value, weight, grad_output):
+    grad_output = grad_output.to(torch.bfloat16).contiguous()
+    if value.device.type != "mps" or len(value) < 4096 or len(weight) not in (128, 384):
+        return torch.ops.aten.linear_backward(
+            value, grad_output, weight, [True, True, True],
+        )
+    if _FastLinear.backward_libraries is None:
+        source_128, source_384, _ = Path(__file__).with_name("linear.metal").read_text().split(
+            "// SPIREFYSH_KERNEL"
+        )
+        source_128 = source_128.replace(
+            "constant bool B_trans = true;", "constant bool B_trans = false;",
+        ).replace("linear_128_128", "linear_backward_128_128").replace(
+            "C->store_bfloat(", "C->store(",
+        )
+        source_384 = source_384.replace(
+            "constant uint N = 384;", "constant uint N = 128;",
+        ).replace(
+            "constant uint K = 128;", "constant uint K = 384;",
+        ).replace(
+            "constant uint A_leading_dimension = 128;",
+            "constant uint A_leading_dimension = 384;",
+        ).replace(
+            "constant uint C_leading_dimension = 384;",
+            "constant uint C_leading_dimension = 128;",
+        ).replace(
+            "constant bool B_trans = true;", "constant bool B_trans = false;",
+        ).replace("linear_128_384", "linear_backward_384_128").replace(
+            "C->store_bfloat(", "C->store(",
+        )
+        _FastLinear.backward_libraries = [
+            torch.mps.compile_shader(source_128), torch.mps.compile_shader(source_384),
+        ]
+        _FastLinear.zero = value.new_zeros(128)
+    grad_value = torch.empty_like(value)
+    getattr(
+        _FastLinear.backward_libraries[len(weight) != 128],
+        f"linear_backward_{len(weight)}_128",
+    )(
+        grad_output, weight, grad_value, _FastLinear.zero, len(value),
+        threads=(128, (len(value) + 31) // 32), group_size=(32, 1),
+    )
+    _, grad_weight, grad_bias = torch.ops.aten.linear_backward(
+        value, grad_output, weight, [False, True, True],
+    )
+    return grad_value, grad_weight, grad_bias
+
+
 class _FastLinear(torch.autograd.Function):
     libraries = None
+    backward_libraries = None
+    zero = None
 
     @staticmethod
     def forward(ctx, value, weight, bias):
@@ -1262,9 +1312,7 @@ class _FastLinear(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         value, weight = ctx.saved_tensors
-        grad_value, grad_weight, grad_bias = torch.ops.aten.linear_backward(
-            value, grad_output.to(torch.bfloat16), weight, [True, True, True],
-        )
+        grad_value, grad_weight, grad_bias = _linear_backward(value, weight, grad_output)
         return grad_value.to(ctx.value_dtype), grad_weight.float(), grad_bias.float()
 
 
@@ -1280,9 +1328,7 @@ class _LinearResidual(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         value, weight = ctx.saved_tensors
-        grad_value, grad_weight, grad_bias = torch.ops.aten.linear_backward(
-            value, grad_output.to(torch.bfloat16), weight, [True, True, True],
-        )
+        grad_value, grad_weight, grad_bias = _linear_backward(value, weight, grad_output)
         return grad_value.to(ctx.value_dtype), grad_weight.float(), grad_bias.float(), grad_output
 
 
@@ -1304,8 +1350,8 @@ class _NormLinear(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         value, gamma, normalized, stats, weight = ctx.saved_tensors
-        grad_normalized, grad_weight, grad_bias = torch.ops.aten.linear_backward(
-            normalized, grad_output.to(torch.bfloat16), weight, [True, True, True],
+        grad_normalized, grad_weight, grad_bias = _linear_backward(
+            normalized, weight, grad_output,
         )
         width = value.shape[1]
         grad_value = torch.empty_like(value)
