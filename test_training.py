@@ -648,12 +648,21 @@ print('restored')
                 "weights_revision": 0, "policy_revision": 0,
                 "training_elapsed_seconds": 0,
             }])
+            nested = root / "group/nested"; nested.mkdir(parents=True)
+            nested_manifest = self.manifest("nested", 1)
+            (nested / "run.json").write_text(json.dumps(nested_manifest))
             train.dashboard(root)
             html = (root / "dashboard.html").read_text()
-            self.assertIn('"step":0', html)
+            self.assertNotIn('"step":0', html)
+            self.assertIn('"group/nested"', html)
+            self.assertTrue(all(path in html for path in ("/api/catalog", "/api/run?run=")))
+            self.assertEqual(
+                train.DashboardSource(root).load("run", 999)["reports"][0]["step"], 0,
+            )
             self.assertFalse((run / "live.js").exists())
+            self.assertNotIn("<label>Branch", html)
             self.assertTrue(all(label in html for label in (
-                "Lineage", "Branch", "Compare", "Metrics", "Subsample", "Optimizer updates",
+                "Experiment", "Compare", "Metrics", "Subsample", "Optimizer updates",
                 "PPO policy loss", "Pre-clip global gradient norm",
                 "Decisions trained on",
                 "Committed optimizer updates/s", "Critic rows processed/s",
@@ -673,7 +682,6 @@ print('restored')
             self.assertIn("function clipComparison", html)
             self.assertIn("setFullRange([primary])", html)
             self.assertIn("compareSelect.onchange=()=>showVersion()", html)
-            self.assertIn("lineages=[...new Set(", html)
             self.assertIn(".localeCompare(", html)
             self.assertIn("latest=recency.at(-1)", html)
             self.assertIn("names=[...recency].sort(", html)
@@ -698,6 +706,13 @@ print('restored')
             self.assertIn("Plotly.extendTraces", html)
             self.assertIn("fetch(url", html)
             self.assertIn("row.step>step", html)
+
+    def test_api_json_replaces_non_finite_metrics_with_null(self):
+        value = {"gradient_norm": math.nan, "steps": [math.inf, -math.inf, 1.]}
+        self.assertEqual(
+            json.loads(train.json_bytes(value)),
+            {"gradient_norm": None, "steps": [None, None, 1.]},
+        )
 
     def test_dashboard_source_returns_only_new_points(self):
         with tempfile.TemporaryDirectory() as temporary:
