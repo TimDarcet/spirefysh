@@ -98,25 +98,25 @@ impl TokenEncoderWeights {
         table: &[f32],
         width: usize,
     ) -> Vec<f32> {
-        self.finish(semantic, table, width, self.numeric.apply(numeric))
+        let mut out = self.input(semantic, numeric, table, width);
+        layer_norm(&mut out, &self.norm_w, &self.norm_b);
+        out
     }
 
-    fn finish(&self, semantic: &[u32], table: &[f32], width: usize, mut out: Vec<f32>) -> Vec<f32> {
+    fn input(&self, semantic: &[u32], numeric: &[f32], table: &[f32], width: usize) -> Vec<f32> {
+        let mut out = self.numeric.apply(numeric);
         for &code in semantic.iter().filter(|&&code| code != 0) {
             let embedding = &table[code as usize * width..][..width];
             out.iter_mut()
                 .zip(embedding)
                 .for_each(|(value, embedding)| *value += embedding);
         }
-        layer_norm(&mut out, &self.norm_w, &self.norm_b);
         out
     }
 }
 
 struct MapEncoding {
     nodes: std::collections::BTreeMap<u32, Vec<f32>>,
-    key_values: Vec<Vec<f32>>,
-    current: Mutex<HashMap<u32, Vec<f32>>>,
 }
 
 #[derive(Default)]
@@ -205,12 +205,15 @@ pub struct ValueModel {
     layout: Layout,
     width: usize,
     heads: usize,
-    pooling: [u8; 13],
+    pooling: [u8; 11],
     semantic_embedding: Vec<f32>,
-    encoders: Vec<TokenEncoderWeights>,
+    encoders: Vec<Option<TokenEncoderWeights>>,
     action_encoder: TokenEncoderWeights,
+    map_node_embedding: Vec<f32>,
     summary_seed: Vec<Vec<f32>>,
     pool_layers: Vec<Option<TransformerLayer>>,
+    relic_pool_projection: LinearWeights,
+    pael_cards: LinearWeights,
     move_gru: GruWeights,
     continuation_gru: Option<GruWeights>,
     actor_norm_w: Vec<f32>,
@@ -224,9 +227,7 @@ pub struct ValueModel {
     graph_norm_b: Vec<f32>,
     graph_query: LinearWeights,
     graph_key_value: LinearWeights,
-    graph_edge: LinearWeights,
     graph_out: LinearWeights,
-    graph_degree: LinearWeights,
     graph_ff_norm_w: Vec<f32>,
     graph_ff_norm_b: Vec<f32>,
     graph_ff1: LinearWeights,
@@ -250,7 +251,7 @@ impl ValueModel {
         let magic = take_bytes(&mut input, 8)?;
         let model_version = read_u32(&mut input)?;
         if magic != MAGIC
-            || !(MIN_VALUE_MODEL_VERSION..=VALUE_MODEL_VERSION).contains(&model_version)
+            || model_version != VALUE_MODEL_VERSION
             || read_u32(&mut input)? != VERSION
             || read_u64(&mut input)? != content_fingerprint(content)
         {
@@ -287,7 +288,7 @@ impl ValueModel {
         let position_caps = (0..POSITION_CAPS.len())
             .map(|_| read_u32(&mut input))
             .collect::<io::Result<Vec<_>>>()?;
-        let pooling = <[u8; 13]>::try_from(take_bytes(&mut input, 13)?).unwrap();
+        let pooling = <[u8; 11]>::try_from(take_bytes(&mut input, 11)?).unwrap();
         let flags = take_bytes(&mut input, 1)?[0];
         let actor = flags & 1 != 0;
         let potential_health_multiplier = model_version < 75 || flags & 2 == 0;
@@ -327,17 +328,25 @@ impl ValueModel {
             return Err(invalid("invalid value calibration"));
         }
         let semantic_embedding = read_f32s(&mut input, concept_vocab as usize * width)?;
+        let map_node_embedding = read_f32s(&mut input, MAP_NODE_KINDS * width)?;
         let encoders = DOMAIN_WIDTHS
             .iter()
-            .map(|&(_, _, semantic, numeric)| {
-                TokenEncoderWeights::read(&mut input, semantic, numeric, width)
+            .enumerate()
+            .map(|(domain, &(_, _, semantic, numeric))| {
+                if matches!(domain, POTION_DOMAIN | MAP_EDGE_DOMAIN) {
+                    Ok(None)
+                } else {
+                    TokenEncoderWeights::read(&mut input, semantic, numeric, width).map(Some)
+                }
             })
             .collect::<io::Result<Vec<_>>>()?;
         let action_encoder = TokenEncoderWeights::read(&mut input, ACTION_C, ACTION_F, width)?;
-        let summary_seed = (0..17)
+        let summary_seed = (0..11)
             .map(|_| read_f32s(&mut input, width))
             .collect::<io::Result<Vec<_>>>()?;
-        let mut pool_layers = Vec::with_capacity(13);
+        let relic_pool_projection = LinearWeights::read_without_bias(&mut input, width, width)?;
+        let pael_cards = LinearWeights::read_without_bias(&mut input, width, width)?;
+        let mut pool_layers = Vec::with_capacity(11);
         for (index, &mode) in pooling.iter().enumerate() {
             pool_layers.push(if transformer_pool(index, mode) {
                 Some(read_transformer_layers(&mut input, 1, width, feedforward)?.remove(0))
@@ -360,9 +369,7 @@ impl ValueModel {
         let graph_norm_b = read_f32s(&mut input, width)?;
         let graph_query = LinearWeights::read(&mut input, width, width)?;
         let graph_key_value = LinearWeights::read(&mut input, width, 2 * width)?;
-        let graph_edge = LinearWeights::read_without_bias(&mut input, width, 2 * width)?;
         let graph_out = LinearWeights::read(&mut input, width, width)?;
-        let graph_degree = LinearWeights::read_without_bias(&mut input, 2, width)?;
         let graph_ff_norm_w = read_f32s(&mut input, width)?;
         let graph_ff_norm_b = read_f32s(&mut input, width)?;
         let graph_ff1 = LinearWeights::read(&mut input, width, feedforward)?;
@@ -382,8 +389,11 @@ impl ValueModel {
             semantic_embedding,
             encoders,
             action_encoder,
+            map_node_embedding,
             summary_seed,
             pool_layers,
+            relic_pool_projection,
+            pael_cards,
             move_gru,
             continuation_gru,
             actor_norm_w,
@@ -397,9 +407,7 @@ impl ValueModel {
             graph_norm_b,
             graph_query,
             graph_key_value,
-            graph_edge,
             graph_out,
-            graph_degree,
             graph_ff_norm_w,
             graph_ff_norm_b,
             graph_ff1,
@@ -420,7 +428,7 @@ impl ValueModel {
     }
 
     #[cfg(test)]
-    pub(super) fn candidate_object_key(observation: &ObservationV56, index: usize) -> (u32, u32) {
+    pub(super) fn candidate_object_key(observation: &Observation, index: usize) -> (u32, u32) {
         let candidate = &observation.candidates[index];
         (candidate.u[0], candidate.u[14])
     }
@@ -450,7 +458,32 @@ impl ValueModel {
     }
 
     fn encode(&self, cache: &mut EncodingCache, domain: usize, row: &DomainRow) -> Vec<f32> {
-        self.encode_values(cache, domain, &row.c, &row.f, &self.encoders[domain])
+        if domain == POTION_DOMAIN {
+            return self.semantic_embedding[row.c[0] as usize * self.width..][..self.width]
+                .to_vec();
+        }
+        let encoder = self.encoders[domain]
+            .as_ref()
+            .expect("domain has no encoder");
+        if domain == MAP_NODE_DOMAIN {
+            let mut value = encoder.input(&row.c, &row.f, &self.semantic_embedding, self.width);
+            value
+                .iter_mut()
+                .zip(&self.map_node_embedding[row.u[1] as usize * self.width..][..self.width])
+                .for_each(|(left, right)| *left += right);
+            layer_norm(&mut value, &encoder.norm_w, &encoder.norm_b);
+            return value;
+        }
+        self.encode_values(cache, domain, &row.c, &row.f, encoder)
+    }
+
+    fn encode_phase(&self, row: &DomainRow) -> Vec<f32> {
+        self.encoders[PHASE_DOMAIN].as_ref().unwrap().input(
+            &row.c,
+            &row.f,
+            &self.semantic_embedding,
+            self.width,
+        )
     }
 
     fn tag(&self, mut value: Vec<f32>, role: u32, collection: Option<u32>) -> Vec<f32> {
@@ -467,6 +500,43 @@ impl ValueModel {
             {
                 *sum += embedding;
             }
+        }
+        value
+    }
+
+    fn add_embedding(&self, value: &mut [f32], semantic: Semantic, index: u32) {
+        value
+            .iter_mut()
+            .zip(self.embedding(semantic, index))
+            .for_each(|(left, right)| *left += right);
+    }
+
+    fn card_context(&self, row: &DomainRow, mut value: Vec<f32>) -> Vec<f32> {
+        if row.u[0] == DRAW_ZONE as u32 && row.u[3] > 0 {
+            let semantic = if row.u[2] == 1 {
+                Semantic::DrawTopPosition
+            } else {
+                Semantic::DrawBottomPosition
+            };
+            self.add_embedding(&mut value, semantic, row.u[3].saturating_sub(1).min(256));
+        }
+        if row.u[19] > 0 {
+            self.add_embedding(
+                &mut value,
+                Semantic::DeckOrigin,
+                row.u[19].saturating_sub(1).min(256),
+            );
+        }
+        value
+    }
+
+    fn relic_context(&self, row: &DomainRow, mut value: Vec<f32>) -> Vec<f32> {
+        if row.u[2] > 0 {
+            self.add_embedding(
+                &mut value,
+                Semantic::RelicPosition,
+                row.u[2].saturating_sub(1).min(256),
+            );
         }
         value
     }
@@ -880,7 +950,7 @@ impl ValueModel {
 
     fn map(
         &self,
-        observation: &ObservationV56,
+        observation: &Observation,
         current: u32,
         cache: &mut EncodingCache,
     ) -> (Vec<f32>, Arc<MapEncoding>) {
@@ -931,13 +1001,19 @@ impl ValueModel {
                     let edges = observation.domains[MAP_EDGE_DOMAIN]
                         .iter()
                         .filter(|row| row.scope == STATE_SCOPE)
-                        .map(|row| (row, self.encode(cache, MAP_EDGE_DOMAIN, row)))
                         .collect::<Vec<_>>();
                     let mut encoded = nodes
                         .iter()
                         .map(|row| (row.u[0], self.encode(cache, MAP_NODE_DOMAIN, row)))
                         .collect::<std::collections::BTreeMap<_, _>>();
-                    let mut levels = nodes.iter().map(|row| row.u[8]).collect::<Vec<_>>();
+                    let mut ranks = nodes
+                        .iter()
+                        .map(|row| (row.u[0], 0u32))
+                        .collect::<std::collections::BTreeMap<_, _>>();
+                    for edge in &edges {
+                        ranks.insert(edge.u[1], ranks[&edge.u[1]].max(ranks[&edge.u[0]] + 1));
+                    }
+                    let mut levels = ranks.values().copied().collect::<Vec<_>>();
                     levels.sort_unstable();
                     levels.dedup();
                     for level in levels.into_iter().rev() {
@@ -952,31 +1028,25 @@ impl ValueModel {
                             .collect::<std::collections::BTreeMap<_, _>>();
                         let updates = nodes
                             .iter()
-                            .filter(|row| row.u[8] == level && row.u[9] > 0)
+                            .filter(|row| {
+                                ranks[&row.u[0]] == level
+                                    && edges.iter().any(|edge| edge.u[0] == row.u[0])
+                            })
                             .map(|row| {
                                 let id = row.u[0];
                                 let query = self.graph_query.apply(&normalized_nodes[&id]);
                                 let children = edges
                                     .iter()
-                                    .filter(|(edge, _)| edge.u[0] == id)
-                                    .map(|(edge, value)| {
-                                        self.graph_key_value
-                                            .apply(&normalized_nodes[&edge.u[1]])
-                                            .into_iter()
-                                            .zip(self.graph_edge.apply(value))
-                                            .map(|(left, right)| left + right)
-                                            .collect::<Vec<_>>()
+                                    .filter(|edge| edge.u[0] == id)
+                                    .map(|edge| {
+                                        self.graph_key_value.apply(&normalized_nodes[&edge.u[1]])
                                     })
                                     .collect::<Vec<_>>();
                                 let mut value = encoded[&id].clone();
                                 let attention =
                                     self.graph_out.apply(&self.attention(&query, &children, 0));
-                                let degree = self.graph_degree.apply(&[
-                                    row.u[9] as f32 / 8.0,
-                                    (row.u[9] as f32).ln_1p() / 3.0,
-                                ]);
                                 for column in 0..self.width {
-                                    value[column] += attention[column] + degree[column];
+                                    value[column] += attention[column];
                                 }
                                 let hidden = dense_gelu(
                                     &normalized(
@@ -1003,21 +1073,7 @@ impl ValueModel {
                         cache.maps.clear();
                         cache.shared_maps.clear();
                     }
-                    let key_values = encoded
-                        .values()
-                        .map(|value| {
-                            self.graph_key_value.apply(&normalized(
-                                value,
-                                &self.graph_norm_w,
-                                &self.graph_norm_b,
-                            ))
-                        })
-                        .collect();
-                    let encoded = Arc::new(MapEncoding {
-                        nodes: encoded,
-                        key_values,
-                        current: Mutex::default(),
-                    });
+                    let encoded = Arc::new(MapEncoding { nodes: encoded });
                     cache.maps.insert(key, Arc::clone(&encoded));
                     encoded
                 });
@@ -1029,39 +1085,7 @@ impl ValueModel {
                 }
                 encoded
             });
-        let cached = encoded.current.lock().unwrap().get(&current).cloned();
-        if let Some(selected) = cached {
-            return (selected, encoded);
-        }
-        let mut selected = encoded.nodes[&current].clone();
-        let query = self.graph_query.apply(&normalized(
-            &selected,
-            &self.graph_norm_w,
-            &self.graph_norm_b,
-        ));
-        for (left, right) in selected
-            .iter_mut()
-            .zip(
-                self.graph_out
-                    .apply(&self.attention(&query, &encoded.key_values, 0)),
-            )
-        {
-            *left += right;
-        }
-        let hidden = dense_gelu(
-            &normalized(&selected, &self.graph_ff_norm_w, &self.graph_ff_norm_b),
-            &self.graph_ff1.w,
-            &self.graph_ff1.b,
-        );
-        for (left, right) in selected.iter_mut().zip(self.graph_ff2.apply(&hidden)) {
-            *left += right;
-        }
-        encoded
-            .current
-            .lock()
-            .unwrap()
-            .insert(current, selected.clone());
-        (selected, encoded)
+        (encoded.nodes[&current].clone(), encoded)
     }
 
     fn collection(&self, mut values: Vec<Vec<f32>>, name: usize, collection: u32) -> Vec<Vec<f32>> {
@@ -1069,31 +1093,31 @@ impl ValueModel {
         if mode == 2 {
             return values
                 .into_iter()
-                .map(|value| self.tag(value, 9, Some(collection)))
+                .map(|value| self.tag(value, 5, Some(collection)))
                 .collect();
         }
         vec![self.tag(
             self.summarize(name, mode, std::mem::take(&mut values)),
-            14,
+            10,
             Some(collection),
         )]
     }
 
-    fn generation(
+    fn bag(
         &self,
-        observation: &ObservationV56,
+        observation: &Observation,
         cache: &mut EncodingCache,
         domain: usize,
         zone: impl Fn(u32) -> bool,
-        name: usize,
         role: u32,
+        projection: Option<&LinearWeights>,
     ) -> Vec<f32> {
         let rows = observation.domains[domain]
             .iter()
             .filter(|row| row.scope == STATE_SCOPE && zone(row.u[0]))
             .collect::<Vec<_>>();
         let mut key = (0xcbf2_9ce4_8422_2325, 0x9e37_79b9_7f4a_7c15);
-        for value in std::iter::once(name as u32).chain(rows.iter().flat_map(|row| {
+        for value in std::iter::once(role).chain(rows.iter().flat_map(|row| {
             row.u
                 .iter()
                 .copied()
@@ -1109,14 +1133,22 @@ impl ValueModel {
             .into_iter()
             .map(|row| self.encode(cache, domain, row))
             .collect();
-        let value = self.tag(self.summarize(name, self.pooling[12], values), role, None);
+        let summary = self.summarize(0, 0, values);
+        let value = self.tag(
+            match projection {
+                Some(layer) => layer.apply(&summary),
+                None => summary,
+            },
+            role,
+            None,
+        );
         cache.summaries.insert(key, value.clone());
         value
     }
 
     fn actors(
         &self,
-        observation: &ObservationV56,
+        observation: &Observation,
         cache: &mut EncodingCache,
     ) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
         let mut actors = observation.domains[ACTOR_DOMAIN]
@@ -1169,7 +1201,7 @@ impl ValueModel {
                 effects_out.extend(
                     effects
                         .into_iter()
-                        .map(|effect| self.tag(effect, 10, Some(if index == 8 { 9 } else { 8 }))),
+                        .map(|effect| self.tag(effect, 6, Some(if index == 8 { 9 } else { 8 }))),
                 );
             } else {
                 let pooled =
@@ -1180,10 +1212,10 @@ impl ValueModel {
                         .zip(pooled)
                         .for_each(|(left, right)| *left += right);
                 } else {
-                    effects_out.push(self.tag(pooled, 10, Some(if index == 8 { 9 } else { 8 })));
+                    effects_out.push(self.tag(pooled, 6, Some(if index == 8 { 9 } else { 8 })));
                 }
             }
-            value = self.tag(value, 8, None);
+            value = self.tag(value, 4, None);
             layer_norm(&mut value, &self.actor_norm_w, &self.actor_norm_b);
             values.push(value);
         }
@@ -1192,7 +1224,7 @@ impl ValueModel {
 
     fn continuation_items(
         &self,
-        observation: &ObservationV56,
+        observation: &Observation,
         cache: &mut EncodingCache,
     ) -> Vec<Vec<f32>> {
         let mut rows = observation.domains[CONTINUATION_DOMAIN]
@@ -1219,7 +1251,7 @@ impl ValueModel {
 
     fn state_tokens(
         &self,
-        observation: &ObservationV56,
+        observation: &Observation,
         cache: &mut EncodingCache,
     ) -> (Vec<Vec<f32>>, usize) {
         let state_rows = |domain: usize| {
@@ -1229,64 +1261,74 @@ impl ValueModel {
                 .collect::<Vec<_>>()
         };
         let run = state_rows(RUN_DOMAIN);
-        let current_id = run[0].u[23];
+        let current_id = run[0].u[22];
         let (map, nodes) = self.map(observation, current_id, cache);
-        let mut phase = state_rows(PHASE_DOMAIN)
-            .into_iter()
-            .map(|row| self.encode(cache, PHASE_DOMAIN, row))
-            .collect::<Vec<_>>();
+        let mut payload = vec![0.0; self.width];
         for domain in 0..DOMAIN_NAMES.len() {
-            phase.extend(
-                observation.domains[domain]
-                    .iter()
-                    .filter(|row| row.scope == PHASE_SCOPE)
-                    .map(|row| self.encode(cache, domain, row)),
-            );
+            for row in observation.domains[domain]
+                .iter()
+                .filter(|row| row.scope == PHASE_SCOPE)
+            {
+                payload
+                    .iter_mut()
+                    .zip(self.encode(cache, domain, row))
+                    .for_each(|(left, right)| *left += right);
+            }
         }
-        let generation = [
-            self.generation(
-                observation,
-                cache,
-                CARD_DOMAIN,
-                |zone| zone == CARD_POOL_ZONE as u32,
-                13,
-                4,
-            ),
-            self.generation(
+        let bags = [
+            self.bag(
                 observation,
                 cache,
                 RELIC_DOMAIN,
-                |zone| matches!(zone, 1 | 2),
-                14,
-                5,
+                |zone| zone == 1,
+                1,
+                Some(&self.relic_pool_projection),
             ),
-            self.generation(
+            self.bag(
                 observation,
                 cache,
                 ENCOUNTER_DOMAIN,
-                |zone| zone <= 2,
-                15,
-                6,
+                |zone| matches!(zone, 1 | 2),
+                2,
+                None,
             ),
-            self.generation(observation, cache, EVENT_DOMAIN, |zone| zone == 0, 16, 7),
+            self.bag(observation, cache, EVENT_DOMAIN, |zone| zone == 0, 3, None),
         ];
-        let mut tokens = vec![
-            self.tag(self.encode(cache, RUN_DOMAIN, run[0]), 1, None),
-            self.tag(self.summarize(11, self.pooling[11], phase), 2, None),
-            self.tag(map, 3, None),
-        ];
-        tokens.extend(generation);
+        let run = self.encode(cache, RUN_DOMAIN, run[0]);
+        let mut tokens = Vec::new();
+        for row in state_rows(PHASE_DOMAIN) {
+            let mut phase = self.encode_phase(row);
+            if row.u[3] != 0 {
+                phase
+                    .iter_mut()
+                    .zip(&payload)
+                    .for_each(|(left, right)| *left += right);
+            }
+            layer_norm(
+                &mut phase,
+                &self.encoders[PHASE_DOMAIN].as_ref().unwrap().norm_w,
+                &self.encoders[PHASE_DOMAIN].as_ref().unwrap().norm_b,
+            );
+            tokens.push(phase);
+        }
+        tokens.push(self.tag(map, 0, None));
+        tokens.extend(bags);
         let cards = state_rows(CARD_DOMAIN);
         let deck = cards
             .iter()
             .filter(|row| row.u[0] == 0)
-            .map(|row| self.encode(cache, CARD_DOMAIN, row))
+            .map(|row| self.card_context(row, self.encode(cache, CARD_DOMAIN, row)))
             .collect();
         tokens.append(&mut self.collection(deck, 1, 0));
         let mut relics = state_rows(RELIC_DOMAIN)
             .into_iter()
             .filter(|row| row.u[0] == 0)
-            .map(|row| (row, self.encode(cache, RELIC_DOMAIN, row)))
+            .map(|row| {
+                (
+                    row,
+                    self.relic_context(row, self.encode(cache, RELIC_DOMAIN, row)),
+                )
+            })
             .collect::<Vec<_>>();
         let stored = cards
             .iter()
@@ -1298,6 +1340,7 @@ impl ValueModel {
                     .for_each(|(left, right)| *left += right);
                 sum
             });
+        let stored = self.pael_cards.apply(&stored);
         for (row, value) in &mut relics {
             if row.u[9] != 0 {
                 value
@@ -1322,19 +1365,19 @@ impl ValueModel {
             tokens.extend(
                 continuations
                     .into_iter()
-                    .map(|value| self.tag(value, 11, Some(10))),
+                    .map(|value| self.tag(value, 7, Some(10))),
             );
         } else {
             tokens.push(self.tag(
                 self.summarize(10, self.pooling[10], continuations),
-                14,
+                10,
                 Some(10),
             ));
         }
         tokens.extend(
             state_rows(CRYSTAL_DOMAIN)
                 .into_iter()
-                .map(|row| self.tag(self.encode(cache, CRYSTAL_DOMAIN, row), 12, None)),
+                .map(|row| self.tag(self.encode(cache, CRYSTAL_DOMAIN, row), 8, None)),
         );
         if !state_rows(ACTOR_DOMAIN).is_empty() {
             let (actors, effects) = self.actors(observation, cache);
@@ -1343,7 +1386,7 @@ impl ValueModel {
                 let values = cards
                     .iter()
                     .filter(|row| row.u[0] == zone)
-                    .map(|row| self.encode(cache, CARD_DOMAIN, row))
+                    .map(|row| self.card_context(row, self.encode(cache, CARD_DOMAIN, row)))
                     .collect();
                 tokens.append(&mut self.collection(values, name, collection));
             }
@@ -1365,7 +1408,11 @@ impl ValueModel {
                 &self.action_encoder,
             );
             for &(domain, row) in &scoped[index] {
-                let value = self.encode(cache, domain, row);
+                let value = if domain == CARD_DOMAIN {
+                    self.card_context(row, self.encode(cache, domain, row))
+                } else {
+                    self.encode(cache, domain, row)
+                };
                 action
                     .iter_mut()
                     .zip(value)
@@ -1377,19 +1424,19 @@ impl ValueModel {
                     .zip(&nodes.nodes[&candidate.u[4]])
                     .for_each(|(left, right)| *left += right);
             }
-            action = self.tag(action, 13, None);
+            action = self.tag(action, 9, None);
             layer_norm(&mut action, &self.action_norm_w, &self.action_norm_b);
             tokens.push(action);
         }
         let action_start = tokens.len() - action_count + 1;
-        let mut sequence = vec![self.embedding(Semantic::TokenRole, 0).to_vec()];
+        let mut sequence = vec![run];
         sequence.extend(tokens);
         (sequence, action_start)
     }
 
     fn state_actions(
         &self,
-        observation: &ObservationV56,
+        observation: &Observation,
         cache: &mut EncodingCache,
     ) -> (Vec<f32>, Vec<Vec<f32>>) {
         let (mut sequence, action_start) = self.state_tokens(observation, cache);
@@ -1409,10 +1456,7 @@ impl ValueModel {
     }
 
     #[cfg(feature = "python")]
-    fn state_actions_batch(
-        &self,
-        observations: &[&ObservationV56],
-    ) -> Vec<(Vec<f32>, Vec<Vec<f32>>)> {
+    fn state_actions_batch(&self, observations: &[&Observation]) -> Vec<(Vec<f32>, Vec<Vec<f32>>)> {
         observations
             .par_chunks(8)
             .flat_map_iter(|observations| {
@@ -1435,14 +1479,14 @@ impl ValueModel {
             .collect()
     }
 
-    fn state(&self, observation: &ObservationV56) -> Vec<f32> {
+    fn state(&self, observation: &Observation) -> Vec<f32> {
         self.state_actions(observation, &mut EncodingCache::default())
             .0
     }
 
     fn evaluate(
         &self,
-        observation: &ObservationV56,
+        observation: &Observation,
         temperature: f32,
         cache: &mut EncodingCache,
     ) -> io::Result<(Vec<f32>, f32, f32, Vec<f32>)> {
@@ -1477,7 +1521,7 @@ impl ValueModel {
 
     fn evaluate_batch(
         &self,
-        observations: &[&ObservationV56],
+        observations: &[&Observation],
         features: &[(Vec<f32>, Vec<Vec<f32>>)],
         temperature: f32,
         rollout_temperature: Option<f32>,
@@ -1534,7 +1578,7 @@ impl ValueModel {
             Phase::Dead => return 0.0,
             _ => {}
         }
-        let observation = observation_v56(game, content, self.layout, (0, 0));
+        let observation = build_observation(game, content, self.layout, (0, 0));
         let value = self.critic.apply(&self.state(&observation))[0]
             + potential_value(
                 &observation.potential,
@@ -1562,18 +1606,17 @@ fn scoped_rows(
 
 fn transformer_pool(index: usize, mode: u8) -> bool {
     match index {
-        0..=7 | 11 | 12 => mode == 1,
+        0..=7 => mode == 1,
         8 | 9 => matches!(mode, 1 | 3),
         10 => mode == 1,
         _ => false,
     }
 }
 
-fn valid_pooling(pooling: [u8; 13]) -> bool {
+fn valid_pooling(pooling: [u8; 11]) -> bool {
     pooling[..8].iter().all(|&mode| mode <= 2)
         && pooling[8..10].iter().all(|&mode| mode <= 4)
         && pooling[10] <= 3
-        && pooling[11..].iter().all(|&mode| mode <= 1)
 }
 
 fn linear(input: &[f32], weights: &[f32], bias: &[f32]) -> Vec<f32> {

@@ -219,7 +219,7 @@ fn later_acts_reveal_their_floor_zero_ancient_deterministically() {
         assert!(allowed.contains(&content.events[event as usize].id));
         assert_eq!(first.run.floor, 1);
         assert_eq!(first.run.hp, 66);
-        assert_eq!(first.rngs.up_front.1, draws + 1);
+        assert_eq!(first.rngs.up_front.1, draws);
         assert_eq!(format!("{:?}", first), format!("{:?}", second));
     }
 }
@@ -391,6 +391,54 @@ fn forced_run_choice_finishes_when_candidates_run_out() {
     assert_eq!(game.run.deck[0].upgrades, 1);
     assert!(matches!(game.phase, Phase::Rewards(_)));
     assert!(!game.actions(&content).is_empty());
+}
+
+#[test]
+fn cooking_uses_a_cancelable_completion() {
+    let content = foundation_content();
+    let mut game = Game::new_character_ascension(&content, 1, 0, 0).unwrap();
+    game.phase = Phase::Rest;
+    game.run
+        .relics
+        .push(content.relic_id("RELIC.MEAT_CLEAVER").unwrap());
+    let max_hp = game.run.max_hp;
+    game.step(&content, Action::Cook).unwrap();
+    assert_eq!(game.run_queue.last(), Some(&RunEffect::FinishCooking));
+    game.step(&content, Action::Cancel).unwrap();
+    assert!(game.run_queue.is_empty());
+    assert_eq!(game.run.max_hp, max_hp);
+    game.step(&content, Action::Cook).unwrap();
+    for _ in 0..2 {
+        let action = game
+            .actions(&content)
+            .into_iter()
+            .find(|action| matches!(action, Action::RemoveCard(_)))
+            .unwrap();
+        game.step(&content, action).unwrap();
+    }
+    assert_eq!(game.run.max_hp, max_hp + 9);
+}
+
+#[test]
+fn neows_bones_curse_is_a_reward_completion() {
+    let content = foundation_content();
+    let mut game = Game::new_character_ascension(&content, 1, 0, 0).unwrap();
+    let relic = content.relic_id("RELIC.CIRCLET").unwrap();
+    game.phase = Phase::Rewards(Rewards {
+        gold: 0,
+        cards: vec![],
+        card_rewards: vec![],
+        relics: vec![relic, relic],
+        potions: vec![],
+        removals: 0,
+    });
+    game.reward_continuation = Some(RewardContinuation::AddRandomCurse);
+    let cards = game.run.deck.len();
+    game.step(&content, Action::RewardRelic(0)).unwrap();
+    assert!(game.reward_continuation.is_some());
+    game.step(&content, Action::RewardRelic(0)).unwrap();
+    assert!(game.reward_continuation.is_none());
+    assert_eq!(game.run.deck.len(), cards + 1);
 }
 
 #[test]

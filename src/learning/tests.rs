@@ -306,8 +306,8 @@ fn v56_distinguishes_remaining_encounter_bags_with_the_same_last_encounter() {
     assert_eq!(first.last_encounter, second.last_encounter);
     assert_ne!(first.encounters, second.encounters);
     assert_ne!(
-        v56_bytes(&observation_v56(&first, &content, layout, (0, 0))),
-        v56_bytes(&observation_v56(&second, &content, layout, (0, 0)))
+        observation_bytes(&build_observation(&first, &content, layout, (0, 0))),
+        observation_bytes(&build_observation(&second, &content, layout, (0, 0)))
     );
     assert_eq!(first.next_encounter(&content, false), Some(second_id));
     assert_eq!(second.next_encounter(&content, false), Some(first_id));
@@ -660,7 +660,7 @@ fn v62_packed_observation_has_no_direct_globals_and_is_digest_protected() {
     let layout = Layout::new(&content);
     let mut game = Game::new_character_ascension(&content, 600, 0, 10).unwrap();
     game.begin_act(&content, 0).unwrap();
-    let observation = observation_v56(&game, &content, layout, (3, 4));
+    let observation = build_observation(&game, &content, layout, (3, 4));
     let (globals, counts, mut exact, actions, digest) = packed_observation(&observation);
     assert_eq!(observation_digest(&observation), digest);
     assert_eq!(globals, observation.globals);
@@ -1021,16 +1021,17 @@ fn v36_play_draw_and_exhaust_hooks_match_play() {
 
 fn model_row_bytes(domain: usize, row: &DomainRow) -> Vec<u8> {
     let structural: &[usize] = match domain {
-        RUN_DOMAIN => &[23],
-        CARD_DOMAIN => &[0],
+        RUN_DOMAIN => &[22],
+        CARD_DOMAIN => &[0, 2, 3, 19],
         ACTOR_DOMAIN | POWER_DOMAIN | HISTORY_DOMAIN => &[0],
         STATUS_DOMAIN => &[0, 1],
-        RELIC_DOMAIN | EVENT_DOMAIN | ENCOUNTER_DOMAIN => &[0],
-        POTION_DOMAIN => &[1],
+        RELIC_DOMAIN => &[0, 2],
+        EVENT_DOMAIN | ENCOUNTER_DOMAIN => &[],
+        POTION_DOMAIN => &[],
         ORB_DOMAIN => &[0],
         CRYSTAL_DOMAIN => &[7],
         CONTINUATION_DOMAIN => &[2, 3, 5],
-        MAP_NODE_DOMAIN => &[0, 8, 9],
+        MAP_NODE_DOMAIN => &[0, 1],
         MAP_EDGE_DOMAIN => &[0, 1],
         _ => &[],
     };
@@ -1047,7 +1048,7 @@ fn model_row_bytes(domain: usize, row: &DomainRow) -> Vec<u8> {
     out
 }
 
-fn v56_candidate_bytes(observation: &ObservationV56, index: usize) -> Vec<u8> {
+fn candidate_bytes(observation: &Observation, index: usize) -> Vec<u8> {
     let row = &observation.candidates[index];
     let mut out = Vec::new();
     out.extend(row.u[1].to_le_bytes());
@@ -1068,7 +1069,7 @@ fn v56_candidate_bytes(observation: &ObservationV56, index: usize) -> Vec<u8> {
     out
 }
 
-fn v56_bytes(observation: &ObservationV56) -> Vec<u8> {
+fn observation_bytes(observation: &Observation) -> Vec<u8> {
     let mut out = vec![observation.character];
     observation
         .globals
@@ -1085,7 +1086,7 @@ fn v56_bytes(observation: &ObservationV56) -> Vec<u8> {
         }
     }
     let mut candidates = (0..observation.candidates.len())
-        .map(|index| v56_candidate_bytes(observation, index))
+        .map(|index| candidate_bytes(observation, index))
         .collect::<Vec<_>>();
     candidates.sort();
     out.extend((candidates.len() as u32).to_le_bytes());
@@ -1118,8 +1119,8 @@ fn v53_observation_is_canonical_under_hidden_resampling() {
     resample_hidden(&mut first, &content, 17);
     resample_hidden(&mut second, &content, 99);
     assert_eq!(
-        v56_bytes(&observation_v56(&first, &content, layout, (0, 0))),
-        v56_bytes(&observation_v56(&second, &content, layout, (0, 0)))
+        observation_bytes(&build_observation(&first, &content, layout, (0, 0))),
+        observation_bytes(&build_observation(&second, &content, layout, (0, 0)))
     );
 }
 
@@ -1131,7 +1132,7 @@ fn v56_public_state_mutations_change_observation() {
     game.begin_act(&content, 0).unwrap();
     game.start_combat(&content, content.acts[0].encounters[0])
         .unwrap();
-    let base = v56_bytes(&observation_v56(&game, &content, layout, (0, 0)));
+    let base = observation_bytes(&build_observation(&game, &content, layout, (0, 0)));
     for mutation in 0..4 {
         let mut changed = game.clone();
         match mutation {
@@ -1151,7 +1152,7 @@ fn v56_public_state_mutations_change_observation() {
             _ => unreachable!(),
         }
         assert_ne!(
-            v56_bytes(&observation_v56(&changed, &content, layout, (0, 0))),
+            observation_bytes(&build_observation(&changed, &content, layout, (0, 0))),
             base,
             "public mutation {mutation} was not observed"
         );
@@ -1179,7 +1180,7 @@ fn v53_combat_choice_keeps_typed_filter_and_operation_fields() {
     combat.enemy_turn = true;
     combat.ending = true;
     combat.force_end = true;
-    let row = phase_domain_row(&game, &content);
+    let row = phase_domain_row(&game, &content, &game.phase, false);
     assert_eq!(
         &row.u[5..16],
         &[
@@ -1224,8 +1225,8 @@ fn v53_map_is_relabel_invariant_and_edge_sensitive() {
         .into();
     second.map.current = first.map.current.map(|current| inverse[current]);
     assert_eq!(
-        v56_bytes(&observation_v56(&first, &content, layout, (0, 0))),
-        v56_bytes(&observation_v56(&second, &content, layout, (0, 0)))
+        observation_bytes(&build_observation(&first, &content, layout, (0, 0))),
+        observation_bytes(&build_observation(&second, &content, layout, (0, 0)))
     );
     let mut changed = first.clone();
     let node = std::sync::Arc::make_mut(&mut changed.map.nodes)
@@ -1234,8 +1235,8 @@ fn v53_map_is_relabel_invariant_and_edge_sensitive() {
         .unwrap();
     node.next.pop();
     assert_ne!(
-        observation_v56(&first, &content, layout, (0, 0)).domains[MAP_EDGE_DOMAIN],
-        observation_v56(&changed, &content, layout, (0, 0)).domains[MAP_EDGE_DOMAIN]
+        build_observation(&first, &content, layout, (0, 0)).domains[MAP_EDGE_DOMAIN],
+        build_observation(&changed, &content, layout, (0, 0)).domains[MAP_EDGE_DOMAIN]
     );
 }
 
@@ -1248,14 +1249,14 @@ fn canonical_map_cache_is_exact_and_tracks_dynamic_geometry() {
     let mut cache = None;
     let exact = |game: &Game, cache: &mut Option<CanonicalMapCache>| {
         assert_eq!(
-            v56_bytes(&observation_v56_cached(
+            observation_bytes(&build_observation_cached(
                 game,
                 &content,
                 layout,
                 (3, 2),
                 cache,
             )),
-            v56_bytes(&observation_v56(game, &content, layout, (3, 2)))
+            observation_bytes(&build_observation(game, &content, layout, (3, 2)))
         );
     };
     exact(&game, &mut cache);
@@ -1288,14 +1289,11 @@ fn canonical_map_cache_is_exact_and_tracks_dynamic_geometry() {
 #[test]
 fn v53_sparse_map_matches_an_independent_scalar_dag() {
     fn node_value(row: &DomainRow) -> i64 {
-        row.u[1..8]
+        row.c
             .iter()
             .enumerate()
             .map(|(index, &value)| (index as i64 + 2) * value as i64)
             .sum()
-    }
-    fn edge_value(row: &DomainRow) -> i64 {
-        row.u[2] as i64 * 37 + row.u[3..].iter().map(|&value| value as i64).sum::<i64>()
     }
     fn recursive(
         id: u32,
@@ -1310,7 +1308,7 @@ fn v53_sparse_map_matches_an_independent_scalar_dag() {
             + edges
                 .iter()
                 .filter(|edge| edge.u[0] == id)
-                .map(|edge| edge_value(edge) + recursive(edge.u[1], nodes, edges, memo))
+                .map(|edge| 1 + recursive(edge.u[1], nodes, edges, memo))
                 .sum::<i64>();
         memo.insert(id, value);
         value
@@ -1320,7 +1318,7 @@ fn v53_sparse_map_matches_an_independent_scalar_dag() {
     let layout = Layout::new(&content);
     let mut game = Game::new_character_ascension(&content, 408, 0, 10).unwrap();
     game.begin_act(&content, 0).unwrap();
-    let observation = observation_v56(&game, &content, layout, (0, 0));
+    let observation = build_observation(&game, &content, layout, (0, 0));
     let nodes = observation.domains[MAP_NODE_DOMAIN]
         .iter()
         .map(|row| (row.u[0], row))
@@ -1332,21 +1330,16 @@ fn v53_sparse_map_matches_an_independent_scalar_dag() {
         .iter()
         .map(|(&id, row)| (id, node_value(row)))
         .collect::<std::collections::BTreeMap<_, _>>();
-    let mut levels = nodes.values().map(|row| row.u[8]).collect::<Vec<_>>();
-    levels.sort_unstable();
-    levels.dedup();
-    for level in levels.into_iter().rev() {
-        for row in nodes.values().filter(|row| row.u[8] == level) {
-            batched.insert(
-                row.u[0],
-                node_value(row)
-                    + edges
-                        .iter()
-                        .filter(|edge| edge.u[0] == row.u[0])
-                        .map(|edge| edge_value(edge) + batched[&edge.u[1]])
-                        .sum::<i64>(),
-            );
-        }
+    for row in nodes.values().rev() {
+        batched.insert(
+            row.u[0],
+            node_value(row)
+                + edges
+                    .iter()
+                    .filter(|edge| edge.u[0] == row.u[0])
+                    .map(|edge| 1 + batched[&edge.u[1]])
+                    .sum::<i64>(),
+        );
     }
     let mut reference = std::collections::BTreeMap::new();
     for &id in nodes.keys() {
@@ -1361,11 +1354,21 @@ fn v53_sparse_map_matches_an_independent_scalar_dag() {
         assert_eq!(batched[&candidate.u[4]], reference[&candidate.u[4]]);
     }
     let mut changed = observation.domains[MAP_EDGE_DOMAIN].to_vec();
-    changed[0].u[2] += 1;
+    changed.remove(0);
     let changed = changed.iter().collect::<Vec<_>>();
     assert_ne!(
-        recursive(0, &nodes, &edges, &mut std::collections::BTreeMap::new()),
-        recursive(0, &nodes, &changed, &mut std::collections::BTreeMap::new())
+        recursive(
+            nodes[&0].u[0],
+            &nodes,
+            &edges,
+            &mut std::collections::BTreeMap::new()
+        ),
+        recursive(
+            nodes[&0].u[0],
+            &nodes,
+            &changed,
+            &mut std::collections::BTreeMap::new()
+        )
     );
 }
 
@@ -1375,8 +1378,8 @@ fn v53_path_candidates_reuse_canonical_destination_ids() {
     let layout = Layout::new(&content);
     let mut game = Game::new_character_ascension(&content, 405, 0, 10).unwrap();
     game.begin_act(&content, 0).unwrap();
-    let observation = observation_v56(&game, &content, layout, (0, 0));
-    assert_eq!(observation.domains[RUN_DOMAIN][0].u[23], 0);
+    let observation = build_observation(&game, &content, layout, (0, 0));
+    assert_eq!(observation.domains[RUN_DOMAIN][0].u[22], 0);
     let nodes = observation.domains[MAP_NODE_DOMAIN]
         .iter()
         .map(|row| row.u[0])
@@ -1404,9 +1407,8 @@ fn v53_path_candidates_reuse_canonical_destination_ids() {
         })
         .unwrap();
     game.map.current = Some(path.0);
-    let entered = observation_v56(&game, &content, layout, (0, 0));
-    assert_eq!(entered.domains[RUN_DOMAIN][0].u[23], path.1);
-    assert_ne!(path.1, 0);
+    let entered = build_observation(&game, &content, layout, (0, 0));
+    assert_eq!(entered.domains[RUN_DOMAIN][0].u[22], path.1);
 
     let current = game
         .map
@@ -1426,7 +1428,7 @@ fn v53_path_candidates_reuse_canonical_destination_ids() {
         .relics
         .push(content.relic_id("RELIC.WINGED_BOOTS").unwrap());
     game.winged_boots = 0;
-    let observation = observation_v56(&game, &content, layout, (0, 0));
+    let observation = build_observation(&game, &content, layout, (0, 0));
     let paths = observation
         .candidates
         .iter()
@@ -1505,7 +1507,7 @@ fn v56_categorical_embeddings_sum_without_field_weights() {
 }
 
 #[test]
-fn v55_production_populates_flag_heavy_cards_once() {
+fn card_flags_are_dense_numeric_features() {
     let content = foundation_content();
     let layout = Layout::new(&content);
     let mut game = Game::new_character_ascension(&content, 549, 0, 10).unwrap();
@@ -1514,10 +1516,12 @@ fn v55_production_populates_flag_heavy_cards_once() {
         id: content.card_id("CARD.STRIKE_IRONCLAD").unwrap(),
         flags: u16::MAX,
         turn_flags: u16::MAX,
+        free: true,
+        cost_override: Some(0),
         ..Card::default()
     };
     game.run.deck.push(card);
-    let observation = observation_v56(&game, &content, layout, (0, 0));
+    let observation = build_observation(&game, &content, layout, (0, 0));
     let actual = observation.domains[CARD_DOMAIN]
         .iter()
         .find(|row| row.u[4] == card.id as u32 && row.u[6] == u16::MAX as u32)
@@ -1540,6 +1544,128 @@ fn v55_production_populates_flag_heavy_cards_once() {
         (actual.c.clone(), actual.f.clone()),
         (expected.c, expected.f)
     );
+    assert!(actual.f[6..].iter().all(|&value| value == 1.0));
+}
+
+#[test]
+fn v57_card_content_is_independent_of_its_consumer() {
+    let content = foundation_content();
+    let layout = Layout::new(&content);
+    let mut game = Game::new_character_ascension(&content, 549, 0, 10).unwrap();
+    game.begin_act(&content, 0).unwrap();
+    let card = game.run.deck[0];
+    let mut encoding = CardEncoding::new(&game, &content);
+    let mut deck = card_domain_row(&game, &content, &mut encoding, -1, 0, 0, 0, 0, card, 0);
+    let mut action = card_domain_row(&game, &content, &mut encoding, 0, 5, 9, 1, 7, card, 999);
+    populate_domain_features(&game, &content, layout, CARD_DOMAIN, &mut deck);
+    populate_domain_features(&game, &content, layout, CARD_DOMAIN, &mut action);
+    assert_eq!((deck.c, deck.f), (action.c, action.f));
+    let observation = build_observation(&game, &content, layout, (0, 0));
+    assert!(
+        observation.domains[CARD_DOMAIN]
+            .iter()
+            .all(|row| row.u[0] != 13)
+    );
+}
+
+#[test]
+fn v57_empty_potion_is_an_item_and_slots_are_not_semantic() {
+    let content = foundation_content();
+    let layout = Layout::new(&content);
+    let mut game = Game::new_character_ascension(&content, 549, 0, 10).unwrap();
+    game.begin_act(&content, 0).unwrap();
+    let observation = build_observation(&game, &content, layout, (0, 0));
+    let empty = layout.semantic(Semantic::Potion, content.potions.len() as u32);
+    let rows = observation.domains[POTION_DOMAIN]
+        .iter()
+        .filter(|row| row.scope == STATE_SCOPE)
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), game.run.potions.len());
+    assert!(rows.iter().all(|row| row.c == vec![empty]));
+}
+
+#[test]
+fn v57_map_has_only_real_nodes_and_untyped_edges() {
+    let content = foundation_content();
+    let layout = Layout::new(&content);
+    let mut game = Game::new_character_ascension(&content, 549, 0, 10).unwrap();
+    game.begin_run(&content).unwrap();
+    let observation = build_observation(&game, &content, layout, (0, 0));
+    assert_eq!(
+        observation.domains[MAP_NODE_DOMAIN].len(),
+        game.map.nodes.len()
+    );
+    assert!(
+        observation.domains[MAP_NODE_DOMAIN]
+            .iter()
+            .all(|row| row.u[1] < MAP_NODE_KINDS as u32)
+    );
+    let ancient = content.events[game.ancient.unwrap() as usize].id;
+    let ancient = [
+        "EVENT.NEOW",
+        "EVENT.OROBAS",
+        "EVENT.PAEL",
+        "EVENT.TEZCATARA",
+        "EVENT.DARV",
+        "EVENT.NONUPEIPE",
+        "EVENT.TANX",
+        "EVENT.VAKUU",
+    ]
+    .iter()
+    .position(|&name| name == ancient)
+    .unwrap();
+    assert_eq!(
+        observation.domains[MAP_NODE_DOMAIN][0].u[1],
+        6 + ancient as u32,
+    );
+    let boss = game.bosses[0].unwrap();
+    let boss_kind = 14
+        + map_bosses(&content)
+            .iter()
+            .position(|&id| id == boss)
+            .unwrap();
+    assert_eq!(
+        observation.domains[MAP_NODE_DOMAIN].last().unwrap().u[1],
+        boss_kind as u32,
+    );
+    assert!(
+        observation.domains[MAP_EDGE_DOMAIN]
+            .iter()
+            .all(|row| row.c.is_empty() && row.f.is_empty())
+    );
+}
+
+#[test]
+fn v57_control_and_resolving_play_state_are_continuations() {
+    let content = foundation_content();
+    let mut game = Game::new_character_ascension(&content, 549, 0, 10).unwrap();
+    game.begin_act(&content, 0).unwrap();
+    game.start_combat(&content, content.acts[0].encounters[0])
+        .unwrap();
+    let Phase::Combat(combat) = &mut game.phase else {
+        unreachable!()
+    };
+    let card = combat.hand[0];
+    combat.playing = Some(card);
+    combat.card_energy = 3;
+    combat.card_stars = 2;
+    combat.card_plays = 4;
+    combat.unsettling_lamp = Some(card.id);
+    combat
+        .control
+        .push(ControlContinuation::StartExtraPlayerTurnAfterResolution);
+    game.run_queue.push(RunEffect::FinishCooking);
+    game.reward_continuation = Some(RewardContinuation::AddRandomCurse);
+    let rows = continuation_domains(&game, &content);
+    assert!(
+        rows.iter()
+            .any(|row| row.u[0] == 9 && row.u[1] == 0 && row.u[11..14] == [3, 2, 4])
+    );
+    assert!(rows.iter().any(|row| row.u[0] == 5 && row.u[23] == 1));
+    assert!(rows.iter().any(|row| row.u[0] == 0 && row.u[1] == 36));
+    for variant in 2..=3 {
+        assert!(rows.iter().any(|row| row.u[0] == 9 && row.u[1] == variant));
+    }
 }
 
 #[test]
@@ -1630,7 +1756,7 @@ fn v55_potion_replacement_menu_is_unique_and_exactly_legal() {
     let (represented, mask) = candidate_actions(&game, &content);
     assert_eq!(represented, legal);
     assert!(mask.into_iter().all(|legal| legal));
-    let observation = observation_v56(&game, &content, layout, (0, 0));
+    let observation = build_observation(&game, &content, layout, (0, 0));
     assert_eq!(
         observation
             .candidates
@@ -1672,7 +1798,7 @@ fn v58_unequal_target_previews_remain_distinct_candidates() {
     combat.queue.clear();
     combat.choice = None;
     combat.player.hp = combat.player.hp.max(1);
-    let observation = observation_v56(&game, &content, layout, (0, 0));
+    let observation = build_observation(&game, &content, layout, (0, 0));
     let targets = [0, 1].map(|target| {
             observation
                 .candidates
@@ -1706,7 +1832,7 @@ fn v56_action_auxiliaries_rederive_from_exact_sources() {
     game.begin_act(&content, 0).unwrap();
     game.start_combat(&content, content.acts[0].encounters[0])
         .unwrap();
-    let observation = observation_v56(&game, &content, layout, (0, 0));
+    let observation = build_observation(&game, &content, layout, (0, 0));
     for candidate in &observation.candidates {
         assert_eq!(candidate.f, action_features(&candidate.u, &candidate.s));
     }
@@ -1759,13 +1885,13 @@ fn v55_power_trigger_order_is_semantic_and_actor_ratios_are_finite() {
         },
     ];
     let mut ordered = game.clone();
-    let first = observation_v56(&game, &content, layout, (0, 0));
+    let first = build_observation(&game, &content, layout, (0, 0));
     let Phase::Combat(combat) = &mut game.phase else {
         unreachable!()
     };
     combat.player.powers.reverse();
-    let second = observation_v56(&game, &content, layout, (0, 0));
-    let visible = |observation: &ObservationV56| {
+    let second = build_observation(&game, &content, layout, (0, 0));
+    let visible = |observation: &Observation| {
         observation.domains[POWER_DOMAIN]
             .iter()
             .map(|row| (row.c.clone(), row.f.clone()))
@@ -1775,8 +1901,8 @@ fn v55_power_trigger_order_is_semantic_and_actor_ratios_are_finite() {
     ordered.step(&content, Action::EndTurn).unwrap();
     game.step(&content, Action::EndTurn).unwrap();
     assert_ne!(
-        v56_bytes(&observation_v56(&ordered, &content, layout, (0, 0))),
-        v56_bytes(&observation_v56(&game, &content, layout, (0, 0)))
+        observation_bytes(&build_observation(&ordered, &content, layout, (0, 0))),
+        observation_bytes(&build_observation(&game, &content, layout, (0, 0)))
     );
     let mut zero = DomainRow::new(ACTOR_DOMAIN, STATE_SCOPE);
     zero.u[..3].copy_from_slice(&[1, 0, 0]);
@@ -1822,8 +1948,8 @@ fn v56_ordered_piles_change_model_inputs_and_successors() {
         combat.discard.reverse();
     }
     assert_ne!(
-        v56_bytes(&observation_v56(&first, &content, layout, (0, 0))),
-        v56_bytes(&observation_v56(&second, &content, layout, (0, 0)))
+        observation_bytes(&build_observation(&first, &content, layout, (0, 0))),
+        observation_bytes(&build_observation(&second, &content, layout, (0, 0)))
     );
     let action = Action::Play {
         hand: 0,
@@ -1832,8 +1958,8 @@ fn v56_ordered_piles_change_model_inputs_and_successors() {
     first.step(&content, action.clone()).unwrap();
     second.step(&content, action).unwrap();
     assert_ne!(
-        v56_bytes(&observation_v56(&first, &content, layout, (0, 0))),
-        v56_bytes(&observation_v56(&second, &content, layout, (0, 0)))
+        observation_bytes(&build_observation(&first, &content, layout, (0, 0))),
+        observation_bytes(&build_observation(&second, &content, layout, (0, 0)))
     );
 
     let Phase::Combat(combat) = &mut first.phase else {
@@ -1865,8 +1991,8 @@ fn v56_ordered_piles_change_model_inputs_and_successors() {
     first.step(&content, Action::Choose(2)).unwrap();
     second.step(&content, Action::Choose(2)).unwrap();
     assert_ne!(
-        v56_bytes(&observation_v56(&first, &content, layout, (0, 0))),
-        v56_bytes(&observation_v56(&second, &content, layout, (0, 0)))
+        observation_bytes(&build_observation(&first, &content, layout, (0, 0))),
+        observation_bytes(&build_observation(&second, &content, layout, (0, 0)))
     );
 }
 
@@ -1891,8 +2017,8 @@ fn v56_unknown_draw_middle_remains_permutation_invariant() {
         combat.draw[1..4].reverse();
     }
     assert_eq!(
-        v56_bytes(&observation_v56(&first, &content, layout, (0, 0))),
-        v56_bytes(&observation_v56(&second, &content, layout, (0, 0)))
+        observation_bytes(&build_observation(&first, &content, layout, (0, 0))),
+        observation_bytes(&build_observation(&second, &content, layout, (0, 0)))
     );
 }
 
@@ -1930,15 +2056,15 @@ fn v56_enemy_instance_renumbering_preserves_wriggler_transitions() {
     combat.enemies[0].instance = 2;
     assert_eq!(first.actions(&content), second.actions(&content));
     assert_eq!(
-        v56_bytes(&observation_v56(&first, &content, layout, (0, 0))),
-        v56_bytes(&observation_v56(&second, &content, layout, (0, 0)))
+        observation_bytes(&build_observation(&first, &content, layout, (0, 0))),
+        observation_bytes(&build_observation(&second, &content, layout, (0, 0)))
     );
     first.step(&content, Action::EndTurn).unwrap();
     second.step(&content, Action::EndTurn).unwrap();
     assert_eq!(first.actions(&content), second.actions(&content));
     assert_eq!(
-        v56_bytes(&observation_v56(&first, &content, layout, (0, 0))),
-        v56_bytes(&observation_v56(&second, &content, layout, (0, 0)))
+        observation_bytes(&build_observation(&first, &content, layout, (0, 0))),
+        observation_bytes(&build_observation(&second, &content, layout, (0, 0)))
     );
 }
 
@@ -1962,7 +2088,7 @@ fn v56_dynamic_event_ids_use_typed_semantics() {
         colorful,
         content.events[colorful as usize].options[..3].to_vec(),
     );
-    let observation = observation_v56(&game, &content, layout, (0, 0));
+    let observation = build_observation(&game, &content, layout, (0, 0));
     for character in 0..3 {
         assert!(
             observation.domains[PHASE_DOMAIN][0]
@@ -2001,7 +2127,7 @@ fn v56_dynamic_event_ids_use_typed_semantics() {
             },
         ],
     );
-    let observation = observation_v56(&game, &content, layout, (0, 0));
+    let observation = build_observation(&game, &content, layout, (0, 0));
     for relic in 0..3 {
         assert!(
             observation.domains[PHASE_DOMAIN][0]
@@ -2028,7 +2154,7 @@ fn v56_dynamic_event_ids_use_typed_semantics() {
     ];
     game.event_data = [1, 3, 0, -1];
     game.phase = Phase::Event(tinker, options.clone());
-    let observation = observation_v56(&game, &content, layout, (0, 0));
+    let observation = build_observation(&game, &content, layout, (0, 0));
     for (option, card_type) in [0, 2].into_iter().enumerate() {
         assert!(
             observation.domains[PHASE_DOMAIN][0]
@@ -2049,7 +2175,7 @@ fn v56_dynamic_event_ids_use_typed_semantics() {
     }
     game.event_data = [4, 6, 0, 2];
     game.phase = Phase::Event(tinker, options);
-    let observation = observation_v56(&game, &content, layout, (0, 0));
+    let observation = build_observation(&game, &content, layout, (0, 0));
     assert!(
         observation.domains[PHASE_DOMAIN][0]
             .c
@@ -2080,7 +2206,7 @@ fn v56_dynamic_event_ids_use_typed_semantics() {
         conveyor,
         content.events[conveyor as usize].options[..2].to_vec(),
     );
-    let phase = &observation_v56(&game, &content, layout, (0, 0)).domains[PHASE_DOMAIN][0];
+    let phase = &build_observation(&game, &content, layout, (0, 0)).domains[PHASE_DOMAIN][0];
     assert!(
         phase
             .c
@@ -2094,7 +2220,7 @@ fn v56_dynamic_event_ids_use_typed_semantics() {
 }
 
 #[test]
-fn v55_periodic_relics_encode_phase_and_remaining() {
+fn v57_relic_counters_are_identity_specific_and_linear() {
     let content = foundation_content();
     let layout = Layout::new(&content);
     let game = Game::new_character_ascension(&content, 555, 0, 10).unwrap();
@@ -2106,9 +2232,9 @@ fn v55_periodic_relics_encode_phase_and_remaining() {
         populate_domain_features(&game, &content, layout, RELIC_DOMAIN, &mut row);
         row
     };
-    assert_eq!((row(0).f[10], row(0).f[11]), (0.0, 1.0));
-    assert!((row(2).f[10] - 2.0 / 3.0).abs() < 1e-6);
-    assert!((row(2).f[11] - 1.0 / 3.0).abs() < 1e-6);
+    let counter = layout.semantic(Semantic::RelicCounter0, id as u32);
+    assert_eq!(row(0).c.iter().filter(|&&code| code == counter).count(), 0);
+    assert_eq!(row(2).c.iter().filter(|&&code| code == counter).count(), 2);
     let id = content.relic_id("RELIC.SILVER_CRUCIBLE").unwrap();
     let capped = |counter| {
         let mut row = DomainRow::new(RELIC_DOMAIN, STATE_SCOPE);
@@ -2117,8 +2243,59 @@ fn v55_periodic_relics_encode_phase_and_remaining() {
         populate_domain_features(&game, &content, layout, RELIC_DOMAIN, &mut row);
         row
     };
-    assert_eq!((capped(2).f[12], capped(2).f[13]), (2.0 / 3.0, 1.0 / 3.0));
-    assert_eq!((capped(3).f[14], capped(3).f[15]), (0.0, 1.0));
+    let counter = layout.semantic(Semantic::RelicCounter0, id as u32);
+    assert_eq!(
+        capped(2).c.iter().filter(|&&code| code == counter).count(),
+        2
+    );
+    assert_eq!(
+        capped(3).c.iter().filter(|&&code| code == counter).count(),
+        3
+    );
+}
+
+#[test]
+fn v57_wax_relics_encode_queue_progress_and_melted_state() {
+    let content = foundation_content();
+    let layout = Layout::new(&content);
+    let mut game = Game::new_character_ascension(&content, 555, 0, 10).unwrap();
+    game.begin_act(&content, 0).unwrap();
+    let id = content.relic_id("RELIC.HAPPY_FLOWER").unwrap();
+    game.run.relics.push(id);
+    let index = game.run.relics.len() - 1;
+    game.wax_relics.push(index);
+    game.toy_box_combats = 0;
+    let first = build_observation(&game, &content, layout, (0, 0));
+    let row = first.domains[RELIC_DOMAIN]
+        .iter()
+        .find(|row| row.u[0] == 0 && row.u[1] == id as u32)
+        .unwrap();
+    let waxed = layout.semantic(Semantic::RelicCounter4, id as u32);
+    let position = layout.semantic(Semantic::RelicCounter5, id as u32);
+    assert_eq!(row.c.iter().filter(|&&code| code == waxed).count(), 1);
+    assert_eq!(row.c.iter().filter(|&&code| code == position).count(), 3);
+    game.toy_box_combats = 3;
+    game.melted_relics.push(index);
+    let melted = build_observation(&game, &content, layout, (0, 0));
+    let row = melted.domains[RELIC_DOMAIN]
+        .iter()
+        .find(|row| row.u[0] == 0 && row.u[1] == id as u32)
+        .unwrap();
+    assert_eq!(row.c.iter().filter(|&&code| code == position).count(), 4);
+}
+
+#[test]
+fn observation_has_one_remaining_relic_pool() {
+    let content = foundation_content();
+    let layout = Layout::new(&content);
+    let mut game = Game::new_character_ascension(&content, 555, 0, 10).unwrap();
+    game.begin_run(&content).unwrap();
+    let observation = build_observation(&game, &content, layout, (0, 0));
+    assert!(
+        observation.domains[RELIC_DOMAIN]
+            .iter()
+            .all(|row| row.u[0] != 2)
+    );
 }
 
 #[test]
@@ -2199,14 +2376,17 @@ fn v55_action_and_phase_discriminants_are_exhaustive() {
     ];
     assert_eq!(
         phases.iter().map(phase_index).collect::<Vec<_>>(),
-        (0..PHASES).collect::<Vec<_>>()
+        (0..PHASES)
+            .map(Some)
+            .chain([None, None])
+            .collect::<Vec<_>>()
     );
 }
 
 #[test]
 fn v56_layout_uses_explicit_token_dimensions_and_positions() {
     let layout = Layout::new(&foundation_content());
-    assert_eq!((VERSION, VALUE_MODEL_VERSION), (56, 75));
+    assert_eq!((VERSION, VALUE_MODEL_VERSION), (58, 77));
     assert_eq!(
         (
             DEFAULT_MODEL_WIDTH,
@@ -2222,12 +2402,10 @@ fn v56_layout_uses_explicit_token_dimensions_and_positions() {
         (Semantic::EnemyPosition, 33),
         (Semantic::PowerPosition, 65),
         (Semantic::OrbPosition, 17),
-        (Semantic::MapFloorPosition, 65),
         (Semantic::DeckOrigin, 257),
         (Semantic::DrawTopPosition, 257),
         (Semantic::DrawBottomPosition, 257),
         (Semantic::RelicPosition, 257),
-        (Semantic::WaxPosition, 257),
         (Semantic::ContinuationPosition, 257),
         (Semantic::CrystalRow, 11),
         (Semantic::CrystalColumn, 11),
@@ -2252,7 +2430,7 @@ fn v56_event_pool_contains_only_eligible_unvisited_events() {
         .collect::<Vec<_>>();
     let visited = eligible[0];
     game.visited_events.push(visited);
-    let observation = observation_v56(&game, &content, layout, (0, 0));
+    let observation = build_observation(&game, &content, layout, (0, 0));
     let actual = observation.domains[EVENT_DOMAIN]
         .iter()
         .filter(|row| row.scope == STATE_SCOPE && row.u[0] == 0)
@@ -2267,7 +2445,7 @@ fn v56_event_pool_contains_only_eligible_unvisited_events() {
 }
 
 #[test]
-fn v56_actions_are_legal_only_but_all_offers_are_phase_local() {
+fn v57_actions_are_legal_only_and_only_suspended_offers_are_phase_local() {
     let content = foundation_content();
     let layout = Layout::new(&content);
     let mut game = Game::new_character_ascension(&content, 46, 0, 10).unwrap();
@@ -2279,7 +2457,7 @@ fn v56_actions_are_legal_only_but_all_offers_are_phase_local() {
         ..Card::default()
     };
     game.phase = Phase::Shop(vec![ShopItem::Card(card, 100)]);
-    let observation = observation_v56(&game, &content, layout, (0, 0));
+    let observation = build_observation(&game, &content, layout, (0, 0));
     assert_eq!(
         observation
             .candidates
@@ -2288,6 +2466,15 @@ fn v56_actions_are_legal_only_but_all_offers_are_phase_local() {
             .collect::<Vec<_>>(),
         [&Action::Leave]
     );
+    assert!(
+        observation.domains[CONTINUATION_DOMAIN]
+            .iter()
+            .all(|row| row.scope != PHASE_SCOPE)
+    );
+    game.resume = Some(Phase::Shop(vec![ShopItem::Card(card, 100)]));
+    game.phase = Phase::RemoveCards(1, 0, true);
+    let observation = build_observation(&game, &content, layout, (0, 0));
+    assert_eq!(observation.domains[PHASE_DOMAIN].len(), 2);
     assert!(observation.domains[CONTINUATION_DOMAIN].iter().any(|row| {
         row.scope == PHASE_SCOPE && row.u[0] == 5 && row.u[11] == card.id as u32 && row.s[5] == 100
     }));
@@ -2317,7 +2504,8 @@ fn v56_actions_are_legal_only_but_all_offers_are_phase_local() {
             },
         ],
     );
-    let observation = observation_v56(&game, &content, layout, (0, 0));
+    game.resume = None;
+    let observation = build_observation(&game, &content, layout, (0, 0));
     assert_eq!(
         observation
             .candidates
@@ -2326,12 +2514,10 @@ fn v56_actions_are_legal_only_but_all_offers_are_phase_local() {
             .collect::<Vec<_>>(),
         [&Action::Event(0)]
     );
-    assert_eq!(
+    assert!(
         observation.domains[CONTINUATION_DOMAIN]
             .iter()
-            .filter(|row| row.scope == PHASE_SCOPE && row.u[0] == 7)
-            .count(),
-        2
+            .all(|row| row.scope != PHASE_SCOPE)
     );
 }
 
@@ -2363,12 +2549,11 @@ fn v56_card_versions_origins_and_enemy_targets_are_explicit() {
         ..Card::default()
     }];
     combat.energy = 99;
-    let observation = observation_v56(&game, &content, layout, (0, 0));
-    let origin = layout.semantic(Semantic::DeckOrigin, 0);
+    let observation = build_observation(&game, &content, layout, (0, 0));
     assert!(
         observation.domains[CARD_DOMAIN]
             .iter()
-            .filter(|row| row.c.contains(&origin))
+            .filter(|row| row.u[19] > 0)
             .count()
             >= 2
     );

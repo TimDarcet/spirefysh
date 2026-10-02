@@ -291,11 +291,11 @@ fn decompress_bytes(input: &[u8], size: usize) -> PyResult<Vec<u8>> {
     Ok(output)
 }
 
-fn compact_packed_observation(row: &ObservationV56) -> Vec<u8> {
+fn compact_packed_observation(row: &Observation) -> Vec<u8> {
     compact_packed_observation_known(row, None)
 }
 
-fn cached_packed_metadata(row: &ObservationV56) -> Vec<u8> {
+fn cached_packed_metadata(row: &Observation) -> Vec<u8> {
     let mut output = vec![0; 32 + 4 * DOMAIN_WIDTHS.len()];
     output[..4].copy_from_slice(b"SP68");
     output[4] = row.character;
@@ -311,14 +311,11 @@ fn cached_packed_metadata(row: &ObservationV56) -> Vec<u8> {
     output
 }
 
-fn compact_packed_observation_known(row: &ObservationV56, digest: Option<u64>) -> Vec<u8> {
+fn compact_packed_observation_known(row: &Observation, digest: Option<u64>) -> Vec<u8> {
     compact_packed_observation_and_digest(row, digest).0
 }
 
-fn compact_packed_observation_and_digest(
-    row: &ObservationV56,
-    digest: Option<u64>,
-) -> (Vec<u8>, u64) {
+fn compact_packed_observation_and_digest(row: &Observation, digest: Option<u64>) -> (Vec<u8>, u64) {
     let (globals, counts, exact, actions, digest) = packed_observation_known(row, digest);
     let exact = compress_words(&exact);
     let exact_len = exact.len();
@@ -966,6 +963,7 @@ fn unpack_domain(
     let mut scope = Vec::with_capacity(rows);
     let mut first = Vec::new();
     let mut inverse = Vec::with_capacity(rows);
+    let mut map_kinds = Vec::new();
     let mut unique = FastMap::<u64, Vec<(usize, usize)>>::with_capacity_and_hasher(
         rows,
         BuildHasherDefault::default(),
@@ -990,6 +988,9 @@ fn unpack_domain(
                 .chunks_exact(width)
                 .map(|record| {
                     let mut hash = FastHasher::default();
+                    if domain == MAP_NODE_DOMAIN {
+                        hash.write_u32(record[1]);
+                    }
                     hash_words(&mut hash, &record[u + s..u + s + c]);
                     hash_words(&mut hash, &record[u + s + c..u + s + c + f]);
                     hash.finish()
@@ -1006,7 +1007,14 @@ fn unpack_domain(
             let value = entries
                 .iter()
                 .find_map(|&(source, value)| {
-                    (semantic_words == &semantic[source * c..(source + 1) * c]
+                    ((domain != MAP_NODE_DOMAIN
+                        || record[1]
+                            == if compact_features {
+                                map_kinds[source]
+                            } else {
+                                unsigned[source * u + 1]
+                            })
+                        && semantic_words == &semantic[source * c..(source + 1) * c]
                         && numeric_words
                             .iter()
                             .copied()
@@ -1025,6 +1033,9 @@ fn unpack_domain(
                     first.push(source as i64);
                     entries.push((source, value));
                     if compact_features {
+                        if domain == MAP_NODE_DOMAIN {
+                            map_kinds.push(record[1]);
+                        }
                         semantic.extend_from_slice(semantic_words);
                         numeric.extend(numeric_words.iter().map(|&value| f32::from_bits(value)));
                     }
@@ -1400,7 +1411,7 @@ impl SearchNode {
 }
 
 fn search_candidate<'a>(
-    observation: &'a ObservationV56,
+    observation: &'a Observation,
     edge: &SearchEdge,
 ) -> Option<&'a CandidateRow> {
     if let Some(candidate) = observation.candidates.get(edge.candidate)
@@ -1485,7 +1496,7 @@ fn heuristic_combat_value(game: &Game) -> f32 {
 
 struct SearchTree {
     root: Game,
-    root_observation: ObservationV56,
+    root_observation: Observation,
     root_digest: u64,
     map: CanonicalMap,
     root_turn: u16,
@@ -1508,7 +1519,7 @@ struct SearchTree {
 
 struct SearchLeaf {
     path: SearchPath,
-    observation: ObservationV56,
+    observation: Observation,
     digest: u64,
     depth: usize,
     game: Option<Game>,
@@ -1534,7 +1545,7 @@ enum SearchResult {
 impl SearchTree {
     fn new(
         root: &Game,
-        observation: &ObservationV56,
+        observation: &Observation,
         content: &Content,
         layout: Layout,
         log_policy: &[f32],
@@ -1696,7 +1707,7 @@ impl SearchTree {
                 return Ok(SearchResult::Value(path, value));
             }
             let next_observation =
-                observation_v56_with_map(&game, content, layout, bonuses, Some(&self.map));
+                build_observation_with_map(&game, content, layout, bonuses, Some(&self.map));
             let digest = observation_digest(&next_observation);
             let next = self.lookup.get(&(digest, depth)).copied();
             let child_packed = (pack_children
@@ -1806,7 +1817,7 @@ impl SearchTree {
 
     fn expand(
         &mut self,
-        observation: ObservationV56,
+        observation: Observation,
         digest: u64,
         depth: usize,
         mut path: SearchPath,
@@ -1840,7 +1851,7 @@ impl SearchTree {
 
     fn insert(
         &mut self,
-        observation: ObservationV56,
+        observation: Observation,
         digest: u64,
         depth: usize,
         log_policy: &[f32],
@@ -2101,7 +2112,7 @@ struct SearchConsistency {
 
 struct PendingLeaf {
     tree: usize,
-    observation: ObservationV56,
+    observation: Observation,
     digest: u64,
     depth: usize,
     path: SearchPath,
@@ -2111,7 +2122,7 @@ struct PendingLeaf {
 
 struct RolloutStep {
     game: Option<Game>,
-    observation: ObservationV56,
+    observation: Observation,
     policy: Vec<f32>,
     digest: u64,
     choice: usize,
@@ -2251,7 +2262,7 @@ fn rollout_combat(
             let observations = indices
                 .par_iter()
                 .map(|&index| {
-                    observation_v56_with_map(
+                    build_observation_with_map(
                         &games[index],
                         content,
                         layout,
@@ -2571,7 +2582,7 @@ fn run_mcts(
 fn mcts_targets(
     model: &ValueModel,
     games: &[Game],
-    observations: &[ObservationV56],
+    observations: &[Observation],
     outputs: &[(Vec<f32>, f32, f32, Vec<f32>, Option<Vec<f32>>)],
     turn_starts: &[bool],
     content: &Content,
@@ -2941,7 +2952,7 @@ impl ExactSearch<'_> {
     fn leaf(
         &mut self,
         particles: &[Game],
-        observation: Option<&ObservationV56>,
+        observation: Option<&Observation>,
         depth: usize,
         rng: bool,
     ) -> Result<ExactResult, String> {
@@ -2989,7 +3000,7 @@ impl ExactSearch<'_> {
 
     fn flush_leaves(
         &mut self,
-        pending: &mut Vec<(f32, usize, Option<Game>, ObservationV56)>,
+        pending: &mut Vec<(f32, usize, Option<Game>, Observation)>,
         depth: usize,
         rng: bool,
     ) -> Result<f32, String> {
@@ -3049,7 +3060,7 @@ impl ExactSearch<'_> {
     fn solve(
         &mut self,
         particles: Vec<Game>,
-        row: Option<ObservationV56>,
+        row: Option<Observation>,
         depth: usize,
         rng: bool,
     ) -> Result<ExactResult, String> {
@@ -3084,7 +3095,7 @@ impl ExactSearch<'_> {
             .collect::<Vec<_>>();
         for (particle, game) in particles.iter().enumerate() {
             let observation = (particle > 0).then(|| {
-                observation_v56_with_map(
+                build_observation_with_map(
                     game,
                     self.content,
                     self.layout,
@@ -3105,7 +3116,7 @@ impl ExactSearch<'_> {
         let mut best = f32::NEG_INFINITY;
         let mut best_choice = 0;
         let mut any_rng = rng;
-        let mut groups = HashMap::<u64, (Option<ObservationV56>, Vec<Game>)>::new();
+        let mut groups = HashMap::<u64, (Option<Observation>, Vec<Game>)>::new();
         for (edge, actions) in node.edges.iter().zip(actions) {
             groups.clear();
             let mut action_rng = false;
@@ -3125,7 +3136,7 @@ impl ExactSearch<'_> {
                         Phase::Won => (u64::MAX, None),
                         Phase::Dead => (u64::MAX - 1, None),
                         _ => {
-                            let observation = observation_v56_with_map(
+                            let observation = build_observation_with_map(
                                 &next,
                                 content,
                                 layout,
@@ -3218,7 +3229,7 @@ fn exact_search<'a>(
         })
         .collect::<Vec<_>>();
     let map = canonical_map(&particles[0], content, layout);
-    let row = observation_v56_with_map(&particles[0], content, layout, bonuses, Some(&map));
+    let row = build_observation_with_map(&particles[0], content, layout, bonuses, Some(&map));
     let mut search = ExactSearch {
         model,
         content,
@@ -3264,7 +3275,7 @@ fn search_diagnostic(
     progress: bool,
     q_temperature: f32,
 ) -> Result<serde_json::Value, String> {
-    let observation = observation_v56(game, content, layout, bonuses);
+    let observation = build_observation(game, content, layout, bonuses);
     let (log_policy, win, progress_value, _) = model
         .evaluate(
             &observation,
@@ -5799,12 +5810,13 @@ impl Batch {
                 .ok_or_else(|| PyValueError::new_err("invalid archived action"))?;
             game.step(&self.content, action.clone())
                 .map_err(|error| PyValueError::new_err(format!("{error:?}")))?;
-            if matches!(action, Action::Path(_)) {
+            if matches!(action, Action::Path(_))
+                && let Some(phase) = phase_index(&game.phase)
+            {
                 let floor = (game.run.act.saturating_sub(1) as usize * 18
                     + game.run.floor as usize)
                     .min(63);
-                let key =
-                    (game.run.character as usize * 64 + floor) * PHASES + phase_index(&game.phase);
+                let key = (game.run.character as usize * 64 + floor) * PHASES + phase;
                 if self.archive[key].len() < 16 {
                     self.archive[key].push(game.clone());
                 }
@@ -6440,7 +6452,7 @@ impl Batch {
                     game.run.floor,
                     game.run.hp,
                     game.run.max_hp,
-                    phase_index(&game.phase) as u8,
+                    phase_index(&game.phase).map_or(u8::MAX, |phase| phase as u8),
                     turn,
                     player_hp,
                     enemy_hp,
@@ -6507,7 +6519,7 @@ impl Batch {
             game.run.floor,
             game.run.hp,
             game.run.max_hp,
-            phase_index(&game.phase),
+            phase_name(&game.phase),
             combat,
         ))
     }
@@ -6566,7 +6578,7 @@ impl Batch {
                     debug_assert!(game.combat().is_none_or(|combat| {
                         combat.queue.is_empty() || combat.choice.is_some()
                     }));
-                    Some(observation_v56_cached(
+                    Some(build_observation_cached(
                         game, content, layout, bonuses, map_cache,
                     ))
                 })
@@ -6979,7 +6991,7 @@ impl Batch {
             .iter()
             .map(|&index| {
                 self.games.get(index).map(|game| {
-                    observation_v56(
+                    build_observation(
                         game,
                         &self.content,
                         self.layout,
@@ -7141,7 +7153,7 @@ impl Batch {
                             .combat()
                             .ok_or_else(|| "exact-search root is not in combat".to_owned())?
                             .turn;
-                        let observation = observation_v56(game, content, layout, bonuses);
+                        let observation = build_observation(game, content, layout, bonuses);
                         let search_seed = seed
                             ^ game.seed as u64
                             ^ observation_digest(&observation).rotate_left(17);
@@ -7326,7 +7338,7 @@ impl Batch {
                     let (mut actions, legal) = candidate_actions(game, content);
                     if !skip_forced || actions.len() != 1 {
                         let map = cached_canonical_map(game, content, layout, map_cache);
-                        return observation_v56_with_candidates(
+                        return build_observation_with_candidates(
                             game,
                             content,
                             layout,
@@ -7336,7 +7348,7 @@ impl Batch {
                             legal,
                         );
                     }
-                    ObservationV56 {
+                    Observation {
                         character: game.run.character as u8,
                         globals: Vec::new(),
                         domains: std::array::from_fn(|_| DomainRows::Owned(Vec::new())),
@@ -7626,7 +7638,7 @@ impl Batch {
             let phases = self
                 .games
                 .iter()
-                .map(|game| phase_index(&game.phase) as u8)
+                .map(|game| phase_index(&game.phase).expect("active game has terminal phase") as u8)
                 .collect::<Vec<_>>();
             let paths = selected_actions
                 .iter()
@@ -7919,7 +7931,8 @@ impl Batch {
         }
         let floor =
             (game.run.act.saturating_sub(1) as usize * 18 + game.run.floor as usize).min(63);
-        let key = (game.run.character as usize * 64 + floor) * PHASES + phase_index(&game.phase);
+        let key = (game.run.character as usize * 64 + floor) * PHASES
+            + phase_index(&game.phase).expect("nonterminal game has no phase");
         self.archive_seen[key] += 1;
         let replacement = self.random_u64() % self.archive_seen[key];
         let bucket = &mut self.archive[key];

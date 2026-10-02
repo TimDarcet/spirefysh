@@ -128,7 +128,7 @@ def trust_region_step(model, optimizer, inputs, action, old, fresh, denominator,
                         parameter.sub_(original).mul_(.25).add_(original)
             with torch.no_grad():
                 kind = inputs[0].device.type
-                dtype = torch.bfloat16 if precision == "bf16" else torch.float16
+                dtype = torch.bfloat16 if precision != "fp32" else torch.float16
                 with torch.autocast(kind, dtype=dtype, enabled=precision != "fp32"):
                     logits = model(
                         *inputs[:6], policy_only=True, flat_policy=choice_index is not None,
@@ -2154,11 +2154,8 @@ def train(args):
     target = device()
     if not 0 <= args.start_stage < len(STAGES):
         raise ValueError("invalid start stage")
-    if args.precision not in PRECISIONS:
-        raise ValueError("precision must be fp32 or bf16")
-    fp32_parts = tuple(part for part in FP32_PARTS if getattr(args, f"fp32_{part}", False))
-    if len(fp32_parts) == len(FP32_PARTS):
-        args.precision = "fp32"
+    if args.precision not in TRAINING_PRECISIONS:
+        raise ValueError("invalid precision")
     if args.precision != "fp32" and target.type not in ("mps", "cuda"):
         raise ValueError(f"{args.precision} requires MPS or CUDA")
     if min(
@@ -2247,7 +2244,7 @@ def train(args):
         model = Agent(layout, *config, pooling=pooling,
                       potential_weights=potential_weights,
                       potential_mode=args.potential_mode).to(target)
-    model.fp32_parts = fp32_parts
+    model.precision = args.precision
     if args.freeze_backbone:
         args.publish_updates = max(args.publish_updates, 16)
         model.requires_grad_(False)
@@ -2815,7 +2812,7 @@ def value_dataset(model, args, target, seed, runs, deadline):
                     raise ValueError("packed observation row count mismatch")
                 inputs = unpack([packed[index] for index in indices], target, model)
                 with torch.no_grad(), torch.autocast(
-                    target.type, dtype=torch.bfloat16 if args.precision == "bf16" else torch.float16,
+                    target.type, dtype=torch.bfloat16 if args.precision != "fp32" else torch.float16,
                     enabled=args.precision != "fp32",
                 ):
                     logits, _, _ = model(*inputs[:6])
@@ -3048,7 +3045,7 @@ def probe():
     layout = dict(env.token_layout())
     assert (layout["version"], layout["model_width"], layout["model_layers"],
             layout["model_heads"], layout["model_feedforward"], layout["state_width"],
-            layout["action_width"], layout["entity_summaries"]) == (56, 128, 4, 8, 384, 128, 128, 0)
+            layout["action_width"], layout["entity_summaries"]) == (58, 128, 4, 8, 384, 128, 128, 0)
     compact_layout = dict(env.token_layout(64, 2, 4, 128))
     assert tuple(compact_layout[key] for key in (
         "model_width", "model_layers", "model_heads", "model_feedforward",
@@ -3056,8 +3053,8 @@ def probe():
     )) == (64, 2, 4, 128, 64, 64, 64)
     for name, size in {
         "enemy_position": 33, "power_position": 65, "orb_position": 17,
-        "map_floor_position": 65, "deck_origin": 257, "draw_top_position": 257,
-        "draw_bottom_position": 257, "relic_position": 257, "wax_position": 257,
+        "deck_origin": 257, "draw_top_position": 257,
+        "draw_bottom_position": 257, "relic_position": 257,
         "continuation_position": 257, "crystal_row": 11, "crystal_column": 11,
         "crystal_width": 4, "crystal_height": 4,
     }.items():
@@ -3070,11 +3067,12 @@ def probe():
         env.step(choices)
     combat = env.observe_tokens()
     noncombat = sts2_sim.Batch(2, 71, 0).observe_tokens()
+    assert Agent(layout).map_nodes.weight.shape == (26, 128)
 
     def expected_lengths(observation, pooling):
         domains, action_rows, _positions, _legal = flat_domains(observation)
         batch = len(observation[0])
-        counts = np.full(batch, 8, np.int64)
+        counts = np.full(batch, 6, np.int64)
         def rows(domain, predicate=lambda _u: True):
             u, _s, _c, _f, row, scope = domains[DOMAIN[domain]]
             selected = (scope == -1) & predicate(u)
@@ -3084,6 +3082,8 @@ def probe():
             item = np.bincount(row, minlength=batch)
             counts[active] += item[active] if pooling[name] == "global_tokens" else 1
         actor_u, actor_rows = rows("actor")
+        _phase_u, phase_rows = rows("phase")
+        counts += np.bincount(phase_rows, minlength=batch) - 1
         combat_rows = np.unique(actor_rows)
         all_rows = np.arange(batch)
         collection("deck", "card", lambda u: u[:, 0] == 0, all_rows)
@@ -3119,8 +3119,6 @@ def probe():
     for name in ("enemy_effect", "friendly_effect"):
         configs.extend(({name: mode} for mode in EFFECT_POOLING))
     configs.extend(({"continuation": mode} for mode in CONTINUATION_POOLING))
-    configs.extend(({"phase": mode} for mode in ("sum", "transformer")))
-    configs.extend(({"generation_pool": mode} for mode in ("sum", "transformer")))
     with tempfile.TemporaryDirectory() as parity_directory:
         for number, config in enumerate(configs):
             torch.manual_seed(number)
@@ -3183,7 +3181,6 @@ def probe():
         "hand": "sum", "discard": "sum", "exhaust": "transformer",
         "orb": "sum", "potion": "transformer", "friendly_effect": "transformer_into_actor",
         "enemy_effect": "sum_token", "continuation": "global_tokens",
-        "phase": "sum", "generation_pool": "sum",
     }
     torch.manual_seed(12)
     model = Agent(layout, pooling=mixed, potential_weights=(.001,) + (0.,) * 12).eval()
@@ -3273,7 +3270,7 @@ def probe():
         assert loaded["model_version"] == MODEL_VERSION
         incompatible = torch.load(checkpoint, weights_only=False)
         incompatible["architecture"]["position_caps"]["enemy"] = 32
-        incompatible["model_version"] = min(COMPATIBLE_MODEL_VERSIONS) - 1
+        incompatible["model_version"] = MODEL_VERSION - 1
         torch.save(incompatible, checkpoint)
         try:
             load(checkpoint, target)

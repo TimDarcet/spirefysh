@@ -1226,7 +1226,7 @@ def _dashboard_runs(target, selected=None):
                 row.pop("description", None); row.pop("pipeline", None)
             version_manifest = manifest | manifest.get("version_history", {}).get(str(version), {})
             version_manifest["model_version"] = version
-            if version in COMPATIBLE_MODEL_VERSIONS:
+            if version == MODEL_VERSION:
                 saved = version_manifest.get("architecture", {})
                 current = Agent(
                     version_manifest["layout"],

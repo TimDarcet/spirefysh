@@ -983,6 +983,7 @@ pub enum RunEffect {
     RemoveRandomCard,
     Options(&'static [EventOption]),
     EventAction(u8),
+    FinishCooking,
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -1653,6 +1654,16 @@ struct Pending {
     context: Context,
 }
 
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+enum ControlContinuation {
+    StartExtraPlayerTurnAfterResolution,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RewardContinuation {
+    AddRandomCurse,
+}
+
 #[derive(Clone, Debug, Hash)]
 struct AutoPlay {
     card: Card,
@@ -1700,6 +1711,7 @@ pub struct Combat {
     playing: Option<Card>,
     auto_plays: Vec<AutoPlay>,
     queue: Vec<Pending>,
+    control: Vec<ControlContinuation>,
     choice: Option<Choice>,
     power_snapshot: Vec<Power>,
     enemy_power_snapshot: Vec<Vec<Power>>,
@@ -1711,7 +1723,6 @@ pub struct Combat {
     centennial_puzzle: bool,
     demon_tongue: bool,
     permafrost: bool,
-    pen_nib: bool,
     ruined_helmet: bool,
     music_box: bool,
     mini_regent: bool,
@@ -1725,7 +1736,6 @@ pub struct Combat {
     red_skull: bool,
     throwing_axe: bool,
     paels_eye: bool,
-    paels_eye_extra: bool,
     paels_legion: u8,
     history_course: Option<Card>,
 }
@@ -2075,6 +2085,7 @@ pub struct Game {
     elite_encounters_left: u8,
     last_encounter: Option<Id>,
     last_elite: Option<Id>,
+    ancient: Option<Id>,
     events: Vec<Id>,
     visited_events: Vec<Id>,
     enemy_starts: Vec<usize>,
@@ -2092,7 +2103,7 @@ pub struct Game {
     relic_queue: Vec<Id>,
     relic_deques: [Vec<Id>; 4],
     shared_relic_deques: [Vec<Id>; 4],
-    pending_curse: bool,
+    reward_continuation: Option<RewardContinuation>,
     wongo_combats: Option<u8>,
     spoils: Option<(u8, u8)>,
     event_combat: u8,
@@ -2110,7 +2121,6 @@ pub struct Game {
     girya: u8,
     pumpkin_candle: u8,
     fishing_rod: u8,
-    cooking: bool,
     astrolabe: bool,
     transform_niche: bool,
     paels_tooth: bool,

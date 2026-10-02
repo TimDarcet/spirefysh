@@ -10,7 +10,7 @@ import torch
 
 import sts2_sim
 from explanations import explain as explain_decision
-from model import COMPATIBLE_MODEL_VERSIONS, CATEGORIES, MAX_PROGRESS, MODEL_VERSION, \
+from model import CATEGORIES, MAX_PROGRESS, MODEL_VERSION, \
     POTENTIAL_TERMS, STAGES, export_value_model, load, sha256_file
 
 
@@ -257,8 +257,7 @@ class TrajectorySource:
 
         def order(path):
             try:
-                compatible = json.loads(path.read_text()).get("model_version") \
-                    in COMPATIBLE_MODEL_VERSIONS
+                compatible = json.loads(path.read_text()).get("model_version") == MODEL_VERSION
             except (OSError, ValueError, json.JSONDecodeError):
                 compatible = False
             return compatible, path.stat().st_mtime
@@ -302,7 +301,7 @@ class TrajectorySource:
             sessions = manifest.get("sessions", [])
             training = sessions[-1].get("training", manifest.get("training", {})) \
                 if sessions else manifest.get("training", {})
-            compatible = manifest.get("model_version") in COMPATIBLE_MODEL_VERSIONS
+            compatible = manifest.get("model_version") == MODEL_VERSION
             traces = self._captured(name) | self.generated.get(name, {})
             return {
                 "run": name,

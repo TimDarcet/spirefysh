@@ -27,13 +27,7 @@ def parser():
                          default=None)
     run.add_argument("--continuation-pooling", choices=CONTINUATION_POOLING,
                      default=None)
-    run.add_argument("--phase-pooling", choices=("sum", "transformer"),
-                     default=None)
-    run.add_argument("--generation-pool-pooling", choices=("sum", "transformer"),
-                     default=None)
-    run.add_argument("--precision", choices=PRECISIONS, default="bf16")
-    for part in FP32_PARTS:
-        run.add_argument(f"--fp32-{part}", action="store_true")
+    run.add_argument("--precision", choices=TRAINING_PRECISIONS, default="bf16")
     run.add_argument("--start-stage", type=int, default=6)
     run.add_argument("--hours", type=float, default=0)
     run.add_argument("--decisions", type=int, default=0)

@@ -5,7 +5,6 @@ import math
 import os
 import struct
 import tempfile
-from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -20,12 +19,12 @@ ACTION_FIELDS = tuple(ACTION_FIELDS)
 TOKEN_SPECS = tuple(tuple(row) for row in TOKEN_SPECS)
 SEMANTIC_NAMES = tuple(SEMANTIC_NAMES)
 POSITION_CAPS = dict(POSITION_CAPS)
-COMPATIBLE_MODEL_VERSIONS = (MODEL_VERSION - 1, MODEL_VERSION)
 DEFAULT_ARCHITECTURE = (128, 4, 8, 384)
+MAP_NODE_KINDS = 26
 PRECISIONS = ("fp32", "bf16")
-FP32_PARTS = ("encoders", "backbone", "heads")
+TRAINING_PRECISIONS = (*PRECISIONS, "bf16_with_fp32_dV")
 WINNING_CAPACITY = 0
-CHANGE = "Current-floor plus resource-potential residual critic."
+CHANGE = "Compact token schema with run-state pooling and dense card flags."
 COLLECTION_POOLING = ("sum", "transformer", "global_tokens")
 EFFECT_POOLING = (
     "sum_into_actor", "transformer_into_actor", "sum_token", "transformer_token",
@@ -37,7 +36,7 @@ POOLING_DEFAULTS = {
     "exhaust": "global_tokens", "discard": "global_tokens", "hand": "global_tokens",
     "orb": "global_tokens", "potion": "global_tokens",
     "enemy_effect": "global_tokens", "friendly_effect": "global_tokens",
-    "continuation": "gru", "phase": "transformer", "generation_pool": "sum",
+    "continuation": "gru",
 }
 STAGES = [(0, bonus) for bonus in (24, 20, 16, 12, 8, 4, 3, 2, 1, 0)] + [
     (ascension, 0) for ascension in range(1, 11)
@@ -527,6 +526,30 @@ kernel void attention_backward_key_value_bfloat_x4(
         grad_qkv[base] = bfloat(dk);
         grad_qkv[base + width] = bfloat(dv);
     }
+}
+
+kernel void attention_backward_value_bfloat(
+    device const bfloat *qkv, device const int *offsets, device const int *sequence,
+    device const int *selected, device const int *query_offsets,
+    device const float *lse, device const bfloat *grad_output, device float *grad_value,
+    constant uint& heads, constant uint& dimension, constant bool& sparse,
+    uint tid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+    uint group = tid / SIMD_WIDTH, heads_per_group = SIMD_WIDTH / dimension;
+    uint groups = heads / heads_per_group, key = group / groups;
+    uint head = group % groups * heads_per_group + lane / dimension, column = lane % dimension;
+    int row = sequence[key], begin = sparse ? query_offsets[row] : offsets[row];
+    int end = sparse ? query_offsets[row + 1] : offsets[row + 1];
+    uint width = heads * dimension, k = key * 3 * width + width + head * dimension;
+    float key_value = float(qkv[k + column]), dv = 0.0f;
+    for (int query_index = begin; query_index < end; ++query_index) {
+        uint token = sparse ? selected[query_index] : query_index;
+        uint query = token * 3 * width + head * dimension + column;
+        uint out = query_index * width + head * dimension + column;
+        float probability = exp(head_sum(float(qkv[query]) * key_value, dimension, lane)
+            * rsqrt(float(dimension)) - lse[query_index * heads + head]);
+        dv += probability * float(grad_output[out]);
+    }
+    grad_value[key * width + head * dimension + column] = dv;
 }
 
 kernel void summary_forward(
@@ -1081,19 +1104,22 @@ class _RaggedAttention(torch.autograd.Function):
     half_library = None
 
     @staticmethod
-    def forward(ctx, qkv, offsets, sequence, heads, selected, query_offsets, sparse):
+    def forward(ctx, qkv, offsets, sequence, heads, selected, query_offsets, sparse,
+                fp32_value_backward=False):
         if _RaggedAttention.library is None:
             _RaggedAttention.library = torch.mps.compile_shader(_TRAINING_METAL)
         if qkv.dtype == torch.float16 and _RaggedAttention.half_library is None:
             _RaggedAttention.half_library = torch.mps.compile_shader(
                 _TRAINING_METAL.replace("bfloat", "half")
             )
-        library = _RaggedAttention.half_library if qkv.dtype == torch.float16 else _RaggedAttention.library
+        library = _RaggedAttention.half_library \
+            if qkv.dtype == torch.float16 else _RaggedAttention.library
         queries = len(selected) if sparse else len(qkv)
         output = qkv.new_empty((queries, qkv.shape[1] // 3))
         lse = torch.empty((queries, heads), dtype=torch.float32, device=qkv.device)
         dimension = output.shape[1] // heads
-        suffix = "_half" if qkv.dtype == torch.float16 else "_bfloat" if qkv.dtype == torch.bfloat16 else ""
+        suffix = "_half" if qkv.dtype == torch.float16 else \
+            "_bfloat" if qkv.dtype == torch.bfloat16 else ""
         tiled = bool(suffix) and dimension == 32
         threads = ((queries * heads + 3) // 4 * 32 if tiled
                    else queries * heads * dimension)
@@ -1111,27 +1137,24 @@ class _RaggedAttention(torch.autograd.Function):
         ctx.save_for_backward(qkv, offsets, sequence, selected, query_offsets, output, lse)
         ctx.heads = heads
         ctx.dimension = dimension
-        ctx.library, ctx.suffix, ctx.sparse = library, suffix, sparse
+        ctx.fp32_value_backward = fp32_value_backward
+        ctx.library, ctx.suffix = library, suffix
+        ctx.sparse = sparse
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
         qkv, offsets, sequence, selected, query_offsets, output, lse = ctx.saved_tensors
+        grad_output = grad_output.contiguous()
         grad_qkv = torch.empty_like(qkv)
         delta = torch.empty_like(lse)
         tiled = bool(ctx.suffix) and ctx.dimension == 32
         query_threads = ((len(output) * ctx.heads + 3) // 4 * 32 if tiled
                          else len(output) * ctx.heads * ctx.dimension)
-        key_threads = ((len(qkv) * ctx.heads + 3) // 4 * 32 if tiled
-                       else len(qkv) * ctx.heads * ctx.dimension)
-        args = qkv, offsets, sequence, selected, output, lse, grad_output.contiguous()
+        args = qkv, offsets, sequence, selected, output, lse, grad_output
         query = getattr(
             ctx.library, f"attention_backward_query{ctx.suffix}{'_x4' if tiled else ''}",
         ) if ctx.suffix else ctx.library.backward_query
-        key_value = getattr(
-            ctx.library,
-            f"attention_backward_key_value{ctx.suffix}{'_x4' if tiled else ''}",
-        ) if ctx.suffix else ctx.library.backward_key_value
         if tiled:
             query(
                 *args, grad_qkv, delta, len(output), ctx.heads, ctx.dimension, ctx.sparse,
@@ -1142,10 +1165,16 @@ class _RaggedAttention(torch.autograd.Function):
                 *args, grad_qkv, delta, ctx.heads, ctx.dimension, ctx.sparse,
                 threads=query_threads, group_size=32,
             )
+        key_threads = ((len(qkv) * ctx.heads + 3) // 4 * 32 if tiled
+                       else len(qkv) * ctx.heads * ctx.dimension)
         arguments = (
             qkv, offsets, sequence, selected, query_offsets, output, lse,
-            grad_output.contiguous(), delta, grad_qkv,
+            grad_output, delta, grad_qkv,
         )
+        key_value = getattr(
+            ctx.library,
+            f"attention_backward_key_value{ctx.suffix}{'_x4' if tiled else ''}",
+        ) if ctx.suffix else ctx.library.backward_key_value
         if tiled:
             key_value(
                 *arguments, len(qkv), ctx.heads, ctx.dimension, ctx.sparse,
@@ -1156,7 +1185,16 @@ class _RaggedAttention(torch.autograd.Function):
                 *arguments, ctx.heads, ctx.dimension, ctx.sparse,
                 threads=key_threads, group_size=32,
             )
-        return grad_qkv, None, None, None, None, None, None
+        if ctx.fp32_value_backward and qkv.dtype == torch.bfloat16:
+            width = qkv.shape[1] // 3
+            grad_value = torch.empty((len(qkv), width), dtype=torch.float32, device=qkv.device)
+            _RaggedAttention.library.attention_backward_value_bfloat(
+                qkv, offsets, sequence, selected, query_offsets, lse, grad_output,
+                grad_value, ctx.heads, ctx.dimension, ctx.sparse,
+                threads=len(qkv) * ctx.heads * ctx.dimension, group_size=32,
+            )
+            grad_qkv = torch.cat((grad_qkv[:, :2 * width], grad_value.to(qkv.dtype)), 1)
+        return grad_qkv, None, None, None, None, None, None, None
 
 
 class _FlashAttention(torch.autograd.Function):
@@ -1566,9 +1604,8 @@ class _FusedDomains(torch.autograd.Function):
                               gamma.new_empty((0, len(gamma))), gamma.new_empty((0, 2))))
                 continue
             numeric_input = numeric.to(torch.bfloat16)
-            numeric = nn.functional.linear(
-                numeric_input, weight.to(torch.bfloat16),
-            )
+            numeric = nn.functional.linear(numeric_input, weight.to(torch.bfloat16)) \
+                if weight.numel() else embedding.new_zeros((len(numeric), len(gamma)))
             rows, fields = categorical.shape
             input = embedding.new_empty((rows, len(gamma)))
             output = torch.empty_like(input)
@@ -1618,7 +1655,7 @@ class _FusedDomains(torch.autograd.Function):
             )
             grad_weight = torch.ops.aten.linear_backward(
                 numeric_input, grad_input.to(torch.bfloat16), weight, [False, True, False],
-            )[1]
+            )[1] if weight.numel() else torch.zeros_like(weight)
             gradients.extend((None, None, grad_weight.float(), grad_gamma, grad_beta))
         return tuple(gradients)
 
@@ -1769,13 +1806,14 @@ class ConceptEmbeddings(nn.Module):
 class TokenEncoder(nn.Module):
     def __init__(self, _categorical, numeric, width):
         super().__init__()
-        self.numeric = nn.Linear(numeric, width, bias=False)
+        self.numeric = nn.Linear(numeric, width, bias=False) if numeric else None
         self.norm = nn.LayerNorm(width)
 
     def forward(self, categorical, numeric, embeddings):
         if not len(categorical):
             return self.norm.weight.new_empty((0, len(self.norm.weight)))
-        numeric = self.numeric(numeric)
+        numeric = self.numeric(numeric) if self.numeric is not None else \
+            self.norm.weight.new_zeros((len(categorical), len(self.norm.weight)))
         if (categorical.device.type == "mps" and numeric.dtype == torch.bfloat16
                 and len(self.norm.weight) % 32 == 0 and len(self.norm.weight) <= 128):
             return _FusedSemantic.apply(
@@ -1804,7 +1842,7 @@ class Agent(nn.Module):
             raise ValueError("incompatible observation schema")
         if min(width, layers, heads, feedforward) <= 0 or width % heads \
                 or head_width not in (None, width) \
-                or model_version not in COMPATIBLE_MODEL_VERSIONS:
+                or model_version != MODEL_VERSION:
             raise ValueError("invalid architecture")
         self.model_version = model_version
         self.width, self.layers, self.heads, self.feedforward = width, layers, heads, feedforward
@@ -1821,6 +1859,8 @@ class Agent(nn.Module):
         self.potential_mode = potential_mode
         self.card_zones = 5
         self.entity_collections = 0
+        if pooling and set(pooling) - POOLING_DEFAULTS.keys():
+            raise ValueError("invalid pooling configuration")
         self.pooling = POOLING_DEFAULTS | (pooling or {})
         for name in ("relic", "deck", "draw", "exhaust", "discard", "hand", "orb", "potion"):
             if self.pooling[name] not in COLLECTION_POOLING:
@@ -1830,19 +1870,18 @@ class Agent(nn.Module):
                 raise ValueError(f"invalid {name} pooling")
         if self.pooling["continuation"] not in CONTINUATION_POOLING:
             raise ValueError("invalid continuation pooling")
-        if self.pooling["phase"] not in ("sum", "transformer") \
-                or self.pooling["generation_pool"] not in ("sum", "transformer"):
-            raise ValueError("invalid summary pooling")
-
         self.concepts = ConceptEmbeddings(self.layout, width)
         self.encoders = nn.ModuleDict({
             name: TokenEncoder(semantic, numeric, width)
             for name, _unsigned, _signed, semantic, numeric in TOKEN_SPECS
+            if name not in ("potion", "map_edge")
         })
         self.action_encoder = TokenEncoder(ACTION_FIELDS[2], ACTION_FIELDS[3], width)
-        summary_names = (*POOLING_DEFAULTS, "card_pool", "relic_pool", "encounter_pool", "event_pool")
+        summary_names = tuple(POOLING_DEFAULTS)
         self.summary_seed = nn.ParameterDict({name: nn.Parameter(torch.randn(width) * .02)
                                               for name in summary_names})
+        self.map_nodes = nn.Embedding(MAP_NODE_KINDS, width)
+        self.relic_pool_projection = nn.Linear(width, width, bias=False)
 
         def transformer(layer_count=1):
             layer = nn.TransformerEncoderLayer(
@@ -1854,23 +1893,21 @@ class Agent(nn.Module):
         self.pool_transformers = nn.ModuleDict()
         for name, mode in self.pooling.items():
             if mode in ("transformer", "transformer_into_actor", "transformer_token"):
-                key = "generation_pool" if name == "generation_pool" else name
-                if key not in self.pool_transformers:
-                    self.pool_transformers[key] = transformer()
+                if name not in self.pool_transformers:
+                    self.pool_transformers[name] = transformer()
         self.move_gru = nn.GRU(width, width, batch_first=True)
         self.continuation_gru = nn.GRU(width, width, batch_first=True) \
             if self.pooling["continuation"] == "gru" else None
         self.actor_norm = nn.LayerNorm(width)
         self.action_norm = nn.LayerNorm(width)
+        self.pael_cards = nn.Linear(width, width, bias=False)
         self.global_transformer = transformer(layers)
         self.global_norm = nn.LayerNorm(width)
 
         self.graph_norm = nn.LayerNorm(width)
         self.graph_query = nn.Linear(width, width)
         self.graph_key_value = nn.Linear(width, 2 * width)
-        self.graph_edge = nn.Linear(width, 2 * width, bias=False)
         self.graph_out = nn.Linear(width, width)
-        self.graph_degree = nn.Linear(2, width, bias=False)
         self.graph_ff_norm = nn.LayerNorm(width)
         self.graph_ff = nn.Sequential(
             nn.Linear(width, feedforward), nn.GELU(), nn.Linear(feedforward, width),
@@ -1882,7 +1919,7 @@ class Agent(nn.Module):
         self._reuse_sequence_layouts = False
         self._sequence_layout_index = 0
         self.cache_stats = {"graph_hit": 0, "graph_miss": 0}
-        self.fp32_parts = ()
+        self.precision = "fp32"
         nn.init.normal_(self.policy.weight, std=.01)
         nn.init.zeros_(self.policy.bias)
         nn.init.zeros_(self.critic.weight)
@@ -1930,8 +1967,7 @@ class Agent(nn.Module):
         return torch.where(legal, value, torch.zeros_like(value))
 
     def encode_map(self, encoded, index):
-        node_source, edge_source, levels, offsets, current, current_inverse, current_source, \
-            current_sequence, keys = index
+        node_source, edge_source, levels, offsets, current, current_inverse, keys = index
         cached = [self._graph_cache.get(key) for key in keys]
         if not self.training and node_source.device.type == "cpu" and all(x is not None for x in cached):
             self.cache_stats["graph_hit"] += len(keys)
@@ -1946,15 +1982,12 @@ class Agent(nn.Module):
                 for graph, value in enumerate(cached):
                     if value is not None:
                         nodes[ranges[graph]:ranges[graph + 1]] = value
-            edges = encoded[DOMAIN["map_edge"]][edge_source]
             for parents, children, edge_rows, sequence, degree, count, _edge_count in levels:
                 attended = self.attend(
                     self.graph_query(self.graph_norm(nodes[parents])),
-                    self.graph_key_value(self.graph_norm(nodes[children]))
-                    + self.graph_edge(edges[edge_rows]), sequence,
+                    self.graph_key_value(self.graph_norm(nodes[children])), sequence,
                 )
-                features = torch.stack((degree / 8, degree.log1p() / 3), 1).to(nodes.dtype)
-                updated = nodes[parents] + self.graph_out(attended) + self.graph_degree(features)
+                updated = nodes[parents] + self.graph_out(attended)
                 updated = updated + self.graph_ff(self.graph_ff_norm(updated))
                 nodes.index_copy_(0, parents[:count], updated[:count])
             if not self.training and node_source.device.type == "cpu":
@@ -1964,44 +1997,99 @@ class Agent(nn.Module):
                         self._graph_cache[key] = nodes[offsets[graph]:offsets[graph + 1]].detach()
                 while len(self._graph_cache) > 8192:
                     self._graph_cache.pop(next(iter(self._graph_cache)))
-        selected = nodes[current]
-        attended = self.attend(
-            self.graph_query(self.graph_norm(selected)),
-            self.graph_key_value(self.graph_norm(nodes[current_source])), current_sequence,
-        )
-        selected = selected + self.graph_out(attended)
-        selected = selected + self.graph_ff(self.graph_ff_norm(selected))
-        return selected[current_inverse], nodes
+        return nodes[current][current_inverse], nodes
 
     def encode_domains(self, domains, concepts):
+        learned = [
+            (index, name, values)
+            for index, ((name, *_), values) in enumerate(zip(TOKEN_SPECS, domains))
+            if name in self.encoders and name != "map_node"
+        ]
         if (concepts.device.type == "mps" and torch.is_autocast_enabled("mps")
                 and self.width == 128):
-            arguments = tuple(value for domain, (name, *_), values in zip(
-                self.encoders.values(), TOKEN_SPECS, domains,
-            ) for value in (*values[:2], domain.numeric.weight,
-                            domain.norm.weight, domain.norm.bias))
-            return tuple(output[:values[2]] for output, values in zip(
-                _FusedDomains.apply(concepts, *arguments), domains,
-            ))
-        return tuple(self.encoders[name](*values[:2], concepts)[:values[2]]
-                     for (name, *_), values in zip(TOKEN_SPECS, domains))
+            arguments = tuple(
+                value
+                for _index, name, values in learned
+                for value in (
+                    *values[:2],
+                    self.encoders[name].numeric.weight
+                    if self.encoders[name].numeric is not None
+                    else concepts.new_empty((self.width, 0)),
+                    self.encoders[name].norm.weight,
+                    self.encoders[name].norm.bias,
+                )
+            )
+            outputs = _FusedDomains.apply(concepts, *arguments)
+        else:
+            outputs = tuple(self.encoders[name](*values[:2], concepts)[:values[2]]
+                            for _index, name, values in learned)
+        encoded = [None] * len(domains)
+        for output, (index, _name, values) in zip(outputs, learned):
+            encoded[index] = output[:values[2]]
+        potion = domains[DOMAIN["potion"]]
+        encoded[DOMAIN["potion"]] = nn.functional.embedding(
+            potion[0][:potion[2], 0].long(), concepts,
+        )
+        node = domains[DOMAIN["map_node"]]
+        node_semantic = nn.functional.embedding(node[0][:node[2]].long(), concepts).sum(1)
+        encoded[DOMAIN["map_node"]] = self.encoders["map_node"].norm(
+            node_semantic + self.map_nodes(node[10][:node[2], 0]),
+        )
+        encoded[DOMAIN["map_edge"]] = concepts.new_empty((0, self.width))
+        return tuple(encoded)
 
     def _tag(self, values, role, collection=None):
         tagged = values + self.concepts.local("token_role", role).to(values.dtype)
         return tagged if collection is None else \
             tagged + self.concepts.local("collection", collection).to(values.dtype)
 
+    def _card_context(self, values, metadata):
+        if not len(values):
+            return values
+        zone, order_kind, order, origin = metadata[:len(values)].T
+        for kind, name in ((1, "draw_top_position"), (2, "draw_bottom_position")):
+            present = (zone == 2) & (order_kind == kind) & (order > 0)
+            if present.any():
+                values = values + present[:, None] * self.concepts.local(
+                    name, (order - 1).clamp(max=256),
+                ).to(values.dtype)
+        present = origin > 0
+        if present.any():
+            values = values + present[:, None] * self.concepts.local(
+                "deck_origin", (origin - 1).clamp(max=256),
+            ).to(values.dtype)
+        return values
+
+    def _relic_context(self, values, metadata):
+        if not len(values):
+            return values
+        position = metadata[:len(values), 0]
+        return values + (position > 0)[:, None] * self.concepts.local(
+            "relic_position", (position - 1).clamp(max=256),
+        ).to(values.dtype)
+
     @staticmethod
     def _domain_rows(domains, encoded, domain, predicate=None, scope_value=-1, source=None):
-        _semantic, _numeric, _count, u, row, _scope, inverse, root, phase, _action = domains[domain]
+        _semantic, _numeric, _count, u, row, _scope, inverse, root, phase, _action, *_ = \
+            domains[domain]
         source = (root if scope_value == -1 else phase) if source is None else source
         if predicate is not None:
             source = source[predicate(u[source])]
         return encoded[domain][inverse[source]], row[source], u[source]
 
+    def _phases(self, domains, concepts):
+        semantic, numeric, _count, metadata, rows, _scope, inverse, root, *_ = \
+            domains[DOMAIN["phase"]]
+        encoder = self.encoders["phase"]
+        values = nn.functional.embedding(semantic.long(), concepts).sum(1)
+        if encoder.numeric is not None:
+            values = values + encoder.numeric(numeric.float())
+        return values[inverse[root]], rows[root], metadata[root]
+
     def _sequence(self, values, group, groups, seed, transformer, selected=None, layout=None):
         selected_count = selected
         real_tokens = len(values) + groups
+        final_attention = transformer is self.global_transformer
         flash = values.device.type == "mps" and self.width == 128 and self.heads == 4 \
             and torch.is_autocast_enabled("mps") \
             and torch.get_autocast_dtype("mps") == torch.bfloat16
@@ -2067,33 +2155,8 @@ class Agent(nn.Module):
             current = values.new_zeros((total, self.width))
             current[offsets[:groups]] = seed.to(current.dtype)
             current[destination] = values.to(current.dtype)
-            for layer_index, layer in enumerate(transformer.layers):
-                if selected_count is not None and layer_index == len(transformer.layers) - 1:
-                    positions, item_positions, query_offsets = sparse
-                    qkv = _norm_linear(
-                        current, layer.norm1, layer.self_attn.in_proj_weight,
-                        layer.self_attn.in_proj_bias,
-                    ) if flash else nn.functional.linear(
-                        layer.norm1(current), layer.self_attn.in_proj_weight,
-                        layer.self_attn.in_proj_bias,
-                    )
-                    attended = _RaggedAttention.apply(
-                        qkv, offsets.to(torch.int32), sequence.to(torch.int32),
-                        layer.self_attn.num_heads, positions.to(torch.int32),
-                        query_offsets.to(torch.int32), True,
-                    )
-                    current = _residual_linear(
-                        attended, layer.self_attn.out_proj, current[positions],
-                    )
-                    current = _residual_linear(
-                        layer.activation(_norm_linear(
-                            current, layer.norm2, layer.linear1.weight, layer.linear1.bias,
-                        )),
-                        layer.linear2, current,
-                    )
-                    state = current[query_offsets[:groups]]
-                    items = current[item_positions]
-                    return state, items
+
+            def attend_layer(current, layer, selected, query_offsets, sparse):
                 qkv = _norm_linear(
                     current, layer.norm1, layer.self_attn.in_proj_weight,
                     layer.self_attn.in_proj_bias,
@@ -2101,20 +2164,46 @@ class Agent(nn.Module):
                     layer.norm1(current), layer.self_attn.in_proj_weight,
                     layer.self_attn.in_proj_bias,
                 )
-                attended = _FlashAttention.apply(
-                    qkv, metal_offsets, metal_lengths, block_rows, block_starts, real_tokens,
-                ) if flash else _RaggedAttention.apply(
-                    qkv, offsets.to(torch.int32), sequence.to(torch.int32),
-                    layer.self_attn.num_heads, sequence.to(torch.int32), offsets.to(torch.int32),
-                    False,
-                )
-                current = _residual_linear(attended, layer.self_attn.out_proj, current)
-                current = _residual_linear(
+                fp32_value_backward = final_attention \
+                    and layer_index + 1 == len(transformer.layers) \
+                    and self.precision == "bf16_with_fp32_dV"
+                if fp32_value_backward:
+                    attended = _RaggedAttention.apply(
+                        qkv, offsets.to(torch.int32), sequence.to(torch.int32),
+                        layer.self_attn.num_heads, selected.to(torch.int32),
+                        query_offsets.to(torch.int32), sparse, True,
+                    )
+                elif flash and not sparse:
+                    attended = _FlashAttention.apply(
+                        qkv, metal_offsets, metal_lengths, block_rows, block_starts, real_tokens,
+                    )
+                else:
+                    attended = _RaggedAttention.apply(
+                        qkv, offsets.to(torch.int32), sequence.to(torch.int32),
+                        layer.self_attn.num_heads, selected.to(torch.int32),
+                        query_offsets.to(torch.int32), sparse, False,
+                    )
+                residual = current[selected] if sparse else current
+                return _residual_linear(attended, layer.self_attn.out_proj, residual)
+
+            def feed_forward(current, layer):
+                return _residual_linear(
                     layer.activation(_norm_linear(
                         current, layer.norm2, layer.linear1.weight, layer.linear1.bias,
                     )),
                     layer.linear2, current,
                 )
+
+            for layer_index, layer in enumerate(transformer.layers):
+                if selected_count is not None and layer_index == len(transformer.layers) - 1:
+                    positions, item_positions, query_offsets = sparse
+                    current = attend_layer(current, layer, positions, query_offsets, True)
+                    current = feed_forward(current, layer)
+                    state = current[query_offsets[:groups]]
+                    items = current[item_positions]
+                    return state, items
+                current = attend_layer(current, layer, sequence, offsets, False)
+                current = feed_forward(current, layer)
             items = current[destination] if len(values) else values
             return current[offsets[:groups]], items
         values = values[order]
@@ -2135,7 +2224,6 @@ class Agent(nn.Module):
         return sequence[:, 0], items
 
     def _summarize(self, values, group, groups, name, mode, transformer_name=None):
-        seed = self.summary_seed[name]
         if mode == "sum":
             summary = _GroupSum.apply(values, group, groups) \
                 if values.device.type == "mps" and len(values) else \
@@ -2143,7 +2231,7 @@ class Agent(nn.Module):
                     0, group, values.to(torch.float32),
                 )
         else:
-            summary, _ = self._sequence(values, group, groups, seed,
+            summary, _ = self._sequence(values, group, groups, self.summary_seed[name],
                                         self.pool_transformers[transformer_name or name])
         return summary
 
@@ -2151,10 +2239,10 @@ class Agent(nn.Module):
         collection = ("deck", "hand", "draw", "discard", "exhaust", "relic", "potion", "orb").index(name)
         mode = self.pooling[name]
         if mode == "global_tokens":
-            return self._tag(values, 9, collection), rows
+            return self._tag(values, 5, collection), rows
         summary = self._summarize(values, rows, int(active.max().item()) + 1 if len(active) else 0,
                                   name, mode)
-        return self._tag(summary[active], 14, collection), active
+        return self._tag(summary[active], 10, collection), active
 
     def _actors(self, domains, encoded, batch, concepts, plan):
         order, player_source, player_group, move_raw, move_order, move_packed_order, \
@@ -2213,7 +2301,7 @@ class Agent(nn.Module):
             values = effects[effect_source]
             mode = self.pooling[name]
             if mode == "global_tokens":
-                extra_values.append(self._tag(values, 10, 8 + (name == "enemy_effect")))
+                extra_values.append(self._tag(values, 6, 8 + (name == "enemy_effect")))
                 extra_rows.append(rows[effect_actor])
                 continue
             pooled_mode = "transformer" if mode.startswith("transformer") else "sum"
@@ -2221,36 +2309,46 @@ class Agent(nn.Module):
             if mode.endswith("into_actor"):
                 actors = actors.index_add(0, actor_index, summary.to(actors.dtype))
             else:
-                extra_values.append(self._tag(summary, 10, 8 + (name == "enemy_effect")))
+                extra_values.append(self._tag(summary, 6, 8 + (name == "enemy_effect")))
                 extra_rows.append(rows[actor_index])
-        actors = self.actor_norm(self._tag(actors, 8))
+        actors = self.actor_norm(self._tag(actors, 4))
         return actors, rows, u, extra_values, extra_rows
 
     def _actions(self, domains, encoded, values, index, nodes, concepts):
         semantic, numeric = values
         action_row, action_flat, _legal, policy_sequence, actions, path, action_count, \
             attachment_rows, *_ = index
-        with torch.autocast(numeric.device.type, enabled=False) \
-                if "encoders" in self.fp32_parts else nullcontext():
-            action = self.action_encoder(
-                semantic, numeric.float(), concepts.float(),
-            )[:action_count]
+        action = self.action_encoder(
+            semantic, numeric.float(), concepts.float(),
+        )[:action_count]
         if action.device.type == "mps":
-            arguments = tuple(value for domain, row in zip(encoded, domains) if len(row[9])
-                              for value in (domain, row[6][row[9]]))
+            arguments = []
+            for domain, row in enumerate(domains):
+                if not len(row[9]):
+                    continue
+                attached_values = encoded[domain]
+                if domain == DOMAIN["card"]:
+                    attached_values = self._card_context(attached_values, row[10])
+                arguments.extend((attached_values, row[6][row[9]]))
             attached = _ActionAttachments.apply(
-                nodes, path[:action_count], attachment_rows, *arguments,
+                nodes, path[:action_count], attachment_rows, *tuple(arguments),
             )
         else:
             attached = action.new_zeros(action.shape)
-            values = [encoded[domain][row[6][row[9]]] for domain, row in enumerate(domains)
-                      if len(row[9])]
+            values = []
+            for domain, row in enumerate(domains):
+                if not len(row[9]):
+                    continue
+                item = encoded[domain][row[6][row[9]]]
+                if domain == DOMAIN["card"]:
+                    item = self._card_context(item, row[3][row[9]])
+                values.append(item)
             if values:
                 attached.index_add_(0, attachment_rows, torch.cat(values).to(attached.dtype))
             present = path[:action_count] >= 0
             if present.any():
                 attached[present] += nodes[path[:action_count][present]]
-        action = self.action_norm(self._tag(action + attached, 13))
+        action = self.action_norm(self._tag(action + attached, 9))
         return action, action_row[:action_count], action_flat[:action_count], actions, policy_sequence
 
     def _continuations(self, domains, encoded, plan):
@@ -2301,30 +2399,29 @@ class Agent(nn.Module):
                 segments.append((name, len(value)))
 
         run, run_rows, _ = self._domain_rows(domains, encoded, DOMAIN["run"])
-        add(self._tag(run, 1), run_rows, "run")
-        phase, phase_rows, _ = self._domain_rows(domains, encoded, DOMAIN["phase"])
-        phase_values, phase_groups = [phase], [phase_rows]
+        seed = run.new_zeros((batch, self.width)).index_copy(0, run_rows, run)
+        phase, phase_rows, phase_u = self._phases(domains, concepts)
+        payload = phase.new_zeros((batch, self.width))
         for domain in range(len(TOKEN_SPECS)):
             item, item_rows, _ = self._domain_rows(
                 domains, encoded, domain, scope_value=-2,
             )
             if len(item):
-                phase_values.append(item); phase_groups.append(item_rows)
-        phase = self._summarize(torch.cat(phase_values), torch.cat(phase_groups), batch,
-                                "phase", self.pooling["phase"])
-        add(self._tag(phase, 2), torch.arange(batch, device=phase.device), "phase")
-        add(self._tag(current, 3), torch.arange(batch, device=current.device), "map")
+                payload.index_add_(0, item_rows, item.to(payload.dtype))
+        suspended = phase_u[:, 0] != 0
+        phase = phase + suspended[:, None] * payload[phase_rows].to(phase.dtype)
+        add(self.encoders["phase"].norm(phase), phase_rows, "phase")
+        add(self._tag(current, 0), torch.arange(batch, device=current.device), "map")
         synchronize()
 
         pool_specs = (
-            ("card_pool", DOMAIN["card"], 0),
-            ("relic_pool", DOMAIN["relic"], 1),
-            ("encounter_pool", DOMAIN["encounter"], 2),
-            ("event_pool", DOMAIN["event"], 3),
+            ("relic_pool", DOMAIN["relic"], 0),
+            ("encounter_pool", DOMAIN["encounter"], 1),
+            ("event_pool", DOMAIN["event"], 2),
         )
         for name, domain, filtered in pool_specs:
             source, pooled = filters[filtered]
-            if encoded[domain].device.type == "mps" and self.pooling["generation_pool"] == "sum":
+            if encoded[domain].device.type == "mps":
                 pooled_source, item_rows, inverse, groups = pooled
                 summary = _IndexedGroupSum.apply(
                     encoded[domain], domains[domain][6][pooled_source], item_rows, groups,
@@ -2334,10 +2431,11 @@ class Agent(nn.Module):
                     domains, encoded, domain, source=source,
                 )
                 summary = self._summarize(
-                    item, item_rows, batch, name, self.pooling["generation_pool"],
-                    transformer_name="generation_pool",
+                    item, item_rows, batch, name, "sum",
                 )
-            role = ("card_pool", "relic_pool", "encounter_pool", "event_pool").index(name) + 4
+            if name == "relic_pool":
+                summary = self.relic_pool_projection(summary)
+            role = ("relic_pool", "encounter_pool", "event_pool").index(name) + 1
             add(self._tag(summary, role), torch.arange(batch, device=summary.device), name)
         synchronize()
 
@@ -2347,27 +2445,31 @@ class Agent(nn.Module):
         synchronize()
         combat_rows = actor_rows[actor_u[:, 0] == 0]
         for name, domain, filtered, active in (
-            ("deck", DOMAIN["card"], 4, torch.arange(batch, device=run.device)),
-            ("hand", DOMAIN["card"], 5, combat_rows),
-            ("draw", DOMAIN["card"], 6, combat_rows),
-            ("discard", DOMAIN["card"], 7, combat_rows),
-            ("exhaust", DOMAIN["card"], 8, combat_rows),
-            ("relic", DOMAIN["relic"], 9, torch.arange(batch, device=run.device)),
-            ("potion", DOMAIN["potion"], 10, torch.arange(batch, device=run.device)),
+            ("deck", DOMAIN["card"], 3, torch.arange(batch, device=run.device)),
+            ("hand", DOMAIN["card"], 4, combat_rows),
+            ("draw", DOMAIN["card"], 5, combat_rows),
+            ("discard", DOMAIN["card"], 6, combat_rows),
+            ("exhaust", DOMAIN["card"], 7, combat_rows),
+            ("relic", DOMAIN["relic"], 8, torch.arange(batch, device=run.device)),
+            ("potion", DOMAIN["potion"], 9, torch.arange(batch, device=run.device)),
             ("orb", DOMAIN["orb"], None, combat_rows),
         ):
             item, item_rows, item_u = self._domain_rows(
                 domains, encoded, domain,
                 source=None if filtered is None else filters[filtered],
             )
+            if domain == DOMAIN["card"]:
+                item = self._card_context(item, item_u)
             if name == "relic" and len(item):
+                item = self._relic_context(item, item_u)
                 stored, stored_rows, _ = self._domain_rows(
-                    domains, encoded, DOMAIN["card"], source=filters[11],
+                    domains, encoded, DOMAIN["card"], source=filters[10],
                 )
                 payload = item.new_zeros((batch, self.width))
                 if len(stored):
                     payload.index_add_(0, stored_rows, stored.to(payload.dtype))
-                pael = item_u[:, 0] != 0
+                    payload = self.pael_cards(payload)
+                pael = item_u[:, 1] != 0
                 item = item + pael[:, None] * payload[item_rows]
             item, item_rows = self._collection(item, item_rows, active, name)
             add(item, item_rows, name)
@@ -2381,7 +2483,7 @@ class Agent(nn.Module):
         )
         mode = self.pooling["continuation"]
         if mode == "global_tokens":
-            add(self._tag(continuation, 11, 10), continuation_rows, "continuation")
+            add(self._tag(continuation, 7, 10), continuation_rows, "continuation")
         elif mode == "gru":
             _groups, maximum, position, present, last, packed_order, packed_present, \
                 batch_sizes = continuation_gru
@@ -2402,14 +2504,14 @@ class Agent(nn.Module):
                     )
             else:
                 summary = continuation.new_zeros((batch, self.width))
-            add(self._tag(summary, 14, 10),
+            add(self._tag(summary, 10, 10),
                 torch.arange(batch, device=run.device), "continuation")
         else:
             add(self._tag(self._summarize(
-                    continuation, continuation_rows, batch, "continuation", mode), 14, 10),
+                    continuation, continuation_rows, batch, "continuation", mode), 10, 10),
                 torch.arange(batch, device=run.device), "continuation")
         crystal, crystal_rows, _ = self._domain_rows(domains, encoded, DOMAIN["crystal"])
-        add(self._tag(crystal, 12), crystal_rows, "crystal")
+        add(self._tag(crystal, 8), crystal_rows, "crystal")
         add(action, action_rows, "action")
         synchronize()
 
@@ -2420,7 +2522,7 @@ class Agent(nn.Module):
         self._sequence_lengths = global_layout[6][:batch] if global_layout is not None else \
             torch.bincount(rows, minlength=batch) + 1
         state, transformed = self._sequence(
-            values, rows, batch, self.concepts.local("token_role", 0), self.global_transformer,
+            values, rows, batch, seed, self.global_transformer,
             len(action), global_layout,
         )
         synchronize()
@@ -2437,36 +2539,26 @@ class Agent(nn.Module):
         if self._reuse_sequence_layouts:
             self._sequence_layout_index = 0
         concepts = self.concepts.flattened()
-        with torch.autocast(concepts.device.type, enabled=False) \
-                if "encoders" in self.fp32_parts else nullcontext():
-            encoded = self.encode_domains(domains, concepts)
+        encoded = self.encode_domains(domains, concepts)
         synchronize()
-        with torch.autocast(concepts.device.type, enabled=False) \
-                if "backbone" in self.fp32_parts else nullcontext():
-            if "backbone" in self.fp32_parts:
-                encoded = tuple(value.float() for value in encoded)
-            state, action, action_row, action_flat, actions, sequence = self.encode_state(
-                domains, encoded, state_index, action_values, action_index, concepts,
-                len(character),
-            )
-        with torch.autocast(concepts.device.type, enabled=False) \
-                if "heads" in self.fp32_parts else nullcontext():
-            if "heads" in self.fp32_parts:
-                state, action = state.float(), action.float()
-            scores = _norm_head(action, self.global_norm, self.policy) / temperature
-            legal = torch.ones_like(scores, dtype=torch.bool)
-            scores = self.group_log_softmax(scores, legal, sequence)
-            synchronize()
-            if flat_policy:
-                policy = scores
-            else:
-                policy = scores.new_zeros(len(state) * actions).scatter(
-                    0, action_flat, scores,
-                ).reshape(len(state), actions)
-            if policy_only:
-                return policy
-            output = policy, _norm_head(state, self.global_norm, self.critic)[:, None]
-            return (*output, self.global_norm(state)) if return_state else output
+        state, action, action_row, action_flat, actions, sequence = self.encode_state(
+            domains, encoded, state_index, action_values, action_index, concepts,
+            len(character),
+        )
+        scores = _norm_head(action, self.global_norm, self.policy) / temperature
+        legal = torch.ones_like(scores, dtype=torch.bool)
+        scores = self.group_log_softmax(scores, legal, sequence)
+        synchronize()
+        if flat_policy:
+            policy = scores
+        else:
+            policy = scores.new_zeros(len(state) * actions).scatter(
+                0, action_flat, scores,
+            ).reshape(len(state), actions)
+        if policy_only:
+            return policy
+        output = policy, _norm_head(state, self.global_norm, self.critic)[:, None]
+        return (*output, self.global_norm(state)) if return_state else output
 
 
 def architecture(model):
@@ -2483,13 +2575,14 @@ def architecture(model):
         "sum_pooling": "unnormalized",
         "policy_factorization": "one linear logit per transformed legal action token",
         "policy_entropy": ["candidate", "normalized", "effective_actions"],
-        "map": "reverse-topological sparse attention; current/entry query over all contextual nodes",
+        "map": "reverse-topological sparse attention; current node is the map summary",
+        "map_node_kinds": MAP_NODE_KINDS,
         "move_history": f"one-layer {model.width}-D GRU",
         "continuations": "normalized execution queue",
         "candidate_context": "explicit selected payload, destination, and enemy identity+position",
         "card_zone_names": ["deck", "hand", "draw", "discard", "exhaust"],
-        "fixed_tokens": ["state", "run", "phase", "current_map_node", "card_pool",
-                         "relic_pool", "encounter_pool", "event_pool"],
+        "fixed_tokens": ["run_state", "current_phase", "current_map_node", "relic_pool",
+                         "encounter_pool", "event_pool"],
         "concept_vocab": model.concepts.num_embeddings,
         "semantic_tables": dict(zip(SEMANTIC_NAMES, model.concepts.sizes)),
         "position_caps": POSITION_CAPS,
@@ -2503,14 +2596,12 @@ def architecture(model):
 
 
 def predict(model, inputs, precision, temperature=1, policy_only=False, flat_policy=False):
-    if precision not in PRECISIONS:
-        raise ValueError("precision must be fp32 or bf16")
-    if all(part in model.fp32_parts for part in FP32_PARTS):
-        precision = "fp32"
+    if precision not in TRAINING_PRECISIONS:
+        raise ValueError("invalid precision")
     kind = inputs[0].device.type
     if precision != "fp32" and kind not in ("mps", "cuda"):
         raise ValueError(f"{precision} requires MPS or CUDA")
-    dtype = torch.bfloat16 if precision == "bf16" else torch.float16
+    dtype = torch.bfloat16 if precision != "fp32" else torch.float16
     with torch.autocast(kind, dtype=dtype, enabled=precision != "fp32"):
         output = model(
             *inputs[:6], temperature=temperature, policy_only=policy_only,
@@ -2522,20 +2613,14 @@ def predict(model, inputs, precision, temperature=1, policy_only=False, flat_pol
 def predict_cached(model, inputs, precision, temperature=1):
     state, action, offsets, action_rows = inputs
     kind = state.device.type
-    if all(part in model.fp32_parts for part in FP32_PARTS):
-        precision = "fp32"
-    dtype = torch.bfloat16 if precision == "bf16" else torch.float16
+    dtype = torch.bfloat16 if precision != "fp32" else torch.float16
     with torch.autocast(kind, dtype=dtype, enabled=precision != "fp32"):
-        with torch.autocast(kind, enabled=False) \
-                if "heads" in model.fp32_parts else nullcontext():
-            if "heads" in model.fp32_parts:
-                state, action = state.float(), action.float()
-            scores = model.policy(action).squeeze(-1) / temperature
-            policy = model.group_log_softmax(
-                scores, torch.ones_like(scores, dtype=torch.bool),
-                (offsets, action_rows, None, None),
-            )
-            critic = model.critic(state)
+        scores = model.policy(action).squeeze(-1) / temperature
+        policy = model.group_log_softmax(
+            scores, torch.ones_like(scores, dtype=torch.bool),
+            (offsets, action_rows, None, None),
+        )
+        critic = model.critic(state)
     return policy.float(), critic.float()
 
 
@@ -2741,15 +2826,23 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
         if unique is not None:
             first, inverse = unique
         elif len(semantic):
+            unique_semantic = np.column_stack((u[:, 1], semantic)) \
+                if name == "map_node" else semantic
             first, inverse = map(np.asarray, sts2_sim.unique_feature_rows(
-                semantic, numeric.view(np.uint32),
+                unique_semantic, numeric.view(np.uint32),
             ))
         else:
             first = inverse = np.empty(0, np.intp)
         count = len(first)
         size = bucket(count) if pad else count
-        metadata = u[:, 1:2] if name == "actor" else u[:, 9:10] \
+        metadata = u[:, 3:4] if name == "phase" else \
+            u[:, [0, 2, 3, 19]] if name == "card" else \
+            u[:, 1:2] if name in ("actor", "map_node") else u[:, [2, 9]] \
             if name == "relic" else np.empty((len(u), 0), np.uint32)
+        feature_metadata = metadata[first]
+        if name == "map_node" and unique is not None:
+            feature_metadata = np.empty((count, 1), np.uint32)
+            feature_metadata[inverse] = metadata
         domain_tensors.append((
             torch.as_tensor(np.pad(
                 semantic[first], ((0, size - count), (0, 0)),
@@ -2763,6 +2856,9 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
             torch.as_tensor(inverse.astype(np.int64), device=target),
             *(torch.as_tensor(np.flatnonzero(predicate), device=target)
               for predicate in (scope == -1, scope == -2, scope >= 0)),
+            torch.as_tensor(np.pad(
+                feature_metadata, ((0, size - count), (0, 0)),
+            ).astype(np.int64), device=target),
         ))
         inverse_rows.append(inverse)
     domain_tensors = tuple(domain_tensors)
@@ -2773,6 +2869,8 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
 
     node_u, _node_s, node_c, node_f, node_row, node_scope = domains[DOMAIN["map_node"]]
     edge_u, _edge_s, edge_c, edge_f, edge_row, edge_scope = domains[DOMAIN["map_edge"]]
+    node_feature = feature_index[DOMAIN["map_node"]]
+    edge_feature = feature_index[DOMAIN["map_edge"]]
     node_source = ordered(np.flatnonzero(node_scope == -1).astype(np.int32), node_row, node_u[:, 0])
     edge_source = ordered(np.flatnonzero(edge_scope == -1).astype(np.int32),
                           edge_row, edge_u[:, 0], edge_u[:, 1])
@@ -2782,9 +2880,9 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
     edge_groups = [edge_source[edge_offsets[row]:edge_offsets[row + 1]] for row in range(batch)]
     if model.training:
         representatives, inverse = map(np.asarray, sts2_sim.unique_graphs(
-            node_u, node_c, node_f, feature_index[DOMAIN["map_node"]],
+            node_u, node_c, node_f, node_feature,
             node_source, node_offsets,
-            edge_u, edge_c, edge_f, feature_index[DOMAIN["map_edge"]],
+            edge_u, edge_c, edge_f, edge_feature,
             edge_source, edge_offsets,
         ))
         representatives = representatives.astype(np.int32)
@@ -2792,8 +2890,9 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
         graph_keys = ()
     else:
         graph_keys = tuple((
-            node_u[nodes].tobytes(), node_c[nodes].tobytes(), node_f[nodes].tobytes(),
-            edge_u[edges].tobytes(), edge_c[edges].tobytes(), edge_f[edges].tobytes(),
+            node_u[nodes].tobytes(), node_c[node_feature[nodes]].tobytes(),
+            node_f[node_feature[nodes]].tobytes(), edge_u[edges].tobytes(),
+            edge_c[edge_feature[edges]].tobytes(), edge_f[edge_feature[edges]].tobytes(),
         ) for nodes, edges in zip(node_groups, edge_groups))
         unique, representatives, inverse = {}, [], np.empty(batch, np.int32)
         for row, key in enumerate(graph_keys):
@@ -2823,7 +2922,9 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
     edge_dst = node_lookup[edge_row[edge_source], edge_ids[:, 1]]
     if np.any(edge_src < 0) or np.any(edge_dst < 0):
         raise ValueError("map edge references missing node")
-    topo = node_u[node_source, 8].astype(np.int32)
+    topo = np.zeros(len(node_source), np.int32)
+    for parent, child in zip(edge_src, edge_dst):
+        topo[child] = max(topo[child], topo[parent] + 1)
     if len(edge_src) and np.any(topo[edge_dst] <= topo[edge_src]):
         raise ValueError("map is not a forward DAG")
     levels = []
@@ -2836,7 +2937,7 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
             parents, group = np.unique(edge_src[selected], return_inverse=True)
             levels.append((
                 parents, edge_dst[selected], selected, group,
-                node_u[node_source[parents], 9].astype(np.float32),
+                np.zeros(len(parents), np.float32),
             ))
     if pad:
         padded = []
@@ -2863,7 +2964,7 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
     run_u, _run_s, _run_c, _run_f, run_row, run_scope = domains[DOMAIN["run"]]
     run_source = np.flatnonzero(run_scope == -1)
     current_id = np.full(batch, np.iinfo(np.uint32).max, np.uint32)
-    current_id[run_row[run_source]] = run_u[run_source, 23]
+    current_id[run_row[run_source]] = run_u[run_source, 22]
     current = np.full(batch, -1, np.int32)
     present = current_id != np.iinfo(np.uint32).max
     if current_id[present].max(initial=0) > max_node:
@@ -2873,18 +2974,10 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
     if np.any(current[present] < 0) or np.any(entry < 0):
         raise ValueError("current map node is missing")
     current, current_inverse = np.unique(np.where(current >= 0, current, entry), return_inverse=True)
-    current_graph = np.searchsorted(node_offsets[1:], current, side="right")
-    current_count = np.diff(node_offsets)[current_graph]
-    current_source = np.concatenate([
-        np.arange(node_offsets[graph], node_offsets[graph + 1], dtype=np.int32)
-        for graph in current_graph
-    ])
-    current_group = np.repeat(np.arange(len(current), dtype=np.int32), current_count)
     map_index = (
         tensor(inverse_rows[DOMAIN["map_node"]][node_source]),
         tensor(inverse_rows[DOMAIN["map_edge"]][edge_source]), tuple(levels),
-        tensor(node_offsets), tensor(current), tensor(current_inverse), tensor(current_source),
-        candidate_index(current_group, len(current), target),
+        tensor(node_offsets), tensor(current), tensor(current_inverse),
         tuple(graph_keys[row] for row in representatives) if graph_keys else (),
     )
 
@@ -2914,13 +3007,12 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
             inverse_rows[domain], source, offsets,
         ))
         groups = int(inverse.max(initial=-1)) + 1
-        return None if pad and model.pooling["generation_pool"] == "sum" else tensor(source), (
+        return None if pad else tensor(source), (
             tensor(pooled), tensor(item_rows), tensor(inverse), groups,
         )
     filters = (
-        filtered(DOMAIN["card"], lambda value: value == 13, True),
-        filtered(DOMAIN["relic"], lambda value: (value == 1) | (value == 2), True),
-        filtered(DOMAIN["encounter"], lambda value: value <= 2, True),
+        filtered(DOMAIN["relic"], lambda value: value == 1, True),
+        filtered(DOMAIN["encounter"], lambda value: (value == 1) | (value == 2), True),
         filtered(DOMAIN["event"], lambda value: value == 0, True),
         *(filtered(DOMAIN["card"], lambda value, kind=kind: value == kind)
           for kind in range(5)),
@@ -2952,7 +3044,7 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
     move_counts = np.bincount(move_group, minlength=len(actor_source))
     move_present = np.flatnonzero(move_counts)
     move_terminal = None
-    if pad and len(move_present):
+    if pad and model.precision != "fp32" and len(move_present):
         move_raw = move_raw[move_order]
         tokens = history_c[feature_index[DOMAIN["history"]][move_raw], 0].astype(np.int64)
         (sources, parents, move_terminal), move_batch_sizes = prefix_tree(tokens, move_counts)
@@ -3048,7 +3140,9 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
         continuation_plan += tensor(np.empty(0, np.int64)), tensor(present), ()
     all_rows = np.arange(batch)
     combat_rows = actor_rows[actor_u[actor_source, 1] == 0]
-    global_rows = [run_row[run_source], *([all_rows] * 6)]
+    phase_domain = domains[DOMAIN["phase"]]
+    phase_rows = phase_domain[4][phase_domain[5] == -1]
+    global_rows = [phase_rows, *([all_rows] * 4)]
     for name, domain, zone, active in (
         ("deck", DOMAIN["card"], 0, all_rows),
         ("hand", DOMAIN["card"], 1, combat_rows),
@@ -3350,7 +3444,7 @@ def load(path, target):
             path = committed
     checkpoint = torch.load(path, map_location=target, weights_only=False)
     version = checkpoint.get("model_version")
-    if checkpoint.get("schema") != 1 or version not in COMPATIBLE_MODEL_VERSIONS:
+    if checkpoint.get("schema") != 1 or version != MODEL_VERSION:
         raise ValueError("incompatible checkpoint")
     config = checkpoint.get("architecture", {})
     try:
@@ -3429,7 +3523,9 @@ def export_value_model(path, model, fingerprint, temperature, bias, actor=False)
         add(module.weight); add(module.bias)
 
     def add_encoder(module):
-        add(module.numeric.weight); add_norm(module.norm)
+        if module.numeric is not None:
+            add(module.numeric.weight)
+        add_norm(module.norm)
 
     def add_transformer(transformer):
         for layer in transformer.layers:
@@ -3445,17 +3541,18 @@ def export_value_model(path, model, fingerprint, temperature, bias, actor=False)
         add(gru.weight_ih_l0); add(gru.bias_ih_l0)
         add(gru.weight_hh_l0); add(gru.bias_hh_l0)
 
-    add(model.concepts.flattened())
+    add(model.concepts.flattened()); add(model.map_nodes.weight)
     for name, *_shape in TOKEN_SPECS:
-        add_encoder(model.encoders[name])
+        if name in model.encoders:
+            add_encoder(model.encoders[name])
     add_encoder(model.action_encoder)
-    for name in (*POOLING_DEFAULTS, "card_pool", "relic_pool", "encounter_pool", "event_pool"):
+    for name in POOLING_DEFAULTS:
         add(model.summary_seed[name])
+    add_linear(model.relic_pool_projection); add_linear(model.pael_cards)
     for index, (name, mode) in enumerate(model.pooling.items()):
         if (index < 8 and mode == "transformer") \
                 or (index < 10 and mode.startswith("transformer")) \
-                or (index == 10 and mode == "transformer") \
-                or (index >= 11 and mode == "transformer"):
+                or (index == 10 and mode == "transformer"):
             add_transformer(model.pool_transformers[name])
     add_gru(model.move_gru)
     if model.continuation_gru is not None:
@@ -3463,8 +3560,7 @@ def export_value_model(path, model, fingerprint, temperature, bias, actor=False)
     add_norm(model.actor_norm); add_norm(model.action_norm)
     add_transformer(model.global_transformer); add_norm(model.global_norm)
     add_norm(model.graph_norm)
-    for module in (model.graph_query, model.graph_key_value, model.graph_edge, model.graph_out,
-                   model.graph_degree):
+    for module in (model.graph_query, model.graph_key_value, model.graph_out):
         add_linear(module)
     add_norm(model.graph_ff_norm); add_linear(model.graph_ff[0]); add_linear(model.graph_ff[2])
     if actor:

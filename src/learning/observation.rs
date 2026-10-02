@@ -12,9 +12,8 @@ use std::{
 };
 
 const MAGIC: &[u8; 8] = b"STSVALUE";
-const VERSION: u32 = 56;
-const VALUE_MODEL_VERSION: u32 = 75;
-const MIN_VALUE_MODEL_VERSION: u32 = 74;
+const VERSION: u32 = 58;
+const VALUE_MODEL_VERSION: u32 = 77;
 const TERMINAL_CATEGORIES: usize = 83;
 const POTENTIAL_WEIGHT_COUNT: usize = 13;
 const CARD_ZONES: usize = 5;
@@ -25,27 +24,25 @@ const DISCARD_ZONE: usize = 3;
 const EXHAUST_ZONE: usize = 4;
 const ATTACHED_CARD_ZONE: usize = CARD_ZONES;
 const PAEL_ZONE: usize = 8;
-const CARD_POOL_ZONE: usize = 13;
 const HISTORY_COURSE_STATUS: u32 = 6;
 
-const PHASES: usize = 14;
+const PHASES: usize = 12;
+const MAP_NODE_KINDS: usize = 26;
 const ENCHANTMENTS: usize = 22;
 const PUBLIC_GLOBALS: usize = 0;
 const DEFAULT_MODEL_WIDTH: usize = 128;
 const DEFAULT_MODEL_LAYERS: usize = 4;
 const DEFAULT_MODEL_HEADS: usize = 8;
 const DEFAULT_MODEL_FEEDFORWARD: usize = 384;
-const POSITION_CAPS: [u32; 14] = [32, 64, 16, 64, 256, 256, 256, 256, 256, 256, 11, 11, 4, 4];
-const POSITION_NAMES: [&str; 14] = [
+const POSITION_CAPS: [u32; 12] = [32, 64, 16, 256, 256, 256, 256, 256, 11, 11, 4, 4];
+const POSITION_NAMES: [&str; 12] = [
     "enemy",
     "power",
     "orb",
-    "map_floor",
     "deck_origin",
     "draw_top",
     "draw_bottom",
     "relic",
-    "wax",
     "continuation",
     "crystal_row",
     "crystal_column",
@@ -73,22 +70,22 @@ const DOMAIN_NAMES: [&str; 16] = [
     "map_edge",
 ];
 const DOMAIN_WIDTHS: [(usize, usize, usize, usize); 16] = [
-    (24, 16, 6, 36),
-    (16, 8, 16, 16),
-    (20, 16, 73, 23),
-    (12, 16, 5, 27),
-    (8, 4, 5, 8),
-    (6, 29, 4, 32),
-    (20, 8, 72, 17),
-    (12, 4, 8, 16),
-    (6, 2, 5, 6),
-    (6, 2, 5, 6),
-    (4, 1, 4, 4),
-    (4, 0, 3, 4),
-    (8, 2, 6, 10),
-    (24, 16, 80, 24),
-    (12, 0, 7, 8),
-    (8, 0, 2, 4),
+    (23, 16, 1, 22),
+    (16, 8, 42, 4),
+    (20, 16, 3, 40),
+    (12, 11, 4, 12),
+    (8, 4, 5, 2),
+    (6, 29, 1, 29),
+    (20, 8, 7, 40),
+    (12, 6, 20, 0),
+    (6, 2, 1, 0),
+    (6, 2, 4, 1),
+    (4, 1, 2, 0),
+    (4, 0, 1, 0),
+    (8, 2, 6, 0),
+    (24, 16, 55, 58),
+    (4, 0, 2, 0),
+    (2, 0, 0, 0),
 ];
 const RUN_DOMAIN: usize = 0;
 const PHASE_DOMAIN: usize = 1;
@@ -111,8 +108,8 @@ const STATE_SCOPE: i32 = -1;
 const PHASE_SCOPE: i32 = -2;
 const ACTION_U: usize = 15;
 const ACTION_S: usize = 12;
-const ACTION_C: usize = 8;
-const ACTION_F: usize = 20;
+const ACTION_C: usize = 6;
+const ACTION_F: usize = 10;
 
 #[repr(usize)]
 #[derive(Clone, Copy)]
@@ -129,7 +126,6 @@ enum Semantic {
     Event,
     EncounterNormal,
     EncounterElite,
-    EncounterBoss,
     Enchantment,
     CardType,
     Rarity,
@@ -147,12 +143,10 @@ enum Semantic {
     EnemyPosition,
     PowerPosition,
     OrbPosition,
-    MapFloorPosition,
     DeckOrigin,
     DrawTopPosition,
     DrawBottomPosition,
     RelicPosition,
-    WaxPosition,
     ContinuationPosition,
     CrystalRow,
     CrystalColumn,
@@ -162,23 +156,19 @@ enum Semantic {
     TurnFlagBit,
     TagBit,
     RunKind,
-    PhaseKind,
-    CardZone,
-    CardRole,
+    SuspendedPhase,
     ActorKind,
-    PowerSource,
-    HistoryKind,
     StatusKind,
-    RelicKind,
-    PotionKind,
-    OrbKind,
-    EventKind,
-    EncounterKind,
     CrystalKind,
     ContinuationKind,
     ContinuationVariant,
-    MapNodeKind,
-    MapEdgeKind,
+    MapModifier,
+    RelicCounter0,
+    RelicCounter1,
+    RelicCounter2,
+    RelicCounter3,
+    RelicCounter4,
+    RelicCounter5,
     RouteKind,
     Requirement,
     TinkerRider,
@@ -202,7 +192,6 @@ const SEMANTIC_NAMES: [&str; Semantic::Count as usize] = [
     "event",
     "encounter_normal",
     "encounter_elite",
-    "encounter_boss",
     "enchantment",
     "card_type",
     "rarity",
@@ -220,12 +209,10 @@ const SEMANTIC_NAMES: [&str; Semantic::Count as usize] = [
     "enemy_position",
     "power_position",
     "orb_position",
-    "map_floor_position",
     "deck_origin",
     "draw_top_position",
     "draw_bottom_position",
     "relic_position",
-    "wax_position",
     "continuation_position",
     "crystal_row",
     "crystal_column",
@@ -235,23 +222,19 @@ const SEMANTIC_NAMES: [&str; Semantic::Count as usize] = [
     "turn_flag_bit",
     "tag_bit",
     "run_kind",
-    "phase_kind",
-    "card_zone",
-    "card_role",
+    "suspended_phase",
     "actor_kind",
-    "power_source",
-    "history_kind",
     "status_kind",
-    "relic_kind",
-    "potion_kind",
-    "orb_kind",
-    "event_kind",
-    "encounter_kind",
     "crystal_kind",
     "continuation_kind",
     "continuation_variant",
-    "map_node_kind",
-    "map_edge_kind",
+    "map_modifier",
+    "relic_counter_0",
+    "relic_counter_1",
+    "relic_counter_2",
+    "relic_counter_3",
+    "relic_counter_4",
+    "relic_counter_5",
     "route_kind",
     "requirement",
     "tinker_rider",
@@ -327,7 +310,7 @@ struct Potential {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-struct ObservationV56 {
+struct Observation {
     character: u8,
     globals: Vec<f32>,
     domains: [DomainRows; 16],
@@ -342,7 +325,6 @@ struct Layout {
     semantic_sizes: [u32; Semantic::Count as usize],
     slippery_bridge: Option<Id>,
     relic_trader: Option<Id>,
-    shared_relics: &'static [Id],
 }
 
 impl Layout {
@@ -354,7 +336,7 @@ impl Layout {
             (Semantic::Card, content.cards.len() * 2 + 512),
             (Semantic::Power, content.powers.len()),
             (Semantic::Relic, content.relics.len()),
-            (Semantic::Potion, content.potions.len()),
+            (Semantic::Potion, content.potions.len() + 1),
             (Semantic::Enemy, content.enemies.len()),
             (
                 Semantic::EnemyMove,
@@ -370,7 +352,6 @@ impl Layout {
             (Semantic::Event, content.events.len()),
             (Semantic::EncounterNormal, 57),
             (Semantic::EncounterElite, 13),
-            (Semantic::EncounterBoss, 13),
             (Semantic::Enchantment, ENCHANTMENTS),
             (Semantic::CardType, 6),
             (Semantic::Rarity, 7),
@@ -380,7 +361,7 @@ impl Layout {
             (Semantic::Phase, PHASES),
             (Semantic::Action, ACTION_KINDS),
             (Semantic::Effect, 119),
-            (Semantic::RunEffect, 36),
+            (Semantic::RunEffect, 37),
             (Semantic::Condition, 23),
             (Semantic::Filter, 16),
             (Semantic::CardOp, 18),
@@ -388,12 +369,10 @@ impl Layout {
             (Semantic::EnemyPosition, 33),
             (Semantic::PowerPosition, 65),
             (Semantic::OrbPosition, 17),
-            (Semantic::MapFloorPosition, 65),
             (Semantic::DeckOrigin, 257),
             (Semantic::DrawTopPosition, 257),
             (Semantic::DrawBottomPosition, 257),
             (Semantic::RelicPosition, 257),
-            (Semantic::WaxPosition, 257),
             (Semantic::ContinuationPosition, 257),
             (Semantic::CrystalRow, 11),
             (Semantic::CrystalColumn, 11),
@@ -402,31 +381,27 @@ impl Layout {
             (Semantic::FlagBit, 16),
             (Semantic::TurnFlagBit, 16),
             (Semantic::TagBit, 16),
-            (Semantic::RunKind, 32),
-            (Semantic::PhaseKind, 32),
-            (Semantic::CardZone, CARD_POOL_ZONE + 1),
-            (Semantic::CardRole, 16),
-            (Semantic::ActorKind, 4),
-            (Semantic::PowerSource, 2),
-            (Semantic::HistoryKind, 4),
+            (Semantic::RunKind, 29),
+            (Semantic::SuspendedPhase, PHASES),
+            (Semantic::ActorKind, 3),
             (Semantic::StatusKind, 12),
-            (Semantic::RelicKind, 16),
-            (Semantic::PotionKind, 8),
-            (Semantic::OrbKind, 8),
-            (Semantic::EventKind, 4),
-            (Semantic::EncounterKind, 5),
             (Semantic::CrystalKind, 9),
             (Semantic::ContinuationKind, 10),
             (Semantic::ContinuationVariant, 128),
-            (Semantic::MapNodeKind, 3),
-            (Semantic::MapEdgeKind, 2),
+            (Semantic::MapModifier, 2),
+            (Semantic::RelicCounter0, content.relics.len()),
+            (Semantic::RelicCounter1, content.relics.len()),
+            (Semantic::RelicCounter2, content.relics.len()),
+            (Semantic::RelicCounter3, content.relics.len()),
+            (Semantic::RelicCounter4, content.relics.len()),
+            (Semantic::RelicCounter5, content.relics.len()),
             (Semantic::RouteKind, 4),
             (Semantic::Requirement, 4),
             (Semantic::TinkerRider, 9),
             (Semantic::ConveyorDish, 8),
-            (Semantic::Boolean, 256),
-            (Semantic::TokenRole, 16),
-            (Semantic::Collection, 16),
+            (Semantic::Boolean, 184),
+            (Semantic::TokenRole, 11),
+            (Semantic::Collection, 11),
         ] {
             semantic_sizes[namespace as usize] = size as u32;
         }
@@ -448,14 +423,12 @@ impl Layout {
             .iter()
             .position(|event| event.id == "EVENT.RELIC_TRADER")
             .map(|id| id as Id);
-        let shared_relics = content.acts.first().map_or(&[][..], |act| act.relics);
         Self {
             characters,
             semantic_offsets,
             semantic_sizes,
             slippery_bridge,
             relic_trader,
-            shared_relics,
         }
     }
 
@@ -515,6 +488,26 @@ fn push_bits(row: &mut DomainRow, layout: Layout, namespace: Semantic, bits: u32
             push_semantic(row, layout, namespace, bit);
         }
     }
+}
+
+fn put_bits(row: &mut DomainRow, offset: usize, bits: u32) {
+    for bit in 0..16 {
+        row.f[offset + bit] = ((bits >> bit) & 1) as f32;
+    }
+}
+
+fn put_card_flags(
+    row: &mut DomainRow,
+    offset: usize,
+    flags: u32,
+    turn_flags: u32,
+    free: u32,
+    override_: u32,
+) {
+    put_bits(row, offset, flags);
+    put_bits(row, offset + 16, turn_flags);
+    row.f[offset + 32] = (free != 0) as u8 as f32;
+    row.f[offset + 33] = (override_ != 0) as u8 as f32;
 }
 
 fn push_filter_semantics(row: &mut DomainRow, layout: Layout, kind: usize, argument: usize) {
@@ -740,13 +733,6 @@ fn populate_domain_features(
     match domain {
         RUN_DOMAIN => {
             push_semantic(row, layout, Semantic::Character, row.u[0]);
-            for (field, value) in <[i32; 4]>::try_from(&row.s[6..10])
-                .unwrap()
-                .into_iter()
-                .enumerate()
-            {
-                push_boolean(row, layout, 30 + field as u32, value > 0);
-            }
             row.f[..22].copy_from_slice(&[
                 row.u[2] as f32 / 20.0,
                 row.u[3] as f32 / 3.0,
@@ -773,23 +759,26 @@ fn populate_domain_features(
             ]);
         }
         PHASE_DOMAIN => {
-            for (namespace, value) in [(Semantic::Phase, row.u[0]), (Semantic::Room, row.u[2])] {
-                push_semantic(row, layout, namespace, value);
-            }
-            push_semantic(row, layout, Semantic::PhaseKind, row.u[0]);
-            if row.u[3] > 0 {
-                push_semantic(row, layout, Semantic::Phase, row.u[3] - 1);
-                push_semantic(
-                    row,
-                    layout,
-                    Semantic::PhaseKind,
-                    PHASES as u32 + row.u[3] - 1,
-                );
-            }
+            let phase = if row.u[3] == 0 {
+                &game.phase
+            } else {
+                game.resume.as_ref().expect("missing suspended phase")
+            };
+            push_semantic(
+                row,
+                layout,
+                if row.u[3] == 0 {
+                    Semantic::Phase
+                } else {
+                    Semantic::SuspendedPhase
+                },
+                row.u[0],
+            );
+            push_semantic(row, layout, Semantic::Room, row.u[2]);
             if row.u[1] > 0 {
                 push_semantic(row, layout, Semantic::Event, row.u[1] - 1);
             }
-            if let Phase::Event(id, options) = &game.phase {
+            if let Phase::Event(id, options) = phase {
                 match content.events[*id as usize].id {
                     "EVENT.COLORFUL_PHILOSOPHERS" => {
                         for value in [row.s[0], row.s[1], row.s[2]] {
@@ -831,7 +820,7 @@ fn populate_domain_features(
                     _ => {}
                 }
             }
-            match &game.phase {
+            match phase {
                 Phase::Combat(combat) if combat.choice.is_some() => {
                     push_semantic(row, layout, Semantic::Pile, row.u[5]);
                     push_filter_semantics(row, layout, 6, 7);
@@ -839,7 +828,9 @@ fn populate_domain_features(
                 }
                 Phase::TransformCards(target, ..) if target.is_some() => {
                     push_semantic(row, layout, Semantic::Card, base_card_id(row.u[4] - 1));
+                    push_boolean(row, layout, 91, row.u[7] != 0);
                 }
+                Phase::TransformCards(..) => push_boolean(row, layout, 91, row.u[7] != 0),
                 Phase::EnchantCards(..) => {
                     push_semantic(row, layout, Semantic::Enchantment, row.u[4] - 1);
                     if row.u[5] > 0 {
@@ -849,7 +840,7 @@ fn populate_domain_features(
                 Phase::RemoveCards(..) => push_bits(row, layout, Semantic::TagBit, row.u[5]),
                 _ => {}
             }
-            match &game.phase {
+            match phase {
                 Phase::Combat(combat) => {
                     push_boolean(row, layout, 0, combat.choice.is_some());
                     push_boolean(row, layout, 1, combat.enemy_turn);
@@ -863,22 +854,10 @@ fn populate_domain_features(
                             row.s[1] as f32 / 10.0,
                         ]);
                     }
-                    if combat.playing.is_some() {
-                        row.f[3..6].copy_from_slice(&[
-                            combat.card_energy as f32 / 5.0,
-                            combat.card_stars as f32 / 5.0,
-                            combat.card_plays as f32 / 5.0,
-                        ]);
-                    }
                 }
-                Phase::Rewards(rewards) => row.f[..3].copy_from_slice(&[
-                    rewards.gold as f32 / 1_000.0,
-                    rewards.removals as f32 / 10.0,
-                    rewards.card_rewards.len() as f32 / 10.0,
-                ]),
-                Phase::Event(id, options) => {
-                    row.f[0] = options.len() as f32 / 10.0;
-                    let values = event_public_data(game, content);
+                Phase::Rewards(_) => {}
+                Phase::Event(id, _) => {
+                    let values = event_public_data(game, content, phase);
                     match content.events[*id as usize].id {
                         "EVENT.CRYSTAL_SPHERE"
                         | "EVENT.JUNGLE_MAZE_ADVENTURE"
@@ -904,36 +883,23 @@ fn populate_domain_features(
                     row.f[..2].copy_from_slice(&[*amount as f32 / 30.0, *count as f32 / 10.0]);
                     push_boolean(row, layout, 4, *optional);
                 }
-                Phase::ChooseBundles(bundles) => row.f[0] = bundles.len() as f32 / 10.0,
+                Phase::ChooseBundles(_) => {}
                 _ => {}
             }
-            if let Some(crystal) = &game.crystal {
-                row.f[15] = crystal.remaining as f32 / 10.0;
+            if row.u[3] == 0
+                && let Some(crystal) = &game.crystal
+            {
+                row.f[3] = crystal.remaining as f32 / 10.0;
                 push_boolean(row, layout, 5, crystal.big);
             }
         }
         CARD_DOMAIN => {
-            for (namespace, value) in [
-                (Semantic::CardZone, row.u[0]),
-                (Semantic::CardRole, row.u[1]),
-                (
-                    Semantic::Card,
-                    card_version_id(content, row.u[4] as Id, row.u[5] > 0, row.u[12] as u8),
-                ),
-            ] {
-                push_semantic(row, layout, namespace, value);
-            }
-            if row.u[0] == DRAW_ZONE as u32 && row.u[3] > 0 {
-                let namespace = if row.u[2] == 1 {
-                    Semantic::DrawTopPosition
-                } else {
-                    Semantic::DrawBottomPosition
-                };
-                push_semantic(row, layout, namespace, row.u[3].saturating_sub(1).min(256));
-            }
-            if row.u[19] > 0 {
-                push_semantic(row, layout, Semantic::DeckOrigin, (row.u[19] - 1).min(256));
-            }
+            push_semantic(
+                row,
+                layout,
+                Semantic::Card,
+                card_version_id(content, row.u[4] as Id, row.u[5] > 0, row.u[12] as u8),
+            );
             if row.u[13] > 0 {
                 push_semantic(
                     row,
@@ -945,14 +911,6 @@ fn populate_domain_features(
             if row.u[11] > 0 {
                 push_semantic(row, layout, Semantic::Enchantment, row.u[11] - 1);
             }
-            for (namespace, bits) in [
-                (Semantic::FlagBit, row.u[6]),
-                (Semantic::TurnFlagBit, row.u[7]),
-            ] {
-                push_bits(row, layout, namespace, bits);
-            }
-            push_boolean(row, layout, 10, row.u[9] != 0);
-            push_boolean(row, layout, 11, row.u[10] != 0);
             row.f[..6].copy_from_slice(&[
                 sf(row.s[0], 10.0),
                 sf(row.s[1], 30.0),
@@ -961,6 +919,7 @@ fn populate_domain_features(
                 sf(row.s[4], 30.0),
                 row.u[8] as f32 / 5.0,
             ]);
+            put_card_flags(row, 6, row.u[6], row.u[7], row.u[9], row.u[10]);
         }
         ACTOR_DOMAIN => {
             push_semantic(row, layout, Semantic::ActorKind, row.u[1]);
@@ -1030,16 +989,8 @@ fn populate_domain_features(
             if row.u[6] > 0 {
                 push_semantic(row, layout, Semantic::PowerPosition, (row.u[6] - 1).min(64));
             }
-            row.f.copy_from_slice(&[
-                sf(row.s[0], 30.0),
-                sf(row.s[1], 30.0),
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-            ]);
+            row.f
+                .copy_from_slice(&[sf(row.s[0], 30.0), sf(row.s[1], 30.0)]);
         }
         HISTORY_DOMAIN => {
             if row.u[1] == 1 && row.u[4] > 0 {
@@ -1085,8 +1036,7 @@ fn populate_domain_features(
                 if row.u[10] > 0 {
                     push_semantic(row, layout, Semantic::Enchantment, row.u[10] - 1);
                 }
-                push_bits(row, layout, Semantic::FlagBit, row.u[5]);
-                push_bits(row, layout, Semantic::TurnFlagBit, row.u[6]);
+                put_card_flags(row, 6, row.u[5], row.u[6], row.u[8], row.u[9]);
             }
             match row.u[1] {
                 1 => row.f[..6].copy_from_slice(&[
@@ -1109,8 +1059,6 @@ fn populate_domain_features(
                 _ => {}
             }
             if matches!(row.u[1], 1 | HISTORY_COURSE_STATUS) {
-                push_boolean(row, layout, 21, row.u[8] != 0);
-                push_boolean(row, layout, 22, row.u[9] != 0);
                 if row.u[17] > 0 {
                     push_semantic(row, layout, Semantic::DeckOrigin, (row.u[17] - 1).min(256));
                 }
@@ -1125,123 +1073,32 @@ fn populate_domain_features(
             }
         }
         RELIC_DOMAIN => {
-            push_semantic(row, layout, Semantic::RelicKind, row.u[0]);
             push_semantic(row, layout, Semantic::Relic, row.u[1]);
-            if matches!(row.u[0], 1 | 2) {
-                push_semantic(row, layout, Semantic::Rarity, row.u[3]);
-            }
-            if row.u[0] == 0 && row.u[2] > 0 {
-                push_semantic(
-                    row,
-                    layout,
-                    Semantic::RelicPosition,
-                    (row.u[2] - 1).min(256),
-                );
-            }
-            if row.u[6] > 0 {
-                push_semantic(row, layout, Semantic::WaxPosition, (row.u[6] - 1).min(256));
-            }
-            if row.scope == STATE_SCOPE && row.u[8] > 0 {
-                push_semantic(row, layout, Semantic::Card, base_card_id(row.u[8] - 1));
-            }
-            push_boolean(row, layout, 40, row.u[5] != 0);
-            for bit in 0..2 {
-                if row.u[4] & 1 << bit != 0 {
-                    push_semantic(row, layout, Semantic::RunKind, 24 + bit);
+            if row.u[0] == 0 {
+                for (slot, namespace) in [
+                    Semantic::RelicCounter0,
+                    Semantic::RelicCounter1,
+                    Semantic::RelicCounter2,
+                    Semantic::RelicCounter3,
+                    Semantic::RelicCounter4,
+                    Semantic::RelicCounter5,
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    for _ in 0..row.s[slot].max(0) {
+                        push_semantic(row, layout, namespace, row.u[1]);
+                    }
                 }
-            }
-            for index in 0..4 {
-                row.f[index] = sf(row.s[index], 10.0);
-            }
-            let name = content.relics[row.u[1] as usize].id;
-            let boolean_slots: &[usize] = match name {
-                "RELIC.PEN_NIB" | "RELIC.WONGOS_MYSTERY_TICKET" => &[1],
-                "RELIC.ASTROLABE" | "RELIC.PAELS_EYE" => &[0, 1],
-                "RELIC.MAW_BANK"
-                | "RELIC.LIZARD_TAIL"
-                | "RELIC.SILKEN_TRESS"
-                | "RELIC.BONE_TEA"
-                | "RELIC.TEA_OF_DISCOURTESY"
-                | "RELIC.GOLDEN_COMPASS"
-                | "RELIC.MEAT_CLEAVER"
-                | "RELIC.NEOWS_BONES"
-                | "RELIC.PAELS_TOOTH"
-                | "RELIC.PAELS_TEARS"
-                | "RELIC.CENTENNIAL_PUZZLE"
-                | "RELIC.DEMON_TONGUE"
-                | "RELIC.PERMAFROST"
-                | "RELIC.RUINED_HELMET"
-                | "RELIC.MUSIC_BOX"
-                | "RELIC.MINI_REGENT"
-                | "RELIC.RAINBOW_RING"
-                | "RELIC.UNSETTLING_LAMP"
-                | "RELIC.DIAMOND_DIADEM"
-                | "RELIC.BURNING_STICKS"
-                | "RELIC.THROWING_AXE"
-                | "RELIC.BELT_BUCKLE" => &[0],
-                _ => &[],
-            };
-            for &slot in boolean_slots {
-                push_boolean(row, layout, 64 + slot as u32, row.s[slot] != 0);
-                row.f[slot] = 0.0;
-            }
-            let period = match name {
-                "RELIC.LASTING_CANDY" | "RELIC.PAELS_WING" => 2,
-                "RELIC.HAPPY_FLOWER" | "RELIC.PENDULUM" | "RELIC.FISHING_ROD" => 3,
-                "RELIC.IRON_CLUB" | "RELIC.POLLINOUS_CORE" => 4,
-                "RELIC.FAKE_HAPPY_FLOWER" | "RELIC.JOSS_PAPER" | "RELIC.BOOK_OF_FIVE_RINGS" => 5,
-                "RELIC.NUNCHAKU"
-                | "RELIC.PEN_NIB"
-                | "RELIC.TUNING_FORK"
-                | "RELIC.GALACTIC_DUST" => 10,
-                _ => 0,
-            };
-            if period > 0 {
-                let phase = row.s[0].rem_euclid(period);
-                row.f[10] = phase as f32 / period as f32;
-                row.f[11] = (period - phase) as f32 / period as f32;
-            }
-            let cap = match name {
-                "RELIC.PAELS_LEGION" => 2,
-                "RELIC.SILVER_CRUCIBLE" | "RELIC.WINGED_BOOTS" | "RELIC.GIRYA" => 3,
-                "RELIC.EMBER_TEA" | "RELIC.SWORD_OF_STONE" => 5,
-                "RELIC.TOY_BOX" => 12,
-                _ => 0,
-            };
-            if cap > 0 {
-                let value = row.s[0].clamp(0, cap);
-                if matches!(name, "RELIC.PAELS_LEGION") {
-                    row.f[12] = (cap - value) as f32 / cap as f32;
-                    row.f[13] = value as f32 / cap as f32;
-                    row.f[14] = (value > 0) as u8 as f32;
-                } else {
-                    row.f[12] = value as f32 / cap as f32;
-                    row.f[13] = (cap - value) as f32 / cap as f32;
-                    row.f[14] = (value < cap) as u8 as f32;
-                    row.f[15] = (value == cap) as u8 as f32;
-                }
-            }
-            if name == "RELIC.TOY_BOX" && row.s[0] < 12 {
-                let phase = row.s[0].rem_euclid(3);
-                row.f[10] = phase as f32 / 3.0;
-                row.f[11] = (3 - phase) as f32 / 3.0;
-            } else if name == "RELIC.PUMPKIN_CANDLE" {
-                let remaining = row.s[0].clamp(0, 5);
-                row.f[12] = (5 - remaining) as f32 / 5.0;
-                row.f[13] = remaining as f32 / 5.0;
-                row.f[14] = (remaining > 0) as u8 as f32;
             }
         }
         POTION_DOMAIN => {
-            push_semantic(row, layout, Semantic::PotionKind, row.u[0]);
-            if row.u[2] > 0 {
-                push_semantic(row, layout, Semantic::Potion, row.u[2] - 1);
-            }
-            push_boolean(row, layout, 50, row.u[3] != 0);
-            row.f[0] = sf(row.s[0], 1_000.0);
+            let id = row.u[2]
+                .checked_sub(1)
+                .unwrap_or(content.potions.len() as u32);
+            push_semantic(row, layout, Semantic::Potion, id);
         }
         ORB_DOMAIN => {
-            push_semantic(row, layout, Semantic::OrbKind, 0);
             if row.u[1] > 0 {
                 push_semantic(row, layout, Semantic::Orb, row.u[1] - 1);
             }
@@ -1253,7 +1110,6 @@ fn populate_domain_features(
             row.f[0] = sf(row.s[0], 30.0);
         }
         EVENT_DOMAIN => {
-            push_semantic(row, layout, Semantic::EventKind, row.u[0]);
             push_semantic(row, layout, Semantic::Event, row.u[1]);
             if row.u[0] == 2
                 && row.u[3] > 0
@@ -1278,17 +1134,14 @@ fn populate_domain_features(
                     _ => {}
                 }
             }
-            row.f.fill(0.0);
         }
         ENCOUNTER_DOMAIN => {
-            push_semantic(row, layout, Semantic::EncounterKind, row.u[0]);
             let namespace = match row.u[0] {
-                0 => Semantic::EncounterBoss,
                 2 | 4 => Semantic::EncounterElite,
-                _ => Semantic::EncounterNormal,
+                1 | 3 => Semantic::EncounterNormal,
+                _ => unreachable!(),
             };
             push_semantic(row, layout, namespace, row.u[1]);
-            row.f.fill(0.0);
         }
         CRYSTAL_DOMAIN => {
             push_semantic(row, layout, Semantic::CrystalKind, row.u[0]);
@@ -1315,9 +1168,6 @@ fn populate_domain_features(
         CONTINUATION_DOMAIN => {
             push_semantic(row, layout, Semantic::ContinuationKind, row.u[0]);
             push_semantic(row, layout, Semantic::Boolean, row.u[10]);
-            if row.scope == PHASE_SCOPE && row.u[23] > 0 {
-                push_semantic(row, layout, Semantic::PhaseKind, 27 + row.u[23]);
-            }
             let namespace = match row.u[0] {
                 0 => Semantic::RunEffect,
                 1 => Semantic::Effect,
@@ -1417,10 +1267,7 @@ fn populate_domain_features(
                     if row.u[18] > 0 {
                         push_semantic(row, layout, Semantic::Enchantment, row.u[18] - 1);
                     }
-                    push_bits(row, layout, Semantic::FlagBit, row.u[13]);
-                    push_bits(row, layout, Semantic::TurnFlagBit, row.u[14]);
-                    push_boolean(row, layout, 60, row.u[16] != 0);
-                    push_boolean(row, layout, 61, row.u[17] != 0);
+                    push_boolean(row, layout, 90, row.u[23] != 0);
                     if row.u[20] > 0 {
                         push_semantic(row, layout, Semantic::DeckOrigin, (row.u[20] - 1).min(256));
                     }
@@ -1518,6 +1365,7 @@ fn populate_domain_features(
                     }
                 }
                 8 if matches!(row.u[1], 5..=7) => row.f[0] = sf(row.s[0], 1_000.0),
+                9 if row.u[1] == 0 => put_continuation_numbers(row, &[11, 12, 13], 10.0),
                 _ => {}
             }
             if row.u[0] == 5 {
@@ -1533,35 +1381,18 @@ fn populate_domain_features(
                     sf(row.s[4], 30.0),
                     sf(row.s[5], 1_000.0),
                 ]);
+                put_card_flags(row, 24, row.u[13], row.u[14], row.u[16], row.u[17]);
             }
         }
         MAP_NODE_DOMAIN => {
-            push_semantic(row, layout, Semantic::MapNodeKind, row.u[1]);
-            push_semantic(row, layout, Semantic::Room, row.u[4]);
-            push_semantic(row, layout, Semantic::MapFloorPosition, row.u[2].min(64));
-            push_boolean(row, layout, 52, row.u[5] != 0);
-            push_boolean(row, layout, 53, row.u[6] != 0);
-            push_boolean(row, layout, 54, row.u[7] != 0);
-            row.f.copy_from_slice(&[
-                0.0,
-                0.0,
-                row.u[9] as f32 / 8.0,
-                (row.u[9] as f32).ln_1p() / 3.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-            ]);
+            if row.u[2] != 0 {
+                push_semantic(row, layout, Semantic::MapModifier, 0);
+            }
+            if row.u[3] != 0 {
+                push_semantic(row, layout, Semantic::MapModifier, 1);
+            }
         }
-        MAP_EDGE_DOMAIN => {
-            push_semantic(row, layout, Semantic::MapEdgeKind, 0);
-            row.f.copy_from_slice(&[
-                row.u[2] as f32 / 8.0,
-                (row.u[2] as f32).ln_1p() / 3.0,
-                1.0,
-                0.0,
-            ]);
-        }
+        MAP_EDGE_DOMAIN => {}
         _ => unreachable!(),
     }
 }
@@ -1579,8 +1410,71 @@ fn room_index(room: Room) -> usize {
     }
 }
 
-fn phase_index(phase: &Phase) -> usize {
-    match phase {
+fn map_bosses(content: &Content) -> Vec<Id> {
+    let mut bosses = Vec::new();
+    for &id in content
+        .acts
+        .iter()
+        .filter(|act| act.id != "ACT.FOUNDATION")
+        .flat_map(|act| act.bosses)
+    {
+        if !bosses.contains(&id) {
+            bosses.push(id);
+        }
+    }
+    assert_eq!(bosses.len(), 12);
+    bosses
+}
+
+fn map_node_kind(
+    game: &Game,
+    content: &Content,
+    bosses: &[Id],
+    node: &MapNode,
+    boss: usize,
+) -> usize {
+    if node.floor == 0 {
+        const ANCIENTS: [&str; 8] = [
+            "EVENT.NEOW",
+            "EVENT.OROBAS",
+            "EVENT.PAEL",
+            "EVENT.TEZCATARA",
+            "EVENT.DARV",
+            "EVENT.NONUPEIPE",
+            "EVENT.TANX",
+            "EVENT.VAKUU",
+        ];
+        return game
+            .ancient
+            .and_then(|id| {
+                ANCIENTS
+                    .iter()
+                    .position(|&name| content.events[id as usize].id == name)
+            })
+            .map_or(0, |index| 6 + index);
+    }
+    if node.room == Room::Boss {
+        return game
+            .bosses
+            .get(boss)
+            .copied()
+            .flatten()
+            .and_then(|id| bosses.iter().position(|&candidate| candidate == id))
+            .map_or(0, |index| 14 + index);
+    }
+    match node.room {
+        Room::Unknown => 0,
+        Room::Combat => 1,
+        Room::Elite => 2,
+        Room::Rest => 3,
+        Room::Treasure => 4,
+        Room::Shop => 5,
+        Room::Event | Room::Boss => unreachable!(),
+    }
+}
+
+fn phase_index(phase: &Phase) -> Option<usize> {
+    Some(match phase {
         Phase::Map => 0,
         Phase::Combat(_) => 1,
         Phase::Rewards(_) => 2,
@@ -1593,9 +1487,8 @@ fn phase_index(phase: &Phase) -> usize {
         Phase::EnchantCards(..) => 9,
         Phase::ChooseCards(..) => 10,
         Phase::ChooseBundles(..) => 11,
-        Phase::Won => 12,
-        Phase::Dead => 13,
-    }
+        Phase::Won | Phase::Dead => return None,
+    })
 }
 
 fn canonical_progress(game: &Game) -> u8 {
@@ -4263,12 +4156,9 @@ fn actor_index(actor: Actor) -> usize {
     }
 }
 
-fn public_relic_bags(game: &Game, content: &Content, layout: Layout) -> [Vec<Vec<Id>>; 2] {
+fn public_relic_bag(game: &Game, layout: Layout) -> Vec<Vec<Id>> {
     let trader = matches!(game.phase, Phase::Event(id, _) if Some(id) == layout.relic_trader);
-    let mut bags = [
-        game.relic_deques.to_vec(),
-        game.shared_relic_deques.to_vec(),
-    ];
+    let mut bag = game.relic_deques.to_vec();
     if !trader || game.event_relic.is_some() {
         let mut hidden = if trader {
             vec![]
@@ -4282,17 +4172,14 @@ fn public_relic_bags(game: &Game, content: &Content, layout: Layout) -> [Vec<Vec
             if game.run.relics.contains(&id) {
                 continue;
             }
-            if let Some(rarity) = crate::game::relic_group(id) {
-                if !bags[0][rarity].contains(&id) {
-                    bags[0][rarity].push(id);
-                }
-                if content.acts[0].relics.contains(&id) && !bags[1][rarity].contains(&id) {
-                    bags[1][rarity].push(id);
-                }
+            if let Some(rarity) = crate::game::relic_group(id)
+                && !bag[rarity].contains(&id)
+            {
+                bag[rarity].push(id);
             }
         }
     }
-    bags
+    bag
 }
 
 fn public_encounters(game: &Game, content: &Content, elite: bool) -> Vec<Id> {
@@ -4328,26 +4215,21 @@ fn relic_state(game: &Game, content: &Content, id: Id) -> [f32; 4] {
         "RELIC.FAKE_HAPPY_FLOWER" => [game.fake_happy_flower as f32, 0.0, 0.0, 0.0],
         "RELIC.VENERABLE_TEA_SET" => [(game.tea_set / 2 * 2) as f32, 0.0, 0.0, 0.0],
         "RELIC.FAKE_VENERABLE_TEA_SET" => [(game.tea_set % 2) as f32, 0.0, 0.0, 0.0],
-        "RELIC.LASTING_CANDY" => [game.lasting_candy as f32, 0.0, 0.0, 0.0],
-        "RELIC.PAELS_WING" => [game.paels_wing as f32, 0.0, 0.0, 0.0],
+        "RELIC.LASTING_CANDY" => [(game.lasting_candy % 2) as f32, 0.0, 0.0, 0.0],
+        "RELIC.PAELS_WING" => [(game.paels_wing % 2) as f32, 0.0, 0.0, 0.0],
         "RELIC.SILVER_CRUCIBLE" => [
-            game.silver_crucible as f32,
-            game.silver_treasures as f32,
+            3u8.saturating_sub(game.silver_crucible) as f32,
+            1u8.saturating_sub(game.silver_treasures) as f32,
             0.0,
             0.0,
         ],
-        "RELIC.WINGED_BOOTS" => [game.winged_boots as f32, 0.0, 0.0, 0.0],
+        "RELIC.WINGED_BOOTS" => [3u8.saturating_sub(game.winged_boots) as f32, 0.0, 0.0, 0.0],
         "RELIC.GIRYA" => [game.girya as f32, 0.0, 0.0, 0.0],
         "RELIC.PUMPKIN_CANDLE" => [game.pumpkin_candle as f32, 0.0, 0.0, 0.0],
-        "RELIC.TOY_BOX" => [game.toy_box_combats as f32, 0.0, 0.0, 0.0],
+        "RELIC.TOY_BOX" => [(game.toy_box_combats % 3) as f32, 0.0, 0.0, 0.0],
         "RELIC.NUNCHAKU" => [game.nunchaku as f32, 0.0, 0.0, 0.0],
         "RELIC.PENDULUM" => [game.pendulum as f32, 0.0, 0.0, 0.0],
-        "RELIC.PEN_NIB" => [
-            game.pen_nib as f32,
-            flag(combat.is_some_and(|combat| combat.pen_nib)),
-            0.0,
-            0.0,
-        ],
+        "RELIC.PEN_NIB" => [game.pen_nib as f32, 0.0, 0.0, 0.0],
         "RELIC.IRON_CLUB" => [game.iron_club as f32, 0.0, 0.0, 0.0],
         "RELIC.JOSS_PAPER" => [game.joss_paper as f32, 0.0, 0.0, 0.0],
         "RELIC.TUNING_FORK" => [game.tuning_fork as f32, 0.0, 0.0, 0.0],
@@ -4361,8 +4243,9 @@ fn relic_state(game: &Game, content: &Content, id: Id) -> [f32; 4] {
         "RELIC.BONE_TEA" => [flag(game.bone_tea), 0.0, 0.0, 0.0],
         "RELIC.TEA_OF_DISCOURTESY" => [flag(game.tea_of_discourtesy), 0.0, 0.0, 0.0],
         "RELIC.WONGOS_MYSTERY_TICKET" => [
-            game.wongo_combats.unwrap_or_default() as f32,
-            flag(game.wongo_combats.is_some()),
+            game.wongo_combats
+                .map_or(0, |combats| 5u8.saturating_sub(combats)) as f32,
+            0.0,
             0.0,
             0.0,
         ],
@@ -4372,12 +4255,10 @@ fn relic_state(game: &Game, content: &Content, id: Id) -> [f32; 4] {
             0.0,
             0.0,
         ],
-        "RELIC.MEAT_CLEAVER" => [flag(game.cooking), 0.0, 0.0, 0.0],
-        "RELIC.NEOWS_BONES" => [flag(game.pending_curse), 0.0, 0.0, 0.0],
-        "RELIC.ASTROLABE" => [flag(game.astrolabe), flag(game.transform_niche), 0.0, 0.0],
+        "RELIC.MEAT_CLEAVER" | "RELIC.NEOWS_BONES" | "RELIC.ASTROLABE" => [0.0; 4],
         "RELIC.FISHING_ROD" => [game.fishing_rod as f32, 0.0, 0.0, 0.0],
         "RELIC.POLLINOUS_CORE" => [game.pollinous_core as f32, 0.0, 0.0, 0.0],
-        "RELIC.PAELS_TOOTH" => [flag(game.paels_tooth), 0.0, 0.0, 0.0],
+        "RELIC.PAELS_TOOTH" => [0.0; 4],
         "RELIC.PAELS_TEARS" => [
             flag(combat.is_some_and(|combat| combat.paels_tears)),
             0.0,
@@ -4458,7 +4339,7 @@ fn relic_state(game: &Game, content: &Content, id: Id) -> [f32; 4] {
         ],
         "RELIC.PAELS_EYE" => [
             flag(combat.is_some_and(|combat| combat.paels_eye)),
-            flag(combat.is_some_and(|combat| combat.paels_eye_extra)),
+            0.0,
             0.0,
             0.0,
         ],
@@ -4578,6 +4459,7 @@ fn event_effect_index(effect: &RunEffect) -> usize {
         RunEffect::RemoveRandomCard => 33,
         RunEffect::Options(_) => 34,
         RunEffect::EventAction(_) => 35,
+        RunEffect::FinishCooking => 36,
     }
 }
 
@@ -4693,48 +4575,6 @@ fn state_card_domains(
         0,
         game.run.deck.iter().copied().map(|card| (0, 0, card, 0)),
     );
-    let active_relic = |wanted: &str| {
-        game.run.relics.iter().enumerate().any(|(index, &id)| {
-            !game.melted_relics.contains(&index) && content.relics[id as usize].id == wanted
-        })
-    };
-    let mut pool = if active_relic("RELIC.PRISMATIC_GEM") {
-        content
-            .characters
-            .iter()
-            .flat_map(|character| character.cards)
-            .copied()
-            .collect()
-    } else {
-        content.characters[game.run.character as usize]
-            .cards
-            .to_vec()
-    };
-    if !active_relic("RELIC.PRISMATIC_GEM") && active_relic("RELIC.DINGY_RUG") {
-        pool.extend_from_slice(content.colorless());
-    }
-    pool.sort_unstable();
-    pool.dedup();
-    push_cards(
-        domains,
-        game,
-        content,
-        encoding,
-        STATE_SCOPE,
-        CARD_POOL_ZONE as u32,
-        0,
-        pool.into_iter().map(|id| {
-            (
-                0,
-                0,
-                Card {
-                    id,
-                    ..Card::default()
-                },
-                0,
-            )
-        }),
-    );
     push_cards(
         domains,
         game,
@@ -4797,11 +4637,11 @@ fn state_card_domains(
     }
 }
 
-fn event_public_data(game: &Game, content: &Content) -> [i32; 4] {
-    let Phase::Event(id, _) = game.phase else {
+fn event_public_data(game: &Game, content: &Content, phase: &Phase) -> [i32; 4] {
+    let Phase::Event(id, _) = phase else {
         return [0; 4];
     };
-    let slots: &[usize] = match content.events[id as usize].id {
+    let slots: &[usize] = match content.events[*id as usize].id {
         "EVENT.ABYSSAL_BATHS" => &[0],
         "EVENT.COLORFUL_PHILOSOPHERS" => &[0, 1, 2],
         "EVENT.CRYSTAL_SPHERE" => &[0],
@@ -4839,15 +4679,12 @@ fn event_option_payload(game: &Game, content: &Content, index: usize) -> Option<
     }
 }
 
-fn phase_domain_row(game: &Game, content: &Content) -> DomainRow {
+fn phase_domain_row(game: &Game, content: &Content, phase: &Phase, suspended: bool) -> DomainRow {
     let mut row = DomainRow::new(PHASE_DOMAIN, STATE_SCOPE);
-    row.u[0] = phase_index(&game.phase) as u32;
+    row.u[0] = phase_index(phase).expect("terminal phase has no observation") as u32;
     row.u[2] = room_index(game.room) as u32;
-    row.u[3] = game
-        .resume
-        .as_ref()
-        .map_or(0, |phase| phase_index(phase) as u32 + 1);
-    match &game.phase {
+    row.u[3] = suspended as u32;
+    match phase {
         Phase::Combat(combat) => {
             row.u[4] = combat.choice.is_some() as u32;
             row.u[13] = combat.enemy_turn as u32;
@@ -4878,7 +4715,7 @@ fn phase_domain_row(game: &Game, content: &Content) -> DomainRow {
         Phase::Event(id, options) => {
             row.u[1] = *id as u32 + 1;
             row.u[4] = options.len() as u32;
-            row.s[..4].copy_from_slice(&event_public_data(game, content));
+            row.s[..4].copy_from_slice(&event_public_data(game, content, phase));
         }
         Phase::RemoveCards(count, tag, optional) => {
             row.u[4..7].copy_from_slice(&[*count as u32, *tag as u32, *optional as u32]);
@@ -4887,10 +4724,11 @@ fn phase_domain_row(game: &Game, content: &Content) -> DomainRow {
             row.u[4..6].copy_from_slice(&[*count as u32, *optional as u32]);
         }
         Phase::TransformCards(target, count, optional) => {
-            row.u[4..7].copy_from_slice(&[
+            row.u[4..8].copy_from_slice(&[
                 target.map_or(0, |id| id as u32 + 1),
                 *count as u32,
                 *optional as u32,
+                game.astrolabe as u32,
             ]);
         }
         Phase::EnchantCards(enchantment, amount, count, card_type, optional) => {
@@ -4921,6 +4759,8 @@ struct CanonicalMapCache {
     source: Arc<[MapNode]>,
     fur_coat: Option<Vec<(u8, u8)>>,
     spoils: Option<(u8, u8)>,
+    ancient: Option<Id>,
+    bosses: [Option<Id>; 2],
     layout: Layout,
     map: CanonicalMap,
 }
@@ -4938,93 +4778,44 @@ fn canonical_map(game: &Game, content: &Content, layout: Layout) -> CanonicalMap
     }
     let mut ids = vec![0; game.map.nodes.len()];
     for (position, &index) in order.iter().enumerate() {
-        ids[index] = position as u32 + 1;
+        ids[index] = position as u32;
     }
-    let terminal = order.len() as u32 + 1;
-    let min_floor = order
-        .iter()
-        .map(|&index| game.map.nodes[index].floor)
-        .min()
-        .unwrap_or(0);
-    let max_floor = order
-        .iter()
-        .map(|&index| game.map.nodes[index].floor)
-        .max()
-        .unwrap_or(0);
-    let entry_degree = order
-        .iter()
-        .filter(|&&index| game.map.nodes[index].floor == min_floor)
-        .count() as u32;
-    let mut nodes = Vec::with_capacity(order.len() + 2);
-    let mut entry = DomainRow::new(MAP_NODE_DOMAIN, STATE_SCOPE);
-    entry.u[1] = 1;
-    entry.u[8] = 0;
-    entry.u[9] = entry_degree;
-    nodes.push(entry);
+    let bosses = map_bosses(content);
+    let mut boss = 0;
+    let mut nodes = Vec::with_capacity(order.len());
     for &index in &order {
         let node = &game.map.nodes[index];
+        let kind = map_node_kind(game, content, &bosses, node, boss);
+        boss += (node.room == Room::Boss) as usize;
+        assert!(kind < MAP_NODE_KINDS);
         let mut row = DomainRow::new(MAP_NODE_DOMAIN, STATE_SCOPE);
-        row.u[..10].copy_from_slice(&[
+        row.u.copy_from_slice(&[
             ids[index],
-            0,
-            node.floor as u32,
-            node.lane as u32,
-            room_index(node.room) as u32,
-            0,
+            kind as u32,
             (game.fur_coat_act == Some(game.run.act)
                 && game.fur_coat.contains(&(node.lane, node.floor))) as u32,
             (game.spoils == Some((node.lane, node.floor))) as u32,
-            node.floor.saturating_sub(min_floor) as u32 + 1,
-            node.next.len() as u32 + node.next.is_empty() as u32,
         ]);
         nodes.push(row);
     }
-    let mut end = DomainRow::new(MAP_NODE_DOMAIN, STATE_SCOPE);
-    end.u[..10].copy_from_slice(&[
-        terminal,
-        2,
-        max_floor as u32 + 1,
-        0,
-        0,
-        1,
-        0,
-        0,
-        max_floor.saturating_sub(min_floor) as u32 + 2,
-        0,
-    ]);
-    nodes.push(end);
-    let mut counts = std::collections::BTreeMap::new();
+    let mut edges = Vec::new();
     for &index in &order {
         let node = &game.map.nodes[index];
-        if node.next.is_empty() {
-            *counts.entry((ids[index], terminal)).or_insert(0u32) += 1;
-        }
         for &next in &node.next {
             let child = game.map.nodes.get(next).expect("invalid map edge");
             assert!(child.floor > node.floor);
-            *counts.entry((ids[index], ids[next])).or_insert(0) += 1;
-        }
-    }
-    for &index in &order {
-        if game.map.nodes[index].floor == min_floor {
-            *counts.entry((0, ids[index])).or_insert(0) += 1;
-        }
-    }
-    let mut edges = counts
-        .into_iter()
-        .map(|((src, dst), multiplicity)| {
             let mut row = DomainRow::new(MAP_EDGE_DOMAIN, STATE_SCOPE);
-            row.u[..3].copy_from_slice(&[src, dst, multiplicity]);
-            row
-        })
-        .collect::<Vec<_>>();
+            row.u.copy_from_slice(&[ids[index], ids[next]]);
+            edges.push(row);
+        }
+    }
     for row in &mut nodes {
         populate_domain_features(game, content, layout, MAP_NODE_DOMAIN, row);
     }
     for row in &mut edges {
         populate_domain_features(game, content, layout, MAP_EDGE_DOMAIN, row);
     }
-    let current = game.map.current.map_or(0, |index| ids[index]);
+    let current = game.map.current.map_or(ids[order[0]], |index| ids[index]);
     (nodes.into(), edges.into(), ids.into(), current)
 }
 
@@ -5039,12 +4830,16 @@ fn cached_canonical_map(
         !Arc::ptr_eq(&cache.source, &game.map.nodes)
             || cache.fur_coat.as_deref() != fur_coat
             || cache.spoils != game.spoils
+            || cache.ancient != game.ancient
+            || cache.bosses != game.bosses
             || cache.layout != layout
     }) {
         *cache = Some(CanonicalMapCache {
             source: game.map.nodes.clone(),
             fur_coat: fur_coat.map(<[_]>::to_vec),
             spoils: game.spoils,
+            ancient: game.ancient,
+            bosses: game.bosses,
             layout,
             map: canonical_map(game, content, layout),
         });
@@ -5077,7 +4872,6 @@ fn run_domain_row(game: &Game, bonuses: (i16, i16), current: u32) -> DomainRow {
         game.rest_used as u32,
         game.replacing_potion as u32,
         game.pending_potion.map_or(0, |id| id as u32 + 1),
-        game.pending_curse as u32,
         game.rerolled_cards as u32,
         game.parasol_removal as u32,
         game.conveyor as u32,
@@ -5165,15 +4959,10 @@ fn push_actor_domains(
             },
         ]);
         if owner == 1 {
-            row.s[8..16].copy_from_slice(&[
+            row.s[8..11].copy_from_slice(&[
                 combat.energy as i32,
                 combat.stars as i32,
                 combat.turn as i32,
-                combat.card_energy as i32,
-                combat.card_stars as i32,
-                combat.card_plays as i32,
-                combat.last_damage as i32,
-                combat.drawn as i32,
             ]);
         }
         domains[ACTOR_DOMAIN].push(row);
@@ -5488,44 +5277,25 @@ fn push_collection_domains(
                 .map_or(0, |id| id as u32 + 1);
         }
         row.u[9] = (content.relics[id as usize].id == "RELIC.PAELS_TOOTH") as u32;
-        row.s
+        row.s[..4]
             .copy_from_slice(&relic_state(game, content, id).map(|value| value.round() as i32));
+        if let Some(position) = game.wax_relics.iter().position(|&wax| wax == order) {
+            row.s[4] = 1;
+            row.s[5] = (3 + game.toy_box_combats / 3)
+                .saturating_sub(position as u8)
+                .min(4) as i32;
+        }
         domains[RELIC_DOMAIN].push(row);
     }
-    let bags = public_relic_bags(game, content, layout);
-    for (pool, bag) in bags.iter().enumerate() {
-        for &id in bag.iter().flatten() {
-            let mut row = DomainRow::new(RELIC_DOMAIN, STATE_SCOPE);
-            row.u[..4].copy_from_slice(&[
-                pool as u32 + 1,
-                id as u32,
-                0,
-                crate::game::relic_group(id).unwrap_or(4) as u32,
-            ]);
-            domains[RELIC_DOMAIN].push(row);
-        }
-    }
-    let mut pool = content.characters[game.run.character as usize]
-        .relic_pool
-        .iter()
-        .chain(layout.shared_relics)
-        .copied()
-        .collect::<Vec<_>>();
-    pool.sort_unstable();
-    pool.dedup();
-    for id in pool {
-        if game.run.relics.contains(&id) {
-            continue;
-        }
-        let general = bags[0].iter().flatten().any(|&candidate| candidate == id);
-        let shared = layout.shared_relics.contains(&id);
-        let shared_left = bags[1].iter().flatten().any(|&candidate| candidate == id);
-        let excluded = (!general) as u32 | ((shared && !shared_left) as u32) << 1;
-        if excluded != 0 {
-            let mut row = DomainRow::new(RELIC_DOMAIN, STATE_SCOPE);
-            row.u[..5].copy_from_slice(&[3, id as u32, 0, 4, excluded]);
-            domains[RELIC_DOMAIN].push(row);
-        }
+    for &id in public_relic_bag(game, layout).iter().flatten() {
+        let mut row = DomainRow::new(RELIC_DOMAIN, STATE_SCOPE);
+        row.u[..4].copy_from_slice(&[
+            1,
+            id as u32,
+            0,
+            crate::game::relic_group(id).unwrap_or(4) as u32,
+        ]);
+        domains[RELIC_DOMAIN].push(row);
     }
     for (slot, potion) in game.run.potions.iter().enumerate() {
         let mut row = DomainRow::new(POTION_DOMAIN, STATE_SCOPE);
@@ -5536,11 +5306,6 @@ fn push_collection_domains(
             potion.is_none() as u32,
             slot as u32 + 1,
         ]);
-        domains[POTION_DOMAIN].push(row);
-    }
-    if let Some(id) = game.pending_potion {
-        let mut row = DomainRow::new(POTION_DOMAIN, PHASE_SCOPE);
-        row.u[..3].copy_from_slice(&[1, u32::MAX, id as u32 + 1]);
         domains[POTION_DOMAIN].push(row);
     }
     if let Some(combat) = game.combat() {
@@ -5567,13 +5332,6 @@ fn push_collection_domains(
         domains[EVENT_DOMAIN].push(row);
     }
     let encounter_vocabs = encounter_vocabs(content);
-    if game.bosses_visited < 2
-        && let Some(id) = game.bosses[game.bosses_visited as usize]
-    {
-        let mut row = DomainRow::new(ENCOUNTER_DOMAIN, STATE_SCOPE);
-        row.u[..2].copy_from_slice(&[0, encounter_id(&encounter_vocabs[2], id) as u32 - 1]);
-        domains[ENCOUNTER_DOMAIN].push(row);
-    }
     for (kind, (items, vocab)) in [
         (
             1,
@@ -5588,16 +5346,6 @@ fn push_collection_domains(
         ),
     ] {
         for id in items {
-            let mut row = DomainRow::new(ENCOUNTER_DOMAIN, STATE_SCOPE);
-            row.u[..2].copy_from_slice(&[kind, encounter_id(vocab, id) as u32 - 1]);
-            domains[ENCOUNTER_DOMAIN].push(row);
-        }
-    }
-    for (kind, id, vocab) in [
-        (3, game.last_encounter, &encounter_vocabs[0]),
-        (4, game.last_elite, &encounter_vocabs[1]),
-    ] {
-        if let Some(id) = id {
             let mut row = DomainRow::new(ENCOUNTER_DOMAIN, STATE_SCOPE);
             row.u[..2].copy_from_slice(&[kind, encounter_id(vocab, id) as u32 - 1]);
             domains[ENCOUNTER_DOMAIN].push(row);
@@ -6387,7 +6135,8 @@ impl ContinuationBuilder {
             | RunEffect::DiscardRandomPotion
             | RunEffect::UpgradeAll
             | RunEffect::CloneDeck
-            | RunEffect::RemoveRandomCard => {}
+            | RunEffect::RemoveRandomCard
+            | RunEffect::FinishCooking => {}
             RunEffect::HealPercent(value)
             | RunEffect::NextRelics(value)
             | RunEffect::RelicOfRarity(value)
@@ -6504,7 +6253,7 @@ impl ContinuationBuilder {
         };
         let index = self.row(
             4,
-            phase_index(phase) as u32,
+            phase_index(phase).expect("cannot resume a terminal phase") as u32,
             parent,
             0,
             1,
@@ -6667,47 +6416,8 @@ fn normalized_effect(
 
 fn phase_continuation_domains(game: &Game, content: &Content) -> Vec<DomainRow> {
     let mut out = ContinuationBuilder::for_game(game, PHASE_SCOPE);
-    if !matches!(
-        game.phase,
-        Phase::Combat(_) | Phase::Map | Phase::Rest | Phase::Won | Phase::Dead
-    ) {
-        let before = out.rows.len();
-        out.resume_phase(&game.phase, content, NO_NODE);
-        for row in &mut out.rows[before..] {
-            row.u[23] = 1;
-        }
-    }
     if let Some(phase) = &game.resume {
-        let before = out.rows.len();
         out.resume_phase(phase, content, NO_NODE);
-        for row in &mut out.rows[before..] {
-            row.u[23] = 2;
-        }
-    }
-    if let Some(combat) = game.combat()
-        && let Some(card) = combat.playing
-    {
-        let before = out.rows.len();
-        out.card(card, NO_NODE, 1, 0);
-        for row in &mut out.rows[before..] {
-            row.u[23] = 1;
-        }
-    }
-    if matches!(&game.phase, Phase::Event(id, _) if content.events[*id as usize].id == "EVENT.SLIPPERY_BRIDGE")
-    {
-        let before = out.rows.len();
-        for (order, card) in game
-            .event_cards
-            .iter()
-            .filter_map(|instance| game.run.deck.iter().find(|card| card.instance == *instance))
-            .copied()
-            .enumerate()
-        {
-            out.card(card, NO_NODE, 1, order as u32);
-        }
-        for row in &mut out.rows[before..] {
-            row.u[23] = 1;
-        }
     }
     out.rows
 }
@@ -6738,10 +6448,47 @@ fn continuation_domains(game: &Game, content: &Content) -> Vec<DomainRow> {
             let item = out.row(3, 0, NO_NODE, 0, 0, 0, order, 1);
             out.rows[item].u[11] = play.plays as u32;
             out.card(play.card, out.rows[item].u[2], 0, 0);
+            if combat.unsettling_lamp == Some(play.card.id) {
+                out.rows.last_mut().unwrap().u[23] = 1;
+            }
             let frame = out.rows[before].u[2];
             group_continuation_item(&mut out.rows[before..], frame, order);
             order += 1;
         }
+        if let Some(card) = combat.playing {
+            let before = out.rows.len();
+            let item = out.row(9, 0, NO_NODE, 0, 0, 0, order, 1);
+            out.rows[item].u[11..14].copy_from_slice(&[
+                combat.card_energy.max(0) as u32,
+                combat.card_stars.max(0) as u32,
+                combat.card_plays as u32,
+            ]);
+            out.card(card, out.rows[item].u[2], 1, 0);
+            if combat.unsettling_lamp == Some(card.id) {
+                out.rows.last_mut().unwrap().u[23] = 1;
+            }
+            let frame = out.rows[before].u[2];
+            group_continuation_item(&mut out.rows[before..], frame, order);
+            order += 1;
+        }
+        if combat
+            .control
+            .contains(&ControlContinuation::StartExtraPlayerTurnAfterResolution)
+        {
+            let row = out.row(9, 3, NO_NODE, 0, 0, 0, order, 0);
+            let frame = out.rows[row].u[2];
+            group_continuation_item(&mut out.rows[row..], frame, order);
+            order += 1;
+        }
+    }
+    if matches!(
+        game.reward_continuation,
+        Some(RewardContinuation::AddRandomCurse)
+    ) {
+        let row = out.row(9, 2, NO_NODE, 0, 0, 0, order, 0);
+        let frame = out.rows[row].u[2];
+        group_continuation_item(&mut out.rows[row..], frame, order);
+        order += 1;
     }
     for item in &game.parasol {
         let before = out.rows.len();
@@ -7113,12 +6860,12 @@ fn action_features(u: &[u32; ACTION_U], s: &[i32; ACTION_S]) -> [f32; ACTION_F] 
     out
 }
 
-fn packed_observation(row: &ObservationV56) -> (Vec<f32>, Vec<u32>, Vec<u32>, Vec<u32>, u64) {
+fn packed_observation(row: &Observation) -> (Vec<f32>, Vec<u32>, Vec<u32>, Vec<u32>, u64) {
     packed_observation_known(row, None)
 }
 
 fn packed_observation_known(
-    row: &ObservationV56,
+    row: &Observation,
     known_digest: Option<u64>,
 ) -> (Vec<f32>, Vec<u32>, Vec<u32>, Vec<u32>, u64) {
     let mut counts = Vec::with_capacity(DOMAIN_NAMES.len());
@@ -7172,7 +6919,7 @@ fn packed_observation_digest(
     digest
 }
 
-fn observation_digest(row: &ObservationV56) -> u64 {
+fn observation_digest(row: &Observation) -> u64 {
     let mut digest = 0xcbf2_9ce4_8422_2325u64;
     let mut update = |value: u32| {
         digest = (digest ^ value as u64).wrapping_mul(0x100_0000_01b3);
@@ -7310,7 +7057,10 @@ fn action_row(
     }
     let mut semantic = Vec::new();
     semantic.push(layout.semantic(Semantic::Action, row.u[0]));
-    semantic.push(layout.semantic(Semantic::Phase, phase_index(&game.phase) as u32));
+    semantic.push(layout.semantic(
+        Semantic::Phase,
+        phase_index(&game.phase).expect("terminal phase has no action") as u32,
+    ));
     if row.u[1] > 0 {
         semantic.push(layout.semantic(Semantic::Target, 3));
         let position = row.u[1].saturating_sub(3);
@@ -7327,6 +7077,11 @@ fn action_row(
     }
     if row.u[4] != NO_NODE {
         semantic.push(layout.semantic(Semantic::RunKind, 28));
+    }
+    if matches!(action, Action::DiscardPotion(_))
+        && let Some(id) = game.pending_potion
+    {
+        semantic.push(layout.semantic(Semantic::Potion, id as u32));
     }
     row.c[..semantic.len()].copy_from_slice(&semantic);
     let preview = action_preview_resolved(game, content, action, legal);
@@ -7371,24 +7126,24 @@ fn action_row(
     row
 }
 
-fn observation_v56(
+fn build_observation(
     game: &Game,
     content: &Content,
     layout: Layout,
     bonuses: (i16, i16),
-) -> ObservationV56 {
-    observation_v56_with_map(game, content, layout, bonuses, None)
+) -> Observation {
+    build_observation_with_map(game, content, layout, bonuses, None)
 }
 
-fn observation_v56_cached(
+fn build_observation_cached(
     game: &Game,
     content: &Content,
     layout: Layout,
     bonuses: (i16, i16),
     cache: &mut Option<CanonicalMapCache>,
-) -> ObservationV56 {
+) -> Observation {
     let map = cached_canonical_map(game, content, layout, cache);
-    observation_v56_with_map(game, content, layout, bonuses, Some(&map))
+    build_observation_with_map(game, content, layout, bonuses, Some(&map))
 }
 
 fn candidate_signature(
@@ -7397,7 +7152,7 @@ fn candidate_signature(
     layout: Layout,
     action: &Action,
 ) -> Option<(CandidateRow, [Vec<DomainRow>; 16])> {
-    let observation = observation_v56(game, content, layout, (0, 0));
+    let observation = build_observation(game, content, layout, (0, 0));
     let index = observation
         .candidates
         .iter()
@@ -7416,18 +7171,18 @@ fn candidate_signature(
     Some((observation.candidates[index].clone(), domains))
 }
 
-fn observation_v56_with_map(
+fn build_observation_with_map(
     game: &Game,
     content: &Content,
     layout: Layout,
     bonuses: (i16, i16),
     map: Option<&CanonicalMap>,
-) -> ObservationV56 {
+) -> Observation {
     let (actions, legal) = candidate_actions(game, content);
-    observation_v56_with_candidates(game, content, layout, bonuses, map, actions, legal)
+    build_observation_with_candidates(game, content, layout, bonuses, map, actions, legal)
 }
 
-fn observation_v56_with_candidates(
+fn build_observation_with_candidates(
     game: &Game,
     content: &Content,
     layout: Layout,
@@ -7435,13 +7190,16 @@ fn observation_v56_with_candidates(
     map: Option<&CanonicalMap>,
     actions: Vec<Action>,
     legal: Vec<bool>,
-) -> ObservationV56 {
+) -> Observation {
     let (nodes, edges, map_ids, current) = map
         .cloned()
         .unwrap_or_else(|| canonical_map(game, content, layout));
     let mut domains: [Vec<DomainRow>; 16] = std::array::from_fn(|_| Vec::new());
     domains[RUN_DOMAIN].push(run_domain_row(game, bonuses, current));
-    domains[PHASE_DOMAIN].push(phase_domain_row(game, content));
+    domains[PHASE_DOMAIN].push(phase_domain_row(game, content, &game.phase, false));
+    if let Some(phase) = &game.resume {
+        domains[PHASE_DOMAIN].push(phase_domain_row(game, content, phase, true));
+    }
     let mut card_encoding = CardEncoding::new(game, content);
     state_card_domains(game, content, &mut card_encoding, &mut domains);
     push_actor_domains(game, content, &card_encoding, &mut domains);
@@ -7465,28 +7223,6 @@ fn observation_v56_with_candidates(
             action,
         );
     }
-    if matches!(&game.phase, Phase::Combat(combat) if combat.choice.is_some()) {
-        let mut frame = 0u32;
-        for action in &actions {
-            let before = domains[CONTINUATION_DOMAIN].len();
-            candidate_domain_rows(
-                &mut domains,
-                game,
-                content,
-                &mut card_encoding,
-                layout,
-                PHASE_SCOPE,
-                action,
-            );
-            for row in &mut domains[CONTINUATION_DOMAIN][before..] {
-                row.u[2] += frame;
-                if row.u[3] != NO_NODE {
-                    row.u[3] += frame;
-                }
-            }
-            frame += (domains[CONTINUATION_DOMAIN].len() - before) as u32;
-        }
-    }
     for (domain, rows) in domains.iter_mut().enumerate() {
         if !matches!(
             domain,
@@ -7506,7 +7242,7 @@ fn observation_v56_with_candidates(
     let mut domains = domains.map(DomainRows::Owned);
     domains[MAP_NODE_DOMAIN] = DomainRows::Shared(nodes);
     domains[MAP_EDGE_DOMAIN] = DomainRows::Shared(edges);
-    ObservationV56 {
+    Observation {
         character: game.run.character as u8,
         globals: observation_globals_with_bonuses(game, content, layout, bonuses, true),
         domains,
@@ -7657,17 +7393,6 @@ fn resample_hidden(game: &mut Game, content: &Content, seed: u64) {
     }
     if let Some(crystal) = &mut game.crystal {
         resample_crystal(crystal, &mut rng);
-    }
-    if game.run.ascension >= 10 && game.run.act == 3 && game.bosses_visited <= 1 {
-        let bosses = content.acts[game.act as usize]
-            .bosses
-            .iter()
-            .copied()
-            .filter(|boss| Some(*boss) != game.bosses[0])
-            .collect::<Vec<_>>();
-        if !bosses.is_empty() {
-            game.bosses[1] = Some(bosses[rng.next() as usize % bosses.len()]);
-        }
     }
 }
 

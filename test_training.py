@@ -100,11 +100,11 @@ print('restored')
         self.assertEqual(args.mps_empty_cache_updates, 8)
         self.assertEqual(args.sampler_threads, 5)
         self.assertEqual(args.dataset_capacity, 131_072)
-        self.assertFalse(any(getattr(args, f"fp32_{part}") for part in train.FP32_PARTS))
-        fp32 = train.parser().parse_args([
-            "train", *(f"--fp32-{part}" for part in train.FP32_PARTS),
+        self.assertEqual(args.precision, "bf16")
+        mixed = train.parser().parse_args([
+            "train", "--precision", "bf16_with_fp32_dV",
         ])
-        self.assertTrue(all(getattr(fp32, f"fp32_{part}") for part in train.FP32_PARTS))
+        self.assertEqual(mixed.precision, "bf16_with_fp32_dV")
         self.assertEqual(
             [args.boss_1_floor_increment, args.boss_2_floor_increment,
              args.boss_3_floor_increment],
@@ -129,39 +129,16 @@ print('restored')
         self.assertEqual((additive.potential_mode, additive.potential_health_weight),
                          ("additive", .01))
 
-    def test_all_fp32_parts_disable_bf16_autocast(self):
+    def test_fp32_disables_autocast(self):
         class Model:
-            fp32_parts = train.FP32_PARTS
-
             def __call__(self, value, *_args, **_kwargs):
                 self.autocast = torch.is_autocast_enabled(value.device.type)
                 return value, value
 
         model = Model()
-        result = train.predict(model, (torch.ones(1),) * 6, "bf16")
+        result = train.predict(model, (torch.ones(1),) * 6, "fp32")
         self.assertFalse(model.autocast)
         self.assertTrue(all(value.dtype == torch.float32 for value in result))
-
-    def test_fp32_parts_cover_each_model_section(self):
-        env = train.sts2_sim.Batch(2, 84, 0)
-        model = train.Agent(dict(env.token_layout())).eval()
-        inputs = train.tensors(env.observe_tokens(), torch.device("cpu"), model)
-        sections = (
-            (next(iter(model.encoders.values())), model.action_encoder),
-            (model.global_transformer,),
-            (model.policy, model.critic),
-        )
-        for part, modules in zip(train.FP32_PARTS, sections):
-            dtypes = []
-            hooks = [module.register_forward_hook(
-                lambda _module, _inputs, output: dtypes.append(output.dtype)
-            ) for module in modules]
-            model.fp32_parts = (part,)
-            with torch.autocast("cpu", dtype=torch.bfloat16):
-                model(*inputs[:6])
-            for hook in hooks:
-                hook.remove()
-            self.assertTrue(dtypes and all(dtype == torch.float32 for dtype in dtypes), part)
 
     def test_sampler_seed_streams_are_disjoint(self):
         args = Namespace(
@@ -963,6 +940,15 @@ print('restored')
 
 
 class ModelKernelTest(unittest.TestCase):
+    def test_card_context_ignores_device_padding(self):
+        env = train.sts2_sim.Batch(1, 7, 0)
+        target = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
+        agent = model.Agent(dict(env.token_layout(64, 1, 4, 128)), 64, 1, 4, 128).to(target)
+        values = torch.randn(510, 64, device=target)
+        metadata = torch.zeros(512, 4, dtype=torch.long, device=target)
+        metadata[:510, 3] = 1
+        self.assertEqual(agent._card_context(values, metadata).shape, values.shape)
+
     def test_native_sequence_deduplication_preserves_empty_groups(self):
         selected, groups, inverse = train.sts2_sim.deduplicate_sequences(
             np.array([5, 7, 5, 8]), np.array([0, 1, 0, 1, 2, 3]),
@@ -1253,16 +1239,10 @@ class TrajectoryTest(unittest.TestCase):
             potential_weights=weights, potential_mode="additive",
         )
         self.assertEqual(train.architecture(model)["potential_mode"], "additive")
-        legacy = train.Agent(
-            dict(env.token_layout(*train.DEFAULT_ARCHITECTURE)), *train.DEFAULT_ARCHITECTURE,
-            model_version=train.MODEL_VERSION - 1, potential_weights=weights,
-        )
-        self.assertEqual(legacy.potential_mode, "health_multiplier")
         with self.assertRaises(ValueError):
             train.Agent(
                 dict(env.token_layout(*train.DEFAULT_ARCHITECTURE)),
                 *train.DEFAULT_ARCHITECTURE, model_version=train.MODEL_VERSION - 1,
-                potential_mode="additive",
             )
         env.set_potential_mode("health_multiplier")
         env.load_policy(train.export_value_model(None, model, env.fingerprint(), 1, 0, True))
@@ -1350,7 +1330,7 @@ class TrajectoryTest(unittest.TestCase):
     def test_catalog_prefers_compatible_runs_and_disables_old_checkpoints(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            for name, version in (("old", min(train.COMPATIBLE_MODEL_VERSIONS) - 1),
+            for name, version in (("old", train.MODEL_VERSION - 1),
                                   ("current", train.MODEL_VERSION)):
                 run = root / name
                 run.mkdir()

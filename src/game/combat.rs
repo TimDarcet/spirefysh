@@ -320,7 +320,6 @@ impl Game {
         if matches!(card_type, CardType::Attack | CardType::Skill) && card.flags & DUPE == 0 {
             self.combat_mut().unwrap().history_course = Some(card);
         }
-        self.combat_mut().unwrap().pen_nib = false;
         if self.combat().unwrap().unsettling_lamp == Some(card.id) {
             self.combat_mut().unwrap().unsettling_lamp = None;
             self.combat_mut().unwrap().unsettling_used = true;
@@ -1143,8 +1142,11 @@ impl Game {
                 && self.has_relic(content, "RELIC.WHISPERING_EARRING"))
         {
             let cards = std::mem::take(&mut self.combat_mut().unwrap().hand);
-            self.combat_mut().unwrap().paels_eye = true;
-            self.combat_mut().unwrap().paels_eye_extra = true;
+            let combat = self.combat_mut().unwrap();
+            combat.paels_eye = true;
+            combat
+                .control
+                .push(ControlContinuation::StartExtraPlayerTurnAfterResolution);
             self.combat_mut().unwrap().history.exhausted += cards.len() as i16;
             for card in cards {
                 self.combat_mut().unwrap().exhaust.push(card);
@@ -1435,8 +1437,10 @@ impl Game {
                     .retain(|power| power.id != power_id::INTANGIBLE);
             }
         }
-        if self.combat().unwrap().paels_eye_extra {
-            self.combat_mut().unwrap().paels_eye_extra = false;
+        if self.combat().unwrap().control.last()
+            == Some(&ControlContinuation::StartExtraPlayerTurnAfterResolution)
+        {
+            self.combat_mut().unwrap().control.pop();
             self.start_turn(content);
             return;
         }
@@ -2360,7 +2364,6 @@ impl Game {
     }
 
     fn apply(&mut self, content: &Content, pending: Pending) {
-        self.combat_mut().unwrap().pen_nib = pending.context.pen_nib;
         let mut amount = self.amount(
             content,
             pending.context,
@@ -2430,13 +2433,12 @@ impl Game {
                 for actor in self.targets(target, pending.context) {
                     let mut lost = 0;
                     for _ in 0..hits {
-                        let result = self.damage(
+                        let result = self.damage_with_bonus(
                             content,
-                            pending.context.source,
                             actor,
                             amount,
                             DamageKind::Attack,
-                            pending.context.card,
+                            pending.context,
                         );
                         lost += result.lost;
                         total += result.resolved;
@@ -2464,13 +2466,12 @@ impl Game {
                 for actor in self.targets(target, pending.context) {
                     let mut lost = 0;
                     for _ in 0..hits {
-                        let result = self.damage(
+                        let result = self.damage_with_bonus(
                             content,
-                            pending.context.source,
                             actor,
                             amount,
                             DamageKind::Attack,
-                            pending.context.card,
+                            pending.context,
                         );
                         lost += result.lost;
                         total += result.resolved;
@@ -2501,13 +2502,15 @@ impl Game {
                     let mut dealt = 0;
                     for _ in 0..hits {
                         dealt += self
-                            .damage(
+                            .damage_with_bonus(
                                 content,
-                                Actor::Osty,
                                 actor,
                                 amount,
                                 DamageKind::Attack,
-                                pending.context.card,
+                                Context {
+                                    source: Actor::Osty,
+                                    ..pending.context
+                                },
                             )
                             .lost;
                     }
@@ -2528,13 +2531,15 @@ impl Game {
                     let mut dealt = 0;
                     for _ in 0..hits {
                         dealt += self
-                            .damage(
+                            .damage_with_bonus(
                                 content,
-                                Actor::Osty,
                                 actor,
                                 amount,
                                 DamageKind::Attack,
-                                pending.context.card,
+                                Context {
+                                    source: Actor::Osty,
+                                    ..pending.context
+                                },
                             )
                             .lost;
                     }
@@ -4390,6 +4395,28 @@ impl Game {
         kind: DamageKind,
         card: Option<Id>,
     ) -> DamageResult {
+        self.damage_with_bonus(
+            content,
+            target,
+            base,
+            kind,
+            Context {
+                source,
+                card,
+                ..Context::player()
+            },
+        )
+    }
+
+    fn damage_with_bonus(
+        &mut self,
+        content: &Content,
+        target: Actor,
+        base: i16,
+        kind: DamageKind,
+        context: Context,
+    ) -> DamageResult {
+        let (source, card) = (context.source, context.card);
         if self.creature(target).hp <= 0 {
             return DamageResult::default();
         }
@@ -4484,21 +4511,7 @@ impl Game {
             {
                 amount = amount.saturating_mul(2);
             }
-            if attack
-                && matches!(source, Actor::Player | Actor::Osty)
-                && self.combat().unwrap().pen_nib
-                && (self
-                    .combat()
-                    .unwrap()
-                    .auto_plays
-                    .last()
-                    .is_some_and(|play| card == Some(play.card.id))
-                    || self
-                        .combat()
-                        .unwrap()
-                        .playing
-                        .is_some_and(|played| card == Some(played.id)))
-            {
+            if attack && matches!(source, Actor::Player | Actor::Osty) && context.pen_nib {
                 amount = amount.saturating_mul(2);
             }
             if attack {

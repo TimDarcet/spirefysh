@@ -194,6 +194,7 @@ impl Game {
             elite_encounters_left: 0,
             last_encounter: None,
             last_elite: None,
+            ancient: None,
             events: vec![],
             visited_events: vec![],
             enemy_starts: vec![],
@@ -211,7 +212,7 @@ impl Game {
             relic_queue: vec![],
             relic_deques: std::array::from_fn(|_| vec![]),
             shared_relic_deques: std::array::from_fn(|_| vec![]),
-            pending_curse: false,
+            reward_continuation: None,
             wongo_combats: None,
             spoils: None,
             event_combat: 0,
@@ -229,7 +230,6 @@ impl Game {
             girya: 0,
             pumpkin_candle: 0,
             fishing_rod: 0,
-            cooking: false,
             astrolabe: false,
             transform_niche: false,
             paels_tooth: false,
@@ -409,6 +409,7 @@ impl Game {
         self.bosses_visited = 0;
         self.unknown_odds = [1000, -10_000, 200, 300];
         self.map = self.make_map(content);
+        self.ancient = self.next_ancient(content);
         self.spoils = (self.run.act == 2
             && self
                 .run
@@ -788,6 +789,7 @@ impl Game {
             playing: None,
             auto_plays: vec![],
             queue: vec![],
+            control: vec![],
             choice: None,
             power_snapshot: vec![],
             enemy_power_snapshot: vec![],
@@ -799,7 +801,6 @@ impl Game {
             centennial_puzzle: false,
             demon_tongue: false,
             permafrost: false,
-            pen_nib: false,
             ruined_helmet: false,
             music_box: false,
             mini_regent: false,
@@ -813,7 +814,6 @@ impl Game {
             red_skull: false,
             throwing_axe: false,
             paels_eye: false,
-            paels_eye_extra: false,
             paels_legion: 0,
             history_course: None,
         }));
@@ -2299,8 +2299,12 @@ impl Game {
                         self.resume = Some(Phase::Rewards(remaining));
                     }
                 }
-                if exhausted && self.pending_curse {
-                    self.pending_curse = false;
+                if exhausted
+                    && matches!(
+                        self.reward_continuation.take(),
+                        Some(RewardContinuation::AddRandomCurse)
+                    )
+                {
                     let mut curses: Vec<_> = content
                         .cards
                         .iter()
@@ -2413,7 +2417,7 @@ impl Game {
                 self.phase = self.rest_destination(content, 8);
             }
             Action::Cook => {
-                self.cooking = true;
+                self.run_queue.push(RunEffect::FinishCooking);
                 self.phase = Phase::RemoveCards(2, 0, true);
             }
             Action::Kindle => {
@@ -2741,8 +2745,11 @@ impl Game {
                     self.finish_run_choice(content);
                 }
             }
-            Action::Cancel if self.cooking && matches!(self.phase, Phase::RemoveCards(..)) => {
-                self.cooking = false;
+            Action::Cancel
+                if self.run_queue.last() == Some(&RunEffect::FinishCooking)
+                    && matches!(self.phase, Phase::RemoveCards(..)) =>
+            {
+                self.run_queue.pop();
                 self.phase = Phase::Rest;
             }
             Action::Cancel
@@ -2932,7 +2939,7 @@ impl Game {
                         .iter()
                         .any(|card| content.cards[card.id as usize].id == "CARD.LANTERN_KEY");
                 let event = if self.map.nodes[node].floor == 0 {
-                    self.next_ancient(content)
+                    self.ancient
                 } else if lantern {
                     content
                         .events
@@ -5216,7 +5223,7 @@ impl Game {
                 .collect();
                 self.rngs.rewards.shuffle(&mut relics);
                 relics.truncate(2);
-                self.pending_curse = true;
+                self.reward_continuation = Some(RewardContinuation::AddRandomCurse);
                 self.phase = Phase::Rewards(Rewards {
                     gold: 0,
                     cards: vec![],
@@ -5821,6 +5828,12 @@ impl Game {
                         return;
                     }
                 }
+                RunEffect::FinishCooking => {
+                    self.run.max_hp += 9;
+                    self.run.hp += 9;
+                    self.phase = self.rest_destination(content, 16);
+                    return;
+                }
             }
             if self.run.hp == 0 {
                 self.phase = Phase::Dead;
@@ -5832,13 +5845,6 @@ impl Game {
     }
 
     fn finish_run_choice(&mut self, content: &Content) {
-        if self.cooking {
-            self.cooking = false;
-            self.run.max_hp += 9;
-            self.run.hp += 9;
-            self.phase = self.rest_destination(content, 16);
-            return;
-        }
         self.astrolabe = false;
         self.transform_niche = false;
         if self.conveyor {
