@@ -204,10 +204,13 @@ print('restored')
             context.RawArray("q", 2), context.RawArray(
                 "q", [-1] * (4 * len(train.SAMPLER_STATE_FIELDS)),
             ),
+            context.RawArray("q", [-1] * (4 * 3)),
         )
         collector = train.RolloutCollector.__new__(train.RolloutCollector)
         collector.args = Namespace(samplers=2, envs=2)
         collector.worker = 1; collector.iteration = 7; collector.diagnostics = diagnostics
+        collector.episode_steps = np.array([8, 9])
+        collector.combat_steps = np.array([3, 4])
         collector.env = mock.Mock()
         collector.env.seeds.return_value = [101, 102]
         collector.env.characters.return_value = [3, 4]
@@ -215,14 +218,45 @@ print('restored')
             (1, 2, 30, 40, 5, 6, 20, 10, .5, 7),
             (2, 3, 31, 41, 6, 7, 21, 11, .6, 8),
         ]
+        collector.env.diagnostic_stats.return_value = [[0] * 14, list(range(14))]
         collector.mark_phase("policy", True)
+        np.frombuffer(diagnostics[4], np.int64).reshape(2, 2, 3)[1, 0] = [5, 2, 7]
         diagnostic = train.sampler_diagnostic(diagnostics, 1, 2)
         self.assertEqual((diagnostic["phase"], diagnostic["iteration"]), ("policy", 7))
         self.assertEqual(diagnostic["states"][0], {
             "seed": 101, "character": 3, "act": 1, "floor": 2, "hp": 30,
             "max_hp": 40, "phase": 5, "turn": 6, "player_hp": 20,
-            "enemy_hp": 10, "canonical_progress": 7,
+            "enemy_hp": 10, "canonical_progress": 7, "episode_steps": 8,
+            "combat_steps": 3, "deck_cards": 0, "relics": 0, "potion_slots": 0,
+            "run_queue": 0, "hand": 0, "draw": 0, "discard": 0, "exhaust": 0,
+            "combat_queue": 0, "auto_plays": 0, "enemies": 0, "player_powers": 0,
+            "enemy_powers": 0, "enemy_move_history": 0, "policy_stage": "environment",
+            "policy_choice": 2, "policy_action_kind": 7,
         })
+        collector.diagnostics = (
+            context.RawArray("i", 2), context.RawArray("d", 2), context.RawArray("q", 2),
+            context.RawArray("q", [-1] * (4 * 11)),
+        )
+        collector.mark_phase("policy", True)
+        legacy = train.sampler_diagnostic(collector.diagnostics, 1, 2)["states"][0]
+        self.assertEqual(legacy["canonical_progress"], 7)
+        self.assertIsNone(legacy["policy_stage"])
+
+    def test_native_sampler_diagnostics_have_fixed_width(self):
+        rows = train.sts2_sim.Batch(2, 7, 0).diagnostic_stats()
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(len(row) == 14 for row in rows))
+        self.assertEqual(rows[0][:4], [11, 1, 2, 0])
+
+    def test_native_policy_reports_its_completed_stage(self):
+        env = train.sts2_sim.Batch(2, 7, 0)
+        env.load_policy(train.export_value_model(
+            None, train.Agent(dict(env.token_layout())).eval(), env.fingerprint(), 1, 0, True,
+        ))
+        diagnostics = np.empty((2, 3), np.int64)
+        env.policy(advance=True, diagnostics=diagnostics)
+        self.assertTrue((diagnostics[:, 0] == 6).all())
+        self.assertTrue((diagnostics[:, 1:] >= 0).all())
 
     def test_trajectory_capture_flag(self):
         self.assertTrue(train.parser().parse_args([

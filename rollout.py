@@ -21,9 +21,15 @@ SAMPLER_PHASES = (
     "starting", "preparing", "policy", "environment", "processing", "reset",
     "queue", "stopped",
 )
+POLICY_STAGES = (
+    "observation", "encoding", "inference", "search", "selection", "environment", "output",
+)
 SAMPLER_STATE_FIELDS = (
     "seed", "character", "act", "floor", "hp", "max_hp", "phase", "turn",
-    "player_hp", "enemy_hp", "canonical_progress",
+    "player_hp", "enemy_hp", "canonical_progress", "episode_steps", "combat_steps",
+    "deck_cards", "relics", "potion_slots", "run_queue", "hand", "draw", "discard",
+    "exhaust", "combat_queue", "auto_plays", "enemies", "player_powers", "enemy_powers",
+    "enemy_move_history",
 )
 
 
@@ -42,13 +48,27 @@ def sampler_seed(args, session, worker, generation, ordinal=0):
 
 
 def sampler_diagnostic(diagnostics, worker, envs):
-    phases, started, iterations, states = diagnostics
-    rows = np.frombuffer(states, np.int64).reshape(-1, envs, len(SAMPLER_STATE_FIELDS))[worker]
+    phases, started, iterations, states = diagnostics[:4]
+    values = np.frombuffer(states, np.int64)
+    width = values.size // (len(phases) * envs)
+    rows = values.reshape(-1, envs, width)[worker]
+    policy = np.full((envs, 3), -1, np.int64) if len(diagnostics) < 5 else np.frombuffer(
+        diagnostics[4], np.int64,
+    ).reshape(-1, envs, 3)[worker]
+    state = []
+    for row, native in zip(rows, policy):
+        if row[0] < 0:
+            continue
+        stage = int(native[0])
+        state.append(dict(zip(SAMPLER_STATE_FIELDS[:width], map(int, row))) | {
+            "policy_stage": POLICY_STAGES[stage] if 0 <= stage < len(POLICY_STAGES) else None,
+            "policy_choice": int(native[1]), "policy_action_kind": int(native[2]),
+        })
     return {
         "phase": SAMPLER_PHASES[phases[worker]],
         "phase_seconds": time.monotonic() - started[worker],
         "iteration": int(iterations[worker]),
-        "states": [dict(zip(SAMPLER_STATE_FIELDS, map(int, row))) for row in rows if row[0] >= 0],
+        "states": state,
     }
 
 
@@ -295,18 +315,21 @@ class RolloutCollector:
     def mark_phase(self, phase, snapshot=False):
         if self.diagnostics is None:
             return
-        phases, started, iterations, states = self.diagnostics
+        phases, started, iterations, states = self.diagnostics[:4]
         if snapshot:
             stats = self.env.stats()
-            rows = np.frombuffer(states, np.int64).reshape(
-                self.args.samplers, self.args.envs, len(SAMPLER_STATE_FIELDS),
-            )[self.worker]
-            rows[:] = [
-                (seed, character, *state[:8], state[9])
-                for seed, character, state in zip(
+            details = self.env.diagnostic_stats()
+            values = np.frombuffer(states, np.int64)
+            width = values.size // (self.args.samplers * self.args.envs)
+            rows = values.reshape(self.args.samplers, self.args.envs, width)[self.worker]
+            snapshot = np.asarray([
+                (seed, character, *state[:8], state[9], episode, combat, *detail)
+                for seed, character, state, episode, combat, detail in zip(
                     self.env.seeds(), self.env.characters(), stats,
+                    self.episode_steps, self.combat_steps, details,
                 )
-            ]
+            ], np.int64)
+            rows[:] = snapshot[:, :width]
         started[self.worker] = time.monotonic()
         iterations[self.worker] = self.iteration
         phases[self.worker] = SAMPLER_PHASES.index(phase)
@@ -450,6 +473,10 @@ class RolloutCollector:
                     )
                 } if trace_indices else {})
                 self.mark_phase("policy")
+                policy_diagnostics = None if self.diagnostics is None \
+                    or len(self.diagnostics) < 5 else np.frombuffer(
+                        self.diagnostics[4], np.int64,
+                    ).reshape(self.args.samplers, args.envs, 3)[self.worker]
                 result = self.env.policy(
                     args.policy_temperature,
                     advance=True,
@@ -469,6 +496,7 @@ class RolloutCollector:
                     mcts_timeout=bounded_mcts_timeout(args.mcts_timeout, args.sampler_timeout),
                     cache_features=args.cache_features,
                     skip_forced=True,
+                    diagnostics=policy_diagnostics,
                 )
                 characters, choice, log_probability, critic_value, step_rows, \
                     step_experts, step_search_stats, *cached = result

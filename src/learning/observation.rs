@@ -474,7 +474,18 @@ fn push_semantic(row: &mut DomainRow, layout: Layout, namespace: Semantic, value
         .c
         .iter()
         .position(|&value| value == 0)
-        .expect("semantic row overflow");
+        .unwrap_or_else(|| {
+            let widths = (row.u.len(), row.s.len(), row.c.len(), row.f.len());
+            let domain = DOMAIN_WIDTHS
+                .iter()
+                .position(|&candidate| candidate == widths)
+                .map_or("unknown", |index| DOMAIN_NAMES[index]);
+            panic!(
+                "semantic row overflow domain={domain} namespace={} value={value} \
+             scope={} widths={widths:?} u={:?} s={:?} c={:?}",
+                SEMANTIC_NAMES[namespace as usize], row.scope, row.u, row.s, row.c,
+            )
+        });
     row.c[slot] = layout.semantic(namespace, value);
 }
 
@@ -1075,6 +1086,19 @@ fn populate_domain_features(
         RELIC_DOMAIN => {
             push_semantic(row, layout, Semantic::Relic, row.u[1]);
             if row.u[0] == 0 {
+                let counters = row
+                    .s
+                    .iter()
+                    .map(|&value| value.max(0) as usize)
+                    .sum::<usize>();
+                assert!(
+                    counters < row.c.len(),
+                    "semantic row overflow domain=relic seed={} relic={} counters={:?} capacity={}",
+                    game.seed,
+                    content.relics[row.u[1] as usize].id,
+                    row.s,
+                    row.c.len(),
+                );
                 for (slot, namespace) in [
                     Semantic::RelicCounter0,
                     Semantic::RelicCounter1,

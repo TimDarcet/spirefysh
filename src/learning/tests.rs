@@ -2255,6 +2255,18 @@ fn v57_relic_counters_are_identity_specific_and_linear() {
 }
 
 #[test]
+#[should_panic(expected = "semantic row overflow domain=relic seed=555 relic=RELIC.PUMPKIN_CANDLE")]
+fn semantic_overflow_reports_the_domain_and_feature() {
+    let content = foundation_content();
+    let layout = Layout::new(&content);
+    let game = Game::new_character_ascension(&content, 555, 0, 10).unwrap();
+    let mut row = DomainRow::new(RELIC_DOMAIN, STATE_SCOPE);
+    row.u[1] = content.relic_id("RELIC.PUMPKIN_CANDLE").unwrap() as u32;
+    row.s[0] = DOMAIN_WIDTHS[RELIC_DOMAIN].2 as i32;
+    populate_domain_features(&game, &content, layout, RELIC_DOMAIN, &mut row);
+}
+
+#[test]
 fn v57_wax_relics_encode_queue_progress_and_melted_state() {
     let content = foundation_content();
     let layout = Layout::new(&content);

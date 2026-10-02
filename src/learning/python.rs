@@ -1,5 +1,7 @@
 use super::*;
-use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, ndarray};
+use numpy::{
+    IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyReadwriteArray2, ndarray,
+};
 use pyo3::{
     exceptions::PyValueError,
     prelude::*,
@@ -6463,6 +6465,56 @@ impl Batch {
             .collect()
     }
 
+    fn diagnostic_stats(&self) -> Vec<[usize; 14]> {
+        self.games
+            .iter()
+            .map(|game| {
+                let Some(combat) = game.combat() else {
+                    return [
+                        game.run.deck.len(),
+                        game.run.relics.len(),
+                        game.run.potions.len(),
+                        game.run_queue.len(),
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ];
+                };
+                [
+                    game.run.deck.len(),
+                    game.run.relics.len(),
+                    game.run.potions.len(),
+                    game.run_queue.len(),
+                    combat.hand.len(),
+                    combat.draw.len(),
+                    combat.discard.len(),
+                    combat.exhaust.len(),
+                    combat.queue.len(),
+                    combat.auto_plays.len(),
+                    combat.enemies.len(),
+                    combat.player.powers.len(),
+                    combat
+                        .enemies
+                        .iter()
+                        .map(|enemy| enemy.creature.powers.len())
+                        .sum(),
+                    combat
+                        .enemies
+                        .iter()
+                        .map(|enemy| enemy.move_history.len())
+                        .sum(),
+                ]
+            })
+            .collect()
+    }
+
     fn describe(&self, index: usize, choice: usize) -> PyResult<String> {
         let game = self
             .games
@@ -7260,6 +7312,7 @@ impl Batch {
             mcts_timeout=0.0,
             cache_features=false,
             skip_forced=false,
+            diagnostics=None,
         ))]
     fn policy<'py>(
         &mut self,
@@ -7283,6 +7336,7 @@ impl Batch {
         mcts_timeout: f64,
         cache_features: bool,
         skip_forced: bool,
+        mut diagnostics: Option<PyReadwriteArray2<'py, i64>>,
     ) -> PyResult<Bound<'py, PyTuple>> {
         if !(0.0..=1.0).contains(&mcts_fraction)
             || mcts_max_depth == 0
@@ -7300,6 +7354,21 @@ impl Batch {
         {
             return Err(PyValueError::new_err("invalid MCTS settings"));
         }
+        if diagnostics
+            .as_mut()
+            .is_some_and(|values| values.as_array_mut().dim() != (self.games.len(), 3))
+        {
+            return Err(PyValueError::new_err("invalid policy diagnostics"));
+        }
+        let stage = |diagnostics: &mut Option<PyReadwriteArray2<'py, i64>>, value| {
+            if let Some(diagnostics) = diagnostics {
+                diagnostics.as_array_mut().column_mut(0).fill(value);
+            }
+        };
+        if let Some(diagnostics) = &mut diagnostics {
+            diagnostics.as_array_mut().fill(-1);
+        }
+        stage(&mut diagnostics, 0);
         let search_enabled = mcts_simulations > 0 || mcts_boss_simulations > 0;
         let turn_starts = self
             .games
@@ -7365,11 +7434,13 @@ impl Batch {
                 })
                 .collect::<Vec<_>>()
         });
+        stage(&mut diagnostics, 1);
         let evaluated_rows = rows
             .iter()
             .filter(|row| !skip_forced || row.candidates.len() > 1)
             .collect::<Vec<_>>();
         let features = py.allow_threads(|| model.state_actions_batch(&evaluated_rows));
+        stage(&mut diagnostics, 2);
         let packed = py.allow_threads(|| {
             rows.par_iter()
                 .map(|row| {
@@ -7384,6 +7455,7 @@ impl Batch {
         let outputs = model
             .evaluate_batch(&evaluated_rows, &features, temperature, None, true)
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        stage(&mut diagnostics, 3);
         let mut random = self.random;
         let mut search_random = random ^ 0x4d43_5453_524e_4701;
         let (expert_targets, search_stats) = if search_enabled {
@@ -7461,6 +7533,7 @@ impl Batch {
         } else {
             (Vec::new(), SearchStats::default())
         };
+        stage(&mut diagnostics, 4);
         let mut characters = Vec::with_capacity(rows.len());
         let mut choices = Vec::with_capacity(rows.len());
         let mut log_probabilities = Vec::with_capacity(rows.len());
@@ -7468,6 +7541,7 @@ impl Batch {
         let mut packed_rows = Vec::with_capacity(rows.len());
         let mut cached_features = Vec::with_capacity(rows.len());
         let mut selected_actions = Vec::with_capacity(rows.len());
+        let mut action_kinds = Vec::with_capacity(rows.len());
         let potentials = rows
             .iter()
             .map(|row| {
@@ -7494,6 +7568,7 @@ impl Batch {
                 } else {
                     self.actions.push(vec![row.candidates[0].action.clone()]);
                 }
+                action_kinds.push(row.candidates[0].u[0]);
                 cached_features.push(PyBytes::new(py, &[]));
                 packed_rows.push(PyBytes::new(py, &packed));
                 continue;
@@ -7515,6 +7590,7 @@ impl Batch {
             choices.push(choice as i64);
             log_probabilities.push(log_policy[choice]);
             critic_values.push(values[0]);
+            action_kinds.push(row.candidates[choice].u[0]);
             if advance {
                 selected_actions.push(row.candidates[choice].action.clone());
             } else {
@@ -7542,6 +7618,13 @@ impl Batch {
             packed_rows.push(PyBytes::new(py, &packed));
         }
         debug_assert!(evaluated.next().is_none());
+        if let Some(diagnostics) = &mut diagnostics {
+            let mut diagnostics = diagnostics.as_array_mut();
+            for (index, (&choice, &kind)) in choices.iter().zip(&action_kinds).enumerate() {
+                diagnostics[[index, 1]] = choice;
+                diagnostics[[index, 2]] = kind as i64;
+            }
+        }
         self.random = random;
         let expert_targets = expert_targets
             .into_iter()
@@ -7630,6 +7713,7 @@ impl Batch {
             .into_any(),
         ];
         if advance {
+            stage(&mut diagnostics, 5);
             let canonical = self
                 .games
                 .iter()
@@ -7669,6 +7753,7 @@ impl Batch {
                         .collect::<Result<Vec<_>, String>>()
                 })
                 .map_err(PyValueError::new_err)?;
+            stage(&mut diagnostics, 6);
             for plan in &mut self.plans {
                 plan.clear();
             }
@@ -7731,6 +7816,7 @@ impl Batch {
         if cache_features {
             output.push(PyTuple::new(py, cached_features)?.into_any());
         }
+        stage(&mut diagnostics, 6);
         PyTuple::new(py, output)
     }
 

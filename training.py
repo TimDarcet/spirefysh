@@ -684,6 +684,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         context.RawArray("d", [started] * args.samplers),
         context.RawArray("q", [base_decisions // args.envs] * args.samplers),
         context.RawArray("q", [-1] * (args.envs * len(SAMPLER_STATE_FIELDS))),
+        context.RawArray("q", [-1] * (args.envs * 3)),
     )
     packer = ThreadPoolExecutor(max_workers=1)
     workers = [None] * args.samplers
@@ -729,6 +730,9 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         diagnostics[2][worker] = sampler_iterations[worker]
         np.frombuffer(diagnostics[3], np.int64).reshape(
             args.samplers, collector_args.envs, len(SAMPLER_STATE_FIELDS),
+        )[worker].fill(-1)
+        np.frombuffer(diagnostics[4], np.int64).reshape(
+            args.samplers, collector_args.envs, 3,
         )[worker].fill(-1)
         process = worker_type(target=collect_worker, args=(
             actor, collector_args, sampler_session, stage,
