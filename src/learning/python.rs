@@ -3762,10 +3762,14 @@ fn action_descriptor(
 
 fn action_preview(game: &Game, content: &Content, action: &Action) -> Option<String> {
     let value = match action {
-        Action::RewardCard(index) => {
-            let card = match &game.phase {
-                Phase::Rewards(rewards) => *rewards.cards.get(*index)?,
-                _ => return None,
+        Action::RewardCard(_) | Action::RemoveCard(_) => {
+            let card = match action {
+                Action::RewardCard(index) => match &game.phase {
+                    Phase::Rewards(rewards) => *rewards.cards.get(*index)?,
+                    _ => return None,
+                },
+                Action::RemoveCard(index) => *game.run.deck.get(*index)?,
+                _ => unreachable!(),
             };
             let def = content.cards[card.id as usize];
             serde_json::json!({

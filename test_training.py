@@ -1297,15 +1297,16 @@ class TrajectoryTest(unittest.TestCase):
         self.assertEqual(compared["attention_case"], case)
         self.assertTrue(compared["case_attention"])
 
-    def test_reward_actions_have_names_and_previews(self):
-        env = train.sts2_sim.Batch(1, 17, 0, teacher_width=8, teacher_turns=1, ascension=0)
+    def test_card_actions_have_names_and_previews(self):
+        env = train.sts2_sim.Batch(1, 1, 0, teacher_width=8, teacher_turns=1, ascension=0)
         env.set_training_bonus(24)
+        found = set()
         for _ in range(800):
             env.observe_tokens()
             descriptors = env.action_descriptors()
-            if any(row[0] == "reward_card" for row in descriptors):
-                rows = [(descriptor, json.loads(preview) if preview else None)
-                        for descriptor, preview in zip(descriptors, env.action_previews())]
+            rows = [(descriptor, json.loads(preview) if preview else None)
+                    for descriptor, preview in zip(descriptors, env.action_previews())]
+            if {"reward_card", "reward_potion"} <= {row[0] for row in descriptors}:
                 card = next(row for row in rows if row[0][0] == "reward_card")
                 potion = next(row for row in rows if row[0][0] == "reward_potion")
                 self.assertTrue(card[0][3].startswith("CARD."))
@@ -1313,10 +1314,18 @@ class TrajectoryTest(unittest.TestCase):
                 self.assertTrue(card[1]["effects"])
                 self.assertTrue(potion[0][3].startswith("POTION."))
                 self.assertEqual(potion[1]["kind"], "potion")
+                found.add("reward")
+            removed = next((row for row in rows
+                            if row[0][0].startswith("RemoveCard(")), None)
+            if removed:
+                self.assertEqual(removed[1]["kind"], "card")
+                self.assertTrue(removed[1]["id"].startswith("CARD."))
+                found.add("remove")
+            if len(found) == 2:
                 break
             env.step(env.teacher())
         else:
-            self.fail("teacher did not reach a card reward")
+            self.fail("teacher did not reach card reward and removal choices")
 
     def test_trace_catalog_reads_gzip_and_ignores_malformed_records(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1439,6 +1448,7 @@ class TrajectoryTest(unittest.TestCase):
         self.assertIn("toExponential(5)", page)
         self.assertIn("action.kind==='use_potion'?`Drink ${name}`", page)
         self.assertIn("action.kind==='discard_potion'?`Discard ${name}`", page)
+        self.assertIn("action.kind.startsWith('RemoveCard(')?`${action.kind} (${name})`", page)
         self.assertIn("${actionThing(action)}", page)
         self.assertIn("text.match(/<p>Message: ([^<]+)/)", page)
         self.assertIn("id=generationNote", page)
@@ -1447,6 +1457,11 @@ class TrajectoryTest(unittest.TestCase):
         self.assertIn("/^(CARD|RELIC|POTION|POWER|ORB)\\./", page)
         self.assertIn("action-name:hover>.preview,.item:hover>.preview", page)
         self.assertIn(".preview{display:none", page)
+        self.assertIn(".preview-description{display:block", page)
+        self.assertIn("<span class=preview-description>${plain(text,value)}</span>", page)
+        self.assertIn("<span class=preview-description>${rich(description(row),row)}</span>", page)
+        self.assertNotIn("<p>${plain(text,value)}</p>", page)
+        self.assertNotIn("<p>${rich(description(row),row)}</p>", page)
         self.assertIn("request('/game-assets/assets.json')", page)
         self.assertIn("request('/game-assets/glossary.json')", page)
         self.assertIn("background-image:url('/game-assets/", page)
