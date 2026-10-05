@@ -98,6 +98,7 @@ def parser():
     run.add_argument("--entropy-start", type=float, default=0.01)
     run.add_argument("--entropy-end", type=float, default=0.001)
     run.add_argument("--entropy-weight", type=float, default=.1)
+    run.add_argument("--uniform-cross-entropy-weight", type=float, default=0.)
     run.add_argument("--target-kl", type=float, default=0.004)
     run.add_argument("--disable-post-kl-check", action="store_true")
     run.add_argument("--training-seed", type=int, default=1_900_000_000)
