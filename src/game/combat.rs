@@ -114,7 +114,7 @@ impl Game {
             + card.replays
             + matches!(card.enchantment, Some(Enchantment::Spiral)) as u8
             + (card.enchantment == Some(Enchantment::Glam) && card.enchantment_value > 0) as u8
-            + (combat.player.power(power_id::ECHO_FORM) > 0) as u8
+            + (combat.history.manual_cards < combat.player.power(power_id::ECHO_FORM)) as u8
             + (combat.player.power(power_id::SIGNAL_BOOST) > 0) as u8
             + burst as u8
             + punch as u8
@@ -1064,6 +1064,15 @@ impl Game {
             }
         }
         turn_effects.push(Effect::HandDraw(count));
+        let entropy = self.creature(Actor::Player).power(power_id::ENTROPY);
+        if entropy > 0 {
+            turn_effects.push(Effect::RandomCardOp(
+                Pile::Hand,
+                CardFilter::Any,
+                CardOp::TransformRandom,
+                Amount::fixed(entropy, entropy),
+            ));
+        }
         for id in self.run.relics.clone() {
             match content.relics[id as usize].id {
                 "RELIC.BELLOWS" if turn == 1 => {
@@ -1252,7 +1261,12 @@ impl Game {
         self.resolve(content);
         if self.creature(Actor::Player).power(power_id::RETAIN_HAND) > 0 {
             for card in &mut self.combat_mut().unwrap().hand {
-                card.turn_flags |= RETAIN;
+                if !matches!(
+                    content.cards[card.id as usize].card_type,
+                    CardType::Curse | CardType::Status
+                ) {
+                    card.turn_flags |= RETAIN;
+                }
             }
             self.creature_mut(Actor::Player)
                 .consume_power(power_id::RETAIN_HAND);
@@ -1351,11 +1365,11 @@ impl Game {
             for card in std::mem::take(&mut combat.hand) {
                 let def = content.cards[card.id as usize];
                 let flags = card.flags(def);
-                if flags & RETAIN != 0 {
-                    hand.push(card);
-                } else if flags & ETHEREAL != 0 || hexed {
+                if flags & ETHEREAL != 0 || hexed {
                     combat.exhaust.push(card);
                     exhausted.push(card);
+                } else if flags & RETAIN != 0 {
+                    hand.push(card);
                 } else {
                     discarded.push(card);
                 }
@@ -1779,7 +1793,9 @@ impl Game {
                 let strength = if self.run.ascension >= 9 { 4 } else { 3 } * (2 - stock);
                 self.apply_power(content, Actor::Enemy(index), power_id::STRENGTH, strength);
             }
-            if content.enemies[id as usize].id == "MONSTER.GREMLIN_MERC" {
+            if content.enemies[id as usize].id == "MONSTER.GREMLIN_MERC"
+                && self.creature(Actor::Player).hp > 0
+            {
                 let stolen = self.run.gold.min(
                     self.creature(Actor::Enemy(index))
                         .power(power_id::THIEVERY)
@@ -2181,7 +2197,7 @@ impl Game {
             }
             choices.retain(|&i| {
                 let cooldown = match (id, i) {
-                    ("MONSTER.FLYCONID", 0) => 3,
+                    ("MONSTER.FLYCONID", 0) => 2,
                     ("MONSTER.FLYCONID", 1) => 2,
                     _ => 0,
                 };
@@ -2446,10 +2462,10 @@ impl Game {
                     self.reaper(content, pending.context.source, actor, lost);
                 }
                 self.combat_mut().unwrap().last_damage = total;
+                self.creature_mut(pending.context.source)
+                    .powers
+                    .retain(|power| power.id != power_id::VIGOR);
                 if pending.context.source == Actor::Player {
-                    self.creature_mut(Actor::Player)
-                        .powers
-                        .retain(|power| power.id != power_id::VIGOR);
                     if self
                         .creature(Actor::Player)
                         .power(power_id::GIGANTIFICATION)
@@ -2479,10 +2495,10 @@ impl Game {
                     self.reaper(content, pending.context.source, actor, lost);
                 }
                 self.combat_mut().unwrap().last_damage = total;
+                self.creature_mut(pending.context.source)
+                    .powers
+                    .retain(|power| power.id != power_id::VIGOR);
                 if pending.context.source == Actor::Player {
-                    self.creature_mut(Actor::Player)
-                        .powers
-                        .retain(|power| power.id != power_id::VIGOR);
                     if self
                         .creature(Actor::Player)
                         .power(power_id::GIGANTIFICATION)
@@ -2802,7 +2818,20 @@ impl Game {
             }
             Effect::ApplyPower(target, id, _) => {
                 for actor in self.targets(target, pending.context) {
+                    let new = self.creature(actor).power(id) == 0;
                     self.apply_power(content, actor, id, amount);
+                    if new
+                        && pending.context.card.is_some_and(|card| {
+                            matches!(content.cards[card as usize].id, "CARD.DOUBT" | "CARD.SHAME")
+                        })
+                        && let Some(power) = self
+                            .creature_mut(actor)
+                            .powers
+                            .iter_mut()
+                            .find(|power| power.id == id)
+                    {
+                        power.skip_next_decay = true;
+                    }
                     if id == power_id::CONSTRICT
                         && let Actor::Enemy(source) = pending.context.source
                         && let Some(power) = self
@@ -3038,7 +3067,9 @@ impl Game {
                         pile,
                         Card {
                             id,
-                            flags,
+                            flags: flags & !INKY,
+                            enchantment: (flags & INKY != 0).then_some(Enchantment::Inky),
+                            enchantment_amount: (flags & INKY != 0) as i16,
                             ..Card::default()
                         },
                     );
@@ -3046,7 +3077,7 @@ impl Game {
             }
             Effect::RandomCard(pile, kind, count, free) => {
                 self.expectation_unknown();
-                let pool: Vec<_> = content.characters[self.run.character as usize]
+                let mut pool: Vec<_> = content.characters[self.run.character as usize]
                     .cards
                     .iter()
                     .copied()
@@ -3060,15 +3091,11 @@ impl Game {
                             && def.flags[0] & NO_GENERATE == 0
                     })
                     .collect();
-                for _ in 0..count {
-                    if pool.is_empty() {
-                        break;
-                    }
-                    let id = if self.expectation.is_some() {
-                        pool[0]
-                    } else {
-                        pool[self.rngs.combat_card_generation.below(pool.len() as u32) as usize]
-                    };
+                pool.sort_unstable_by_key(|&id| content.cards[id as usize].id);
+                if self.expectation.is_none() {
+                    self.rngs.combat_card_generation.shuffle(&mut pool);
+                }
+                for id in pool.into_iter().take(count as usize) {
                     self.add_generated(
                         content,
                         pile,
@@ -4042,6 +4069,15 @@ impl Game {
                     self.passive_orb(content, Some(index));
                 }
             }
+            Effect::PassiveLightning(count) => {
+                for _ in 0..count {
+                    for index in (0..self.combat().unwrap().orbs.len()).rev() {
+                        if self.combat().unwrap().orbs[index].id == orb_id::LIGHTNING {
+                            self.passive_orb_target(content, index, pending.context.target);
+                        }
+                    }
+                }
+            }
             Effect::OrbSlots(amount) => {
                 let combat = self.combat_mut().unwrap();
                 combat.orb_slots = (combat.orb_slots as i16 + amount as i16).clamp(0, 10) as u8;
@@ -4309,6 +4345,7 @@ impl Game {
         let target = Actor::Player;
         let mut amount = base.max(0);
         if powered {
+            amount = amount.saturating_add(self.creature(source).power(power_id::VIGOR));
             amount =
                 amount.saturating_add(self.creature(source).kind(content, PowerKind::Strength));
             if attack {
@@ -4420,6 +4457,7 @@ impl Game {
         if self.creature(target).hp <= 0 {
             return DamageResult::default();
         }
+        let overflow_kind = matches!(kind, DamageKind::Overflow);
         let attack = matches!(kind, DamageKind::Attack);
         let powered = matches!(kind, DamageKind::Attack | DamageKind::Move);
         if attack
@@ -4478,9 +4516,7 @@ impl Game {
             {
                 amount = amount.saturating_add(1);
             }
-            if source == Actor::Player {
-                amount = amount.saturating_add(self.creature(source).power(power_id::VIGOR));
-            }
+            amount = amount.saturating_add(self.creature(source).power(power_id::VIGOR));
             if card == Some(card_id::HANG) {
                 amount = amount.saturating_mul(self.creature(target).power(power_id::HANG).max(1));
             }
@@ -4596,7 +4632,7 @@ impl Game {
             amount /= 2;
         }
         let cap = self.creature(target).power(power_id::HARD_TO_KILL);
-        if cap > 0 {
+        if !overflow_kind && cap > 0 {
             amount = amount.min(cap);
         }
         if attack
@@ -4650,14 +4686,14 @@ impl Game {
                 }
             }
         }
-        if self.creature(target).kind(content, PowerKind::Intangible) > 0 {
+        if !overflow_kind && self.creature(target).kind(content, PowerKind::Intangible) > 0 {
             amount = amount.min(1);
         }
         if target == Actor::Player && matches!(source, Actor::Enemy(_)) {
             let expected = self.incoming_damage_amount(content, source, base, kind);
             debug_assert_eq!(amount, expected);
         }
-        let blocked = if matches!(kind, DamageKind::Unblockable) {
+        let blocked = if matches!(kind, DamageKind::Unblockable | DamageKind::Overflow) {
             0
         } else {
             amount.min(self.creature(target).block)
@@ -4686,7 +4722,11 @@ impl Game {
             }
         }
         let mut lost = amount - blocked;
-        let shell = self.creature(target).power(power_id::HARDENED_SHELL);
+        let shell = if overflow_kind {
+            0
+        } else {
+            self.creature(target).power(power_id::HARDENED_SHELL)
+        };
         if shell > 0 {
             let received = self
                 .creature(target)
@@ -4738,7 +4778,11 @@ impl Game {
         {
             lost = 5;
         }
-        lost = lost.min(self.creature(hp_target).hp.max(0));
+        let hp = self.creature(hp_target).hp.max(0);
+        let overflow = (target == Actor::Player && hp_target == Actor::Osty)
+            .then(|| lost.saturating_sub(hp))
+            .unwrap_or(0);
+        lost = lost.min(hp);
         self.creature_mut(hp_target).hp -= lost;
         if lost > 0
             && hp_target == Actor::Player
@@ -4892,7 +4936,7 @@ impl Game {
                 enemy.repeats = 0;
             }
         }
-        if attack && hp_target == Actor::Player && lost > 0 {
+        if (attack || overflow_kind) && hp_target == Actor::Player && lost > 0 {
             let paper_cuts = self.creature(source).power(power_id::PAPER_CUTS).max(0);
             if paper_cuts > 0 {
                 let player = self.creature_mut(Actor::Player);
@@ -5011,7 +5055,7 @@ impl Game {
                 );
             }
         }
-        if attack
+        if (attack || overflow_kind)
             && hp_target == Actor::Player
             && matches!(source, Actor::Enemy(_))
             && lost > 0
@@ -5025,8 +5069,21 @@ impl Game {
         if self.creature(hp_target).hp <= 0 {
             self.died(content, hp_target);
         }
+        let overflow = if overflow > 0 {
+            self.damage(
+                content,
+                source,
+                Actor::Player,
+                overflow,
+                DamageKind::Overflow,
+                card,
+            )
+            .lost
+        } else {
+            0
+        };
         DamageResult {
-            lost,
+            lost: lost.saturating_add(overflow),
             resolved: amount,
         }
     }
@@ -5356,16 +5413,20 @@ impl Game {
             .unwrap() as Id;
         let range = content.enemies[id as usize].hp(self.run.ascension);
         for _ in 0..count {
-            let mut instance = 2;
-            while self
+            let instance = self
                 .combat()
                 .unwrap()
                 .enemies
                 .iter()
-                .any(|enemy| enemy.instance == instance)
-            {
-                instance += 1;
-            }
+                .map(|enemy| enemy.instance)
+                .max()
+                .unwrap_or(1)
+                .max(if self.combat().unwrap().osty.max_hp > 0 {
+                    3
+                } else {
+                    1
+                })
+                + 1;
             let candidates: Vec<_> = range
                 .clone()
                 .filter(|hp| {
@@ -5417,7 +5478,12 @@ impl Game {
             .iter()
             .map(|enemy| enemy.instance)
             .max()
-            .unwrap_or_default()
+            .unwrap_or(1)
+            .max(if self.combat().unwrap().osty.max_hp > 0 {
+                3
+            } else {
+                1
+            })
             + 1;
         let powers = def
             .powers(self.run.ascension)
@@ -5742,6 +5808,9 @@ impl Game {
                     skip_next_decay: false,
                     value: 0,
                 });
+            } else if id == power_id::RITUAL && before == 0 {
+                self.creature_mut(actor)
+                    .add_power_with_skip_next_decay(id, amount, true);
             } else {
                 self.creature_mut(actor).add_power(id, amount);
             }
@@ -5774,6 +5843,11 @@ impl Game {
     }
 
     fn apply_debuff(&mut self, content: &Content, actor: Actor, id: Id, amount: i16) -> bool {
+        let amount = if id == power_id::SMOGGY {
+            amount.saturating_sub(self.creature(actor).power(id))
+        } else {
+            amount
+        };
         if amount == 0 {
             return false;
         }
@@ -6009,6 +6083,10 @@ impl Game {
 
     pub(super) fn passive_orb(&mut self, content: &Content, index: Option<usize>) {
         let Some(index) = index else { return };
+        self.passive_orb_target(content, index, None);
+    }
+
+    fn passive_orb_target(&mut self, content: &Content, index: usize, target: Option<usize>) {
         let Some(orb) = self.combat().unwrap().orbs.get(index).copied() else {
             return;
         };
@@ -6028,12 +6106,12 @@ impl Game {
             }
             contexts.push(Context {
                 source: Actor::Player,
-                target: None,
+                target,
                 card: None,
                 upgraded: false,
                 x: 0,
                 event,
-                orb: false,
+                orb: target.is_some(),
                 orb_id: Some(orb.id),
                 pen_nib: false,
             });
@@ -6127,6 +6205,16 @@ impl Game {
         powers: Vec<Power>,
     ) {
         for power in powers.into_iter().rev() {
+            if trigger == Trigger::TurnEnd && power.id == power_id::RITUAL && power.skip_next_decay
+            {
+                self.creature_mut(owner)
+                    .powers
+                    .iter_mut()
+                    .find(|current| current.id == power.id)
+                    .unwrap()
+                    .skip_next_decay = false;
+                continue;
+            }
             if power.id == 79
                 && trigger == Trigger::TurnStart
                 && self.combat().is_some_and(|combat| combat.turn == 1)
@@ -6544,6 +6632,17 @@ impl Game {
                 .map(|(i, _)| Actor::Enemy(i))
                 .collect(),
             Target::RandomEnemy => {
+                if context.orb
+                    && let Some(target) = context.target
+                    && self
+                        .combat()
+                        .unwrap()
+                        .enemies
+                        .get(target)
+                        .is_some_and(|enemy| enemy.creature.hp > 0)
+                {
+                    return vec![Actor::Enemy(target)];
+                }
                 let alive: Vec<_> = self
                     .combat()
                     .unwrap()
@@ -6596,6 +6695,7 @@ impl Game {
             .map(|(i, _)| i)
             .collect();
         let count = count.min(candidates.len() as u8);
+        let random = random && count as usize != candidates.len();
         if random {
             let mut candidates = candidates;
             for _ in 0..count {
@@ -6617,8 +6717,9 @@ impl Game {
                 }
             }
         } else if !optional && count as usize == candidates.len() {
-            for &index in candidates.iter().rev() {
-                self.apply_card_op(content, pile, index, op);
+            let mut removed = 0;
+            for index in candidates {
+                removed += self.apply_card_op(content, pile, index - removed, op) as usize;
             }
         } else if count > 0 {
             self.combat_mut().unwrap().choice = Some(Choice {
@@ -6749,8 +6850,8 @@ impl Game {
                     })
                     .collect();
                 if !pool.is_empty() {
-                    let id =
-                        pool[self.rngs.combat_card_generation.below(pool.len() as u32) as usize];
+                    let mut rng = self.rngs.combat_card_generation;
+                    let id = pool[rng.below(pool.len() as u32) as usize];
                     self.pile_mut(pile)[index] = Card {
                         id,
                         upgrades: old.upgrades,
@@ -7495,7 +7596,10 @@ impl Game {
         if combat.player.hp <= 0 {
             self.run.hp = 0;
             self.phase = Phase::Dead;
-        } else if combat.enemies.iter().all(|x| x.creature.hp <= 0)
+        } else if combat
+            .enemies
+            .iter()
+            .all(|x| x.creature.hp <= 0 || x.creature.power(power_id::MINION) > 0)
             && combat
                 .enemies
                 .iter()
@@ -7504,6 +7608,11 @@ impl Game {
             && combat.queue.is_empty()
             && combat.playing.is_none()
         {
+            for enemy in &mut self.combat_mut().unwrap().enemies {
+                if enemy.creature.power(power_id::MINION) > 0 {
+                    enemy.creature.hp = 0;
+                }
+            }
             if self.has_relic(content, "RELIC.MEAT_ON_THE_BONE")
                 && self.creature(Actor::Player).hp * 2 <= self.creature(Actor::Player).max_hp
             {

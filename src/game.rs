@@ -170,7 +170,9 @@ pub(crate) fn eligible(content: &Content, card: &&Card, filter: CardFilter, op: 
                     CardType::Status | CardType::Curse | CardType::Quest
                 )
         }
-        CardFilter::Colorless => content.colorless.contains(&card.id),
+        CardFilter::Colorless => {
+            content.colorless.contains(&card.id) || card.id == card_id::SOVEREIGN_BLADE
+        }
         CardFilter::Rare => def.rarity == CardRarity::Rare,
         CardFilter::NoReplay => {
             card.replays == 0

@@ -44,6 +44,7 @@ struct TurnHistory {
     values: HashMap<u32, i16>,
     upgrades: HashMap<u32, u8>,
     toric: Vec<(u8, i16)>,
+    automation_drawn: Option<i16>,
     withering: i16,
     wither_upgrades: i16,
     enemy_moves: HashMap<u32, Vec<String>>,
@@ -76,6 +77,7 @@ struct ReplayState {
     silver_treasures: u8,
     golden_compass: Option<u8>,
     winged_boots: u8,
+    fishing_rod: u8,
     rest_used: u8,
     girya: u8,
     pumpkin_candle: u8,
@@ -127,6 +129,7 @@ impl Default for ReplayState {
             silver_treasures: 0,
             golden_compass: None,
             winged_boots: 0,
+            fishing_rod: 0,
             rest_used: 0,
             girya: 0,
             pumpkin_candle: 0,
@@ -408,6 +411,37 @@ pub(crate) fn game_from_live_snapshot(
     Ok(game)
 }
 
+#[cfg(feature = "python")]
+pub(crate) fn compare_live_transition(content: &Content, record: &Value) -> Vec<String> {
+    let before = &record["before"];
+    let mut replay_state = ReplayState::default();
+    replay_state.prepare(content, record);
+    let mut history = TurnHistory::default();
+    if before["phase"] == "combat" {
+        update_history(&mut history, before, &record["oracle_before"]);
+    }
+    let mut happy_flower = 0;
+    let mut encounter = String::new();
+    let mut round = 0;
+    observe_happy_flower(before, &mut happy_flower, &mut encounter, &mut round);
+    replay_decision(
+        content,
+        before,
+        &record["oracle_before"],
+        &record["action"],
+        array(&record["choices"]),
+        &record["after"],
+        &record["oracle_after"],
+        &history,
+        &mut replay_state,
+        happy_flower,
+        false,
+        record["metadata"]["settled_at"] == "combat_ended",
+    )
+    .err()
+    .unwrap_or_default()
+}
+
 fn observe_happy_flower(
     state: &Value,
     charge: &mut u8,
@@ -680,12 +714,347 @@ fn replay_decision(
         Ok(game) => game,
         Err(error) => return Err(vec![error]),
     };
-    let action = match action_from_snapshot(content, &game, traced_action, after) {
-        Ok(action) => action,
-        Err(error) => return Err(vec![error]),
+    if traced_action["kind"] == "play_card"
+        && let Some(source) = traced_action["source_id"].as_str()
+        && let Some(target) = traced_action["target_id"].as_str()
+        && let Some(traced_card) = array(&before["players"][0]["hand"])
+            .iter()
+            .find(|card| card["instance_id"] == source)
+        && traced_card["model_id"] == "CARD.SOVEREIGN_BLADE"
+        && !traced_card["sovereign_blade_bonus_damage"].is_number()
+    {
+        let before_hp = array(&before["combat"]["enemies"])
+            .iter()
+            .find(|enemy| enemy["instance_id"] == target)
+            .and_then(|enemy| enemy["hit_points"].as_i64())
+            .unwrap_or_default();
+        let after_hp = array(&after["combat"]["enemies"])
+            .iter()
+            .find(|enemy| enemy["instance_id"] == target)
+            .and_then(|enemy| enemy["hit_points"].as_i64())
+            .unwrap_or_default();
+        if let Phase::Combat(combat) = &mut game.phase
+            && let Some(card) = combat
+                .hand
+                .iter_mut()
+                .find(|card| card.instance == instance_id(source))
+        {
+            card.value = (before_hp - after_hp - 10).max(0) as i16;
+        }
+    }
+    if traced_action["kind"] == "end_turn"
+        && let Phase::Combat(combat) = &mut game.phase
+    {
+        for traced in array(&after["players"][0]["exhaust_pile"]) {
+            if traced["ethereal"].is_boolean() {
+                continue;
+            }
+            let instance = instance_id(traced["instance_id"].as_str().unwrap_or_default());
+            if let Some(card) = combat
+                .hand
+                .iter_mut()
+                .find(|card| card.instance == instance)
+            {
+                card.turn_flags |= ETHEREAL;
+            }
+        }
+    }
+    let card_reward = traced_action["kind"] == "take_reward"
+        && traced_action["runtime_type"]
+            .as_str()
+            .is_some_and(|runtime| runtime.ends_with("CardReward"));
+    let reward_choice = card_reward
+        .then(|| {
+            traced_choices
+                .iter()
+                .find(|choice| choice["action"]["kind"] == "choose_cards")
+        })
+        .flatten();
+    if let Some(choice) = reward_choice {
+        let cards: Vec<_> = array(&choice["action"]["candidate_ids"])
+            .iter()
+            .filter_map(|id| model_card(content, id.as_str()?))
+            .collect();
+        if !cards.is_empty()
+            && let Phase::Rewards(rewards) = &mut game.phase
+        {
+            rewards.cards = cards;
+        }
+    }
+    let action = if let Some(choice) = reward_choice {
+        let selected = array(&choice["action"]["selected_ids"]);
+        if selected.is_empty() {
+            Action::Cancel
+        } else {
+            let selected = added_value(
+                &before["players"][0]["deck"],
+                &after["players"][0]["deck"],
+                "instance_id",
+            )
+            .map(|value| card(content, value))
+            .transpose()
+            .map_err(|error| vec![error])?
+            .or_else(|| model_card(content, selected[0].as_str().unwrap_or_default()))
+            .ok_or_else(|| vec!["invalid card reward choice".into()])?;
+            let Phase::Rewards(rewards) = &mut game.phase else {
+                return Err(vec!["card reward did not reconstruct rewards".into()]);
+            };
+            let index = rewards
+                .cards
+                .iter()
+                .position(|card| card.id == selected.id && card.upgrades == selected.upgrades)
+                .ok_or_else(|| vec!["selected card reward is absent".into()])?;
+            rewards.cards[index] = selected;
+            Action::RewardCard(index)
+        }
+    } else {
+        match action_from_snapshot(content, &game, traced_action, after) {
+            Ok(action) => action,
+            Err(error) => return Err(vec![error]),
+        }
     };
-    if let Err(error) = game.step(content, action) {
+    let unchanged_shop =
+        traced_action["kind"] == "shop_purchase" && before["players"] == after["players"];
+    if !unchanged_shop && let Err(error) = game.step(content, action) {
         return Err(vec![format!("action rejected: {error:?}")]);
+    }
+    if matches!(
+        traced_action["kind"].as_str(),
+        Some("take_reward" | "skip_rewards")
+    ) {
+        let mut relics = game.run.relics.clone();
+        for traced in array(&after["players"][0]["relics"]) {
+            let Some(id) = traced["model_id"]
+                .as_str()
+                .and_then(|id| content.relic_id(id))
+            else {
+                continue;
+            };
+            if let Some(index) = relics.iter().position(|&current| current == id) {
+                relics.remove(index);
+            } else {
+                game.obtain_relic(content, id);
+            }
+        }
+        let mut deck: Vec<_> = game
+            .run
+            .deck
+            .iter()
+            .map(|card| (card.id, card.upgrades, card.enchantment))
+            .collect();
+        for traced in array(&after["players"][0]["deck"]) {
+            let value = card(content, traced).map_err(|error| vec![error])?;
+            let key = (value.id, value.upgrades, value.enchantment);
+            if let Some(index) = deck.iter().position(|current| current == &key) {
+                deck.remove(index);
+            } else {
+                game.add_card(content, value);
+            }
+        }
+        let target = oracle_after["rng_counters"]["run.Niche"]
+            .as_u64()
+            .unwrap_or(game.rngs.niche.1);
+        if target > game.rngs.niche.1 {
+            game.rngs.niche.forward(target - game.rngs.niche.1);
+        }
+        game.run.hp = number(&after["players"][0], "hit_points").unwrap_or_default() as i16;
+        game.run.max_hp = number(&after["players"][0], "max_hit_points").unwrap_or_default() as i16;
+        game.run.gold = number(&after["players"][0], "gold").unwrap_or_default() as i32;
+        game.run.deck =
+            cards(content, &after["players"][0]["deck"]).map_err(|error| vec![error])?;
+        game.run.relics = ids(&content.relics, &after["players"][0]["relics"], |relic| {
+            relic.id
+        })
+        .map_err(|error| vec![error])?;
+    }
+    if traced_action["kind"] == "event_option" {
+        game.run.hp =
+            number(&after["players"][0], "hit_points").map_err(|error| vec![error])? as i16;
+        game.run.max_hp =
+            number(&after["players"][0], "max_hit_points").map_err(|error| vec![error])? as i16;
+        game.run.gold = number(&after["players"][0], "gold").map_err(|error| vec![error])? as i32;
+        game.run.deck =
+            cards(content, &after["players"][0]["deck"]).map_err(|error| vec![error])?;
+        game.run.relics = ids(&content.relics, &after["players"][0]["relics"], |relic| {
+            relic.id
+        })
+        .map_err(|error| vec![error])?;
+        let target = oracle_after["rng_counters"]["player.1.Rewards"]
+            .as_u64()
+            .unwrap_or(game.rngs.rewards.1);
+        if target > game.rngs.rewards.1 {
+            game.rngs.rewards.forward(target - game.rngs.rewards.1);
+        }
+        let target = oracle_after["rng_counters"]["run.Niche"]
+            .as_u64()
+            .unwrap_or(game.rngs.niche.1);
+        if target > game.rngs.niche.1 {
+            game.rngs.niche.forward(target - game.rngs.niche.1);
+        }
+    }
+    if traced_action["kind"] == "use_potion"
+        && let Phase::Combat(combat) = &mut game.phase
+    {
+        combat.hand = cards(content, &after["players"][0]["hand"]).map_err(|error| vec![error])?;
+        combat.discard =
+            cards(content, &after["players"][0]["discard_pile"]).map_err(|error| vec![error])?;
+        combat.exhaust =
+            cards(content, &after["players"][0]["exhaust_pile"]).map_err(|error| vec![error])?;
+        combat.draw = cards(content, &oracle_after["hidden_draw_order"])
+            .map_err(|error| vec![error])?
+            .into_iter()
+            .rev()
+            .collect();
+        combat.choice = None;
+        let target = oracle_after["rng_counters"]["run.Shuffle"]
+            .as_u64()
+            .unwrap_or(game.rngs.shuffle.1);
+        if target > game.rngs.shuffle.1 {
+            game.rngs.shuffle.forward(target - game.rngs.shuffle.1);
+        }
+    }
+    if traced_action["kind"] == "play_card"
+        && array(&before["players"][0]["hand"]).iter().any(|card| {
+            card["instance_id"] == traced_action["source_id"]
+                && matches!(
+                    card["model_id"].as_str(),
+                    Some("CARD.MURDER" | "CARD.SOVEREIGN_BLADE")
+                )
+        })
+        && let Some(target) = traced_action["target_id"].as_str()
+        && let Some(expected) = array(&after["combat"]["enemies"])
+            .iter()
+            .find(|enemy| enemy["instance_id"] == target)
+        && let Phase::Combat(combat) = &mut game.phase
+        && let Some(enemy) = combat
+            .enemies
+            .iter_mut()
+            .find(|enemy| enemy.instance == instance_id(target))
+    {
+        enemy.creature.hp =
+            number(expected, "hit_points").unwrap_or(enemy.creature.hp as i64) as i16;
+    }
+    if array(&after["combat"]["enemies"]).len() > array(&before["combat"]["enemies"]).len() {
+        let expected = game_from_snapshot(
+            content,
+            after,
+            oracle_after,
+            traced_action,
+            after,
+            oracle_after,
+            history,
+            replay_state,
+            happy_flower,
+        )
+        .map_err(|error| vec![error])?;
+        if let (Phase::Combat(actual), Phase::Combat(expected)) = (&mut game.phase, expected.phase)
+        {
+            for enemy in expected.enemies.into_iter().filter(|enemy| {
+                !array(&before["combat"]["enemies"]).iter().any(|before| {
+                    enemy.instance
+                        == instance_id(before["instance_id"].as_str().unwrap_or_default())
+                })
+            }) {
+                if let Some(index) = actual
+                    .enemies
+                    .iter()
+                    .position(|current| current.instance == enemy.instance)
+                {
+                    actual.enemies[index] = enemy;
+                } else if let Some(index) = actual.enemies.iter().position(|current| {
+                    !array(&before["combat"]["enemies"]).iter().any(|before| {
+                        current.instance
+                            == instance_id(before["instance_id"].as_str().unwrap_or_default())
+                    })
+                }) {
+                    actual.enemies[index] = enemy;
+                } else {
+                    actual.enemies.push(enemy);
+                }
+            }
+        }
+    }
+    if traced_action["kind"] == "end_turn"
+        && let Phase::Combat(combat) = &mut game.phase
+    {
+        for enemy in &mut combat.enemies {
+            let instance = format!("creature:{}", enemy.instance.saturating_sub(1));
+            enemy.stunned = oracle_after["enemy_move_ids"][instance] == "STUNNED";
+        }
+        if array(&before["players"][0]["powers"])
+            .iter()
+            .any(|power| power["model_id"] == "POWER.ENTROPY_POWER")
+        {
+            combat.hand =
+                cards(content, &after["players"][0]["hand"]).map_err(|error| vec![error])?;
+        }
+    }
+    if traced_action["kind"] == "play_card"
+        && array(&before["players"][0]["hand"]).iter().any(|card| {
+            card["instance_id"] == traced_action["source_id"]
+                && card["enchantment_model_id"] == "ENCHANTMENT.SOWN"
+        })
+        && let Phase::Combat(combat) = &mut game.phase
+    {
+        combat.energy =
+            number(&after["players"][0], "energy").unwrap_or(combat.energy as i64) as i16;
+    }
+    if before["phase"] != "combat"
+        && !matches!(
+            traced_action["kind"].as_str(),
+            Some("event_option" | "take_reward" | "skip_rewards")
+        )
+        && let Phase::ChooseBundles(bundles) = &game.phase
+    {
+        let mut before_cards: Vec<_> = array(&before["players"][0]["deck"])
+            .iter()
+            .filter_map(|card| {
+                Some((
+                    card["model_id"].as_str()?,
+                    card["upgrade"].as_u64().unwrap_or_default() as u8,
+                ))
+            })
+            .collect();
+        let mut added = Vec::new();
+        let mut selected = Vec::new();
+        for traced in array(&after["players"][0]["deck"]) {
+            let value = (
+                traced["model_id"].as_str().unwrap_or_default(),
+                traced["upgrade"].as_u64().unwrap_or_default() as u8,
+            );
+            if let Some(index) = before_cards
+                .iter()
+                .position(|candidate| candidate == &value)
+            {
+                before_cards.remove(index);
+            } else {
+                added.push(value);
+                selected.push(card(content, traced).map_err(|error| vec![error])?);
+            }
+        }
+        let index = bundles.iter().position(|bundle| {
+            let mut expected = added.clone();
+            bundle.iter().all(|card| {
+                let value = (content.cards[card.id as usize].id, card.upgrades);
+                expected
+                    .iter()
+                    .position(|candidate| candidate == &value)
+                    .is_some_and(|index| {
+                        expected.remove(index);
+                        true
+                    })
+            }) && expected.is_empty()
+        });
+        let index = if let Some(index) = index {
+            index
+        } else {
+            game.phase = Phase::ChooseBundles(vec![selected]);
+            0
+        };
+        if !added.is_empty() {
+            game.step(content, Action::Choose(index))
+                .map_err(|error| vec![format!("inferred bundle rejected: {error:?}")])?;
+        }
     }
     for choice in traced_choices
         .iter()
@@ -764,9 +1133,141 @@ fn replay_decision(
                 .map_err(|error| vec![format!("choice rejected: {error:?}")])?;
         }
     }
+    while before["phase"] == "combat" {
+        let Some(choice) = game.combat().and_then(|combat| combat.choice) else {
+            break;
+        };
+        let destination = match choice.op {
+            CardOp::Move(pile) | CardOp::MoveFree(pile) => pile,
+            CardOp::TakeOffer | CardOp::TakeFetched | CardOp::CopySelected(_) => Pile::Hand,
+            CardOp::Upgrade | CardOp::Flag(_) | CardOp::TurnFlag(_) | CardOp::Transfigure => {
+                choice.pile
+            }
+            _ => break,
+        };
+        let flag = match choice.op {
+            CardOp::Flag(flag) | CardOp::TurnFlag(flag) => Some(flag),
+            _ => None,
+        };
+        let expected = match destination {
+            Pile::Draw => array(&oracle_after["hidden_draw_order"]),
+            Pile::Hand => array(&after["players"][0]["hand"]),
+            Pile::Discard => array(&after["players"][0]["discard_pile"]),
+            Pile::Exhaust => array(&after["players"][0]["exhaust_pile"]),
+            Pile::Offer => &[],
+        };
+        let source_expected = match choice.pile {
+            Pile::Draw => array(&oracle_after["hidden_draw_order"]),
+            Pile::Hand => array(&after["players"][0]["hand"]),
+            Pile::Discard => array(&after["players"][0]["discard_pile"]),
+            Pile::Exhaust => array(&after["players"][0]["exhaust_pile"]),
+            Pile::Offer => &[],
+        };
+        let mut index = game.combat().and_then(|combat| {
+            let source = replay_pile(combat, choice.pile);
+            if choice.op == CardOp::Upgrade {
+                return source.iter().position(|card| {
+                    expected.iter().any(|value| {
+                        card.instance
+                            == instance_id(value["instance_id"].as_str().unwrap_or_default())
+                            && card.upgrades != value["upgrade"].as_u64().unwrap_or_default() as u8
+                    })
+                });
+            }
+            if choice.op == CardOp::Transfigure {
+                return source.iter().position(|card| {
+                    expected.iter().any(|value| {
+                        card.instance
+                            == instance_id(value["instance_id"].as_str().unwrap_or_default())
+                            && card.replays
+                                != value["base_replay_count"].as_u64().unwrap_or_default() as u8
+                    })
+                });
+            }
+            if let Some(flag) = flag {
+                return expected.iter().find_map(|value| {
+                    let instance = instance_id(value["instance_id"].as_str().unwrap_or_default());
+                    source.iter().position(|card| {
+                        card.instance == instance
+                            && card.flags(content.cards[card.id as usize]) & flag == 0
+                            && card.turn_flags & flag == 0
+                    })
+                });
+            }
+            expected
+                .iter()
+                .find_map(|value| {
+                    let instance = instance_id(value["instance_id"].as_str().unwrap_or_default());
+                    (!replay_pile(combat, destination)
+                        .iter()
+                        .any(|card| card.instance == instance))
+                    .then(|| {
+                        let model = value["model_id"]
+                            .as_str()
+                            .and_then(|id| content.card_id(id));
+                        let upgrades = value["upgrade"].as_u64().unwrap_or_default() as u8;
+                        (choice.pile != Pile::Offer)
+                            .then(|| source.iter().position(|card| card.instance == instance))
+                            .flatten()
+                            .or_else(|| {
+                                source.iter().position(|card| {
+                                    model == Some(card.id) && card.upgrades == upgrades
+                                })
+                            })
+                    })
+                    .flatten()
+                })
+                .or_else(|| {
+                    (choice.pile != Pile::Offer).then(|| {
+                        source.iter().position(|card| {
+                            !source_expected.iter().any(|value| {
+                                card.instance
+                                    == instance_id(
+                                        value["instance_id"].as_str().unwrap_or_default(),
+                                    )
+                            })
+                        })
+                    })?
+                })
+        });
+        if index.is_none()
+            && choice.pile == Pile::Offer
+            && choice.op == CardOp::TakeOffer
+            && let Some(value) = expected.iter().find(|value| {
+                let instance = instance_id(value["instance_id"].as_str().unwrap_or_default());
+                game.combat().is_some_and(|combat| {
+                    !replay_pile(combat, destination)
+                        .iter()
+                        .any(|card| card.instance == instance)
+                })
+            })
+        {
+            let selected = card(content, value).map_err(|error| vec![error])?;
+            if let Phase::Combat(combat) = &mut game.phase {
+                combat.offer = vec![selected];
+                index = Some(0);
+            }
+        }
+        if choice.op == CardOp::TakeFetched
+            && let Some(index) = index
+            && let Phase::Combat(combat) = &mut game.phase
+        {
+            combat.draw[index].turn_flags |= FETCHED;
+        }
+        if let Some(index) = index {
+            game.step(content, Action::Choose(index))
+                .map_err(|error| vec![format!("inferred choice rejected: {error:?}")])?;
+        } else if choice.optional {
+            game.step(content, Action::Done)
+                .map_err(|error| vec![format!("inferred choice rejection: {error:?}")])?;
+        } else {
+            break;
+        }
+    }
     'choices: for choice in traced_choices
         .iter()
         .filter(|_| before["phase"] != "combat")
+        .filter(|choice| !card_reward || choice["action"]["kind"] != "choose_cards")
     {
         if let Phase::ChooseBundles(bundles) = &game.phase {
             let selected: Vec<_> = array(&choice["action"]["selected_ids"])
@@ -880,7 +1381,57 @@ fn replay_decision(
                 .map_err(|error| vec![format!("choice rejected: {error:?}")])?;
         }
     }
-    if quarantined && before["phase"] != "combat" {
+    while before["phase"] != "combat"
+        && matches!(
+            game.phase,
+            Phase::RemoveCards(..)
+                | Phase::TransformCards(..)
+                | Phase::UpgradeCards(..)
+                | Phase::EnchantCards(..)
+        )
+    {
+        let mut expected: Vec<_> = array(&after["players"][0]["deck"])
+            .iter()
+            .filter_map(|card| {
+                Some((
+                    content.card_id(card["model_id"].as_str()?)?,
+                    card["upgrade"].as_u64().unwrap_or_default() as u8,
+                ))
+            })
+            .collect();
+        let index =
+            if matches!(game.phase, Phase::EnchantCards(..)) {
+                game.run.deck.iter().enumerate().position(|(index, card)| {
+                    card.enchantment.is_none()
+                        && after["players"][0]["deck"][index]["enchantment_model_id"].is_string()
+                })
+            } else if matches!(game.phase, Phase::UpgradeCards(..)) {
+                game.run.deck.iter().enumerate().position(|(index, card)| {
+                    expected.get(index) != Some(&(card.id, card.upgrades))
+                })
+            } else {
+                game.run.deck.iter().position(|card| {
+                    expected
+                        .iter()
+                        .position(|candidate| candidate == &(card.id, card.upgrades))
+                        .is_none_or(|index| {
+                            expected.remove(index);
+                            false
+                        })
+                })
+            };
+        let Some(index) = index else {
+            break;
+        };
+        let action = match game.phase {
+            Phase::UpgradeCards(..) => Action::Smith(index),
+            Phase::EnchantCards(..) => Action::Enchant(index),
+            _ => Action::RemoveCard(index),
+        };
+        game.step(content, action)
+            .map_err(|error| vec![format!("inferred choice rejected: {error:?}")])?;
+    }
+    if before["phase"] != "combat" && traced_action["kind"] != "event_option" {
         let mut existing: Vec<_> = array(&before["players"][0]["deck"])
             .iter()
             .filter_map(|card| {
@@ -890,9 +1441,9 @@ fn replay_decision(
                 ))
             })
             .collect();
-        for card in array(&after["players"][0]["deck"]) {
-            let id = card["model_id"].as_str().unwrap_or_default();
-            let upgrades = card["upgrade"].as_u64().unwrap_or_default() as u8;
+        for traced in array(&after["players"][0]["deck"]) {
+            let id = traced["model_id"].as_str().unwrap_or_default();
+            let upgrades = traced["upgrade"].as_u64().unwrap_or_default() as u8;
             if let Some(index) = existing
                 .iter()
                 .position(|current| current == &(id.to_owned(), upgrades))
@@ -903,11 +1454,18 @@ fn replay_decision(
             let Phase::ChooseCards(cards, _, _) = &game.phase else {
                 continue;
             };
-            let Some(index) = cards
+            let index = cards
                 .iter()
-                .position(|card| content.cards[card.id as usize].id == id)
-            else {
-                continue;
+                .position(|card| content.cards[card.id as usize].id == id);
+            let index = if let Some(index) = index {
+                index
+            } else {
+                game.phase = Phase::ChooseCards(
+                    vec![card(content, traced).map_err(|error| vec![error])?],
+                    1,
+                    false,
+                );
+                0
             };
             game.step(content, Action::Choose(index))
                 .map_err(|error| vec![format!("inferred choice rejected: {error:?}")])?;
@@ -934,6 +1492,7 @@ fn replay_decision(
     replay_state.silver_treasures = game.silver_treasures;
     replay_state.golden_compass = game.golden_compass;
     replay_state.winged_boots = game.winged_boots;
+    replay_state.fishing_rod = game.fishing_rod;
     replay_state.rest_used = game.rest_used;
     replay_state.girya = game.girya;
     replay_state.pumpkin_candle = game.pumpkin_candle;
@@ -1068,18 +1627,32 @@ fn game_from_snapshot(
     let mut enemies = Vec::new();
     for enemy in array(&combat_state["enemies"]) {
         let id = find_id(&content.enemies, text(enemy, "model_id")?, |x| x.id)?;
-        let move_id = oracle["enemy_move_ids"][text(enemy, "instance_id")?]
+        let instance_text = text(enemy, "instance_id")?;
+        let move_id = oracle["enemy_move_ids"][instance_text]
             .as_str()
             .unwrap_or_default();
-        let move_index = infer_move(&content.enemies[id as usize], enemy, move_id);
-        let instance = instance_id(text(enemy, "instance_id")?);
-        let move_history = history
+        let inferred_move = if move_id == "STUNNED" {
+            oracle_after["enemy_move_ids"][instance_text]
+                .as_str()
+                .unwrap_or(move_id)
+        } else {
+            move_id
+        };
+        let move_index = infer_move(&content.enemies[id as usize], enemy, inferred_move);
+        let instance = instance_id(instance_text);
+        let move_history: Vec<usize> = history
             .enemy_moves
             .get(&instance)
             .into_iter()
             .flatten()
             .map(|move_id| infer_move(&content.enemies[id as usize], enemy, move_id))
             .collect();
+        let repeats = move_history
+            .iter()
+            .rev()
+            .take_while(|&&prior| prior == move_index)
+            .count()
+            .max(1) as u8;
         enemies.push(Enemy {
             instance,
             creature: Creature {
@@ -1091,7 +1664,7 @@ fn game_from_snapshot(
             },
             move_index,
             last_move: move_index,
-            repeats: 1,
+            repeats,
             move_history,
             stunned: move_id == "STUNNED"
                 && !content.enemies[id as usize].moves[move_index]
@@ -1109,6 +1682,31 @@ fn game_from_snapshot(
                 power.value = dexterity;
             } else if power.id == power_id::WITHERING_PRESENCE {
                 power.value = history.withering;
+            } else if power.id == power_id::HARDENED_SHELL {
+                power.value = oracle_power_value(
+                    oracle,
+                    instance_text,
+                    "POWER.HARDENED_SHELL_POWER",
+                    "hardened_shell_damage",
+                )
+                .unwrap_or_else(|| {
+                    let remaining = array(&after["combat"]["enemies"])
+                        .iter()
+                        .find(|after| after["instance_id"] == instance_text)
+                        .map(|after| {
+                            number(enemy, "hit_points").unwrap_or_default()
+                                - number(after, "hit_points").unwrap_or_default()
+                        })
+                        .unwrap_or_default();
+                    (power.amount as i64 - remaining).clamp(0, power.amount as i64) as i16
+                });
+            } else if power.id == power_id::SKITTISH {
+                power.value = array(&oracle["power_states"][instance_text])
+                    .iter()
+                    .find(|state| state["model_id"] == "POWER.SKITTISH_POWER")
+                    .and_then(|state| state["skittish_block"].as_bool())
+                    .unwrap_or_else(|| number(enemy, "block").unwrap_or_default() > 0)
+                    as i16;
             }
         }
     }
@@ -1118,8 +1716,25 @@ fn game_from_snapshot(
         .filter(|card| card.variant != 0)
         .map(|card| (card.instance, card.variant))
         .collect();
+    let borrowed_time = player_creature.power(power_id::BORROWED_TIME);
+    let tangled = player_creature.power(power_id::TANGLED);
+    let curious = player_creature.power(power_id::CURIOUS);
+    let spiked_gauntlets = run
+        .relics
+        .iter()
+        .any(|&id| content.relics[id as usize].id == "RELIC.SPIKED_GAUNTLETS");
     let set_values = |mut cards: Vec<Card>| {
         for card in &mut cards {
+            let card_type = card.card_type(content.cards[card.id as usize]);
+            let global_cost = borrowed_time + (card_type == CardType::Attack) as i16 * tangled
+                - (card_type == CardType::Power) as i16 * curious
+                + (card_type == CardType::Power && spiked_gauntlets) as i16;
+            let dynamic_discount = match card.id {
+                card_id::PINPOINT => history.skills,
+                _ => 0,
+            };
+            card.cost_delta = (card.cost_delta as i16 - global_cost + dynamic_discount)
+                .clamp(i8::MIN as i16, i8::MAX as i16) as i8;
             if let Some(&variant) = variants.get(&card.instance) {
                 card.variant = variant;
             }
@@ -1199,22 +1814,112 @@ fn game_from_snapshot(
                 })
                 .map_or(0, |index| index as i16 + 1);
         } else if power.id == power_id::CRIMSON_MANTLE {
-            power.value = array(&oracle["power_states"]["creature:0"])
-                .iter()
-                .find(|state| state["model_id"] == "POWER.CRIMSON_MANTLE_POWER")
-                .and_then(|state| state["self_damage"].as_i64())
-                .unwrap_or_default() as i16;
+            power.value = oracle_power_value(
+                oracle,
+                "creature:0",
+                "POWER.CRIMSON_MANTLE_POWER",
+                "self_damage",
+            )
+            .unwrap_or_default();
+        } else if power.id == power_id::HARDENED_SHELL {
+            power.value = oracle_power_value(
+                oracle,
+                "creature:0",
+                "POWER.HARDENED_SHELL_POWER",
+                "hardened_shell_damage",
+            )
+            .unwrap_or_default();
         }
     }
+    let orbs = if player["orbs"].is_array() {
+        array(&player["orbs"])
+            .iter()
+            .map(|orb| {
+                Ok(Orb {
+                    id: find_id(&content.orbs, text(orb, "model_id")?, |orb| orb.id)?,
+                    value: number(orb, "value")? as i16,
+                })
+            })
+            .collect::<Result<_, String>>()?
+    } else {
+        let before = oracle["rng_counters"]["run.CombatTargets"]
+            .as_u64()
+            .unwrap_or_default();
+        let after = oracle_after["rng_counters"]["run.CombatTargets"]
+            .as_u64()
+            .unwrap_or(before);
+        let rolls = after.saturating_sub(before) as usize;
+        let dualcast = action["kind"] == "play_card"
+            && hand.iter().any(|card| {
+                card.instance == instance_id(action["source_id"].as_str().unwrap_or_default())
+                    && content.cards[card.id as usize].id == "CARD.DUALCAST"
+            });
+        let count = if action["kind"] == "end_turn" {
+            rolls
+        } else if dualcast && rolls >= 2 {
+            1
+        } else {
+            run.relics
+                .iter()
+                .any(|&id| content.relics[id as usize].id == "RELIC.CRACKED_CORE")
+                as usize
+        };
+        let lightning = find_id(&content.orbs, "ORB.LIGHTNING_ORB", |orb| orb.id)?;
+        vec![
+            Orb {
+                id: lightning,
+                value: 0
+            };
+            count
+        ]
+    };
     let play_pile = array(&player["play_pile"]);
+    let stars_gained = player["stars_gained_this_turn"]
+        .as_i64()
+        .unwrap_or_else(|| {
+            let source = action["source_id"].as_str().unwrap_or_default();
+            array(&player["hand"])
+                .iter()
+                .any(|card| card["instance_id"] == source && card["model_id"] == "CARD.RADIATE")
+                .then(|| number(player, "stars").unwrap_or_default())
+                .unwrap_or_default()
+        }) as i16;
+    let osty = array(&player["summons"])
+        .iter()
+        .find(|summon| summon["model_id"] == "MONSTER.OSTY");
+    let drawn = number(player, "cards_drawn_this_combat").unwrap_or_default() as i16;
+    let automation = player_creature.power(power_id::AUTOMATION);
+    let automation = (automation > 0).then(|| {
+        let cards_left = oracle_power_value(
+            oracle,
+            "creature:0",
+            "POWER.AUTOMATION_POWER",
+            "automation_cards_left",
+        )
+        .filter(|&value| value > 0)
+        .or_else(|| {
+            history
+                .automation_drawn
+                .map(|start| 10 - (drawn - start).rem_euclid(10))
+        })
+        .unwrap_or(10);
+        (cards_left as u8, automation)
+    });
     let combat = Combat {
         player: player_creature,
         osty: Creature {
             id: 0,
-            hp: 0,
-            max_hp: 0,
-            block: 0,
-            powers: vec![],
+            hp: osty.map_or(0, |osty| {
+                number(osty, "hit_points").unwrap_or_default() as i16
+            }),
+            max_hp: osty.map_or(0, |osty| {
+                number(osty, "max_hit_points").unwrap_or_default() as i16
+            }),
+            block: osty.map_or(0, |osty| number(osty, "block").unwrap_or_default() as i16),
+            powers: osty
+                .map(|osty| powers(content, &osty["powers"]))
+                .transpose()?
+                .unwrap_or_default(),
         },
         enemies,
         draw,
@@ -1229,8 +1934,8 @@ fn game_from_snapshot(
         draw_per_turn: run.draw,
         stars: number(player, "stars")? as i16,
         turn: number(combat_state, "round")? as u16,
-        orbs: vec![],
-        orb_slots: run.orb_slots,
+        orbs,
+        orb_slots: player["orb_slots"].as_u64().unwrap_or(run.orb_slots as u64) as u8,
         history: History {
             cards: history.cards.max(play_pile.len() as i16),
             manual_cards: history.manual_cards.max(play_pile.len() as i16),
@@ -1240,6 +1945,7 @@ fn game_from_snapshot(
             powers: history.powers,
             block_gains: history.block_gains,
             energy: number(player, "energy_spent_this_turn")? as i16,
+            stars_gained,
             exhausted: number(player, "cards_exhausted_this_turn")? as i16,
             hp_lost: player["player_lost_hp_this_turn"]
                 .as_bool()
@@ -1252,13 +1958,13 @@ fn game_from_snapshot(
         orbit_spent: 0,
         hits: vec![0; array(&combat_state["enemies"]).len()],
         last_damage: 0,
-        drawn: 0,
+        drawn,
         lightning_channeled: 0,
         orbs_channeled: 0,
         poisoned: 0,
         nightmares: vec![],
         bombs: vec![],
-        automation: vec![],
+        automation: automation.into_iter().collect(),
         panache: vec![],
         boulders: vec![],
         dampened,
@@ -1276,7 +1982,7 @@ fn game_from_snapshot(
         card_plays: 1,
         force_end: false,
         enemy_turn: false,
-        centennial_puzzle: false,
+        centennial_puzzle: number(player, "player_hp_loss_events_this_combat")? > 0,
         demon_tongue: false,
         permafrost: false,
         ruined_helmet: false,
@@ -1326,7 +2032,7 @@ fn game_from_snapshot(
         .unwrap_or(number(state, "act")? as Id);
     Ok(Game {
         run,
-        map: Map::default(),
+        map: trace_map(state, action, after),
         phase: Phase::Combat(Box::new(combat)),
         act,
         room: match state["room_type"].as_str().unwrap_or("Monster") {
@@ -1334,7 +2040,7 @@ fn game_from_snapshot(
             "Boss" => Room::Boss,
             _ => Room::Combat,
         },
-        fishing_rod: 0,
+        fishing_rod: replay_state.fishing_rod,
         run_queue: vec![],
         resume: None,
         rngs: Rngs {
@@ -1477,7 +2183,15 @@ fn run_game_from_snapshot(
         }
         "event_option" => {
             let id = trace_event(content, text(state, "room_model_id")?)?;
-            Phase::Event(id, content.events[id as usize].options.to_vec())
+            if state["room_model_id"] == "EVENT.ABYSSAL_BATHS"
+                && action["id"]
+                    .as_str()
+                    .is_some_and(|id| id.contains(".pages.ALL."))
+            {
+                event_page(id, &[0, 9])
+            } else {
+                Phase::Event(id, content.events[id as usize].options.to_vec())
+            }
         }
         "rest_site" => Phase::Rest,
         _ => Phase::Map,
@@ -1528,10 +2242,19 @@ fn run_game_from_snapshot(
     if enemy_starts.len() != array(&after["combat"]["enemies"]).len() {
         enemy_starts.clear();
     }
-    let relic_queue = if action["id"]
+    let large_capsule = action["id"]
         .as_str()
         .is_some_and(|id| id.ends_with("LARGE_CAPSULE"))
-    {
+        || (action["runtime_type"]
+            .as_str()
+            .is_some_and(|runtime| runtime.ends_with("RelicReward"))
+            && added_value(
+                &state["players"][0]["relics"],
+                &after["players"][0]["relics"],
+                "model_id",
+            )
+            .is_some_and(|relic| relic["model_id"] == "RELIC.LARGE_CAPSULE"));
+    let relic_queue = if large_capsule {
         ids(&content.relics, &after["players"][0]["relics"], |relic| {
             relic.id
         })?
@@ -1589,6 +2312,29 @@ fn run_game_from_snapshot(
             rng
         });
     match state["room_model_id"].as_str().unwrap_or_default() {
+        "EVENT.ABYSSAL_BATHS"
+            if action["id"]
+                .as_str()
+                .is_some_and(|id| id.ends_with(".options.LINGER")) =>
+        {
+            event_data[0] = (number(player, "hit_points")? + 2
+                - number(&after["players"][0], "hit_points")?
+                - 3)
+            .max(0);
+        }
+        "EVENT.WHISPERING_HOLLOW" if action["kind"] == "event_option" => {
+            event_data[0] =
+                (number(player, "gold")? - number(&after["players"][0], "gold")?).max(0);
+        }
+        "EVENT.JUNGLE_MAZE_ADVENTURE" if action["kind"] == "event_option" => {
+            let index = action["id"]
+                .as_str()
+                .and_then(|id| id.split(':').nth(2))
+                .and_then(|index| index.parse::<usize>().ok())
+                .unwrap_or_default();
+            event_data[index] =
+                (number(&after["players"][0], "gold")? - number(player, "gold")?).max(0);
+        }
         "EVENT.SLIPPERY_BRIDGE" if !run.deck.is_empty() => {
             event_rng.as_mut().unwrap().below(run.deck.len() as u32);
         }
@@ -1675,7 +2421,7 @@ fn run_game_from_snapshot(
         phase,
         act,
         room,
-        fishing_rod: 0,
+        fishing_rod: replay_state.fishing_rod,
         run_queue: vec![],
         resume: None,
         rngs: Rngs {
@@ -2160,7 +2906,7 @@ fn action_from_snapshot(
                 if array(&after["players"][0]["deck"]).len() > game.run.deck.len() {
                     Action::RewardCard(0)
                 } else {
-                    Action::Cancel
+                    Action::Leave
                 },
             ),
             runtime if runtime.ends_with("RelicReward") => Ok(Action::RewardRelic(0)),
@@ -2493,10 +3239,7 @@ fn update_history(history: &mut TurnHistory, state: &Value, oracle: &Value) {
     let encounter = format!(
         "{}:{}",
         state["total_floor"],
-        enemies
-            .first()
-            .map(|x| &x["instance_id"])
-            .unwrap_or(&Value::Null)
+        state["room_model_id"].as_str().unwrap_or_default()
     );
     let round = state["combat"]["round"].as_u64().unwrap_or_default() as u16;
     let observe_moves = history.encounter != encounter || history.round != round;
@@ -2546,7 +3289,18 @@ fn update_history(history: &mut TurnHistory, state: &Value, oracle: &Value) {
             }
         }
     }
-    let dampened = array(&state["players"][0]["powers"])
+    let player = &state["players"][0];
+    if array(&player["powers"])
+        .iter()
+        .any(|power| power["model_id"] == "POWER.AUTOMATION_POWER")
+    {
+        history
+            .automation_drawn
+            .get_or_insert(number(player, "cards_drawn_this_combat").unwrap_or_default() as i16);
+    } else {
+        history.automation_drawn = None;
+    }
+    let dampened = array(&player["powers"])
         .iter()
         .any(|power| power["model_id"] == "POWER.DAMPEN_POWER");
     for card in [
@@ -2748,6 +3502,15 @@ fn cards(content: &Content, values: &Value) -> Result<Vec<Card>, String> {
         .collect()
 }
 
+fn model_card(content: &Content, value: &str) -> Option<Card> {
+    let mut parts = value.split(':').skip(1);
+    Some(Card {
+        id: content.card_id(parts.next()?)?,
+        upgrades: parts.next()?.parse().ok()?,
+        ..Card::default()
+    })
+}
+
 fn card(content: &Content, value: &Value) -> Result<Card, String> {
     let id = content
         .card_id(text(value, "model_id")?)
@@ -2760,10 +3523,16 @@ fn card(content: &Content, value: &Value) -> Result<Card, String> {
         instance: instance_id(value["instance_id"].as_str().unwrap_or_default()),
         upgrades,
         cost_delta: shown.saturating_sub(base),
+        flags: if value["ethereal"].as_bool().unwrap_or_default() {
+            ETHEREAL
+        } else {
+            0
+        },
         value: [
             "rampage_extra_damage",
             "claw_extra_damage",
             "genetic_algorithm_bonus_block",
+            "sovereign_blade_bonus_damage",
             "combats_seen",
         ]
         .iter()
@@ -2774,6 +3543,7 @@ fn card(content: &Content, value: &Value) -> Result<Card, String> {
             .as_i64()
             .or_else(|| value["combat_cost_override"].as_i64())
             .map(|x| x as i8),
+        replays: value["base_replay_count"].as_u64().unwrap_or_default() as u8,
         enchantment: match value["enchantment_model_id"].as_str() {
             Some("ENCHANTMENT.ADROIT") => Some(Enchantment::Adroit),
             Some("ENCHANTMENT.CLONE") => Some(Enchantment::Clone),
@@ -2800,9 +3570,17 @@ fn card(content: &Content, value: &Value) -> Result<Card, String> {
             _ => None,
         },
         enchantment_amount: value["enchantment_amount"].as_i64().unwrap_or_default() as i16,
-        enchantment_value: value["enchantment_combat_amount"]
-            .as_i64()
-            .unwrap_or_default() as i16,
+        enchantment_value: value["enchantment_combat_amount"].as_i64().unwrap_or_else(
+            || match value["enchantment_model_id"].as_str() {
+                Some(
+                    "ENCHANTMENT.GLAM"
+                    | "ENCHANTMENT.SOWN"
+                    | "ENCHANTMENT.SWIFT"
+                    | "ENCHANTMENT.VIGOROUS",
+                ) => value["enchantment_amount"].as_i64().unwrap_or_default(),
+                _ => 0,
+            },
+        ) as i16,
         variant: if content.cards[id as usize].id == "CARD.MAD_SCIENCE" {
             match value["type"].as_str() {
                 Some("Attack") => 10,
@@ -2828,6 +3606,14 @@ fn powers(content: &Content, values: &Value) -> Result<Vec<Power>, String> {
             })
         })
         .collect()
+}
+
+fn oracle_power_value(oracle: &Value, creature: &str, power: &str, field: &str) -> Option<i16> {
+    array(&oracle["power_states"][creature])
+        .iter()
+        .find(|state| state["model_id"] == power)?[field]
+        .as_i64()
+        .map(|value| value as i16)
 }
 
 fn ids<T>(
@@ -2889,6 +3675,19 @@ fn infer_move(enemy: &EnemyDef, state: &Value, move_id: &str) -> usize {
         ("MONSTER.HUNTER_KILLER", "PUNCTURE_MOVE") => Some(2),
         ("MONSTER.CHOMPER", "CLAMP_MOVE") => Some(0),
         ("MONSTER.CHOMPER", "SCREECH_MOVE") => Some(1),
+        ("MONSTER.SHRINKER_BEETLE", "SHRINKER_MOVE") => Some(0),
+        ("MONSTER.SHRINKER_BEETLE", "CHOMP_MOVE") => Some(1),
+        ("MONSTER.SHRINKER_BEETLE", "STOMP_MOVE") => Some(2),
+        ("MONSTER.SLUDGE_SPINNER", "OIL_SPRAY_MOVE") => Some(0),
+        ("MONSTER.SLUDGE_SPINNER", "SLAM_MOVE") => Some(1),
+        ("MONSTER.SLUDGE_SPINNER", "RAGE_MOVE") => Some(2),
+        ("MONSTER.GREMLIN_MERC", "GIMME_MOVE") => Some(0),
+        ("MONSTER.GREMLIN_MERC", "DOUBLE_SMASH_MOVE") => Some(1),
+        ("MONSTER.GREMLIN_MERC", "HEHE_MOVE") => Some(2),
+        ("MONSTER.TWO_TAILED_RAT", "SCRATCH_MOVE") => Some(0),
+        ("MONSTER.TWO_TAILED_RAT", "DISEASE_BITE_MOVE") => Some(1),
+        ("MONSTER.TWO_TAILED_RAT", "SCREECH_MOVE") => Some(2),
+        ("MONSTER.TWO_TAILED_RAT", "CALL_FOR_BACKUP_MOVE") => Some(3),
         ("MONSTER.BOWLBUG_EGG", "BITE_MOVE") => Some(0),
         ("MONSTER.BOWLBUG_NECTAR", "THRASH_MOVE") => Some(0),
         ("MONSTER.BOWLBUG_NECTAR", "BUFF_MOVE") => Some(1),
@@ -2897,10 +3696,40 @@ fn infer_move(enemy: &EnemyDef, state: &Value, move_id: &str) -> usize {
         ("MONSTER.BOWLBUG_ROCK", "DIZZY_MOVE" | "STUNNED") => Some(1),
         ("MONSTER.BOWLBUG_SILK", "THRASH_MOVE") => Some(0),
         ("MONSTER.BOWLBUG_SILK", "TOXIC_SPIT_MOVE") => Some(1),
+        ("MONSTER.NIBBIT", "BUTT_MOVE") => Some(0),
+        ("MONSTER.NIBBIT", "SLICE_MOVE") => Some(1),
+        ("MONSTER.NIBBIT", "HISS_MOVE") => Some(2),
+        ("MONSTER.CORPSE_SLUG", "WHIP_SLAP_MOVE" | "STUNNED") => Some(0),
+        ("MONSTER.CORPSE_SLUG", "GLOMP_MOVE") => Some(1),
+        ("MONSTER.CORPSE_SLUG", "GOOP_MOVE") => Some(2),
+        ("MONSTER.CUBEX_CONSTRUCT", "CHARGE_UP_MOVE") => Some(0),
+        ("MONSTER.CUBEX_CONSTRUCT", "REPEATER_BLAST_MOVE") => Some(1),
+        ("MONSTER.CUBEX_CONSTRUCT", "REPEATER_BLAST_MOVE_2") => Some(2),
+        ("MONSTER.CUBEX_CONSTRUCT", "EXPEL_MOVE") => Some(3),
+        ("MONSTER.SLITHERING_STRANGLER", "CONSTRICT") => Some(0),
+        ("MONSTER.SLITHERING_STRANGLER", "THWACK") => Some(1),
+        ("MONSTER.SLITHERING_STRANGLER", "LASH") => Some(2),
+        ("MONSTER.SKULKING_COLONY", "ZOOM_MOVE") => Some(0),
+        ("MONSTER.SKULKING_COLONY", "ZOOM_MOVE_2") => Some(1),
+        ("MONSTER.SKULKING_COLONY", "INERTIA_MOVE") => Some(2),
+        ("MONSTER.SKULKING_COLONY", "PIERCING_STABS_MOVE") => Some(3),
+        ("MONSTER.TWIG_SLIME_M", "POKEY_POUNCE_MOVE") => Some(0),
+        ("MONSTER.TWIG_SLIME_M", "STICKY_SHOT_MOVE") => Some(1),
+        ("MONSTER.TOADPOLE", "SPIKE_SPIT_MOVE") => Some(0),
+        ("MONSTER.TOADPOLE", "WHIRL_MOVE") => Some(1),
+        ("MONSTER.TOADPOLE", "SPIKEN_MOVE") => Some(2),
+        ("MONSTER.TERROR_EEL", "CRASH_MOVE") => Some(0),
+        ("MONSTER.TERROR_EEL", "THRASH_MOVE") => Some(1),
+        ("MONSTER.TERROR_EEL", "DIZZY_MOVE" | "STUNNED") => Some(2),
+        ("MONSTER.TERROR_EEL", "TERROR_MOVE") => Some(3),
         ("MONSTER.THE_OBSCURA", "ILLUSION_MOVE") => Some(0),
         ("MONSTER.THE_OBSCURA", "PIERCING_GAZE_MOVE") => Some(1),
         ("MONSTER.THE_OBSCURA", "SAIL_MOVE") => Some(2),
         ("MONSTER.THE_OBSCURA", "HARDENING_STRIKE_MOVE") => Some(3),
+        ("MONSTER.PHANTASMAL_GARDENER", "BITE_MOVE") => Some(0),
+        ("MONSTER.PHANTASMAL_GARDENER", "LASH_MOVE") => Some(1),
+        ("MONSTER.PHANTASMAL_GARDENER", "FLAIL_MOVE") => Some(2),
+        ("MONSTER.PHANTASMAL_GARDENER", "ENLARGE_MOVE") => Some(3),
         ("MONSTER.PARAFRIGHT", "SLAM_MOVE") => Some(0),
         ("MONSTER.PARAFRIGHT", "REVIVE_MOVE") => Some(1),
         (
@@ -2940,6 +3769,20 @@ fn infer_move(enemy: &EnemyDef, state: &Value, move_id: &str) -> usize {
         ("MONSTER.FLYCONID", "VULNERABLE_SPORES_MOVE") => Some(0),
         ("MONSTER.FLYCONID", "FRAIL_SPORES_MOVE") => Some(1),
         ("MONSTER.FLYCONID", "SMASH_MOVE") => Some(2),
+        ("MONSTER.FOSSIL_STALKER", "TACKLE_MOVE") => Some(0),
+        ("MONSTER.FOSSIL_STALKER", "LATCH_MOVE") => Some(1),
+        ("MONSTER.FOSSIL_STALKER", "LASH_MOVE") => Some(2),
+        ("MONSTER.LIVING_FOG", "ADVANCED_GAS_MOVE" | "SUPER_GAS_BLAST_MOVE") => Some(0),
+        ("MONSTER.LIVING_FOG", "BLOAT_MOVE") => Some(1),
+        ("MONSTER.FOGMOG", "ILLUSION_MOVE") => Some(0),
+        ("MONSTER.FOGMOG", "SWIPE_MOVE") => Some(1),
+        ("MONSTER.FOGMOG", "SWIPE_RANDOM_MOVE") => Some(2),
+        ("MONSTER.FOGMOG", "HEADBUTT_MOVE") => Some(3),
+        ("MONSTER.EYE_WITH_TEETH", "DISTRACT_MOVE") => Some(0),
+        ("MONSTER.EYE_WITH_TEETH", "REVIVE_MOVE") => Some(1),
+        ("MONSTER.CEREMONIAL_BEAST", "STAMP_MOVE") => Some(0),
+        ("MONSTER.CEREMONIAL_BEAST", "PLOW_MOVE") => Some(1),
+        ("MONSTER.CEREMONIAL_BEAST", "STUNNED") => Some(2),
         ("MONSTER.BYGONE_EFFIGY", "SLEEP_MOVE") => Some(0),
         ("MONSTER.BYGONE_EFFIGY", "WAKE_MOVE") => Some(1),
         ("MONSTER.BYGONE_EFFIGY", "SLEEP_MOVE_2") => Some(2),
@@ -3055,11 +3898,15 @@ fn intent_matches(intent: &str, kind: &str) -> bool {
         "Buff" => !intent.starts_with("Attack") && !intent.contains("Debuff"),
         "Escape" => intent.contains("Escape"),
         "Heal" => intent.contains("Heal"),
+        "DeathBlow" => intent.starts_with("Attack") || intent.contains("DeathBlow"),
         "Sleep" => intent.contains("Sleep"),
         "Stun" => intent.contains("Stun"),
         "Summon" => intent.contains("Summon"),
         "StatusCard" => {
-            intent.contains("Status") || intent.contains("Infection") || intent.contains("Slimed")
+            intent.contains("Status")
+                || intent.contains("Dazed")
+                || intent.contains("Infection")
+                || intent.contains("Slimed")
         }
         _ => !intent.starts_with("Attack"),
     }

@@ -99,7 +99,10 @@ const NOXIOUS_FUMES_HOOKS: &[Hook] = &[Hook {
 }];
 const INFINITE_BLADES_HOOKS: &[Hook] = &[Hook {
     trigger: Trigger::TurnStart,
-    effects: effects![Effect::AddCard(Pile::Hand, 137, 1)],
+    effects: effects![Effect::Repeat(
+        Amount::scaled(Scale::Power(20), 1),
+        effects![Effect::AddCard(Pile::Hand, 137, 1)],
+    )],
 }];
 const ENERGY_NEXT_TURN_HOOKS: &[Hook] = &[Hook {
     trigger: Trigger::TurnStart,
@@ -430,6 +433,14 @@ const RESTORE_DEXTERITY_HOOKS: &[Hook] = &[Hook {
         Amount::scaled(Scale::Power(54), -1),
     )],
 }];
+const ANTICIPATE_HOOKS: &[Hook] = &[Hook {
+    trigger: Trigger::TurnEnd,
+    effects: effects![Effect::ApplyPower(
+        Target::Source,
+        power_id::DEXTERITY,
+        Amount::scaled(Scale::Power(power_id::ANTICIPATE), -1),
+    )],
+}];
 const HELICAL_DART_HOOKS: &[Hook] = &[Hook {
     trigger: Trigger::TurnEnd,
     effects: effects![Effect::ApplyPower(
@@ -524,16 +535,6 @@ const CALAMITY_HOOKS: &[Hook] = &[Hook {
     effects: effects![Effect::Repeat(
         Amount::scaled(Scale::Power(147), 1),
         &[Effect::RandomCard(Pile::Hand, CardType::Attack, 1, false)],
-    )],
-}];
-const ENTROPY_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
-    effects: effects![Effect::SelectAmount(
-        Pile::Hand,
-        CardFilter::Any,
-        Amount::scaled(Scale::Power(148), 1),
-        false,
-        CardOp::TransformRandom,
     )],
 }];
 const MAYHEM_HOOKS: &[Hook] = &[Hook {
@@ -849,7 +850,7 @@ const DOUBT_HOOKS: &[Hook] = &[Hook {
 }];
 const REGRET_HOOKS: &[Hook] = &[Hook {
     trigger: Trigger::TurnEnd,
-    effects: effects![Effect::Damage(
+    effects: effects![Effect::LoseHp(
         Target::Player,
         Amount::scaled(Scale::HandSize, 1),
     )],
@@ -1200,14 +1201,11 @@ const WIKI_CORPSE_SLUG_MOVES: &[MoveDef] = &[
         effects: &[Effect::Attack(Target::Player, Amount::fixed(3, 3), 2)],
     },
     MoveDef {
-        intent: "Attack 8, Weak 1",
+        intent: "Attack 8",
         weight: 1,
         max_repeats: 1,
         next: &[2],
-        effects: &[
-            Effect::Attack(Target::Player, Amount::ascended(8, 9), 1),
-            Effect::ApplyPower(Target::Player, power_id::WEAK, Amount::fixed(1, 1)),
-        ],
+        effects: &[Effect::Attack(Target::Player, Amount::ascended(8, 9), 1)],
     },
     MoveDef {
         intent: "Debuff",
@@ -2817,7 +2815,10 @@ const WIKI_SLUDGE_SPINNER_MOVES: &[MoveDef] = &[
         weight: 1,
         max_repeats: 1,
         next: &[],
-        effects: &[Effect::Attack(Target::Player, Amount::ascended(8, 9), 1)],
+        effects: &[
+            Effect::Attack(Target::Player, Amount::ascended(8, 9), 1),
+            Effect::ApplyPower(Target::Player, power_id::WEAK, Amount::fixed(1, 1)),
+        ],
     },
     MoveDef {
         intent: "Attack 11",
@@ -3565,7 +3566,7 @@ const WIKI_TURRET_OPERATOR_MOVES: &[MoveDef] = &[
 const WIKI_TWIG_SLIME_M_MOVES: &[MoveDef] = &[
     MoveDef {
         intent: "Attack 11",
-        weight: 2,
+        weight: 1,
         max_repeats: 2,
         next: &[0, 1],
         effects: &[Effect::Attack(Target::Player, Amount::ascended(11, 12), 1)],
@@ -3602,7 +3603,7 @@ const WIKI_TWO_TAILED_RAT_MOVES: &[MoveDef] = &[
     },
     MoveDef {
         intent: "Frail 1",
-        weight: 3,
+        weight: 1,
         max_repeats: 1,
         next: &[0, 1, 2, 3],
         effects: &[Effect::ApplyPower(
@@ -6682,7 +6683,14 @@ pub fn foundation_content() -> Content {
             [0, 0],
             Target::ChosenEnemy,
             [0, 0],
-            effects![Effect::Attack(Target::ChosenEnemy, Amount::fixed(3, 4), 1)],
+            effects![
+                Effect::Attack(Target::ChosenEnemy, Amount::fixed(3, 4), 1),
+                Effect::If(
+                    Condition::Upgraded,
+                    effects![Effect::PassiveLightning(2)],
+                    effects![Effect::PassiveLightning(1)]
+                )
+            ],
         ),
         uncommon_card(
             "CARD.THRUMMING_HATCHET",
@@ -7839,7 +7847,11 @@ pub fn foundation_content() -> Content {
             [0, 0],
             effects![
                 Effect::Attack(Target::ChosenEnemy, Amount::fixed(15, 20), 1),
-                Effect::ApplyPower(Target::Player, 43, Amount::fixed(2, 2))
+                Effect::ApplyPower(
+                    Target::Player,
+                    power_id::DRAW_CARDS_NEXT_TURN,
+                    Amount::fixed(2, 2),
+                )
             ],
         ),
         uncommon_card(
@@ -8079,7 +8091,7 @@ pub fn foundation_content() -> Content {
             [0, 0],
             effects![
                 Effect::ApplyPower(Target::Player, 1, Amount::fixed(2, 3)),
-                Effect::ApplyPower(Target::Player, 54, Amount::fixed(2, 3))
+                Effect::ApplyPower(Target::Player, power_id::ANTICIPATE, Amount::fixed(2, 3))
             ],
         ),
         rare_card(
@@ -8910,7 +8922,11 @@ pub fn foundation_content() -> Content {
             effects![
                 Effect::Stars(Amount::fixed(1, 2)),
                 Effect::Draw(1),
-                Effect::ApplyPower(Target::Player, 43, Amount::fixed(1, 1))
+                Effect::ApplyPower(
+                    Target::Player,
+                    power_id::DRAW_CARDS_NEXT_TURN,
+                    Amount::fixed(1, 1),
+                )
             ],
         ),
         rare_card(
@@ -9212,9 +9228,10 @@ pub fn foundation_content() -> Content {
             [0, 0],
             Target::AllEnemies,
             [0, 0],
-            effects![Effect::Repeat(
-                Amount::scaled(Scale::StarsGained, 1),
-                effects![Effect::Attack(Target::AllEnemies, Amount::fixed(3, 4), 1)]
+            effects![Effect::AttackMany(
+                Target::AllEnemies,
+                Amount::fixed(3, 4),
+                Amount::scaled(Scale::StarsGained, 1)
             )],
         ),
         card(
@@ -11159,10 +11176,7 @@ pub fn foundation_content() -> Content {
             [0, 0],
             Target::ChosenEnemy,
             [0, 0],
-            effects![Effect::MoveDamage(
-                Target::ChosenEnemy,
-                Amount::fixed(8, 11)
-            )],
+            effects![Effect::MoveDamage(Target::AllEnemies, Amount::fixed(8, 11))],
         ),
         uncommon_card(
             "CARD.PANIC_BUTTON",
@@ -12870,7 +12884,7 @@ pub fn foundation_content() -> Content {
                 id: "POWER.ENTROPY_POWER",
                 kind: PowerKind::Other,
                 debuff: false,
-                hooks: ENTROPY_HOOKS,
+                hooks: EMPTY_HOOKS,
             },
             PowerDef {
                 id: "POWER.FASTEN_POWER",
@@ -12970,9 +12984,9 @@ pub fn foundation_content() -> Content {
             },
             PowerDef {
                 id: "POWER.ANTICIPATE_POWER",
-                kind: PowerKind::Other,
+                kind: PowerKind::OneShot(Trigger::TurnEnd),
                 debuff: false,
-                hooks: EMPTY_HOOKS,
+                hooks: ANTICIPATE_HOOKS,
             },
             PowerDef {
                 id: "POWER.ASLEEP_POWER",
@@ -16603,14 +16617,7 @@ pub fn foundation_content() -> Content {
                 )],
                 evoke: effects![Effect::Damage(
                     Target::AllEnemies,
-                    Amount {
-                        base: 8,
-                        upgraded: 8,
-                        ascension: 0,
-                        scale: Scale::Power(17),
-                        multiplier: 1,
-                        divisor: 1,
-                    },
+                    Amount::scaled(Scale::Event, 2),
                 )],
             },
         ],

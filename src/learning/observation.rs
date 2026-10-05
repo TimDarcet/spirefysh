@@ -1824,6 +1824,9 @@ fn preview_target(target: Target, context: Context) -> Option<PreviewTarget> {
             _ => None,
         },
         Target::ChosenEnemy | Target::ChosenEnemyOrDead => Some(PreviewTarget::Chosen),
+        Target::RandomEnemy if context.orb && context.target.is_some() => {
+            Some(PreviewTarget::Chosen)
+        }
         Target::RandomEnemy => Some(PreviewTarget::Random),
         Target::LowestHpEnemy => Some(PreviewTarget::Lowest),
         Target::AllEnemies => Some(PreviewTarget::All),
@@ -2114,7 +2117,13 @@ fn preview_channel(game: &Game, content: &Content, id: Id, preview: &mut CardPre
     }
 }
 
-fn preview_passive(game: &Game, content: &Content, index: usize, preview: &mut CardPreview) {
+fn preview_passive(
+    game: &Game,
+    content: &Content,
+    index: usize,
+    target: Option<usize>,
+    preview: &mut CardPreview,
+) {
     let Some(orb) = preview.orbs.get(index).copied() else {
         return;
     };
@@ -2140,7 +2149,9 @@ fn preview_passive(game: &Game, content: &Content, index: usize, preview: &mut C
             preview.orbs[index].value = event.saturating_sub(def.passive_decay).max(0);
         }
         contexts.push(Context {
+            target,
             event,
+            orb: target.is_some(),
             orb_id: Some(orb.id),
             ..Context::player()
         });
@@ -2927,7 +2938,7 @@ fn preview_effects(
             }
             Effect::PassiveFirst(count) => {
                 for _ in 0..(count as i16).saturating_mul(repeats).max(0) {
-                    preview_passive(game, content, 0, preview);
+                    preview_passive(game, content, 0, None, preview);
                 }
             }
             Effect::PassiveLast(count) => {
@@ -2935,13 +2946,22 @@ fn preview_effects(
                     let Some(last) = preview.orbs.len().checked_sub(1) else {
                         break;
                     };
-                    preview_passive(game, content, last, preview);
+                    preview_passive(game, content, last, None, preview);
                 }
             }
             Effect::PassiveAll => {
                 for _ in 0..repeats.max(0) {
                     for index in (0..preview.orbs.len()).rev() {
-                        preview_passive(game, content, index, preview);
+                        preview_passive(game, content, index, None, preview);
+                    }
+                }
+            }
+            Effect::PassiveLightning(count) => {
+                for _ in 0..(count as i16).saturating_mul(repeats).max(0) {
+                    for index in (0..preview.orbs.len()).rev() {
+                        if preview.orbs[index].id == orb_id::LIGHTNING {
+                            preview_passive(game, content, index, context.target, preview);
+                        }
                     }
                 }
             }
@@ -4154,6 +4174,7 @@ fn effect_index(effect: &Effect) -> usize {
         Effect::PassiveFirst(..) => 101,
         Effect::PassiveLast(..) => 102,
         Effect::PassiveAll => 103,
+        Effect::PassiveLightning(..) => 118,
         Effect::OrbSlots(..) => 104,
         Effect::Stars(..) => 105,
         Effect::Forge(..) => 106,
@@ -4839,7 +4860,10 @@ fn canonical_map(game: &Game, content: &Content, layout: Layout) -> CanonicalMap
     for row in &mut edges {
         populate_domain_features(game, content, layout, MAP_EDGE_DOMAIN, row);
     }
-    let current = game.map.current.map_or(ids[order[0]], |index| ids[index]);
+    let current = game.map.current.map_or_else(
+        || order.first().map_or(0, |&index| ids[index]),
+        |index| ids[index],
+    );
     (nodes.into(), edges.into(), ids.into(), current)
 }
 
@@ -5865,6 +5889,7 @@ impl ContinuationBuilder {
             | Effect::EvokeAll(count)
             | Effect::PassiveFirst(count)
             | Effect::PassiveLast(count)
+            | Effect::PassiveLightning(count)
             | Effect::WhisperingEarring(count) => row.u[11] = count as u32,
             Effect::DrawTo(values)
             | Effect::RandomOrb(values)

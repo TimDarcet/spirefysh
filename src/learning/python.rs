@@ -1256,7 +1256,6 @@ struct Batch {
     root_ids: Vec<usize>,
     archive: Vec<Vec<Game>>,
     archive_seen: Vec<u64>,
-    first_archive: Vec<Game>,
     random: u64,
     next_seed: u64,
     seed_stride: u64,
@@ -5491,7 +5490,6 @@ impl Batch {
         let mut batch = Self {
             archive: vec![vec![]; content.characters.len() * 64 * PHASES],
             archive_seen: vec![0; content.characters.len() * 64 * PHASES],
-            first_archive: vec![],
             actions: vec![vec![]; size],
             plans: vec![vec![]; size],
             starts: vec![],
@@ -5659,6 +5657,15 @@ impl Batch {
         self.root_ids = vec![usize::MAX; self.games.len()];
         self.searched_turns = vec![None; self.games.len()];
         Ok(())
+    }
+
+    fn compare_transition(&self, transition: &str) -> PyResult<Vec<String>> {
+        let value = serde_json::from_str(transition)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        Ok(crate::replay::compare_live_transition(
+            &self.content,
+            &value,
+        ))
     }
 
     fn action_descriptors(
@@ -8011,9 +8018,6 @@ impl Batch {
         let game = self.games[index].clone();
         if matches!(game.phase, Phase::Won | Phase::Dead) {
             return;
-        }
-        if index == 0 {
-            self.first_archive.push(game.clone());
         }
         let floor =
             (game.run.act.saturating_sub(1) as usize * 18 + game.run.floor as usize).min(63);

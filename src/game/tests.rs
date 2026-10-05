@@ -31,7 +31,7 @@ fn dead_test_subject_keeps_its_revive_move() {
 }
 
 #[test]
-fn corpse_slug_glomp_attacks_and_applies_weak() {
+fn corpse_slug_glomp_attacks_and_goop_applies_frail() {
     let content = foundation_content();
     let slug = content
         .enemies
@@ -40,19 +40,73 @@ fn corpse_slug_glomp_attacks_and_applies_weak() {
         .unwrap();
     assert!(matches!(
         slug.moves[1].effects,
-        [
-            Effect::Attack(Target::Player, ..),
-            Effect::ApplyPower(
-                Target::Player,
-                power_id::WEAK,
-                Amount {
-                    base: 1,
-                    upgraded: 1,
-                    ..
-                }
-            ),
-        ]
+        [Effect::Attack(Target::Player, ..)]
     ));
+    assert!(matches!(
+        slug.moves[2].effects,
+        [Effect::ApplyPower(
+            Target::Player,
+            power_id::FRAIL,
+            Amount {
+                base: 2,
+                upgraded: 2,
+                ..
+            }
+        )]
+    ));
+}
+
+#[test]
+fn omnislice_damages_all_enemies() {
+    let content = foundation_content();
+    let card = &content.cards[content.card_id("CARD.OMNISLICE").unwrap() as usize];
+    assert!(matches!(
+        card.effects,
+        [Effect::MoveDamage(Target::AllEnemies, _)]
+    ));
+}
+
+#[test]
+fn tesla_coil_triggers_lightning_on_its_target() {
+    let content = foundation_content();
+    let mut game = Game::new_character_ascension(&content, 1, 1, 0).unwrap();
+    game.begin_act(&content, 0).unwrap();
+    game.start_combat(&content, content.acts[0].encounters[0])
+        .unwrap();
+    let combat = game.combat_mut().unwrap();
+    let mut enemy = combat.enemies[0].clone();
+    enemy.instance += 1;
+    combat.enemies.push(enemy);
+    for enemy in &mut combat.enemies {
+        enemy.creature.hp = 100;
+        enemy.creature.max_hp = 100;
+        enemy.creature.block = 0;
+        enemy.creature.powers.clear();
+    }
+    combat.hand = vec![Card {
+        id: content.card_id("CARD.TESLA_COIL").unwrap(),
+        ..Card::default()
+    }];
+    combat.orbs = vec![
+        Orb {
+            id: orb_id::LIGHTNING,
+            value: 0,
+        };
+        2
+    ];
+
+    game.step(
+        &content,
+        Action::Play {
+            hand: 0,
+            target: Some(1),
+        },
+    )
+    .unwrap();
+
+    let enemies = &game.combat().unwrap().enemies;
+    assert_eq!(enemies[0].creature.hp, 100);
+    assert_eq!(enemies[1].creature.hp, 91);
 }
 
 #[test]
@@ -527,6 +581,8 @@ fn smoggy_allows_only_one_skill_each_turn() {
     ];
     combat.energy = 10;
     combat.player.add_power(power_id::SMOGGY, 1);
+    game.apply_power(&content, Actor::Player, power_id::SMOGGY, 1);
+    assert_eq!(game.combat().unwrap().player.power(power_id::SMOGGY), 1);
     assert!(game.actions(&content).contains(&Action::Play {
         hand: 0,
         target: None
@@ -785,6 +841,64 @@ fn generated_encounters_align_enemy_hit_counters() {
 }
 
 #[test]
+fn osty_attack_overflow_damages_player() {
+    let content = foundation_content();
+    let mut game = Game::new_character_ascension(&content, 1, 4, 0).unwrap();
+    game.begin_act(&content, 0).unwrap();
+    game.start_combat(&content, content.acts[0].encounters[0])
+        .unwrap();
+    let combat = game.combat_mut().unwrap();
+    combat.player.hp = 50;
+    combat.player.block = 3;
+    combat.player.powers.clear();
+    combat.osty.hp = 2;
+    combat.osty.max_hp = 2;
+    combat.osty.powers.clear();
+    combat.enemies[0].creature.powers.clear();
+
+    let result = game.damage(
+        &content,
+        Actor::Enemy(0),
+        Actor::Player,
+        10,
+        DamageKind::Attack,
+        None,
+    );
+
+    let combat = game.combat().unwrap();
+    assert_eq!(combat.osty.hp, 0);
+    assert_eq!(combat.player.hp, 45);
+    assert_eq!(combat.history.hp_lost, 5);
+    assert_eq!(result.lost, 7);
+}
+
+#[test]
+fn direct_osty_damage_does_not_overflow() {
+    let content = foundation_content();
+    let mut game = Game::new_character_ascension(&content, 1, 4, 0).unwrap();
+    game.begin_act(&content, 0).unwrap();
+    game.start_combat(&content, content.acts[0].encounters[0])
+        .unwrap();
+    let combat = game.combat_mut().unwrap();
+    combat.player.hp = 50;
+    combat.osty.hp = 1;
+    combat.osty.max_hp = 1;
+
+    game.damage(
+        &content,
+        Actor::Enemy(0),
+        Actor::Osty,
+        2,
+        DamageKind::Unpowered,
+        None,
+    );
+
+    let combat = game.combat().unwrap();
+    assert_eq!(combat.osty.hp, 0);
+    assert_eq!(combat.player.hp, 50);
+}
+
+#[test]
 fn channeling_with_no_slots_creates_one() {
     let content = foundation_content();
     let mut game = Game::new_character_ascension(&content, 1, 0, 0).unwrap();
@@ -808,6 +922,278 @@ fn channeling_with_no_slots_creates_one() {
         (combat.orbs[0].id, combat.orbs[0].value),
         (orb_id::LIGHTNING, 0)
     );
+}
+
+#[test]
+fn glass_orb_evokes_for_twice_its_remaining_value() {
+    let content = foundation_content();
+    let glass = content
+        .orbs
+        .iter()
+        .position(|orb| orb.id == "ORB.GLASS_ORB")
+        .unwrap() as Id;
+    let mut game = Game::new_character_ascension(&content, 1, 1, 0).unwrap();
+    game.begin_act(&content, 0).unwrap();
+    game.start_combat(&content, content.acts[0].encounters[0])
+        .unwrap();
+    let combat = game.combat_mut().unwrap();
+    combat.enemies[0].creature.hp = 100;
+    combat.enemies[0].creature.powers.clear();
+    combat.orb_slots = 1;
+    combat.orbs = vec![Orb {
+        id: glass,
+        value: 3,
+    }];
+    combat.queue.push(Pending {
+        effect: Effect::Channel(orb_id::LIGHTNING, 1),
+        context: Context::player(),
+    });
+
+    game.resolve(&content);
+
+    assert_eq!(game.combat().unwrap().enemies[0].creature.hp, 94);
+}
+
+#[test]
+fn regret_ignores_block() {
+    let content = foundation_content();
+    let mut game = Game::new_character_ascension(&content, 1, 2, 0).unwrap();
+    game.begin_act(&content, 0).unwrap();
+    game.start_combat(&content, content.acts[0].encounters[0])
+        .unwrap();
+    let combat = game.combat_mut().unwrap();
+    combat.player.hp = 50;
+    combat.player.block = 5;
+    combat.hand = vec![Card {
+        id: content.card_id("CARD.REGRET").unwrap(),
+        ..Card::default()
+    }];
+    combat.enemies[0].move_index = 1;
+
+    game.step(&content, Action::EndTurn).unwrap();
+
+    assert_eq!(game.combat().unwrap().player.hp, 49);
+}
+
+#[test]
+fn curse_debuffs_survive_their_application_turn() {
+    let content = foundation_content();
+    for (card, power) in [
+        ("CARD.DOUBT", power_id::WEAK),
+        ("CARD.SHAME", power_id::FRAIL),
+    ] {
+        let mut game = Game::new_character_ascension(&content, 1, 2, 0).unwrap();
+        game.begin_act(&content, 0).unwrap();
+        game.start_combat(&content, content.acts[0].encounters[0])
+            .unwrap();
+        let combat = game.combat_mut().unwrap();
+        combat.hand = vec![Card {
+            id: content.card_id(card).unwrap(),
+            ..Card::default()
+        }];
+        combat.enemies[0].move_index = 1;
+
+        game.step(&content, Action::EndTurn).unwrap();
+
+        assert_eq!(game.combat().unwrap().player.power(power), 1);
+    }
+}
+
+#[test]
+fn ethereal_cards_exhaust_when_the_hand_is_retained() {
+    let content = foundation_content();
+    let mut game = Game::new_character_ascension(&content, 1, 2, 0).unwrap();
+    game.begin_act(&content, 0).unwrap();
+    game.start_combat(&content, content.acts[0].encounters[0])
+        .unwrap();
+    let combat = game.combat_mut().unwrap();
+    let defend = Card {
+        id: content.card_id("CARD.DEFEND_IRONCLAD").unwrap(),
+        ..Card::default()
+    };
+    let bane = Card {
+        id: content.card_id("CARD.ASCENDERS_BANE").unwrap(),
+        ..Card::default()
+    };
+    let regret = Card {
+        id: content.card_id("CARD.REGRET").unwrap(),
+        ..Card::default()
+    };
+    combat.hand = vec![bane, defend, regret];
+    combat.player.add_power(power_id::RETAIN_HAND, 1);
+    combat.enemies[0].move_index = 1;
+
+    game.step(&content, Action::EndTurn).unwrap();
+
+    let combat = game.combat().unwrap();
+    assert!(combat.hand.contains(&defend));
+    assert!(combat.exhaust.contains(&bane));
+    assert!(combat.discard.contains(&regret));
+}
+
+#[test]
+fn enemy_vigor_strengthens_one_attack() {
+    let content = foundation_content();
+    let mut game = Game::new_character_ascension(&content, 1, 2, 10).unwrap();
+    game.begin_act(&content, 1).unwrap();
+    let encounter = content
+        .encounters
+        .iter()
+        .position(|encounter| encounter.id == "ENCOUNTER.TERROR_EEL_ELITE")
+        .unwrap() as Id;
+    game.start_combat(&content, encounter).unwrap();
+    let combat = game.combat_mut().unwrap();
+    combat.player.hp = 68;
+    combat.player.block = 10;
+    combat.enemies[0].move_index = 0;
+    combat.enemies[0].creature.add_power(power_id::VIGOR, 6);
+
+    game.step(&content, Action::EndTurn).unwrap();
+
+    let combat = game.combat().unwrap();
+    assert_eq!(combat.player.hp, 54);
+    assert_eq!(combat.enemies[0].creature.power(power_id::VIGOR), 0);
+}
+
+#[test]
+fn cubex_construct_starts_without_block() {
+    let content = foundation_content();
+    let mut game = Game::new_character_ascension(&content, 1, 1, 10).unwrap();
+    game.begin_act(&content, 0).unwrap();
+    let encounter = content
+        .encounters
+        .iter()
+        .position(|encounter| encounter.id == "ENCOUNTER.CUBEX_CONSTRUCT_NORMAL")
+        .unwrap() as Id;
+
+    game.start_combat(&content, encounter).unwrap();
+
+    assert_eq!(game.combat().unwrap().enemies[0].creature.block, 0);
+}
+
+#[test]
+fn echo_form_duplicates_only_the_first_card() {
+    let content = foundation_content();
+    let mut game = Game::new_character_ascension(&content, 1, 0, 0).unwrap();
+    game.begin_act(&content, 0).unwrap();
+    game.start_combat(&content, content.acts[0].encounters[0])
+        .unwrap();
+    let combat = game.combat_mut().unwrap();
+    let strike = Card {
+        id: content.card_id("CARD.STRIKE_IRONCLAD").unwrap(),
+        ..Card::default()
+    };
+    combat.hand = vec![strike; 2];
+    combat.energy = 2;
+    combat.enemies[0].creature.hp = 100;
+    combat.enemies[0].creature.powers.clear();
+    combat.player.add_power(power_id::ECHO_FORM, 1);
+
+    game.step(
+        &content,
+        Action::Play {
+            hand: 0,
+            target: Some(0),
+        },
+    )
+    .unwrap();
+    game.step(
+        &content,
+        Action::Play {
+            hand: 0,
+            target: Some(0),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(game.combat().unwrap().enemies[0].creature.hp, 82);
+}
+
+#[test]
+fn ritual_starts_gaining_strength_on_the_next_turn() {
+    let content = foundation_content();
+    let mut game = Game::new_character_ascension(&content, 1, 0, 10).unwrap();
+    game.begin_act(&content, 0).unwrap();
+    game.start_combat(&content, content.acts[0].encounters[0])
+        .unwrap();
+    let cultist = content
+        .enemies
+        .iter()
+        .position(|enemy| enemy.id == "MONSTER.CALCIFIED_CULTIST")
+        .unwrap() as Id;
+    let enemy = &mut game.combat_mut().unwrap().enemies[0];
+    enemy.creature.id = cultist;
+    enemy.move_index = 0;
+    enemy.last_move = 0;
+
+    game.step(&content, Action::EndTurn).unwrap();
+
+    let enemy = &game.combat().unwrap().enemies[0].creature;
+    assert_eq!(enemy.power(power_id::RITUAL), 2);
+    assert_eq!(enemy.power(power_id::STRENGTH), 0);
+}
+
+#[test]
+fn anticipate_restores_dexterity_at_turn_end() {
+    let content = foundation_content();
+    let mut game = Game::new_character_ascension(&content, 1, 2, 0).unwrap();
+    game.begin_act(&content, 0).unwrap();
+    game.start_combat(&content, content.acts[0].encounters[0])
+        .unwrap();
+    let player = &mut game.combat_mut().unwrap().player;
+    player.add_power(power_id::DEXTERITY, 2);
+    player.add_power(power_id::ANTICIPATE, 2);
+
+    game.step(&content, Action::EndTurn).unwrap();
+
+    let player = &game.combat().unwrap().player;
+    assert_eq!(player.power(power_id::DEXTERITY), 0);
+    assert_eq!(player.power(power_id::ANTICIPATE), 0);
+}
+
+#[test]
+fn infinite_blades_creates_one_shiv_per_stack() {
+    let content = foundation_content();
+    let mut game = Game::new_character_ascension(&content, 1, 0, 0).unwrap();
+    game.begin_act(&content, 0).unwrap();
+    game.start_combat(&content, content.acts[0].encounters[0])
+        .unwrap();
+    let combat = game.combat_mut().unwrap();
+    combat.hand.clear();
+    combat.draw.clear();
+    combat.player.add_power(20, 2);
+
+    game.start_turn(&content);
+
+    let shiv = content.card_id("CARD.SHIV").unwrap();
+    assert_eq!(
+        game.combat()
+            .unwrap()
+            .hand
+            .iter()
+            .filter(|card| card.id == shiv)
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn minions_do_not_keep_combat_open() {
+    let content = foundation_content();
+    let mut game = Game::new_character_ascension(&content, 1, 0, 0).unwrap();
+    game.begin_act(&content, 0).unwrap();
+    let encounter = content
+        .encounters
+        .iter()
+        .position(|encounter| encounter.id == "ENCOUNTER.FOGMOG_NORMAL")
+        .unwrap() as Id;
+    game.start_combat(&content, encounter).unwrap();
+    game.combat_mut().unwrap().enemies[0].creature.hp = 0;
+    game.spawn_enemy(&content, "MONSTER.EYE_WITH_TEETH");
+
+    game.finish_combat(&content);
+
+    assert!(!matches!(game.phase, Phase::Combat(_)));
 }
 
 #[test]

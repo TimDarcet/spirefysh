@@ -412,6 +412,7 @@ pub enum Effect {
     PassiveFirst(u8),
     PassiveLast(u8),
     PassiveAll,
+    PassiveLightning(u8),
     OrbSlots(i8),
     Stars(Amount),
     Forge(Amount),
@@ -518,6 +519,7 @@ mod foundation_id {
         pub const MIND_ROT: Id = 219;
         pub const PAINFUL_STABS: Id = 223;
         pub const RAVENOUS: Id = 231;
+        pub const ANTICIPATE: Id = 165;
         pub const SLUMBER: Id = 244;
         pub const SKITTISH: Id = 240;
         pub const SLOTH: Id = 242;
@@ -612,6 +614,7 @@ mod foundation_id {
         pub const NO_BLOCK: Id = 144;
         pub const THE_GAMBIT: Id = 145;
         pub const AUTOMATION: Id = 146;
+        pub const ENTROPY: Id = 148;
         pub const FASTEN: Id = 149;
         pub const NOSTALGIA: Id = 151;
         pub const PANACHE: Id = 152;
@@ -1407,6 +1410,7 @@ impl Content {
             | Effect::PassiveFirst(_)
             | Effect::PassiveLast(_)
             | Effect::PassiveAll
+            | Effect::PassiveLightning(_)
             | Effect::OrbSlots(_)
             | Effect::MaxEnergy(_)
             | Effect::SetCardCost(_)
@@ -1659,9 +1663,10 @@ enum ControlContinuation {
     StartExtraPlayerTurnAfterResolution,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum RewardContinuation {
     AddRandomCurse,
+    PrefetchedCards(Vec<Card>),
 }
 
 #[derive(Clone, Debug, Hash)]
@@ -1838,6 +1843,7 @@ pub enum Phase {
 #[derive(Clone, Copy, Debug)]
 enum DamageKind {
     Attack,
+    Overflow,
     Move,
     Unpowered,
     Unblockable,
