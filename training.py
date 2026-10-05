@@ -85,10 +85,20 @@ def upload(value, target):
     return rebuild(structure)
 
 
+def clip_gradients(parameters):
+    norm = nn.utils.clip_grad_norm_(
+        [parameter for parameter in parameters if parameter.grad is not None], .5,
+    )
+    value = float(norm)
+    return value, math.isfinite(value) and value < float(torch.finfo(norm.dtype).max)
+
+
 def trust_region_step(model, optimizer, inputs, action, old, fresh, denominator, precision, limit,
                       temperature=1, attempts=3, choice_index=None):
     parameters = [parameter for parameter in model.parameters() if parameter.grad is not None]
-    gradient_norm = float(nn.utils.clip_grad_norm_(parameters, .5))
+    gradient_norm, gradient_finite = clip_gradients(parameters)
+    if not gradient_finite:
+        return None, [], None, gradient_norm
     optimizer_state = copy.deepcopy(optimizer.state_dict()) if any(
         parameter.grad is not None and parameter not in optimizer.state for parameter in parameters
     ) else None
@@ -157,9 +167,10 @@ def critic_only_step(model, optimizer, parameters=None):
     for parameter in model.parameters():
         if id(parameter) not in selected:
             parameter.grad = None
-    gradient_norm = float(nn.utils.clip_grad_norm_(parameters, .5))
-    optimizer.step()
-    return gradient_norm
+    gradient_norm, gradient_finite = clip_gradients(parameters)
+    if gradient_finite:
+        optimizer.step()
+    return gradient_norm, gradient_finite
 
 
 def set_learning_rate(optimizer, rate, warmup_steps, weights_revision):
@@ -1009,6 +1020,24 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             **values,
         })
 
+    def nan_gradient_event(gradient_norm, scope, attempted_rows, fresh_rows, retired_rows):
+        optimizer.zero_grad(set_to_none=True)
+        prefetch()
+        model._sequence_layouts.clear()
+        release_mps_cache(True)
+        emit_event({
+            "event": "nan_gradient", "step": base_decisions + handled, "stage": stage,
+            "update_attempt": revisions["update_attempt"],
+            "weights_revision": revisions["weights_revision"],
+            "policy_revision": revisions["policy_revision"],
+            "training_elapsed_seconds": time.monotonic() - run_started,
+            "gradient_scope": scope, "gradient_norm": gradient_norm,
+            "gradient_kind": "nan" if math.isnan(gradient_norm) else
+                             "infinite" if math.isinf(gradient_norm) else "overflow",
+            "attempted_rows": attempted_rows, "fresh_rows": fresh_rows,
+            "retired_rows": retired_rows, "optimizer_step_skipped": True,
+        }, "WARNING")
+
     def dump_wedge(process):
         if hasattr(signal, "SIGUSR2"):
             try:
@@ -1351,11 +1380,20 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 revisions["weights_revision"],
             )
             if not args.critic_only and kl_value > args.target_kl:
-                handled += dataset.discard_trajectories(values["trajectory"][fresh_cpu])
+                rejected = dataset.discard_trajectories(values["trajectory"][fresh_cpu])
+                handled += rejected
                 prefetch()
                 backward_started = time.monotonic()
                 optimizer.zero_grad(set_to_none=True); critic_loss.backward(inputs=critic_parameters)
-                gradient_norm = critic_only_step(model, optimizer, critic_parameters)
+                gradient_norm, gradient_finite = critic_only_step(
+                    model, optimizer, critic_parameters,
+                )
+                if not gradient_finite:
+                    nan_gradient_event(
+                        gradient_norm, "pre_kl_critic", len(rows), fresh_rows,
+                        len(expired) + rejected,
+                    )
+                    continue
                 revisions["weights_revision"] += 1
                 release_mps_cache()
                 backward_seconds = time.monotonic() - backward_started
@@ -1494,11 +1532,12 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             backward_started = time.monotonic()
             optimizer.zero_grad(set_to_none=True); loss.backward()
             if args.critic_only:
-                gradient_norm = critic_only_step(model, optimizer)
+                gradient_norm, gradient_finite = critic_only_step(model, optimizer)
                 accepted, proposals = True, [0.]
             elif args.disable_post_kl_check or args.target_kl >= 1:
-                gradient_norm = float(nn.utils.clip_grad_norm_(model.parameters(), .5))
-                optimizer.step()
+                gradient_norm, gradient_finite = clip_gradients(model.parameters())
+                if gradient_finite:
+                    optimizer.step()
                 accepted, proposals = True, []
             else:
                 accepted, proposals, _, gradient_norm = trust_region_step(
@@ -1506,8 +1545,16 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     args.precision, args.target_kl, args.policy_temperature,
                     choice_index=choice_index if flat_policy else None,
                 )
+                gradient_finite = accepted is not None
+            if not gradient_finite:
+                nan_gradient_event(
+                    gradient_norm, "critic" if args.critic_only else "full",
+                    len(rows), fresh_rows, len(expired),
+                )
+                continue
             if not accepted:
-                handled += dataset.discard_trajectories(values["trajectory"][fresh_cpu])
+                rejected = dataset.discard_trajectories(values["trajectory"][fresh_cpu])
+                handled += rejected
                 optimizer.zero_grad(set_to_none=True)
                 retry_logits = predict(
                     model, inputs, args.precision, args.policy_temperature,
@@ -1524,7 +1571,15 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     )
                 retry_critic_loss = args.value_weight * retry_value_loss
                 retry_critic_loss.backward(inputs=critic_parameters)
-                gradient_norm = critic_only_step(model, optimizer, critic_parameters)
+                gradient_norm, gradient_finite = critic_only_step(
+                    model, optimizer, critic_parameters,
+                )
+                if not gradient_finite:
+                    nan_gradient_event(
+                        gradient_norm, "post_kl_critic", len(rows), fresh_rows,
+                        len(expired) + rejected,
+                    )
+                    continue
                 revisions["weights_revision"] += 1
                 release_mps_cache()
                 update_elapsed = time.monotonic() - update_started

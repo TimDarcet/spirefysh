@@ -456,6 +456,7 @@ class MetricsProjector:
         self.closed, self.current, self.promotions = [], None, []
         self.status, self.last_time, self.invalid = "running", None, 0
         self.decisions_trained = 0
+        self.last_commit_seconds = None
         self.cursor = 0
         segments = lineage_segments(root, manifest["run_id"], session_id)
         if not segments:
@@ -492,7 +493,7 @@ class MetricsProjector:
                 "_samples": [[] for _ in range(5)], "_sampled": 0,
                 "_trained": 0, "_critic_trained": 0, "_discarded": 0, "_batches": 0,
                 "_optimizer_steps": [],
-                "_collect_seconds": 0., "_update_seconds": 0.,
+                "_collect_seconds": 0., "_update_seconds": 0., "_commit_seconds": 0.,
                 "_episode_length": 0, "_episode_length_max": 0,
                 "_episode_seconds": 0., "_episode_seconds_max": 0.,
                 "_boss_entries": 0,
@@ -548,12 +549,18 @@ class MetricsProjector:
         outcome, commit = event.get("policy_outcome"), event.get("commit_kind")
         duration = event.get("total_seconds", 0.)
         if commit and commit != "none" and duration > 0:
+            seconds = event.get("training_elapsed_seconds")
+            interval = seconds - self.last_commit_seconds \
+                if seconds is not None and self.last_commit_seconds is not None \
+                and seconds > self.last_commit_seconds else duration
+            self.last_commit_seconds = seconds
+            window["_commit_seconds"] += interval
             step = {
                 "step": event.get("step", 0),
                 "weights_revision": event.get("weights_revision", 0),
-                "seconds": event.get("training_elapsed_seconds", 0),
+                "seconds": seconds or 0,
                 "decisions_trained": self.decisions_trained,
-                "optimizer_steps_per_second": 1 / duration,
+                "optimizer_steps_per_second": 1 / interval,
                 "used_rows_per_second": event.get("critic_trained_rows", 0) / duration,
                 "total_seconds": duration,
             }
@@ -825,7 +832,7 @@ class MetricsProjector:
             "learner_decisions_per_second": window["_trained"]
             / max(1e-9, window["_update_seconds"]),
             "optimizer_steps_per_second": weight_commits
-            / max(1e-9, window["_update_seconds"]),
+            / max(1e-9, window["_commit_seconds"]),
             "used_rows_per_second": window["_critic_trained"]
             / max(1e-9, window["_update_seconds"]),
             "critic_floor_conditioned_explained_reward_variance":
@@ -1080,7 +1087,7 @@ def _cached_projection(root, run, manifest, session_id):
     if not segments:
         segments = [(run / manifest["sessions"][-1]["log"], None)]
     signature = {
-        "version": 6,
+        "version": 7,
         "window": manifest.get("telemetry_window_decisions", 32_768),
         "manifest": [(run / "run.json").stat().st_size,
                      (run / "run.json").stat().st_mtime_ns],

@@ -129,6 +129,29 @@ print('restored')
         self.assertEqual((additive.potential_mode, additive.potential_health_weight),
                          ("additive", .01))
 
+    def test_non_finite_gradient_skips_optimizer_step(self):
+        parameter = torch.nn.Parameter(torch.ones(1))
+        model = Namespace(
+            critic=Namespace(parameters=lambda: (parameter,)),
+            parameters=lambda: (parameter,),
+        )
+        optimizer = mock.Mock()
+        parameter.grad = torch.full_like(parameter, math.nan)
+        gradient_norm, finite = train.critic_only_step(model, optimizer)
+        self.assertTrue(math.isnan(gradient_norm))
+        self.assertFalse(finite)
+        optimizer.step.assert_not_called()
+        parameter.grad = torch.ones_like(parameter)
+        _, finite = train.critic_only_step(model, optimizer)
+        self.assertTrue(finite)
+        optimizer.step.assert_called_once_with()
+        with mock.patch(
+            "training.nn.utils.clip_grad_norm_",
+            return_value=torch.tensor(torch.finfo(torch.float32).max),
+        ):
+            _, finite = train.clip_gradients((parameter,))
+        self.assertFalse(finite)
+
     def test_fp32_disables_autocast(self):
         class Model:
             def __call__(self, value, *_args, **_kwargs):
@@ -566,6 +589,26 @@ print('restored')
             self.assertAlmostEqual(metrics["rejected_trigger_log_ratio_mean"], -1 / 6)
             self.assertAlmostEqual(metrics["rejected_trigger_abs_log_ratio_mean"], 17 / 30)
             self.assertEqual(metrics["rejected_trigger_abs_log_ratio_max"], .6)
+
+    def test_optimizer_rate_includes_time_between_commits(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); run = root / "run"; (run / "events").mkdir(parents=True)
+            manifest = self.manifest("run", 1)
+            (run / "run.json").write_text(json.dumps(manifest))
+            write_events(run / "events/000001.jsonl", [
+                {"event": "training_batch", "time": 1, "step": 1, "stage": 0,
+                 "weights_revision": 1, "commit_kind": "full", "total_seconds": 1,
+                 "training_elapsed_seconds": 2},
+                {"event": "training_batch", "time": 2, "step": 2, "stage": 0,
+                 "weights_revision": 2, "commit_kind": "full", "total_seconds": 1,
+                 "training_elapsed_seconds": 6},
+            ])
+            metrics = train.MetricsProjector(root, run, manifest, 1).value()["reports"][-1]["metrics"]
+            self.assertEqual(
+                [step["optimizer_steps_per_second"] for step in metrics["optimizer_steps"]],
+                [1, .25],
+            )
+            self.assertEqual(metrics["optimizer_steps_per_second"], .4)
 
     def test_projector_combines_distributions_instead_of_batch_statistics(self):
         with tempfile.TemporaryDirectory() as temporary:
