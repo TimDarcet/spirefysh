@@ -440,6 +440,8 @@ class MetricsProjector:
         "winning_collection_drift": "winning_replayed_rows",
         "search_consistency_loss": None,
         "entropy": "policy_trained_rows", "entropy_weight": "policy_trained_rows",
+        "uniform_cross_entropy": "policy_trained_rows",
+        "uniform_cross_entropy_weight": "policy_trained_rows",
         "pre_kl": "fresh_rows", "post_kl": "policy_trained_rows",
         "clip_fraction": "policy_trained_rows", "gradient_norm": None,
         "gradient_clipped": None,

@@ -101,6 +101,10 @@ print('restored')
         self.assertEqual(args.sampler_threads, 5)
         self.assertEqual(args.dataset_capacity, 131_072)
         self.assertEqual(args.precision, "bf16")
+        self.assertEqual(args.uniform_cross_entropy_weight, 0)
+        self.assertEqual(train.parser().parse_args([
+            "train", "--uniform-cross-entropy-weight", ".2",
+        ]).uniform_cross_entropy_weight, .2)
         mixed = train.parser().parse_args([
             "train", "--precision", "bf16_with_fp32_dV",
         ])
@@ -128,6 +132,23 @@ print('restored')
         ])
         self.assertEqual((additive.potential_mode, additive.potential_health_weight),
                          ("additive", .01))
+
+    def test_uniform_cross_entropy(self):
+        probability = torch.tensor([[.6, .3, .1], [.5, .5, .01]])
+        log_probability = probability.log()
+        legal = torch.tensor([[True, True, True], [True, True, False]])
+        expected = -(log_probability[0].mean() + log_probability[1, :2].mean()) / 2
+        self.assertAlmostEqual(float(train.uniform_cross_entropy(
+            log_probability, legal,
+        )), float(expected))
+        self.assertAlmostEqual(float(train.uniform_cross_entropy(
+            log_probability.flatten(), legal.flatten(),
+            torch.tensor([0, 0, 0, 1, 1, 1]), 2,
+        )), float(expected))
+        self.assertAlmostEqual(float(train.uniform_cross_entropy(
+            torch.cat((log_probability[0], log_probability[1, :2])), None,
+            torch.tensor([0, 0, 0, 1, 1]), 2,
+        )), float(expected))
 
     def test_fp32_disables_autocast(self):
         class Model:
@@ -353,7 +374,7 @@ print('restored')
                  },
                  "retired_rows": 4, "policy_lag_counts": {"0": 10, "1": 10},
                  "advantage_mean": 2, "advantage_stddev": 3,
-                 "policy_loss": 2, "critic_loss": 3,
+                 "policy_loss": 2, "uniform_cross_entropy": 1.5, "critic_loss": 3,
                  "search_consistency_loss": .25, "gradient_clipped": True,
                  "critic_explained_reward_variance": .5, "total_seconds": 1,
                  "pause_seconds": .25,
@@ -385,6 +406,7 @@ print('restored')
             self.assertEqual(metrics["boss_conversion"], 1)
             self.assertEqual(len(metrics["win_rate_interval"]), 2)
             self.assertEqual(metrics["policy_loss"], 2)
+            self.assertEqual(metrics["uniform_cross_entropy"], 1.5)
             self.assertEqual(metrics["critic_explained_reward_variance"], .5)
             self.assertEqual(metrics["critic_explained_reward_variance_by_floor"], {
                 "12": {"value": .5, "target_variance": .25, "rows": 20},

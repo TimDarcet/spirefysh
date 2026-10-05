@@ -204,6 +204,17 @@ def curriculum_weights(stage, stage_decisions, auxiliary_decisions, args, active
     }
 
 
+def uniform_cross_entropy(log_probability, legal, action_row=None, row_count=None):
+    legal = torch.ones_like(log_probability, dtype=torch.bool) if legal is None else legal
+    terms = torch.where(legal, -log_probability, 0.)
+    if action_row is None:
+        return (terms.sum(1) / legal.sum(1)).mean()
+    counts = log_probability.new_zeros(row_count).index_add(
+        0, action_row, legal.to(log_probability.dtype),
+    )
+    return (log_probability.new_zeros(row_count).index_add(0, action_row, terms) / counts).mean()
+
+
 def resume_curriculum(source, stage):
     if not source:
         return 0, stage <= 6
@@ -1389,12 +1400,17 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             ).mean()
             if flat_policy:
                 action_row = inputs[3] if cached else inputs[5][0][:len(logits)]
-                action_legal = 1 if cached else inputs[5][2][:len(logits)]
+                action_legal = None if cached else inputs[5][2][:len(logits)]
                 entropy_by_row = logits.new_zeros(len(rows)).index_add(
-                    0, action_row, -(logits.exp() * logits * action_legal),
+                    0, action_row, -(logits.exp() * logits
+                                     * (1 if action_legal is None else action_legal)),
+                )
+                uniform_loss = uniform_cross_entropy(
+                    logits, action_legal, action_row, len(rows),
                 )
             else:
                 entropy_by_row = -(logits.exp() * logits * legal).sum(1)
+                uniform_loss = uniform_cross_entropy(logits, legal)
             entropy = entropy_by_row.mean()
             expert_loss = logits.sum() * 0
             expert_count = len(expert_rows)
@@ -1426,6 +1442,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     consistency_losses.append((parent - expected).square())
                 search_consistency_loss = torch.stack(consistency_losses).mean()
             loss = policy_loss + critic_loss - entropy_weight * entropy \
+                + args.uniform_cross_entropy_weight * uniform_loss \
                 + args.expert_weight * expert_loss \
                 + args.search_consistency_weight * search_consistency_loss
             ppo_head_grad = expert_head_grad = expert_ppo_grad_cosine = None
@@ -1588,6 +1605,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 winning_rejected_rows=replay_rejected_count,
                 winning_collection_drift=winning_drift,
                 policy_loss=float(policy_loss.detach()),
+                uniform_cross_entropy=float(uniform_loss.detach()),
+                uniform_cross_entropy_weight=args.uniform_cross_entropy_weight,
                 expert_loss=float(expert_loss.detach()),
                 ppo_head_grad=float(ppo_head_grad.detach()) if ppo_head_grad is not None else 0,
                 expert_head_grad=float(expert_head_grad.detach())
@@ -1615,7 +1634,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             if updates % args.publish_updates == 0:
                 publish()
             loss = policy_loss = critic_loss = value_loss = prediction = squared_error = None
-            entropy = entropy_by_row = expert_loss = search_consistency_loss = None
+            entropy = entropy_by_row = uniform_loss = expert_loss = search_consistency_loss = None
             ppo_head_grad = expert_head_grad = expert_ppo_grad_cosine = None
             winning_loss = replay_kl_mean = None
             logits = expert_logits = critic_logits = all_logits = all_critic_logits = None
@@ -2193,6 +2212,9 @@ def train(args):
         raise ValueError("invalid critic settings")
     if args.entropy_weight is not None and args.entropy_weight < 0:
         raise ValueError("invalid entropy weight")
+    if (not math.isfinite(args.uniform_cross_entropy_weight)
+            or args.uniform_cross_entropy_weight < 0):
+        raise ValueError("invalid uniform cross-entropy weight")
     if (not 0 <= args.mcts_fraction <= 1
             or min(args.mcts_simulations, args.mcts_boss_simulations, args.mcts_turns,
                    args.expert_max_lag) < 0
