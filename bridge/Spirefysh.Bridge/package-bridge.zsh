@@ -71,7 +71,9 @@ if [[ ! -x "$python" || ! -f "$model" ]]; then
 fi
 "$repo_root/.venv/bin/maturin" develop --release --features python --manifest-path "$repo_root/Cargo.toml"
 cp "$script_dir/advisor.py" "$output_dir/advisor.py"
+cp "$script_dir/policy.py" "$output_dir/policy.py"
+cp "$script_dir/verifier.py" "$output_dir/verifier.py"
 cp "$repo_root/model.py" "$output_dir/model.py"
 "$python" "$script_dir/advisor.py" export "$model" "$output_dir/Spirefysh.Bridge.model.pt"
-jq -n --arg python "$python" --arg source "$model" '{show_win_probability_delta:true, show_current_win_probability:true, python:$python, model:"Spirefysh.Bridge.model.pt", source_model:$source}' > "$output_dir/Spirefysh.Bridge.advisor-config"
+jq -n --arg python "$python" --arg source "$model" '{show_win_probability_delta:true, show_current_win_probability:true, check_transitions:true, python:$python, model:"Spirefysh.Bridge.model.pt", source_model:$source}' > "$output_dir/Spirefysh.Bridge.advisor-config"
 print "$output_dir/Spirefysh.Bridge.dll"

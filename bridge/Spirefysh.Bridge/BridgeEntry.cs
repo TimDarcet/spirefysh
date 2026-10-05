@@ -30,6 +30,8 @@ public static class BridgeEntry
     internal const string SupportedContentArchiveSha256 = "62c887be791250b7a90c6cd929c19d03d33e17cc76aa7ff610b2889cccdadadb";
     internal const string SupportedReleaseInfoSha256 = "93838093ff803a60a8f086355a1d1a9cb103358089f8a46ae41743ddd8919b42";
     private static AdvisorClient? _advisor;
+    private static TransitionVerifier? _verifier;
+    private static PolicyClient? _policy;
     private static TraceCapture? _capture;
     private static bool _modsVerified;
     private static bool _runStartedAttached;
@@ -42,8 +44,12 @@ public static class BridgeEntry
         try
         {
             VerifyGameAssembly();
-            _capture = TraceCapture.CreateFromConfiguration();
             _advisor = AdvisorClient.CreateFromConfiguration();
+            _verifier = TransitionVerifier.CreateFromConfiguration();
+            _policy = PolicyClient.CreateFromConfiguration();
+            _capture = TraceCapture.CreateFromConfiguration(_verifier);
+            if (_policy is not null && _capture?.RecordsTrace != true)
+                throw new InvalidOperationException("Policy AutoSlay requires trace capture.");
             if (_capture is null && _advisor is null)
             {
                 Console.Error.WriteLine("[Spirefysh] No trace or advisor configuration was found; bridge is disabled.");
@@ -54,50 +60,61 @@ public static class BridgeEntry
             if (_capture is not null)
             {
                 harmony.Patch(
-                    RequiredMethod(typeof(NGame), nameof(NGame.IsReleaseGame)),
-                    postfix: new HarmonyMethod(typeof(BridgeEntry), nameof(AllowAutoSlay)));
-                harmony.Patch(
-                    RequiredMethod(typeof(CommandLineHelper), nameof(CommandLineHelper.HasArg)),
-                    postfix: new HarmonyMethod(typeof(BridgeEntry), nameof(ForceAutoSlay)));
-                harmony.Patch(
-                    RequiredMethod(typeof(CommandLineHelper), nameof(CommandLineHelper.GetValue)),
-                    postfix: new HarmonyMethod(typeof(BridgeEntry), nameof(AutoSlayValue)));
-                harmony.Patch(
                     RequiredMethod(typeof(RunManager), nameof(RunManager.Launch)),
                     prefix: new HarmonyMethod(typeof(BridgeEntry), nameof(BeforeRunManagerLaunch)));
-                harmony.Patch(
-                    RequiredMethod(typeof(RunManager), nameof(RunManager.SetUpNewSingleplayer)),
-                    prefix: new HarmonyMethod(typeof(BridgeEntry), nameof(ConfigureNewSingleplayer)));
-                foreach (var methodName in new[]
-                         {
-                             nameof(RunManager.SetUpNewMultiplayer),
-                             nameof(RunManager.SetUpSavedSingleplayer),
-                             nameof(RunManager.SetUpSavedMultiplayer),
-                             nameof(RunManager.SetUpReplay),
-                             nameof(RunManager.SetUpTest)
-                         })
+                if (_capture.RecordsTrace)
+                {
                     harmony.Patch(
-                        RequiredMethod(typeof(RunManager), methodName),
-                        prefix: new HarmonyMethod(typeof(BridgeEntry), nameof(RejectUnsupportedRunSetup)));
+                        RequiredMethod(typeof(NGame), nameof(NGame.IsReleaseGame)),
+                        postfix: new HarmonyMethod(typeof(BridgeEntry), nameof(AllowAutoSlay)));
+                    harmony.Patch(
+                        RequiredMethod(typeof(CommandLineHelper), nameof(CommandLineHelper.HasArg)),
+                        postfix: new HarmonyMethod(typeof(BridgeEntry), nameof(ForceAutoSlay)));
+                    harmony.Patch(
+                        RequiredMethod(typeof(CommandLineHelper), nameof(CommandLineHelper.GetValue)),
+                        postfix: new HarmonyMethod(typeof(BridgeEntry), nameof(AutoSlayValue)));
+                    harmony.Patch(
+                        RequiredMethod(typeof(RunManager), nameof(RunManager.SetUpNewSingleplayer)),
+                        prefix: new HarmonyMethod(typeof(BridgeEntry), nameof(ConfigureNewSingleplayer)));
+                    foreach (var methodName in new[]
+                             {
+                                 nameof(RunManager.SetUpNewMultiplayer),
+                                 nameof(RunManager.SetUpSavedSingleplayer),
+                                 nameof(RunManager.SetUpSavedMultiplayer),
+                                 nameof(RunManager.SetUpReplay),
+                                 nameof(RunManager.SetUpTest)
+                             })
+                        harmony.Patch(
+                            RequiredMethod(typeof(RunManager), methodName),
+                            prefix: new HarmonyMethod(typeof(BridgeEntry), nameof(RejectUnsupportedRunSetup)));
+                }
                 BridgePatches.Install(harmony, _capture);
-                CommandPhaseTelemetryWave112.Install(
-                    harmony,
-                    _capture.RecordOracleCommandWave112,
-                    _capture.CaptureGap,
-                    () => _capture.Enabled);
+                if (_policy is not null) PolicyAutoSlay.Install(harmony, _policy, _capture);
+                if (_capture.RecordsTrace)
+                    CommandPhaseTelemetryWave112.Install(
+                        harmony,
+                        _capture.RecordOracleCommandWave112,
+                        _capture.CaptureGap,
+                        () => _capture.Enabled);
             }
             if (_advisor?.ShowWinProbabilityDelta == true) AdvisorHover.Install(harmony, _advisor);
             if (_advisor?.ShowCurrentWinProbability == true) AdvisorTopBar.Install(_advisor);
+            if (_verifier is not null) TransitionWarning.Install(_verifier);
             AppDomain.CurrentDomain.ProcessExit += (_, _) =>
             {
                 _capture?.RecordIncompleteShutdown();
                 _advisor?.Dispose();
+                _verifier?.Dispose();
+                _policy?.Dispose();
             };
-            Console.WriteLine($"[Spirefysh] Bridge initialized; telemetry={_capture is not null} advisor={_advisor is not null}.");
+            Console.WriteLine($"[Spirefysh] Bridge initialized; telemetry={_capture?.RecordsTrace == true} advisor={_advisor is not null} verifier={_verifier is not null} policy={_policy is not null}.");
         }
         catch (Exception exception)
         {
             _capture?.Disable($"initialization failed: {exception.GetType().Name}: {exception.Message}");
+            _advisor?.Dispose();
+            _verifier?.Dispose();
+            _policy?.Dispose();
             Console.Error.WriteLine($"[Spirefysh] Refusing telemetry: {exception}");
         }
     }

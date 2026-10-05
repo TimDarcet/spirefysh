@@ -26,11 +26,13 @@ internal sealed class TraceCapture : IDisposable
 {
     private readonly object _writeLock = new();
     private readonly object _decisionLock = new();
-    private readonly AppendOnlyTraceWriter _writer;
+    private readonly AppendOnlyTraceWriter? _writer;
+    private readonly TransitionVerifier? _verifier;
     private readonly string _sessionId = Guid.NewGuid().ToString("N");
     private readonly string _episodeId = Guid.NewGuid().ToString("N");
     private readonly string _bridgeSha256;
     private readonly List<PendingDecision> _openDecisions = [];
+    private readonly List<TraceEvent> _settledNestedDecisions = [];
     private ChoiceOffer? _choiceOffer;
     private MegaCrit.Sts2.Core.Rewards.RewardsSet? _rewardsSet;
     private int _decisionIndex;
@@ -39,20 +41,33 @@ internal sealed class TraceCapture : IDisposable
     private int _gapFaultIndex;
     private bool _completed;
 
-    internal const uint TraceSchemaVersion = 2;
+    internal const uint TraceSchemaVersion = 3;
     internal const string ContentManifestSha256 =
         "9d6e30675e62e87886375d6f1f701e5b0fb8f0ccd5bef0268eed7e5399a9e604";
 
-    private TraceCapture(AppendOnlyTraceWriter writer, string bridgeSha256)
+    private TraceCapture(
+        AppendOnlyTraceWriter? writer,
+        string bridgeSha256,
+        TransitionVerifier? verifier)
     {
         _writer = writer;
         _bridgeSha256 = bridgeSha256;
+        _verifier = verifier;
     }
     public bool Enabled { get; private set; } = true;
+    public bool RecordsTrace => _writer is not null;
     public bool HasChoiceOffer => _choiceOffer is not null;
     public string AutoSlaySeed => _episodeId[..12];
 
-    public static TraceCapture? CreateFromConfiguration()
+    internal CapturedSnapshot CaptureForPolicy(SemanticAction[]? actions = null)
+    {
+        if (actions is null && !CombatManager.Instance.IsInProgress)
+            actions = _choiceOffer?.LegalActions ??
+                (_rewardsSet is null ? null : BridgePatches.RewardActions(_rewardsSet));
+        return Snapshotter.Capture(actions);
+    }
+
+    public static TraceCapture? CreateFromConfiguration(TransitionVerifier? verifier = null)
     {
         var configuredPath = Environment.GetEnvironmentVariable("SPIREFYSH_TRACE_PATH");
         if (string.IsNullOrWhiteSpace(configuredPath))
@@ -60,7 +75,13 @@ internal sealed class TraceCapture : IDisposable
             var configurationPath = Path.ChangeExtension(typeof(TraceCapture).Assembly.Location, ".trace-path");
             if (File.Exists(configurationPath)) configuredPath = File.ReadAllText(configurationPath).Trim();
         }
-        if (string.IsNullOrWhiteSpace(configuredPath)) return null;
+        if (string.IsNullOrWhiteSpace(configuredPath))
+        {
+            if (verifier is null) return null;
+            using var assemblyStream = File.OpenRead(typeof(TraceCapture).Assembly.Location);
+            var assemblyHash = Convert.ToHexString(SHA256.HashData(assemblyStream)).ToLowerInvariant();
+            return new(null, assemblyHash, verifier);
+        }
         if (!Path.IsPathFullyQualified(configuredPath)) throw new InvalidOperationException("SPIREFYSH_TRACE_PATH must be absolute.");
         configuredPath = Path.GetFullPath(configuredPath);
         var extension = Path.GetExtension(configuredPath);
@@ -80,12 +101,12 @@ internal sealed class TraceCapture : IDisposable
         var bridgeAssemblyPath = typeof(TraceCapture).Assembly.Location;
         using var bridgeStream = File.OpenRead(bridgeAssemblyPath);
         var bridgeSha256 = Convert.ToHexString(SHA256.HashData(bridgeStream)).ToLowerInvariant();
-        var capture = new TraceCapture(AppendOnlyTraceWriter.Open(configuredPath), bridgeSha256);
+        var capture = new TraceCapture(AppendOnlyTraceWriter.Open(configuredPath), bridgeSha256, verifier);
         capture.Write(new TraceEvent(0, "episode_started", null, null, null, null, null, null,
             new Dictionary<string, object?>
             {
                 ["complete"] = false,
-                ["resumed_append"] = capture._writer.LastSequence > 0
+                ["resumed_append"] = capture._writer!.LastSequence > 0
             }));
         Console.WriteLine($"[Spirefysh] Trace opened: {configuredPath}");
         return capture;
@@ -124,7 +145,7 @@ internal sealed class TraceCapture : IDisposable
     {
         Guard("run start", () =>
         {
-            if (RunManager.Instance.ShouldSave)
+            if (RecordsTrace && RunManager.Instance.ShouldSave)
             {
                 Disable("RunManager.ShouldSave was true");
                 return;
@@ -227,7 +248,10 @@ internal sealed class TraceCapture : IDisposable
     private void CancelAction(GameAction action) => Guard("action cancellation", () =>
     {
         lock (_decisionLock)
+        {
             _openDecisions.RemoveAll(candidate => ReferenceEquals(candidate.RuntimeAction, action));
+            _settledNestedDecisions.Clear();
+        }
         var snapshot = Snapshotter.Capture();
         Write(new TraceEvent(0, "action_cancelled", action.Id, snapshot.Public, SemanticAction.From(action), null, snapshot.Oracle, null, null)
         {
@@ -256,14 +280,25 @@ internal sealed class TraceCapture : IDisposable
                 .ToArray();
             _openDecisions.RemoveAll(candidate => !nestedOnly || candidate.IsNested);
         }
-        foreach (var decision in pending) WriteDecision(decision, snapshot, boundary);
+        var decisions = pending.Select(decision => WriteDecision(decision, snapshot, boundary)).ToArray();
+        var primary = Array.FindIndex(pending, decision => !decision.IsNested);
+        if (primary < 0)
+        {
+            _settledNestedDecisions.AddRange(decisions);
+            return;
+        }
+        var choices = _settledNestedDecisions
+            .Concat(decisions.Where((_, index) => index != primary && pending[index].IsNested))
+            .ToArray();
+        _settledNestedDecisions.Clear();
+        _verifier?.Check(decisions[primary], choices);
     }
 
-    private void WriteDecision(PendingDecision pending, CapturedSnapshot after, string boundary)
+    private TraceEvent WriteDecision(PendingDecision pending, CapturedSnapshot after, string boundary)
     {
         int decisionIndex;
         lock (_decisionLock) decisionIndex = _decisionIndex++;
-        Write(new TraceEvent(0, "decision", pending.GameActionId, pending.Before, pending.Action, after.Public,
+        var decision = new TraceEvent(0, "decision", pending.GameActionId, pending.Before, pending.Action, after.Public,
             pending.BeforeOracle, after.Oracle, new Dictionary<string, object?>
             {
                 ["decision_index"] = decisionIndex,
@@ -275,7 +310,9 @@ internal sealed class TraceCapture : IDisposable
             BeforeOracleHash = pending.BeforeOracleHash,
             AfterPublicHash = after.PublicHash,
             AfterOracleHash = after.OracleHash
-        });
+        };
+        Write(decision);
+        return decision;
     }
 
     public void OnRewardsSetBegun(MegaCrit.Sts2.Core.Rewards.RewardsSet set) =>
@@ -296,7 +333,8 @@ internal sealed class TraceCapture : IDisposable
                 _choiceOffer = null;
                 return;
             }
-            if (minimum < 0 || maximum < minimum || maximum > candidates.Length)
+            maximum = Math.Min(maximum, candidates.Length);
+            if (minimum < 0 || maximum < minimum)
                 throw new InvalidOperationException(
                     $"Invalid card-choice range {minimum}..{maximum} for {candidates.Length} candidates.");
             var choice = new SemanticAction(
@@ -504,6 +542,7 @@ internal sealed class TraceCapture : IDisposable
             faultIndex = _gapFaultIndex++;
             quarantined = _openDecisions.ToArray();
             _openDecisions.Clear();
+            _settledNestedDecisions.Clear();
             _choiceOffer = null;
             _rewardsSet = null;
         }
@@ -567,6 +606,7 @@ internal sealed class TraceCapture : IDisposable
 
     private void Write(TraceEvent item)
     {
+        if (_writer is null) return;
         try
         {
             lock (_writeLock)
@@ -603,7 +643,7 @@ internal sealed class TraceCapture : IDisposable
         });
     }
 
-    public void Dispose() { Enabled = false; _writer.Dispose(); }
+    public void Dispose() { Enabled = false; _writer?.Dispose(); }
     private sealed record PendingDecision(
         object RuntimeAction,
         object? GameActionId,
@@ -928,11 +968,15 @@ internal static class Snapshotter
             player.Relics.Select(x => new EntitySnapshot(x.Id.ToString(), x.StackCount, x.Status.ToString())).ToArray(),
             player.Potions.Select(x => new EntitySnapshot(x.Id.ToString(), player.GetPotionSlotIndex(x), x.Usage.ToString())).ToArray(),
             creature.Pets.Select(CaptureSummon).ToArray(),
+            combatState?.OrbQueue.Orbs.Select(CaptureOrb).ToArray() ?? [],
+            combatState?.OrbQueue.Capacity ?? 0,
             CapturePowers(creature.Powers),
             CaptureCardsExhaustedThisTurn(combat),
+            CaptureCardsDrawnThisCombat(combat),
             CapturePlayerLostHpThisTurn(combat, creature),
             CapturePlayerHpLossEventsThisCombat(combat, creature),
             CaptureEnergySpentThisTurn(combat, player),
+            CaptureStarsGainedThisTurn(combat),
             CaptureOstyAttacksThisTurn(combat, player),
             actions);
     }
@@ -979,6 +1023,17 @@ internal static class Snapshotter
             CapturePowers(pet.Powers));
     }
 
+    private static OrbSnapshot CaptureOrb(OrbModel orb) => new(
+        orb.Id.ToString(),
+        orb.Id.ToString() switch
+        {
+            "ORB.DARK_ORB" => decimal.ToInt32(orb.EvokeVal),
+            "ORB.GLASS_ORB" => decimal.ToInt32(Convert.ToDecimal(orb.GetType()
+                .GetField("_passiveVal", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .GetValue(orb))),
+            _ => 0
+        });
+
     private static CombatSnapshot CaptureCombat(CombatState combat) => new(
         combat.RoundNumber,
         combat.CurrentSide.ToString(),
@@ -1022,9 +1077,11 @@ internal static class Snapshotter
             card.CurrentStarCost,
             card.Type.ToString(),
             card.TargetType.ToString(),
+            CaptureLocalEthereal(card),
             CaptureRampageExtraDamage(card),
             CaptureClawExtraDamage(card),
             CaptureGeneticAlgorithmBonusBlock(card),
+            CaptureSovereignBladeBonusDamage(card),
             card.BaseReplayCount,
             card.EnergyCost.CostsX,
             costForTurn,
@@ -1058,6 +1115,16 @@ internal static class Snapshotter
                 ?? throw new MissingMemberException(type.FullName, "ExtraDamage");
             combatAmount = Convert.ToDecimal(extraDamage.GetValue(enchantment)
                 ?? throw new InvalidOperationException("Momentum extra damage is unavailable."));
+        }
+        else if (enchantment.Id.ToString() is
+                 "ENCHANTMENT.GLAM" or "ENCHANTMENT.SOWN" or "ENCHANTMENT.SWIFT" or
+                 "ENCHANTMENT.VIGOROUS")
+        {
+            var status = type.BaseType?.GetProperty(
+                    "Status", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                ?? throw new MissingMemberException(type.FullName, "Status");
+            if (string.Equals(status.GetValue(enchantment)?.ToString(), "Normal", StringComparison.Ordinal))
+                combatAmount = amount;
         }
         return (enchantment.Id.ToString(), amount, combatAmount);
     }
@@ -1188,8 +1255,31 @@ internal static class Snapshotter
                 "Genetic Algorithm persistent Block bonus is unavailable."));
     }
 
+    private static int CaptureSovereignBladeBonusDamage(CardModel card)
+    {
+        if (card.Id.ToString() != "CARD.SOVEREIGN_BLADE") return 0;
+        var property = card.GetType().GetProperty(
+            "CurrentDamage", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+            ?? throw new MissingMemberException(card.GetType().FullName, "CurrentDamage");
+        return Math.Max(0, decimal.ToInt32((decimal)(property.GetValue(card)
+            ?? throw new InvalidOperationException("Sovereign Blade damage is unavailable."))) - 10);
+    }
+
+    private static bool CaptureLocalEthereal(CardModel card)
+    {
+        var property = typeof(CardModel).GetProperty(
+            "LocalKeywords", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+            ?? throw new MissingMemberException(typeof(CardModel).FullName, "LocalKeywords");
+        var keywords = (System.Collections.IEnumerable)(property.GetValue(card)
+            ?? throw new InvalidOperationException("Card local keywords are unavailable."));
+        return keywords.Cast<object>().Any(keyword => keyword.ToString() == "Ethereal");
+    }
+
     private static int CaptureCardsExhaustedThisTurn(CombatState? combat) => combat is null ? 0 :
         CombatManager.Instance.History.Entries.OfType<CardExhaustedEntry>().Count(entry => entry.HappenedThisTurn(combat));
+
+    private static int CaptureCardsDrawnThisCombat(CombatState? combat) => combat is null ? 0 :
+        CombatManager.Instance.History.Entries.OfType<CardDrawnEntry>().Count();
 
     private static bool CapturePlayerLostHpThisTurn(CombatState? combat, Creature player) => combat is not null &&
         CombatManager.Instance.History.Entries.OfType<DamageReceivedEntry>().Any(entry =>
@@ -1202,6 +1292,10 @@ internal static class Snapshotter
     private static int CaptureEnergySpentThisTurn(CombatState? combat, Player player) => combat is null ? 0 :
         CombatManager.Instance.History.Entries.OfType<EnergySpentEntry>().Where(entry =>
             ReferenceEquals(entry.Actor, player.Creature) && entry.HappenedThisTurn(combat)).Sum(entry => entry.Amount);
+
+    private static int CaptureStarsGainedThisTurn(CombatState? combat) => combat is null ? 0 :
+        CombatManager.Instance.History.Entries.OfType<StarsModifiedEntry>().Where(entry =>
+            entry.Amount > 0 && entry.HappenedThisTurn(combat)).Sum(entry => entry.Amount);
 
     private static int CaptureOstyAttacksThisTurn(CombatState? combat, Player player)
     {
@@ -1232,19 +1326,29 @@ internal static class Snapshotter
             CaptureDarkEmbraceEtherealCount(x), CaptureSelfDamage(x),
             CaptureIntProperty(x, "POWER.SLOTH_POWER", "CardsPlayedThisTurn"),
             CaptureAdvancedCounterDebuffActivityCount(x), CaptureBoundCardPlayed(x),
-            CaptureFeralReturnsThisTurn(x), CaptureToricToughnessBlock(x))).ToArray();
+            CaptureFeralReturnsThisTurn(x), CaptureAutomationCardsLeft(x), 0,
+            x.Id.ToString() == "POWER.HARDENED_SHELL_POWER" ? x.Amount - x.DisplayAmount : 0,
+            CaptureBoolProperty(x, "POWER.SKITTISH_POWER", "HasGainedBlockThisTurn"))).ToArray();
 
-    private static int CaptureToricToughnessBlock(PowerModel power)
+    private static int CaptureAutomationCardsLeft(PowerModel power)
     {
-        if (power.Id.ToString() != "POWER.TORIC_TOUGHNESS_POWER") return 0;
+        if (power.Id.ToString() != "POWER.AUTOMATION_POWER") return 0;
+        var data = typeof(PowerModel).GetField("_internalData", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(power) ?? throw new InvalidOperationException("Automation internal data is unavailable.");
+        var field = data.GetType().GetField("cardsLeft", BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new MissingFieldException(data.GetType().FullName, "cardsLeft");
+        return (int)(field.GetValue(data)
+            ?? throw new InvalidOperationException("Automation cards-left counter is unavailable."));
+    }
+
+    private static bool CaptureBoolProperty(PowerModel power, string id, string name)
+    {
+        if (power.Id.ToString() != id) return false;
         var property = power.GetType().GetProperty(
-            "Block", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
-            ?? throw new MissingMemberException(power.GetType().FullName, "Block");
-        var value = Convert.ToDecimal(property.GetValue(power)
-            ?? throw new InvalidOperationException("Toric Toughness Block is unavailable."));
-        if (value <= 0 || value != decimal.Truncate(value))
-            throw new InvalidOperationException($"Toric Toughness Block '{value}' is invalid.");
-        return decimal.ToInt32(value);
+            name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+            ?? throw new MissingMemberException(power.GetType().FullName, name);
+        return (bool)(property.GetValue(power)
+            ?? throw new InvalidOperationException($"{id}.{name} is unavailable."));
     }
 
     private static int CaptureFeralReturnsThisTurn(PowerModel power)
@@ -1406,10 +1510,11 @@ internal sealed record PublicSnapshot(
     HistorySnapshot[] History,
     SemanticAction[] VisibleOffers);
 internal sealed record OracleSnapshot(IReadOnlyDictionary<string, uint> RngSeeds, IReadOnlyDictionary<string, int> RngCounters, CardSnapshot[] HiddenDrawOrder, IReadOnlyDictionary<string, string?> EnemyMoveIds, IReadOnlyDictionary<string, PowerOracleSnapshot[]> PowerStates, IReadOnlyDictionary<string, int?> CardDeckVersionIndices, uint NextCombatCardId);
-internal sealed record PlayerSnapshot(ulong NetId, string InstanceId, string CharacterId, int HitPoints, int MaxHitPoints, int Block, int Gold, int Energy, int MaxEnergy, int Stars, int TurnNumber, CardSnapshot[] Deck, CardSnapshot[] Hand, CardSnapshot[] PlayPile, int DrawPileCount, CardSnapshot[] DiscardPile, CardSnapshot[] ExhaustPile, EntitySnapshot[] Relics, EntitySnapshot[] Potions, SummonSnapshot[] Summons, EntitySnapshot[] Powers, int CardsExhaustedThisTurn, bool PlayerLostHpThisTurn, int PlayerHpLossEventsThisCombat, int EnergySpentThisTurn, int OstyAttacksThisTurn, SemanticAction[] LegalActions);
+internal sealed record PlayerSnapshot(ulong NetId, string InstanceId, string CharacterId, int HitPoints, int MaxHitPoints, int Block, int Gold, int Energy, int MaxEnergy, int Stars, int TurnNumber, CardSnapshot[] Deck, CardSnapshot[] Hand, CardSnapshot[] PlayPile, int DrawPileCount, CardSnapshot[] DiscardPile, CardSnapshot[] ExhaustPile, EntitySnapshot[] Relics, EntitySnapshot[] Potions, SummonSnapshot[] Summons, OrbSnapshot[] Orbs, int OrbSlots, EntitySnapshot[] Powers, int CardsExhaustedThisTurn, int CardsDrawnThisCombat, bool PlayerLostHpThisTurn, int PlayerHpLossEventsThisCombat, int EnergySpentThisTurn, int StarsGainedThisTurn, int OstyAttacksThisTurn, SemanticAction[] LegalActions);
 internal sealed record CombatSnapshot(int Round, string Side, EnemySnapshot[] Enemies);
 internal sealed record EnemySnapshot(string InstanceId, string ModelId, int HitPoints, int MaxHitPoints, int Block, IntentSnapshot[] VisibleIntents, EntitySnapshot[] Powers);
 internal sealed record SummonSnapshot(string InstanceId, string ModelId, int HitPoints, int MaxHitPoints, int Block, EntitySnapshot[] Powers);
+internal sealed record OrbSnapshot(string ModelId, int Value);
 internal sealed record IntentSnapshot(string Kind, int Damage, int Hits);
 internal sealed record CardSnapshot(
     string InstanceId,
@@ -1419,9 +1524,11 @@ internal sealed record CardSnapshot(
     int StarCost,
     string Type,
     string TargetType,
+    bool Ethereal,
     int RampageExtraDamage,
     int ClawExtraDamage,
     int GeneticAlgorithmBonusBlock,
+    int SovereignBladeBonusDamage,
     int BaseReplayCount,
     bool CostsX,
     int? CostForTurn,
@@ -1437,7 +1544,7 @@ internal sealed record CardCostModifierSnapshot(
     int Expiration,
     bool IsReduceOnly);
 internal sealed record EntitySnapshot(string ModelId, int Amount, string State);
-internal sealed record PowerOracleSnapshot(string ModelId, int Amount, int AmountOnTurnStart, bool SkipNextDurationTick, int DarkEmbraceEtherealCount, int SelfDamage, int CardsPlayedThisTurn, int AdvancedCounterDebuffActivityCount, bool BoundCardPlayed, int FeralReturnsThisTurn, int ToricToughnessBlock);
+internal sealed record PowerOracleSnapshot(string ModelId, int Amount, int AmountOnTurnStart, bool SkipNextDurationTick, int DarkEmbraceEtherealCount, int SelfDamage, int CardsPlayedThisTurn, int AdvancedCounterDebuffActivityCount, bool BoundCardPlayed, int FeralReturnsThisTurn, int AutomationCardsLeft, int ToricToughnessBlock, int HardenedShellDamage, bool SkittishBlock);
 internal sealed record MapCoordSnapshot(int Column, int Row);
 internal sealed record MapNodeSnapshot(
     int Column,

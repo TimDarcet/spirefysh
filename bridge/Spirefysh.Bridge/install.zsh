@@ -28,7 +28,7 @@ if [[ ${1:-} == advisor ]]; then
   mkdir -p "$mods_dir" "$backup_dir"
   stage=$(mktemp -d "$mods_dir/.spirefysh-bridge.install.XXXXXX")
   cp "$output"/Spirefysh.Bridge.{dll,json,advisor-config,model.pt} \
-    "$output"/{advisor,model}.py "$stage/"
+    "$output"/{advisor,model,policy,verifier}.py "$stage/"
   if [[ -e "$install_dir" ]]; then
     backup="$backup_dir/spirefysh-bridge.backup.$(date +%Y%m%d-%H%M%S)"
     mv "$install_dir" "$backup"

@@ -144,7 +144,7 @@ static class Program
         var assembly = context.LoadFromAssemblyPath(Path.GetFullPath(bridgePath));
         var clientType = assembly.GetType("Spirefysh.Bridge.AdvisorClient", true)!;
         var configType = assembly.GetType("Spirefysh.Bridge.AdvisorConfiguration", true)!;
-        var config = Activator.CreateInstance(configType, false, false, "", "")!;
+        var config = Activator.CreateInstance(configType, false, false, "", "", false, null, null)!;
         var script = "while IFS= read -r line; do case $line in slow) sleep .2; print '{\"win_probability\":0.1,\"delta\":0}' ;; hang) sleep 10 ;; hover) print '{\"win_probability\":0.8,\"delta\":0}' ;; *) print '{\"win_probability\":0.5,\"delta\":0}' ;; esac; done";
         var start = new ProcessStartInfo("/bin/zsh")
         {

@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -24,9 +25,216 @@ using MegaCrit.Sts2.Core.Runs;
 
 namespace Spirefysh.Bridge;
 
-internal sealed record AdvisorConfiguration(bool ShowWinProbabilityDelta, bool ShowCurrentWinProbability, string Python, string Model);
+internal sealed record AdvisorConfiguration(
+    bool ShowWinProbabilityDelta,
+    bool ShowCurrentWinProbability,
+    string Python,
+    string Model,
+    bool CheckTransitions = false,
+    string? MismatchDirectory = null,
+    string? AdvisorPythonPath = null);
 internal sealed record AdvisorSelector(string? Kind = null, string? SourceId = null, string? TargetId = null, string? ModelId = null);
 internal sealed record AdvisorResult(double WinProbability, double Delta, string? Error = null);
+internal sealed record TransitionResult(bool TransitionMatch, string? Warning = null, string? Path = null, string? Error = null);
+
+internal sealed class TransitionVerifier : IDisposable
+{
+    private readonly Process _process;
+    private readonly object _gate = new();
+    private readonly Queue<string> _requests = [];
+    private readonly ConcurrentQueue<string> _warnings = [];
+    private readonly CancellationTokenSource _stopping = new();
+    private Task? _worker;
+    private bool _disposed;
+
+    private TransitionVerifier(Process process) => _process = process;
+
+    internal static TransitionVerifier? CreateFromConfiguration()
+    {
+        var directory = Path.GetDirectoryName(typeof(TransitionVerifier).Assembly.Location)!;
+        var path = Path.Combine(directory, "Spirefysh.Bridge.advisor-config");
+        if (!File.Exists(path)) return null;
+        var config = JsonSerializer.Deserialize<AdvisorConfiguration>(File.ReadAllText(path), TraceJson.Options)
+            ?? throw new InvalidDataException("Invalid advisor configuration.");
+        if (!config.CheckTransitions) return null;
+        var python = Path.GetFullPath(Path.IsPathFullyQualified(config.Python)
+            ? config.Python : Path.Combine(directory, config.Python));
+        var script = Path.Combine(directory, "verifier.py");
+        foreach (var required in new[] { python, script })
+            if (!File.Exists(required)) throw new FileNotFoundException("Transition verifier dependency is missing.", required);
+        var output = config.MismatchDirectory is { Length: > 0 } configured
+            ? Path.GetFullPath(Path.IsPathFullyQualified(configured) ? configured : Path.Combine(directory, configured))
+            : Path.Combine(System.Environment.GetFolderPath(System.Environment.SpecialFolder.ApplicationData),
+                "Spirefysh", "simulator-mismatches");
+        Directory.CreateDirectory(output);
+        var start = new ProcessStartInfo(python)
+        {
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+        start.ArgumentList.Add("-u");
+        start.ArgumentList.Add(script);
+        start.ArgumentList.Add(output);
+        var process = Process.Start(start)
+            ?? throw new InvalidOperationException("Could not start the transition verifier process.");
+        process.ErrorDataReceived += (_, eventArgs) =>
+        {
+            if (!string.IsNullOrWhiteSpace(eventArgs.Data))
+                Console.Error.WriteLine($"[Spirefysh verifier] {eventArgs.Data}");
+        };
+        process.BeginErrorReadLine();
+        return new(process);
+    }
+
+    internal void Check(TraceEvent transition, IReadOnlyList<TraceEvent> choices)
+    {
+        var request = JsonSerializer.Serialize(new
+        {
+            transition = new
+            {
+                schema_version = TraceCapture.TraceSchemaVersion,
+                build_commit = BridgeEntry.SupportedCommit,
+                game_assembly_sha256 = BridgeEntry.SupportedAssemblySha256,
+                content_manifest_sha256 = TraceCapture.ContentManifestSha256,
+                content_archive_sha256 = BridgeEntry.SupportedContentArchiveSha256,
+                transition.Kind,
+                transition.GameActionId,
+                transition.Before,
+                transition.Action,
+                transition.After,
+                transition.OracleBefore,
+                transition.OracleAfter,
+                transition.Metadata,
+                choices
+            }
+        }, TraceJson.Options);
+        lock (_gate)
+        {
+            if (_disposed) return;
+            _requests.Enqueue(request);
+            _worker ??= Task.Run(ProcessQueue);
+        }
+    }
+
+    internal bool TryTakeWarning(out string warning) => _warnings.TryDequeue(out warning!);
+
+    private void ProcessQueue()
+    {
+        while (true)
+        {
+            string request;
+            lock (_gate)
+            {
+                if (_disposed || !_requests.TryDequeue(out request!))
+                {
+                    _worker = null;
+                    return;
+                }
+            }
+            try
+            {
+                var result = Request(request);
+                if (!result.TransitionMatch)
+                    _warnings.Enqueue($"SIMULATOR MISMATCH: {result.Warning ?? "transition differs"}\nSaved to {result.Path ?? "diagnostics folder unavailable"}");
+            }
+            catch (Exception exception)
+            {
+                _warnings.Enqueue($"SIMULATOR CHECK FAILED: {exception.Message}");
+                Console.Error.WriteLine($"[Spirefysh verifier] {exception}");
+                return;
+            }
+        }
+    }
+
+    private TransitionResult Request(string request)
+    {
+        if (_process.HasExited) throw new InvalidOperationException("verifier process exited");
+        _process.StandardInput.WriteLine(request);
+        _process.StandardInput.Flush();
+        var response = _process.StandardOutput.ReadLineAsync(_stopping.Token).AsTask()
+            .WaitAsync(TimeSpan.FromSeconds(10), _stopping.Token).GetAwaiter().GetResult()
+            ?? throw new EndOfStreamException("verifier process closed its output");
+        var result = JsonSerializer.Deserialize<TransitionResult>(response, TraceJson.Options)
+            ?? throw new InvalidDataException("verifier returned an empty response");
+        if (result.Error is not null) throw new InvalidOperationException(result.Error);
+        return result;
+    }
+
+    public void Dispose()
+    {
+        lock (_gate)
+        {
+            if (_disposed) return;
+            _disposed = true;
+            _requests.Clear();
+            _stopping.Cancel();
+        }
+        try { _process.StandardInput.Close(); }
+        catch { }
+        try { if (!_process.HasExited) _process.Kill(entireProcessTree: true); }
+        catch { }
+        _process.Dispose();
+        _stopping.Dispose();
+    }
+}
+
+internal static class TransitionWarning
+{
+    private static TransitionVerifier? _verifier;
+    private static SceneTree? _tree;
+    private static Label? _label;
+    private static long _hideAt;
+
+    internal static void Install(TransitionVerifier verifier)
+    {
+        _verifier = verifier;
+        _tree = Engine.GetMainLoop() as SceneTree
+            ?? throw new InvalidOperationException("Godot scene tree is unavailable.");
+        _tree.ProcessFrame += Update;
+    }
+
+    private static void Update()
+    {
+        var now = System.Environment.TickCount64;
+        while (_verifier?.TryTakeWarning(out var warning) == true)
+        {
+            var label = Label();
+            label.Text = warning;
+            label.Visible = true;
+            _hideAt = now + 1000;
+        }
+        if (_label is not null && now >= _hideAt)
+            _label.Visible = false;
+    }
+
+    private static Label Label()
+    {
+        if (_label is not null) return _label;
+        _label = new Label
+        {
+            AnchorLeft = 0.5f,
+            AnchorRight = 0.5f,
+            OffsetLeft = -500,
+            OffsetRight = 500,
+            OffsetTop = 56,
+            OffsetBottom = 136,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center,
+            AutowrapMode = TextServer.AutowrapMode.WordSmart,
+            MouseFilter = Control.MouseFilterEnum.Ignore,
+            ZIndex = 8192
+        };
+        _label.AddThemeFontSizeOverride("font_size", 22);
+        _label.AddThemeColorOverride("font_color", Colors.Red);
+        _label.AddThemeColorOverride("font_outline_color", Colors.Black);
+        _label.AddThemeConstantOverride("outline_size", 8);
+        _tree!.Root.AddChild(_label);
+        return _label;
+    }
+}
 
 internal sealed class AdvisorClient : IDisposable
 {
@@ -83,6 +291,8 @@ internal sealed class AdvisorClient : IDisposable
         start.ArgumentList.Add(script);
         start.ArgumentList.Add("serve");
         start.ArgumentList.Add(model);
+        if (config.AdvisorPythonPath is { Length: > 0 } pythonPath)
+            start.Environment["PYTHONPATH"] = Resolve(directory, pythonPath);
         var process = Process.Start(start) ?? throw new InvalidOperationException("Could not start the advisor process.");
         process.ErrorDataReceived += (_, eventArgs) =>
         {

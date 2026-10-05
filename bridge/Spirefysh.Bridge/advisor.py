@@ -3,13 +3,12 @@ import json
 import shutil
 import sys
 
-import torch
-
 import sts2_sim
 
 
 def serve(path):
     from model import load, predict, tensors
+    import torch
 
     torch.set_num_threads(1)
     target = torch.device("cpu")
@@ -21,6 +20,8 @@ def serve(path):
             request = json.loads(line)
             env.load_snapshot(line)
             descriptors = env.action_descriptors()
+            if not descriptors:
+                raise ValueError("state has no actions")
             with torch.inference_mode():
                 current = predict(model, tensors(env.observe_tokens(), target, model), "fp32")[1].sigmoid().item()
             phase = env.stats()[0][4]

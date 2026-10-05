@@ -67,7 +67,7 @@ internal static class BridgePatches
             harmony.Patch(method,
                 prefix: new HarmonyMethod(typeof(BridgePatches), nameof(BeforeCardSelection)));
         foreach (var method in liveSelector.Assembly.GetTypes()
-                     .Where(type => !type.IsAbstract && liveSelector.IsAssignableFrom(type))
+                     .Where(type => type.Namespace == typeof(NCardRewardSelectionScreen).Namespace)
                      .SelectMany(type => type.GetMethods(BindingFlags.Public | BindingFlags.Instance |
                                                          BindingFlags.Static | BindingFlags.DeclaredOnly))
                      .Where(method => method.Name is "Create" or "ShowScreen")
@@ -185,7 +185,7 @@ internal static class BridgePatches
         _capture?.BeginExternalDecision(set, set.Id, skip, RewardActions(set));
     });
 
-    private static SemanticAction[] RewardActions(RewardsSet set)
+    internal static SemanticAction[] RewardActions(RewardsSet set)
     {
         var actions = set.Rewards.Select((reward, index) =>
                 RewardAction(set, reward, index))
