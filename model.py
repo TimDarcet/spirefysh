@@ -1,4 +1,6 @@
+import contextvars
 import fcntl
+import functools
 import hashlib
 import json
 import math
@@ -41,6 +43,28 @@ POOLING_DEFAULTS = {
 STAGES = [(0, bonus) for bonus in (24, 20, 16, 12, 8, 4, 3, 2, 1, 0)] + [
     (ascension, 0) for ascension in range(1, 11)
 ]
+
+_GRAPH_RECORDER = contextvars.ContextVar("model_graph_recorder", default=None)
+_GRAPH_SCOPES = contextvars.ContextVar("model_graph_scopes", default=())
+
+
+def graph_region(function):
+    @functools.wraps(function)
+    def wrapped(*args, **kwargs):
+        if _GRAPH_RECORDER.get() is None:
+            return function(*args, **kwargs)
+        name = function.__name__
+        if name in ("_collection", "_summarize") and len(args) > 4:
+            name += "." + str(args[4])
+        elif name == "_sequence" and len(args) > 5 and args[5] is args[0].global_transformer:
+            name = "global_transformer"
+        scope = _GRAPH_RECORDER.get().region(name)
+        token = _GRAPH_SCOPES.set((*_GRAPH_SCOPES.get(), scope))
+        try:
+            return function(*args, **kwargs)
+        finally:
+            _GRAPH_SCOPES.reset(token)
+    return wrapped
 POTENTIAL_TERMS = (
     "health", "max_hp", "upgrades", "relics", "potions", "gold", "cards",
     "uncommon_relics", "rare_relics", "uncommon_potions", "rare_potions",
@@ -1915,6 +1939,7 @@ class Agent(nn.Module):
         self.policy = nn.Linear(width, 1)
         self.critic = nn.Linear(width, 1)
         self._graph_cache = {}
+        self._trace_graph = False
         self._sequence_layouts = []
         self._reuse_sequence_layouts = False
         self._sequence_layout_index = 0
@@ -1966,18 +1991,20 @@ class Agent(nn.Module):
         value = score - torch.where(torch.isfinite(normalizer), normalizer, 0)[group]
         return torch.where(legal, value, torch.zeros_like(value))
 
+    @graph_region
     def encode_map(self, encoded, index):
         node_source, edge_source, levels, offsets, current, current_inverse, keys = index
-        cached = [self._graph_cache.get(key) for key in keys]
-        if not self.training and node_source.device.type == "cpu" and all(x is not None for x in cached):
+        cacheable = not self.training and not self._trace_graph and node_source.device.type == "cpu"
+        cached = [self._graph_cache.get(key) for key in keys] if cacheable else [None] * len(keys)
+        if cacheable and all(x is not None for x in cached):
             self.cache_stats["graph_hit"] += len(keys)
             nodes = torch.cat(cached)
         else:
-            if not self.training and node_source.device.type == "cpu":
+            if cacheable:
                 self.cache_stats["graph_hit"] += sum(x is not None for x in cached)
                 self.cache_stats["graph_miss"] += sum(x is None for x in cached)
             nodes = encoded[DOMAIN["map_node"]][node_source]
-            if not self.training and node_source.device.type == "cpu":
+            if cacheable:
                 ranges = offsets.tolist()
                 for graph, value in enumerate(cached):
                     if value is not None:
@@ -1990,7 +2017,7 @@ class Agent(nn.Module):
                 updated = nodes[parents] + self.graph_out(attended)
                 updated = updated + self.graph_ff(self.graph_ff_norm(updated))
                 nodes.index_copy_(0, parents[:count], updated[:count])
-            if not self.training and node_source.device.type == "cpu":
+            if cacheable:
                 offsets = offsets.tolist()
                 for graph, key in enumerate(keys):
                     if cached[graph] is None:
@@ -1999,6 +2026,7 @@ class Agent(nn.Module):
                     self._graph_cache.pop(next(iter(self._graph_cache)))
         return nodes[current][current_inverse], nodes
 
+    @graph_region
     def encode_domains(self, domains, concepts):
         learned = [
             (index, name, values)
@@ -2077,6 +2105,7 @@ class Agent(nn.Module):
             source = source[predicate(u[source])]
         return encoded[domain][inverse[source]], row[source], u[source]
 
+    @graph_region
     def _phases(self, domains, concepts):
         semantic, numeric, _count, metadata, rows, _scope, inverse, root, *_ = \
             domains[DOMAIN["phase"]]
@@ -2086,6 +2115,7 @@ class Agent(nn.Module):
             values = values + encoder.numeric(numeric.float())
         return values[inverse[root]], rows[root], metadata[root]
 
+    @graph_region
     def _sequence(self, values, group, groups, seed, transformer, selected=None, layout=None):
         selected_count = selected
         real_tokens = len(values) + groups
@@ -2223,6 +2253,7 @@ class Agent(nn.Module):
             items = items[selected[inverse]]
         return sequence[:, 0], items
 
+    @graph_region
     def _summarize(self, values, group, groups, name, mode, transformer_name=None):
         if mode == "sum":
             summary = _GroupSum.apply(values, group, groups) \
@@ -2235,6 +2266,7 @@ class Agent(nn.Module):
                                         self.pool_transformers[transformer_name or name])
         return summary
 
+    @graph_region
     def _collection(self, values, rows, active, name):
         collection = ("deck", "hand", "draw", "discard", "exhaust", "relic", "potion", "orb").index(name)
         mode = self.pooling[name]
@@ -2244,6 +2276,7 @@ class Agent(nn.Module):
                                   name, mode)
         return self._tag(summary[active], 10, collection), active
 
+    @graph_region
     def _actors(self, domains, encoded, batch, concepts, plan):
         order, player_source, player_group, move_raw, move_order, move_packed_order, \
             move_present, move_batch_sizes, move_terminal, effect_plans, families = plan
@@ -2314,6 +2347,7 @@ class Agent(nn.Module):
         actors = self.actor_norm(self._tag(actors, 4))
         return actors, rows, u, extra_values, extra_rows
 
+    @graph_region
     def _actions(self, domains, encoded, values, index, nodes, concepts):
         semantic, numeric = values
         action_row, action_flat, _legal, policy_sequence, actions, path, action_count, \
@@ -2351,6 +2385,7 @@ class Agent(nn.Module):
         action = self.action_norm(self._tag(action + attached, 9))
         return action, action_row[:action_count], action_flat[:action_count], actions, policy_sequence
 
+    @graph_region
     def _continuations(self, domains, encoded, plan):
         values, rows, u = self._domain_rows(domains, encoded, DOMAIN["continuation"])
         if not len(values):
@@ -2360,6 +2395,7 @@ class Agent(nn.Module):
         items.index_add_(0, group, values[order])
         return items, item_rows, plan[3:]
 
+    @graph_region
     def _packed_gru(self, values, batch_sizes, gru, parents=None):
         gates = _FastLinear.apply(values, gru.weight_ih_l0, gru.bias_ih_l0)
         if parents is not None:
@@ -2381,6 +2417,7 @@ class Agent(nn.Module):
             offset += size
         return state
 
+    @graph_region
     def encode_state(self, domains, encoded, index, action_values, action_index, concepts, batch):
         synchronize = torch.mps.synchronize if concepts.device.type == "mps" \
             and self.training and torch.is_grad_enabled() else lambda: None
@@ -2529,6 +2566,7 @@ class Agent(nn.Module):
         return state, transformed if len(action) else action, \
             action_rows, action_flat, actions, policy_sequence
 
+    @graph_region
     def forward(self, character, _globals, domains, state_index, action_values, action_index,
                 return_state=False, policy_only=False, flat_policy=False, temperature=1):
         synchronize = torch.mps.synchronize if domains[0][0].device.type == "mps" \

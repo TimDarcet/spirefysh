@@ -17,7 +17,7 @@ import numpy as np
 
 import sts2_sim
 from model import *
-from trajectories import TrajectorySource, trajectory_page
+from trajectories import TrajectorySource, model_page, trajectory_page
 _EVENT_FD = None
 _EVENT_ROLE = None
 _TRAINER_SESSION = None
@@ -1443,12 +1443,15 @@ def serve_dashboard(target, host, port):
                     body, content_type = (target / "dashboard.html").read_bytes(), "text/html"
                 elif request.path == "/trajectories.html":
                     body, content_type = trajectory_page().encode(), "text/html"
+                elif request.path == "/model.html":
+                    body, content_type = model_page().encode(), "text/html"
                 elif request.path.startswith("/game-assets/"):
                     name = request.path.removeprefix("/game-assets/")
                     if name not in {"assets.json", "glossary.json", "card_atlas_0.webp",
                                     "card_atlas_1.webp", "card_atlas_2.webp",
                                     "relic_atlas.webp", "potion_atlas.webp",
-                                    "power_atlas.webp"}:
+                                    "power_atlas.webp", "creature_atlas.webp",
+                                    "block.webp"}:
                         self.send_error(404); return
                     body = (assets / name).read_bytes()
                     content_type = "application/json" if name.endswith(".json") else "image/webp"
@@ -1497,18 +1500,24 @@ def serve_dashboard(target, host, port):
         def do_POST(self):
             try:
                 path = urlparse(self.path).path
-                if path not in ("/api/trajectory", "/api/explanation"):
+                if path not in ("/api/trajectory", "/api/explanation", "/api/model-graph"):
                     self.send_error(404); return
                 length = int(self.headers.get("Content-Length", 0))
                 if not 0 < length <= 64 * 1024 * 1024:
                     raise ValueError("invalid request size")
                 request = json.loads(self.rfile.read(length))
-                run = request.pop("run")
-                if path == "/api/explanation":
+                run = request.pop("run", None)
+                if path == "/api/model-graph":
+                    value = trajectories.model_graph(run, request)
+                elif path == "/api/explanation":
+                    if run is None:
+                        raise ValueError("missing run")
                     value = trajectories.explain(
                         run, request["trajectory"], request["step"], request.get("case"),
                     )
                 else:
+                    if run is None:
+                        raise ValueError("missing run")
                     value = trajectories.add(run, request["trace"]) if "trace" in request \
                         else trajectories.generate(run, request)
                 body = json_bytes(value)

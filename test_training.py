@@ -21,6 +21,7 @@ import rollout
 import telemetry
 import trajectories
 from explanations import explain
+from model_graph import trace_model
 
 
 def write_events(path, rows):
@@ -1017,6 +1018,59 @@ print('restored')
 
 
 class ModelKernelTest(unittest.TestCase):
+    def test_model_graph_trace_is_complete_and_exact(self):
+        env = train.sts2_sim.Batch(1, 18427, 1, ascension=0)
+        env.set_training_bonus(4)
+        observation = env.observe_tokens()
+        network = train.Agent(dict(env.token_layout())).eval()
+        result, recorder = trace_model(
+            network, train.tensors(observation, torch.device("cpu"), network),
+            "checkpoint", observation[5][0], train.sts2_sim.sts2_sim.__file__,
+        )
+        proof, graph = result["proof"], result["graph"]
+        self.assertTrue(proof["verified"])
+        self.assertLessEqual(proof["maximum_output_error"], 1e-6)
+        self.assertEqual(proof["operation_coverage"], 1)
+        self.assertGreater(proof["verified_rewrites"], 0)
+        self.assertLessEqual(proof["maximum_rewrite_error"], 1e-6)
+        self.assertEqual(len(recorder.ops), proof["raw_operations"])
+        self.assertTrue(graph["nodes"])
+        self.assertTrue(all(node["op_ids"] for node in graph["nodes"]))
+        self.assertEqual({op["id"] for op in recorder.ops}, {
+            op for node in graph["nodes"] for op in node["op_ids"]
+        })
+        self.assertTrue(all(int(edge["from"][1:]) < int(edge["to"][1:])
+                            for edge in graph["edges"]))
+        scope_order = {}
+        for node in graph["nodes"]:
+            scope_order.setdefault(node["scope"], int(node["id"][1:]))
+        by_id = {node["id"]: node for node in graph["nodes"]}
+        self.assertTrue(all(
+            by_id[edge["from"]]["scope"] == by_id[edge["to"]]["scope"]
+            or scope_order[by_id[edge["from"]]["scope"]]
+            < scope_order[by_id[edge["to"]]["scope"]]
+            for edge in graph["edges"]
+        ))
+        self.assertNotIn('"data"', json.dumps(result))
+
+    def test_model_graph_trace_fails_closed_on_output_difference(self):
+        env = train.sts2_sim.Batch(1, 7, 0, ascension=0)
+        observation = env.observe_tokens()
+        network = train.Agent(dict(env.token_layout())).eval()
+        functionalize = torch.func.functionalize
+        def corrupt(function):
+            traced = functionalize(function)
+            def call(*args):
+                policy, critic = traced(*args)
+                return policy + 1, critic
+            return call
+        with mock.patch("model_graph.torch.func.functionalize", side_effect=corrupt), \
+                self.assertRaisesRegex(RuntimeError, "does not reproduce"):
+            trace_model(
+                network, train.tensors(observation, torch.device("cpu"), network),
+                "checkpoint", observation[5][0], train.sts2_sim.sts2_sim.__file__,
+            )
+
     def test_card_context_ignores_device_padding(self):
         env = train.sts2_sim.Batch(1, 7, 0)
         target = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
@@ -1484,8 +1538,7 @@ class TrajectoryTest(unittest.TestCase):
     def test_trajectory_page_has_replay_and_portability_controls(self):
         page = trajectories.trajectory_page()
         for text in ("Generate from checkpoint", "Download JSON", "Import", "Legal actions",
-                     "Explain decision", "Causal token deletion",
-                     "What the training signal would be if this was a training example"):
+                     "Explain decision", "Model graph", "Causal token deletion", "<h2>Loss</h2>"):
             self.assertIn(text, page)
         self.assertIn("katex@0.16.11", page)
         self.assertIn("aria-expanded", page)
@@ -1511,9 +1564,15 @@ class TrajectoryTest(unittest.TestCase):
         self.assertIn("id=generationNote", page)
         self.assertIn("renderTraining(terminal?null:row)", page)
         self.assertIn("row.id?title(row)", page)
-        self.assertIn("/^(CARD|RELIC|POTION|POWER|ORB)\\./", page)
+        self.assertIn("/^(CARD|CHARACTER|MONSTER|RELIC|POTION|POWER|ORB)\\./", page)
         self.assertIn("action-name:hover>.preview,.item:hover>.preview", page)
         self.assertIn(".preview{display:none", page)
+        self.assertIn("position:fixed;z-index:1000", page)
+        self.assertIn("width:min(280px,calc(100vw - 16px))", page)
+        self.assertIn("function placePreview(event)", page)
+        self.assertIn("addEventListener('pointerover',placePreview)", page)
+        self.assertIn(".relic-icon{display:grid;place-items:center;width:46px", page)
+        self.assertIn(".effect-icon{display:grid;place-items:center;width:34px", page)
         self.assertIn(".preview-description{display:block", page)
         self.assertIn("<span class=preview-description>${plain(text,value)}</span>", page)
         self.assertIn("<span class=preview-description>${rich(description(row),row)}</span>", page)
@@ -1522,11 +1581,26 @@ class TrajectoryTest(unittest.TestCase):
         self.assertIn("request('/game-assets/assets.json')", page)
         self.assertIn("request('/game-assets/glossary.json')", page)
         self.assertIn("background-image:url('/game-assets/", page)
+        self.assertIn("id=relics", page)
+        self.assertIn("class=combatants", page)
+        self.assertIn("class=enemies", page)
+        self.assertIn("/game-assets/block.webp", page)
+        self.assertIn("base.relics.map(relic=>icon(relic,'relic-icon'))", page)
+        self.assertNotIn("<b>Relics</b>${chips(base.relics)}", page)
         self.assertIn("class=card-description", page)
         self.assertIn("resolved legal choice", page)
         self.assertNotIn("event data [", page)
         self.assertLess(page.index("id=phase"), page.index("Legal actions"))
         self.assertGreater(page.index("id=inventory"), page.index("Legal actions"))
+        self.assertGreater(page.index("id=trainingSignal"), page.index("id=inventory"))
+        self.assertNotIn("What the training signal would be if this was a training example", page)
+        graph = trajectories.model_page()
+        for text in ("Verified model graph", "Semantic", "Raw operations", "Execution",
+                     "Fold all", "Loading exact tensors"):
+            self.assertIn(text, graph)
+        self.assertIn("function automaticLayout", graph)
+        self.assertIn("function semanticGraph", graph)
+        self.assertIn("class=region", graph)
 
     def test_trajectory_assets_include_game_card_and_relic_art(self):
         root = Path(trajectories.__file__).with_name("game-assets")
@@ -1535,6 +1609,8 @@ class TrajectoryTest(unittest.TestCase):
         self.assertEqual(assets["relic/burning_blood"][3:], [71, 81])
         self.assertEqual(assets["potion/energy_potion"][3:], [80, 80])
         self.assertEqual(assets["power/vulnerable_power"][3:], [64, 64])
+        self.assertEqual(assets["character/ironclad"][3:], [180, 180])
+        self.assertEqual(assets["monster/fuzzy_wurm_crawler"][3:], [180, 180])
         glossary = json.loads((root / "glossary.json").read_text())
         self.assertEqual(glossary["card"]["BASH.title"], "Bash")
         self.assertIn("end of combat", glossary["relic"]["BURNING_BLOOD.description"])
@@ -1545,6 +1621,8 @@ class TrajectoryTest(unittest.TestCase):
         for atlas in {row[0] for row in assets.values()}:
             data = (root / f"{atlas}.webp").read_bytes()
             self.assertEqual((data[:4], data[8:12]), (b"RIFF", b"WEBP"))
+        data = (root / "block.webp").read_bytes()
+        self.assertEqual((data[:4], data[8:12]), (b"RIFF", b"WEBP"))
 
     def test_game_content_previews_expose_hover_details(self):
         content = json.loads((Path(trajectories.__file__).with_name(

@@ -6,7 +6,7 @@ use pyo3::{
     exceptions::PyValueError,
     prelude::*,
     pybacked::PyBackedBytes,
-    types::{PyBytes, PyList, PyTuple},
+    types::{PyBytes, PyDict, PyList, PyTuple},
 };
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -133,6 +133,33 @@ fn model_schema() -> (
         SEMANTIC_NAMES.to_vec(),
         POSITION_NAMES.into_iter().zip(POSITION_CAPS).collect(),
     )
+}
+
+#[pyfunction]
+fn feature_schema(py: Python<'_>) -> PyResult<Py<PyAny>> {
+    let result = PyDict::new(py);
+    result.set_item("schema", 1)?;
+    result.set_item("feature_version", VERSION)?;
+    result.set_item(
+        "domains",
+        DOMAIN_NAMES
+            .into_iter()
+            .zip(DOMAIN_WIDTHS)
+            .map(|(name, (unsigned, signed, categorical, numeric))| {
+                (name, unsigned, signed, categorical, numeric)
+            })
+            .collect::<Vec<_>>(),
+    )?;
+    result.set_item("action", [ACTION_U, ACTION_S, ACTION_C, ACTION_F])?;
+    result.set_item("semantic_namespaces", SEMANTIC_NAMES)?;
+    result.set_item(
+        "position_caps",
+        POSITION_NAMES
+            .into_iter()
+            .zip(POSITION_CAPS)
+            .collect::<Vec<_>>(),
+    )?;
+    Ok(result.into_any().unbind())
 }
 
 #[pyfunction]
@@ -8090,6 +8117,7 @@ impl Batch {
 fn sts2_sim(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Batch>()?;
     module.add_function(wrap_pyfunction!(model_schema, module)?)?;
+    module.add_function(wrap_pyfunction!(feature_schema, module)?)?;
     module.add_function(wrap_pyfunction!(configure_logging, module)?)?;
     module.add_function(wrap_pyfunction!(unique_rows, module)?)?;
     module.add_function(wrap_pyfunction!(unique_feature_rows, module)?)?;
