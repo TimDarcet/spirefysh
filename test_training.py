@@ -1476,9 +1476,38 @@ class TrajectoryTest(unittest.TestCase):
             self.assertEqual([row["id"] for row in listing["traces"]], ["trace"])
             imported = source.add("run", json.loads(json.dumps(self.trace())))
             self.assertEqual(imported["trace"]["source"], "imported")
+            self.assertIn(imported["trace"]["id"], {
+                row["id"] for row in trajectories.TrajectorySource(root).list("run")["traces"]})
             self.assertEqual(len(imported["steps"]), 1)
             with self.assertRaisesRegex(ValueError, "invalid run"):
                 source.list("../run")
+
+    def test_generation_snapshots_checkpoint_for_later_analysis(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(); run = root / "run"; run.mkdir()
+            (run / "run.json").write_text(json.dumps({"stages": [[0, 0]]}))
+            (run / "latest.pt").write_bytes(b"first")
+            source = trajectories.TrajectorySource(root)
+            loaded = []
+            generated = lambda *args: {"id": f"generated:{len(source.generated.get('run', {}))}"}
+            with mock.patch("trajectories.load", side_effect=lambda path, _target: (
+                    loaded.append(Path(path)) or mock.Mock(), {"stage": 0, "fingerprint": 1})), \
+                    mock.patch("trajectories.export_value_model"), \
+                    mock.patch.object(source, "_generate_one", side_effect=generated):
+                source.generate("run", {"characters": [0]})
+                source.generate("run", {"characters": [0], "snapshot": False})
+            first, second = source.generated["run"].values()
+            snapshot = run / "snapshots" / f"{model.sha256_file(run / 'latest.pt')}.pt"
+            self.assertEqual(loaded, [snapshot, run / "latest.pt"])
+            self.assertEqual(first["checkpoint_sha256"], second["checkpoint_sha256"])
+            self.assertEqual([path.name for path in (run / "snapshots").iterdir()], [snapshot.name])
+            restarted = trajectories.TrajectorySource(root)
+            self.assertEqual(restarted._generated("run"), source.generated["run"])
+            (run / "latest.pt").write_bytes(b"overwritten")
+            for trace in (first, second):
+                trace["checkpoint"] = "latest.pt"
+                self.assertEqual(trajectories._checkpoint_file(run, trace), snapshot)
+                self.assertTrue(source._graph_availability(run, trace)["available"])
 
     def test_catalog_prefers_compatible_runs_and_disables_old_checkpoints(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -1,6 +1,8 @@
 import gzip
 import json
 import math
+import os
+import shutil
 import threading
 import time
 import uuid
@@ -238,6 +240,11 @@ def replay_trace(trace, config=None):
             "training_config": config}
 
 
+def _checkpoint_file(run, trace):
+    snapshot = run / "snapshots" / f"{trace['checkpoint_sha256']}.pt"
+    return snapshot if snapshot.is_file() else (run / str(trace["checkpoint"])).resolve()
+
+
 class TrajectorySource:
     def __init__(self, target):
         self.target = Path(target).resolve()
@@ -291,6 +298,21 @@ class TrajectorySource:
         self.cache[name] = signature, traces
         return traces
 
+    def _generated(self, name):
+        if name not in self.generated:
+            self.generated[name] = {trace["id"]: trace for trace in (
+                json.loads(path.read_text())
+                for path in sorted((self._run(name) / "generated").glob("*.json")))}
+        return self.generated[name]
+
+    def _remember(self, name, trace):
+        folder = self._run(name) / "generated"
+        folder.mkdir(exist_ok=True)
+        temporary = folder / f".{uuid.uuid4().hex}.tmp"
+        temporary.write_text(json.dumps(trace))
+        os.replace(temporary, folder / f"{trace['id'].split(':')[1]}.json")
+        self._generated(name)[trace["id"]] = trace
+
     def _checkpoints(self, run):
         paths = [run / "latest.pt", run / "initial.pt"]
         paths += sorted((run / "checkpoints").glob("*.pt"))
@@ -305,7 +327,7 @@ class TrajectorySource:
             training = sessions[-1].get("training", manifest.get("training", {})) \
                 if sessions else manifest.get("training", {})
             compatible = manifest.get("model_version") == MODEL_VERSION
-            traces = self._captured(name) | self.generated.get(name, {})
+            traces = self._captured(name) | self._generated(name)
             return {
                 "run": name,
                 "checkpoints": self._checkpoints(run) if compatible else [],
@@ -328,7 +350,7 @@ class TrajectorySource:
     def get(self, name, trace_id):
         with self.lock:
             run = self._run(name)
-            trace = self.generated.get(name, {}).get(trace_id) or self._captured(name).get(trace_id)
+            trace = self._generated(name).get(trace_id) or self._captured(name).get(trace_id)
             if trace is None:
                 raise ValueError("unknown trajectory")
             result = replay_trace(trace, _training_config(json.loads(
@@ -342,7 +364,7 @@ class TrajectorySource:
         checkpoint, digest = trace.get("checkpoint"), trace.get("checkpoint_sha256")
         if not checkpoint or not digest:
             return {"available": False, "reason": "exact checkpoint proof is unavailable"}
-        path = (run / str(checkpoint)).resolve()
+        path = _checkpoint_file(run, trace)
         if not path.is_relative_to(run) or not path.is_file():
             return {"available": False, "reason": "exact checkpoint file is unavailable"}
         if sha256_file(path) != str(digest):
@@ -373,13 +395,15 @@ class TrajectorySource:
 
             run = self._run(name)
             trace_id, step = str(request["trajectory"]), int(request["step"])
-            trace = self.generated.get(name, {}).get(trace_id) or self._captured(name).get(trace_id)
-            if trace is None or not 0 <= step < len(trace["choices"]):
+            trace = self._generated(name).get(trace_id) or self._captured(name).get(trace_id)
+            if trace is None:
+                raise ValueError("unknown trajectory; reopen it from the trajectory list")
+            if not 0 <= step < len(trace["choices"]):
                 raise ValueError("invalid trajectory decision")
             availability = self._graph_availability(run, trace)
             if not availability["available"]:
                 raise ValueError(availability["reason"])
-            checkpoint_path = (run / str(trace["checkpoint"])).resolve()
+            checkpoint_path = _checkpoint_file(run, trace)
             digest = str(trace["checkpoint_sha256"])
             if sha256_file(checkpoint_path) != digest:
                 raise ValueError("checkpoint proof does not match the exact file")
@@ -426,7 +450,7 @@ class TrajectorySource:
             trace = dict(validate_trace(trace))
             trace["id"] = f"imported:{uuid.uuid4().hex}"
             trace["source"] = "imported"
-            self.generated.setdefault(name, {})[trace["id"]] = trace
+            self._remember(name, trace)
             return replay_trace(trace, _training_config(json.loads(
                 (run / "run.json").read_text()
             ), trace))
@@ -438,7 +462,15 @@ class TrajectorySource:
             checkpoint_path = (run / checkpoint_name).resolve()
             if not checkpoint_path.is_relative_to(run) or not checkpoint_path.is_file():
                 raise ValueError("invalid checkpoint")
-            checkpoint_sha256 = sha256_file(checkpoint_path)
+            if options.get("snapshot", True):
+                (run / "snapshots").mkdir(exist_ok=True)
+                temporary = run / "snapshots" / f".{uuid.uuid4().hex}.tmp"
+                shutil.copyfile(checkpoint_path, temporary)
+                checkpoint_sha256 = sha256_file(temporary)
+                checkpoint_path = run / "snapshots" / f"{checkpoint_sha256}.pt"
+                os.replace(temporary, checkpoint_path)
+            else:
+                checkpoint_sha256 = sha256_file(checkpoint_path)
             model, checkpoint = load(checkpoint_path, torch.device("cpu"))
             model.eval()
             self.model = name, checkpoint_name, checkpoint_sha256, model
@@ -485,13 +517,13 @@ class TrajectorySource:
                         ascension, bonus, temperature, sampled, max_steps, max_combat_steps,
                     )
                     trajectory["checkpoint_sha256"] = checkpoint_sha256
-                    self.generated.setdefault(name, {})[trajectory["id"]] = trajectory
+                    self._remember(name, trajectory)
                     generated.append(_metadata(trajectory))
             return {"generated": generated}
 
     def explain(self, name, trace_id, step, case=None):
         with self.lock:
-            trace = self.generated.get(name, {}).get(trace_id)
+            trace = self._generated(name).get(trace_id)
             if trace is None or trace.get("source") != "generated":
                 raise ValueError("explanations are available only for freshly generated trajectories")
             step = int(step)
@@ -503,7 +535,7 @@ class TrajectorySource:
             checkpoint = str(trace["checkpoint"])
             digest = str(trace["checkpoint_sha256"])
             if self.model is None or self.model[:3] != (name, checkpoint, digest):
-                path = (self._run(name) / checkpoint).resolve()
+                path = _checkpoint_file(self._run(name), trace)
                 if not path.is_relative_to(self._run(name)) or not path.is_file() \
                         or sha256_file(path) != digest:
                     raise ValueError("the exact generating checkpoint is no longer available")
@@ -605,7 +637,7 @@ def trajectory_page():
 .preview{width:min(280px,calc(100vw - 16px))}
 </style><div class=bar><a href=/>&larr; Metrics</a><h1>Trajectories</h1><span id=status class=muted></span></div>
 <div class=panel><div class=controls><label>Run <select id=run></select></label><label>Session <select id=session><option value="">All</option></select></label><label>Character <select id=character><option value="">All</option></select></label><label>Outcome <select id=outcome><option value="">All</option><option>won</option><option>dead</option><option>step_cap</option><option>combat_cap</option><option>empty_actions</option></select></label><label>Minimum floor <input id=floor type=number min=0 value=0></label><label>Seed <input id=seedFilter type=number placeholder=any></label><label>Policy revision <input id=revision type=number placeholder=any></label><button id=refresh>Refresh</button><label>Import <input id=import type=file accept=application/json></label></div>
-<details><summary>Generate from checkpoint</summary><div class=controls><label>Checkpoint <select id=checkpoint></select></label><label>Seed <input id=seed type=number></label><label>Runs / character <input id=runs type=number min=1 max=64 value=1></label><label>Mode <select id=mode><option value=sample>Sampled</option><option value=greedy>Greedy</option></select></label><label>Temperature <input id=temperature type=number min=.001 step=.05></label><label>Stage <input id=stage type=number min=0 placeholder=checkpoint></label><label>Ascension <input id=ascension type=number min=0 placeholder=stage></label><label>Bonus <input id=bonus type=number min=0 placeholder=stage></label><label>Max steps <input id=maxSteps type=number min=1></label><label>Max combat steps <input id=maxCombat type=number min=1></label><span id=characters></span><button id=generate>Generate</button><span id=generationNote class=error></span></div></details></div>
+<details><summary>Generate from checkpoint</summary><div class=controls><label>Checkpoint <select id=checkpoint></select></label><label>Seed <input id=seed type=number></label><label>Runs / character <input id=runs type=number min=1 max=64 value=1></label><label>Mode <select id=mode><option value=sample>Sampled</option><option value=greedy>Greedy</option></select></label><label>Temperature <input id=temperature type=number min=.001 step=.05></label><label>Stage <input id=stage type=number min=0 placeholder=checkpoint></label><label>Ascension <input id=ascension type=number min=0 placeholder=stage></label><label>Bonus <input id=bonus type=number min=0 placeholder=stage></label><label>Max steps <input id=maxSteps type=number min=1></label><label>Max combat steps <input id=maxCombat type=number min=1></label><label title="Copy the checkpoint into snapshots/ so activation exploration survives it being overwritten"><input id=snapshot type=checkbox checked> Keep checkpoint copy</label><span id=characters></span><button id=generate>Generate</button><span id=generationNote class=error></span></div></details></div>
 <div class=grid><section class="panel list"><h2>Trajectories</h2><div id=traces></div></section><main class=panel><div class=playback><button id=previous>&larr;</button><button id=play>Play</button><button id=next>&rarr;</button><input id=position type=range min=0 value=0><span id=step></span><button id=explain>Explain decision</button><button id=modelGraph>Model graph</button><button id=download>Download JSON</button></div><div id=summary></div><div id=relics></div><div id=phase></div><div id=state></div><h2>Legal actions</h2><table class=actions><thead><tr><th>Choice</th><th>Action</th><th>Source</th><th>Target</th><th>Probability</th><th>Log p</th></tr></thead><tbody id=actions></tbody></table><section id=explanation class=explanation hidden><div class=bar><h2>Decision explanation</h2><button id=downloadExplanation>Download explanation JSON</button></div><div id=explanationSummary></div><h3>Causal token deletion</h3><div id=influences></div><h3>Attention <span class=muted>routing, not causal attribution</span></h3><div class=controls><label>Layer <select id=attentionRecord></select></label><label>Head <select id=attentionHead></select></label></div><div id=attentionOverview></div><div id=attentionHeatmap class=attention></div></section><div id=inventory></div><section id=trainingSignal class=training-signal hidden><h2>Loss</h2><div id=signalSummary></div><p id=signalNote class=muted></p><div id=formulaTree></div></section><details><summary>Raw state</summary><pre id=raw></pre></details></main></div>
 <script>
 const $=id=>document.querySelector('#'+id),names=['Ironclad','Defect','Silent','Regent','Necrobinder'];let listing,current,timer,explanation,assets={},glossary={},content={},terms={};const explanationCache=new Map;
@@ -636,7 +668,7 @@ function influenceTable(rows){return `<table class=influences><thead><tr><th>Tok
 function showAttention(){const records=explanation._attention||explanation.attention,record=records[Number($('attentionRecord').value)];if(!record)return;const heads=record.weights,head=Number($('attentionHead').value),matrix=head<0?heads[0].map((row,q)=>row.map((_,k)=>heads.reduce((sum,current)=>sum+current[q][k],0)/heads.length)):heads[head],labels=record.labels;const interesting=record.hierarchy==='global_transformer'?[0,...labels.map((token,index)=>token.kind==='action'&&(token.action===explanation.chosen||token.action===explanation.alternative)?index:false).filter(index=>index!==false)]:[0],links=interesting.map(query=>{const top=matrix[query].map((weight,key)=>({weight,key})).sort((a,b)=>b.weight-a.weight).slice(0,8);return `<p><b>${thing(labels[query]?.label||'query '+query)}</b>: ${top.map(item=>`${thing(labels[item.key]?.label||'token '+item.key)} ${(100*item.weight).toFixed(1)}%`).join(' · ')}</p>`}).join('');$('attentionOverview').innerHTML=links;const header=labels.map((token,index)=>`<th title="${esc(label(token.label))}">${index}</th>`).join(''),body=matrix.map((row,query)=>`<tr><th>${thing(labels[query]?.label||'token '+query)}</th>${row.map(weight=>`<td title="${weight.toFixed(6)}" style="background:rgba(96,165,250,${Math.min(1,weight*4)})">${(100*weight).toFixed(1)}</td>`).join('')}</tr>`).join('');$('attentionHeatmap').innerHTML=`<table class=heatmap><thead><tr><th>query \\ key</th>${header}</tr></thead><tbody>${body}</tbody></table>`}
 function selectAttention(){const records=explanation._attention||explanation.attention,heads=records[Number($('attentionRecord').value)]?.weights.length||0;$('attentionHead').innerHTML='<option value=-1>Head average</option>'+Array.from({length:heads},(_,index)=>`<option value=${index}>Head ${index}</option>`).join('');showAttention()}function renderExplanation(value){explanation=value;Object.defineProperty(value,'_attention',{value:value.case_attention?[...value.attention.filter(row=>row.hierarchy!=='global_transformer'),...value.case_attention]:value.attention,configurable:true});$('explanation').hidden=false;const baseline=value.baseline,flags=value.flags.map(label).join(', ');$('explanationSummary').innerHTML=`<p>Chosen ${value.chosen} vs alternative ${value.alternative} · margin ${baseline.margin.toFixed(4)} · probabilities ${(100*baseline.chosen_probability).toFixed(2)}% / ${(100*baseline.alternative_probability).toFixed(2)}% · critic ${baseline.critic.toFixed(4)}${flags?' · '+esc(flags):''}${value.attention_case?` · attention after deleting ${esc(label(value.attention_case))}`:''}</p>`;const top=value.influences.slice(0,12);$('influences').innerHTML=influenceTable(top)+(value.influences.length>12?`<details><summary>All ${value.influences.length} results</summary>${influenceTable(value.influences)}</details>`:'');document.querySelectorAll('.compare-case').forEach(node=>node.onclick=()=>analyze(node.dataset.case));$('attentionRecord').innerHTML=value._attention.map((row,index)=>`<option value=${index}>${esc(label(row.hierarchy))} · layer ${row.layer} · call ${row.call}</option>`).join('');selectAttention();scrollTo({top:$('explanation').offsetTop-20,behavior:'smooth'})}
 async function analyze(caseId){if(!current||Number($('position').value)>=current.steps.length)return;const step=Number($('position').value),key=`${current.trace.id}:${step}:${caseId||''}`;try{setStatus('analyzing');const body={run:$('run').value,trajectory:current.trace.id,step};if(typeof caseId==='string')body.case=caseId;const value=explanationCache.get(key)||await request('/api/explanation',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});explanationCache.set(key,value);renderExplanation(value);setStatus('')}catch(error){setStatus(error.message,true)}}
-async function generate(){try{setStatus('generating');const body={run:$('run').value,checkpoint:$('checkpoint').value,seed:value('seed'),runs:value('runs'),sample:$('mode').value==='sample',temperature:value('temperature'),stage:value('stage'),ascension:value('ascension'),bonus:value('bonus'),max_steps:value('maxSteps'),max_combat_steps:value('maxCombat'),characters:[...document.querySelectorAll('#characters input:checked')].map(node=>Number(node.value))};for(const key of Object.keys(body))if(body[key]===undefined)delete body[key];const result=await request('/api/trajectory',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});await loadRun();if(result.generated.length)await openTrace(result.generated[0].id)}catch(error){setStatus(error.message,true)}}
+async function generate(){try{setStatus('generating');const body={run:$('run').value,checkpoint:$('checkpoint').value,seed:value('seed'),runs:value('runs'),sample:$('mode').value==='sample',temperature:value('temperature'),stage:value('stage'),ascension:value('ascension'),bonus:value('bonus'),max_steps:value('maxSteps'),max_combat_steps:value('maxCombat'),snapshot:$('snapshot').checked,characters:[...document.querySelectorAll('#characters input:checked')].map(node=>Number(node.value))};for(const key of Object.keys(body))if(body[key]===undefined)delete body[key];const result=await request('/api/trajectory',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});await loadRun();if(result.generated.length)await openTrace(result.generated[0].id)}catch(error){setStatus(error.message,true)}}
 async function importTrace(file){try{const trace=JSON.parse(await file.text()),result=await request('/api/trajectory',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({run:$('run').value,trace})});await loadRun();current=result;$('position').max=current.steps.length;$('position').value=0;show()}catch(error){setStatus(error.message,true)}}
 addEventListener('pointerover',placePreview);
 $('characters').innerHTML=names.map((name,index)=>`<label><input type=checkbox value=${index} checked>${name}</label>`).join(' ');$('character').innerHTML+=[...names].map((name,index)=>`<option value=${index}>${name}</option>`).join('');$('run').onchange=loadRun;$('refresh').onclick=loadRun;for(const id of ['session','character','outcome','floor','seedFilter','revision'])$(id).oninput=renderList;$('generate').onclick=generate;$('explain').onclick=()=>analyze();$('modelGraph').onclick=()=>{if(!current||$('modelGraph').disabled)return;const query=new URLSearchParams({run:$('run').value,trajectory:current.trace.id,step:$('position').value});location.href='/model.html?'+query};$('attentionRecord').onchange=selectAttention;$('attentionHead').onchange=showAttention;$('import').onchange=event=>event.target.files[0]&&importTrace(event.target.files[0]);$('position').oninput=show;$('previous').onclick=()=>{$('position').value=Math.max(0,Number($('position').value)-1);show()};$('next').onclick=()=>{$('position').value=Math.min(Number($('position').max),Number($('position').value)+1);show()};$('play').onclick=()=>{if(timer){clearInterval(timer);timer=null;$('play').textContent='Play'}else{timer=setInterval(()=>{if(Number($('position').value)>=Number($('position').max)){$('play').click();return}$('next').click()},500);$('play').textContent='Pause'}};$('download').onclick=()=>{if(!current)return;const link=document.createElement('a');link.href=URL.createObjectURL(new Blob([JSON.stringify(current.trace,null,2)],{type:'application/json'}));link.download=`trajectory-${current.trace.seed}.json`;link.click();URL.revokeObjectURL(link.href)};$('downloadExplanation').onclick=()=>{if(!explanation)return;const link=document.createElement('a');link.href=URL.createObjectURL(new Blob([JSON.stringify(explanation,null,2)],{type:'application/json'}));link.download=`explanation-${current.trace.seed}-${explanation.step}.json`;link.click();URL.revokeObjectURL(link.href)};addEventListener('keydown',event=>{if(event.target.matches('input,select'))return;if(event.key==='ArrowLeft')$('previous').click();if(event.key==='ArrowRight')$('next').click()});catalog().catch(error=>setStatus(error.message,true));
