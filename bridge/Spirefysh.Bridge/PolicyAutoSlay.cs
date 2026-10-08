@@ -18,6 +18,7 @@ using MegaCrit.Sts2.Core.Entities.Players;
 using MegaCrit.Sts2.Core.GameActions;
 using MegaCrit.Sts2.Core.GameActions.Multiplayer;
 using MegaCrit.Sts2.Core.Models;
+using MegaCrit.Sts2.Core.Models.Events;
 using MegaCrit.Sts2.Core.Nodes;
 using MegaCrit.Sts2.Core.Nodes.Cards.Holders;
 using MegaCrit.Sts2.Core.Nodes.CommonUi;
@@ -160,6 +161,9 @@ internal static class PolicyAutoSlay
         harmony.Patch(
             AccessTools.Method(typeof(NCharacterSelectButton), nameof(NCharacterSelectButton.Select)),
             prefix: new HarmonyMethod(typeof(PolicyAutoSlay), nameof(BeforeCharacterSelect)));
+        harmony.Patch(
+            AccessTools.Method(typeof(PunchOff), nameof(PunchOff.AfterEventStarted)),
+            prefix: new HarmonyMethod(typeof(PolicyAutoSlay), nameof(BeforePunchOff)));
         var nextItem = typeof(Rng).GetMethods().Single(method =>
             method.Name == nameof(Rng.NextItem) && method.IsGenericMethodDefinition);
         var prefix = typeof(PolicyAutoSlay).GetMethod(
@@ -183,6 +187,12 @@ internal static class PolicyAutoSlay
     private static bool BeforeEventCombat(CancellationToken ct, ref Task __result)
     {
         __result = PlayCombat(ct);
+        return false;
+    }
+
+    private static bool BeforePunchOff(ref Task __result)
+    {
+        __result = Task.CompletedTask;
         return false;
     }
 

@@ -1,3 +1,4 @@
+use super::combat::sort_for_shuffle;
 use super::*;
 
 impl Game {
@@ -767,6 +768,7 @@ impl Game {
             orbs: vec![],
             orb_slots: self.run.orb_slots,
             history: History::default(),
+            total_cards: 0,
             last_cards: 0,
             orbit_spent: 0,
             hits: vec![0; enemy_count],
@@ -810,6 +812,7 @@ impl Game {
             burning_sticks: false,
             red_skull: false,
             throwing_axe: false,
+            vambrace: false,
             paels_eye: false,
             paels_legion: 0,
             history_course: None,
@@ -901,19 +904,26 @@ impl Game {
                         .unwrap()
                         .draw
                         .iter()
-                        .enumerate()
-                        .filter(|(_, card)| {
+                        .rev()
+                        .copied()
+                        .filter(|card| {
                             card.upgrades == 0
                                 && !matches!(
                                     card.card_type(content.cards[card.id as usize]),
                                     CardType::Status | CardType::Curse | CardType::Quest
                                 )
                         })
-                        .map(|(index, _)| index)
                         .collect();
+                    sort_for_shuffle(&mut cards, content);
                     self.rngs.combat_card_selection.shuffle(&mut cards);
-                    for index in cards.into_iter().take(2) {
-                        self.combat_mut().unwrap().draw[index].upgrades = 1;
+                    for card in cards.into_iter().take(2) {
+                        self.combat_mut()
+                            .unwrap()
+                            .draw
+                            .iter_mut()
+                            .find(|candidate| candidate.instance == card.instance)
+                            .unwrap()
+                            .upgrades = 1;
                     }
                 }
                 _ => {}
@@ -935,6 +945,17 @@ impl Game {
         self.start_turn(content);
         self.trigger(content, Trigger::CombatStart, Actor::Player, 0);
         self.resolve(content);
+        if self.has_relic(content, "RELIC.GAMBLING_CHIP") {
+            self.select(
+                content,
+                Pile::Hand,
+                CardFilter::Any,
+                CardOp::DiscardDraw,
+                u8::MAX,
+                false,
+                true,
+            );
+        }
         Ok(())
     }
 

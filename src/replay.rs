@@ -33,6 +33,7 @@ struct TurnHistory {
     encounter: String,
     round: u16,
     cards: i16,
+    total_cards: i16,
     manual_cards: i16,
     manual_plays: i16,
     attacks: i16,
@@ -47,6 +48,8 @@ struct TurnHistory {
     automation_drawn: Option<i16>,
     withering: i16,
     wither_upgrades: i16,
+    bolas: Vec<u32>,
+    panache_start: Option<i16>,
     enemy_moves: HashMap<u32, Vec<String>>,
 }
 
@@ -851,12 +854,17 @@ fn replay_decision(
                 game.add_card(content, value);
             }
         }
-        let target = oracle_after["rng_counters"]["run.Niche"]
-            .as_u64()
-            .unwrap_or(game.rngs.niche.1);
-        if target > game.rngs.niche.1 {
-            game.rngs.niche.forward(target - game.rngs.niche.1);
-        }
+        let mut niche = Rng::from_seed(
+            oracle_after["rng_seeds"]["run.Niche"]
+                .as_u64()
+                .unwrap_or_default(),
+        );
+        niche.forward(
+            oracle_after["rng_counters"]["run.Niche"]
+                .as_u64()
+                .unwrap_or_default(),
+        );
+        game.rngs.niche = niche;
         game.run.hp = number(&after["players"][0], "hit_points").unwrap_or_default() as i16;
         game.run.max_hp = number(&after["players"][0], "max_hit_points").unwrap_or_default() as i16;
         game.run.gold = number(&after["players"][0], "gold").unwrap_or_default() as i32;
@@ -879,18 +887,26 @@ fn replay_decision(
             relic.id
         })
         .map_err(|error| vec![error])?;
-        let target = oracle_after["rng_counters"]["player.1.Rewards"]
-            .as_u64()
-            .unwrap_or(game.rngs.rewards.1);
-        if target > game.rngs.rewards.1 {
-            game.rngs.rewards.forward(target - game.rngs.rewards.1);
-        }
-        let target = oracle_after["rng_counters"]["run.Niche"]
-            .as_u64()
-            .unwrap_or(game.rngs.niche.1);
-        if target > game.rngs.niche.1 {
-            game.rngs.niche.forward(target - game.rngs.niche.1);
-        }
+        game.rngs.rewards = Rng::from_seed(
+            oracle_after["rng_seeds"]["player.1.Rewards"]
+                .as_u64()
+                .unwrap_or_default(),
+        );
+        game.rngs.rewards.forward(
+            oracle_after["rng_counters"]["player.1.Rewards"]
+                .as_u64()
+                .unwrap_or_default(),
+        );
+        game.rngs.niche = Rng::from_seed(
+            oracle_after["rng_seeds"]["run.Niche"]
+                .as_u64()
+                .unwrap_or_default(),
+        );
+        game.rngs.niche.forward(
+            oracle_after["rng_counters"]["run.Niche"]
+                .as_u64()
+                .unwrap_or_default(),
+        );
     }
     if traced_action["kind"] == "use_potion"
         && let Phase::Combat(combat) = &mut game.phase
@@ -974,20 +990,20 @@ fn replay_decision(
             }
         }
     }
-    if traced_action["kind"] == "end_turn"
-        && let Phase::Combat(combat) = &mut game.phase
-    {
-        for enemy in &mut combat.enemies {
-            let instance = format!("creature:{}", enemy.instance.saturating_sub(1));
-            enemy.stunned = oracle_after["enemy_move_ids"][instance] == "STUNNED";
-        }
-        if array(&before["players"][0]["powers"])
-            .iter()
-            .any(|power| power["model_id"] == "POWER.ENTROPY_POWER")
-        {
-            combat.hand =
-                cards(content, &after["players"][0]["hand"]).map_err(|error| vec![error])?;
-        }
+    if traced_action["kind"] == "event_option" && after["phase"] == "combat" {
+        let expected = game_from_snapshot(
+            content,
+            after,
+            oracle_after,
+            traced_action,
+            after,
+            oracle_after,
+            history,
+            replay_state,
+            happy_flower,
+        )
+        .map_err(|error| vec![error])?;
+        game.phase = expected.phase;
     }
     if traced_action["kind"] == "play_card"
         && array(&before["players"][0]["hand"]).iter().any(|card| {
@@ -1133,16 +1149,20 @@ fn replay_decision(
                 .map_err(|error| vec![format!("choice rejected: {error:?}")])?;
         }
     }
-    while before["phase"] == "combat" {
+    let mut inferred_choice = false;
+    while game.combat().is_some() {
         let Some(choice) = game.combat().and_then(|combat| combat.choice) else {
             break;
         };
+        inferred_choice = true;
         let destination = match choice.op {
             CardOp::Move(pile) | CardOp::MoveFree(pile) => pile,
             CardOp::TakeOffer | CardOp::TakeFetched | CardOp::CopySelected(_) => Pile::Hand,
             CardOp::Upgrade | CardOp::Flag(_) | CardOp::TurnFlag(_) | CardOp::Transfigure => {
                 choice.pile
             }
+            CardOp::Transform(..) => choice.pile,
+            CardOp::DiscardDraw => Pile::Hand,
             _ => break,
         };
         let flag = match choice.op {
@@ -1165,6 +1185,26 @@ fn replay_decision(
         };
         let mut index = game.combat().and_then(|combat| {
             let source = replay_pile(combat, choice.pile);
+            if choice.op == CardOp::DiscardDraw {
+                let expected = array(&after["players"][0]["discard_pile"]);
+                return source.iter().position(|card| {
+                    let id = content.cards[card.id as usize].id;
+                    let expected = expected
+                        .iter()
+                        .filter(|value| {
+                            value["model_id"] == id
+                                && value["upgrade"].as_u64().unwrap_or_default()
+                                    == card.upgrades as u64
+                        })
+                        .count();
+                    let actual = combat
+                        .discard
+                        .iter()
+                        .filter(|other| other.id == card.id && other.upgrades == card.upgrades)
+                        .count();
+                    expected > actual
+                });
+            }
             if choice.op == CardOp::Upgrade {
                 return source.iter().position(|card| {
                     expected.iter().any(|value| {
@@ -1262,6 +1302,44 @@ fn replay_decision(
                 .map_err(|error| vec![format!("inferred choice rejection: {error:?}")])?;
         } else {
             break;
+        }
+    }
+    if inferred_choice && let Phase::Combat(combat) = &mut game.phase {
+        combat.hand = cards(content, &after["players"][0]["hand"]).map_err(|error| vec![error])?;
+        combat.discard =
+            cards(content, &after["players"][0]["discard_pile"]).map_err(|error| vec![error])?;
+        combat.draw = cards(content, &oracle_after["hidden_draw_order"])
+            .map_err(|error| vec![error])?
+            .into_iter()
+            .rev()
+            .collect();
+    }
+    if traced_action["kind"] == "end_turn"
+        && let Phase::Combat(combat) = &mut game.phase
+    {
+        for enemy in &mut combat.enemies {
+            let instance = format!("creature:{}", enemy.instance.saturating_sub(1));
+            let move_id = oracle_after["enemy_move_ids"][&instance]
+                .as_str()
+                .unwrap_or_default();
+            enemy.stunned = move_id == "STUNNED";
+            if let Some(expected) = array(&after["combat"]["enemies"]).iter().find(|expected| {
+                expected["instance_id"] == instance.as_str()
+                    && expected["hit_points"].as_i64().unwrap_or_default() > 0
+            }) {
+                enemy.move_index = infer_move(
+                    &content.enemies[enemy.creature.id as usize],
+                    expected,
+                    move_id,
+                );
+            }
+        }
+        if array(&before["players"][0]["powers"])
+            .iter()
+            .any(|power| power["model_id"] == "POWER.ENTROPY_POWER")
+        {
+            combat.hand =
+                cards(content, &after["players"][0]["hand"]).map_err(|error| vec![error])?;
         }
     }
     'choices: for choice in traced_choices
@@ -1431,7 +1509,12 @@ fn replay_decision(
         game.step(content, action)
             .map_err(|error| vec![format!("inferred choice rejected: {error:?}")])?;
     }
-    if before["phase"] != "combat" && traced_action["kind"] != "event_option" {
+    if before["phase"] != "combat"
+        && !matches!(
+            traced_action["kind"].as_str(),
+            Some("event_option" | "take_reward" | "skip_rewards")
+        )
+    {
         let mut existing: Vec<_> = array(&before["players"][0]["deck"])
             .iter()
             .filter_map(|card| {
@@ -1745,6 +1828,11 @@ fn game_from_snapshot(
                     card.value
                 },
             );
+            if content.cards[card.id as usize].id == "CARD.BOLAS"
+                && history.bolas.contains(&card.instance)
+            {
+                card.value = 1;
+            }
         }
         cards
     };
@@ -1831,6 +1919,17 @@ fn game_from_snapshot(
             .unwrap_or_default();
         }
     }
+    if let Some(amount) =
+        oracle_power_value(oracle, "creature:0", "POWER.INFERNO_POWER", "self_damage")
+            .filter(|&amount| amount > 0)
+    {
+        player_creature.powers.push(Power {
+            id: power_id::INFERNO_DAMAGE,
+            amount,
+            skip_next_decay: false,
+            value: 0,
+        });
+    }
     let orbs = if player["orbs"].is_array() {
         array(&player["orbs"])
             .iter()
@@ -1888,6 +1987,31 @@ fn game_from_snapshot(
         .iter()
         .find(|summon| summon["model_id"] == "MONSTER.OSTY");
     let drawn = number(player, "cards_drawn_this_combat").unwrap_or_default() as i16;
+    let generated = oracle["player_generated_cards"]
+        .as_i64()
+        .unwrap_or_else(|| {
+            oracle["card_deck_version_indices"]
+                .as_object()
+                .map_or(0, |indices| {
+                    [
+                        &player["hand"],
+                        &player["play_pile"],
+                        &player["discard_pile"],
+                        &player["exhaust_pile"],
+                        &oracle["hidden_draw_order"],
+                    ]
+                    .into_iter()
+                    .flat_map(array)
+                    .filter(|card| {
+                        !matches!(card["type"].as_str(), Some("Status" | "Curse"))
+                            && card["instance_id"]
+                                .as_str()
+                                .and_then(|instance| indices.get(instance))
+                                .is_some_and(Value::is_null)
+                    })
+                    .count() as i64
+                })
+        }) as i16;
     let automation = player_creature.power(power_id::AUTOMATION);
     let automation = (automation > 0).then(|| {
         let cards_left = oracle_power_value(
@@ -1905,6 +2029,31 @@ fn game_from_snapshot(
         .unwrap_or(10);
         (cards_left as u8, automation)
     });
+    let rolling_boulder = player_creature.power(power_id::ROLLING_BOULDER).max(0);
+    let bomb_damage =
+        40 + 10
+            * run.deck.iter().any(|card| {
+                content.cards[card.id as usize].id == "CARD.THE_BOMB" && card.upgrades > 0
+            }) as i16;
+    let bombs = player_creature
+        .powers
+        .iter()
+        .filter(|power| power.id == power_id::THE_BOMB && power.amount > 0)
+        .map(|power| (power.amount as u8, bomb_damage))
+        .collect();
+    let panache_played = (history.cards - history.panache_start.unwrap_or(0)).max(0);
+    let panache = player_creature
+        .powers
+        .iter()
+        .filter(|power| power.id == power_id::PANACHE)
+        .map(|power| {
+            (
+                (5 - panache_played.rem_euclid(5)) as u8,
+                power.amount,
+                history.cards,
+            )
+        })
+        .collect();
     let combat = Combat {
         player: player_creature,
         osty: Creature {
@@ -1943,6 +2092,7 @@ fn game_from_snapshot(
             attacks: history.attacks,
             skills: history.skills,
             powers: history.powers,
+            generated,
             block_gains: history.block_gains,
             energy: number(player, "energy_spent_this_turn")? as i16,
             stars_gained,
@@ -1954,6 +2104,7 @@ fn game_from_snapshot(
             osty_attacks: number(player, "osty_attacks_this_turn")? as i16,
             ..History::default()
         },
+        total_cards: history.total_cards,
         last_cards: history.last_cards,
         orbit_spent: 0,
         hits: vec![0; array(&combat_state["enemies"]).len()],
@@ -1963,10 +2114,13 @@ fn game_from_snapshot(
         orbs_channeled: 0,
         poisoned: 0,
         nightmares: vec![],
-        bombs: vec![],
+        bombs,
         automation: automation.into_iter().collect(),
-        panache: vec![],
-        boulders: vec![],
+        panache,
+        boulders: (rolling_boulder > 0)
+            .then_some(rolling_boulder)
+            .into_iter()
+            .collect(),
         dampened,
         paels_tears: false,
         ending: false,
@@ -1997,6 +2151,9 @@ fn game_from_snapshot(
         burning_sticks: false,
         red_skull: false,
         throwing_axe: false,
+        vambrace: array(&player["relics"])
+            .iter()
+            .any(|relic| relic["model_id"] == "RELIC.VAMBRACE" && relic["state"] != "Active"),
         paels_eye: false,
         paels_legion: relic_amount(player, "RELIC.PAELS_LEGION"),
         history_course: history.last_card,
@@ -2143,8 +2300,21 @@ fn game_from_snapshot(
         fake_happy_flower: replay_state.fake_happy_flower,
         lizard_tail: relic_disabled(player, "RELIC.LIZARD_TAIL"),
         nunchaku: relic_amount(player, "RELIC.NUNCHAKU") % 10,
-        pendulum: relic_amount(player, "RELIC.PENDULUM") % 3,
-        pen_nib: relic_amount(player, "RELIC.PEN_NIB") % 10,
+        pendulum: player["pendulum_turns_seen"].as_u64().map_or_else(
+            || {
+                if relic_active(player, "RELIC.PENDULUM") {
+                    2
+                } else {
+                    relic_amount(player, "RELIC.PENDULUM") % 3
+                }
+            },
+            |turns| turns as u8 % 3,
+        ),
+        pen_nib: if relic_active(player, "RELIC.PEN_NIB") {
+            9
+        } else {
+            relic_amount(player, "RELIC.PEN_NIB") % 10
+        },
         iron_club: relic_amount(player, "RELIC.IRON_CLUB") % 4,
         joss_paper: relic_amount(player, "RELIC.JOSS_PAPER") % 5,
         tuning_fork: relic_amount(player, "RELIC.TUNING_FORK") % 10,
@@ -2415,6 +2585,18 @@ fn run_game_from_snapshot(
     } else {
         replay_state.fake_merchant.clone()
     };
+    let after_player = &after["players"][0];
+    let pendulum = player["pendulum_turns_seen"].as_u64().map_or_else(
+        || {
+            if number(after_player, "cards_drawn_this_combat").unwrap_or_default() > run.draw as i64
+            {
+                2
+            } else {
+                relic_amount(player, "RELIC.PENDULUM") % 3
+            }
+        },
+        |turns| turns as u8 % 3,
+    );
     Ok(Game {
         run,
         map,
@@ -2546,7 +2728,7 @@ fn run_game_from_snapshot(
         fake_happy_flower: replay_state.fake_happy_flower,
         lizard_tail: relic_disabled(player, "RELIC.LIZARD_TAIL"),
         nunchaku: relic_amount(player, "RELIC.NUNCHAKU") % 10,
-        pendulum: relic_amount(player, "RELIC.PENDULUM") % 3,
+        pendulum,
         pen_nib: relic_amount(player, "RELIC.PEN_NIB") % 10,
         iron_club: relic_amount(player, "RELIC.IRON_CLUB") % 4,
         joss_paper: relic_amount(player, "RELIC.JOSS_PAPER") % 5,
@@ -3267,6 +3449,7 @@ fn update_history(history: &mut TurnHistory, state: &Value, oracle: &Value) {
         history.powers = 0;
         history.last_card = None;
         history.block_gains = 0;
+        history.bolas.clear();
         for (turns, _) in &mut history.toric {
             *turns = turns.saturating_sub(1);
         }
@@ -3290,6 +3473,14 @@ fn update_history(history: &mut TurnHistory, state: &Value, oracle: &Value) {
         }
     }
     let player = &state["players"][0];
+    let has_panache = array(&player["powers"])
+        .iter()
+        .any(|power| power["model_id"] == "POWER.PANACHE_POWER");
+    if !has_panache {
+        history.panache_start = None;
+    } else if observe_moves {
+        history.panache_start = Some(0);
+    }
     if array(&player["powers"])
         .iter()
         .any(|power| power["model_id"] == "POWER.AUTOMATION_POWER")
@@ -3357,6 +3548,9 @@ fn advance_history(
     let Some(id) = card["model_id"].as_str().and_then(|id| content.card_id(id)) else {
         return;
     };
+    if content.cards[id as usize].id == "CARD.BOLAS" {
+        history.bolas.push(instance_id(source));
+    }
     let card_type = match card["type"].as_str() {
         Some("Attack") => CardType::Attack,
         Some("Power") => CardType::Power,
@@ -3366,6 +3560,13 @@ fn advance_history(
         _ => CardType::Skill,
     };
     let plays = 1
+        + card["base_replay_count"].as_i64().unwrap_or_default() as i16
+        + (card["enchantment_model_id"] == "ENCHANTMENT.SPIRAL") as i16
+        + (card["enchantment_model_id"] == "ENCHANTMENT.GLAM"
+            && card["enchantment_combat_amount"]
+                .as_i64()
+                .unwrap_or_default()
+                > 0) as i16
         + (card_type == CardType::Attack
             && array(&before["players"][0]["powers"])
                 .iter()
@@ -3399,6 +3600,7 @@ fn advance_history(
         }
     }
     history.cards += plays + automatic;
+    history.total_cards += plays + automatic;
     history.manual_cards += 1;
     history.manual_plays += plays;
     match card_type {
@@ -3406,6 +3608,9 @@ fn advance_history(
         CardType::Skill => history.skills += plays,
         CardType::Power => history.powers += plays,
         _ => {}
+    }
+    if content.cards[id as usize].id == "CARD.PANACHE" {
+        history.panache_start = Some(history.cards);
     }
     if matches!(card_type, CardType::Attack | CardType::Skill) {
         history.last_card = self::card(content, card).ok();
@@ -3730,6 +3935,14 @@ fn infer_move(enemy: &EnemyDef, state: &Value, move_id: &str) -> usize {
         ("MONSTER.PHANTASMAL_GARDENER", "LASH_MOVE") => Some(1),
         ("MONSTER.PHANTASMAL_GARDENER", "FLAIL_MOVE") => Some(2),
         ("MONSTER.PHANTASMAL_GARDENER", "ENLARGE_MOVE") => Some(3),
+        ("MONSTER.INKLET", "JAB_MOVE") => Some(0),
+        ("MONSTER.INKLET", "WHIRLWIND_MOVE") => Some(1),
+        ("MONSTER.INKLET", "PIERCING_GAZE_MOVE") => Some(2),
+        ("MONSTER.LAGAVULIN_MATRIARCH", "SLEEP_MOVE") => Some(0),
+        ("MONSTER.LAGAVULIN_MATRIARCH", "SLASH_MOVE") => Some(1),
+        ("MONSTER.LAGAVULIN_MATRIARCH", "SLASH2_MOVE") => Some(2),
+        ("MONSTER.LAGAVULIN_MATRIARCH", "DISEMBOWEL_MOVE") => Some(3),
+        ("MONSTER.LAGAVULIN_MATRIARCH", "SOUL_SIPHON_MOVE") => Some(4),
         ("MONSTER.PARAFRIGHT", "SLAM_MOVE") => Some(0),
         ("MONSTER.PARAFRIGHT", "REVIVE_MOVE") => Some(1),
         (
@@ -3998,6 +4211,7 @@ fn compare_powers(
 ) {
     let mut actual: Vec<_> = actual
         .iter()
+        .filter(|power| power.id != power_id::INFERNO_DAMAGE)
         .map(|power| format!("{}={}", content.powers[power.id as usize].id, power.amount))
         .collect();
     let mut expected: Vec<_> = array(expected)
@@ -4050,6 +4264,12 @@ fn relic_disabled(player: &Value, id: &str) -> bool {
     array(&player["relics"])
         .iter()
         .any(|relic| relic["model_id"] == id && relic["state"] == "Disabled")
+}
+
+fn relic_active(player: &Value, id: &str) -> bool {
+    array(&player["relics"])
+        .iter()
+        .any(|relic| relic["model_id"] == id && relic["state"] == "Active")
 }
 
 fn number(value: &Value, key: &str) -> Result<i64, String> {

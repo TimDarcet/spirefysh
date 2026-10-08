@@ -893,6 +893,9 @@ internal static class Snapshotter
                 requireCombatId: true)
             : [];
         var cardDeckVersionIndices = CaptureCardDeckVersionIndices(run.Players);
+        var playerGeneratedCards = combat is null || run.Players.Count != 1 ? 0 :
+            CombatManager.Instance.History.Entries.OfType<CardGeneratedEntry>()
+                .Count(entry => ReferenceEquals(entry.Creator, run.Players[0]));
         var enemyMoveIds = combat is null
             ? new SortedDictionary<string, string?>(StringComparer.Ordinal)
             : new SortedDictionary<string, string?>(combat.Enemies.ToDictionary(
@@ -916,6 +919,7 @@ internal static class Snapshotter
             enemyMoveIds,
             powerStates,
             cardDeckVersionIndices,
+            playerGeneratedCards,
             combat is null ? 0U : CaptureNextCombatCardId());
         return new(
             publicSnapshot,
@@ -978,7 +982,18 @@ internal static class Snapshotter
             CaptureEnergySpentThisTurn(combat, player),
             CaptureStarsGainedThisTurn(combat),
             CaptureOstyAttacksThisTurn(combat, player),
+            CapturePendulumTurnsSeen(player),
             actions);
+    }
+
+    private static int CapturePendulumTurnsSeen(Player player)
+    {
+        var pendulum = player.Relics.FirstOrDefault(relic => relic.Id.ToString() == "RELIC.PENDULUM");
+        if (pendulum is null) return 0;
+        var property = pendulum.GetType().GetProperty("TurnsSeen", BindingFlags.Instance | BindingFlags.Public)
+            ?? throw new MissingMemberException(pendulum.GetType().FullName, "TurnsSeen");
+        return (int)(property.GetValue(pendulum)
+            ?? throw new InvalidOperationException("Pendulum turn counter is unavailable."));
     }
 
     private static string CapturePhase(RunState run, CombatState? combat)
@@ -1335,7 +1350,8 @@ internal static class Snapshotter
         if (power.Id.ToString() != "POWER.AUTOMATION_POWER") return 0;
         var data = typeof(PowerModel).GetField("_internalData", BindingFlags.Instance | BindingFlags.NonPublic)!
             .GetValue(power) ?? throw new InvalidOperationException("Automation internal data is unavailable.");
-        var field = data.GetType().GetField("cardsLeft", BindingFlags.Instance | BindingFlags.NonPublic)
+        var field = data.GetType().GetField(
+            "cardsLeft", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
             ?? throw new MissingFieldException(data.GetType().FullName, "cardsLeft");
         return (int)(field.GetValue(data)
             ?? throw new InvalidOperationException("Automation cards-left counter is unavailable."));
@@ -1509,8 +1525,8 @@ internal sealed record PublicSnapshot(
     MapNodeSnapshot[] Map,
     HistorySnapshot[] History,
     SemanticAction[] VisibleOffers);
-internal sealed record OracleSnapshot(IReadOnlyDictionary<string, uint> RngSeeds, IReadOnlyDictionary<string, int> RngCounters, CardSnapshot[] HiddenDrawOrder, IReadOnlyDictionary<string, string?> EnemyMoveIds, IReadOnlyDictionary<string, PowerOracleSnapshot[]> PowerStates, IReadOnlyDictionary<string, int?> CardDeckVersionIndices, uint NextCombatCardId);
-internal sealed record PlayerSnapshot(ulong NetId, string InstanceId, string CharacterId, int HitPoints, int MaxHitPoints, int Block, int Gold, int Energy, int MaxEnergy, int Stars, int TurnNumber, CardSnapshot[] Deck, CardSnapshot[] Hand, CardSnapshot[] PlayPile, int DrawPileCount, CardSnapshot[] DiscardPile, CardSnapshot[] ExhaustPile, EntitySnapshot[] Relics, EntitySnapshot[] Potions, SummonSnapshot[] Summons, OrbSnapshot[] Orbs, int OrbSlots, EntitySnapshot[] Powers, int CardsExhaustedThisTurn, int CardsDrawnThisCombat, bool PlayerLostHpThisTurn, int PlayerHpLossEventsThisCombat, int EnergySpentThisTurn, int StarsGainedThisTurn, int OstyAttacksThisTurn, SemanticAction[] LegalActions);
+internal sealed record OracleSnapshot(IReadOnlyDictionary<string, uint> RngSeeds, IReadOnlyDictionary<string, int> RngCounters, CardSnapshot[] HiddenDrawOrder, IReadOnlyDictionary<string, string?> EnemyMoveIds, IReadOnlyDictionary<string, PowerOracleSnapshot[]> PowerStates, IReadOnlyDictionary<string, int?> CardDeckVersionIndices, int PlayerGeneratedCards, uint NextCombatCardId);
+internal sealed record PlayerSnapshot(ulong NetId, string InstanceId, string CharacterId, int HitPoints, int MaxHitPoints, int Block, int Gold, int Energy, int MaxEnergy, int Stars, int TurnNumber, CardSnapshot[] Deck, CardSnapshot[] Hand, CardSnapshot[] PlayPile, int DrawPileCount, CardSnapshot[] DiscardPile, CardSnapshot[] ExhaustPile, EntitySnapshot[] Relics, EntitySnapshot[] Potions, SummonSnapshot[] Summons, OrbSnapshot[] Orbs, int OrbSlots, EntitySnapshot[] Powers, int CardsExhaustedThisTurn, int CardsDrawnThisCombat, bool PlayerLostHpThisTurn, int PlayerHpLossEventsThisCombat, int EnergySpentThisTurn, int StarsGainedThisTurn, int OstyAttacksThisTurn, int PendulumTurnsSeen, SemanticAction[] LegalActions);
 internal sealed record CombatSnapshot(int Round, string Side, EnemySnapshot[] Enemies);
 internal sealed record EnemySnapshot(string InstanceId, string ModelId, int HitPoints, int MaxHitPoints, int Block, IntentSnapshot[] VisibleIntents, EntitySnapshot[] Powers);
 internal sealed record SummonSnapshot(string InstanceId, string ModelId, int HitPoints, int MaxHitPoints, int Block, EntitySnapshot[] Powers);

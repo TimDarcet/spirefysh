@@ -1776,13 +1776,7 @@ fn preview_block(
     {
         amount = amount.saturating_mul(2);
     }
-    let prior_card_blocks = combat.history.block_gains
-        - if combat.history.block_card == combat.history.cards {
-            combat.history.block_card_gains
-        } else {
-            0
-        };
-    if context.card.is_some() && prior_card_blocks == 0 && relic("RELIC.VAMBRACE") {
+    if context.card.is_some() && !combat.vambrace && relic("RELIC.VAMBRACE") {
         amount = amount.saturating_mul(2);
     }
     if context.card.is_some() && combat.paels_legion == 0 && relic("RELIC.PAELS_LEGION") {
@@ -2348,7 +2342,7 @@ fn preview_effects(
                     game,
                     content,
                     preview,
-                    preview_block(game, content, context, base, true),
+                    preview_block(game, content, context, base, context.card.is_some()),
                     repeats,
                 );
             }

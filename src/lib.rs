@@ -558,6 +558,7 @@ mod foundation_id {
         pub const CHILD_OF_THE_STARS: Id = 69;
         pub const CONQUEROR: Id = 70;
         pub const RETAIN_HAND: Id = 71;
+        pub const FURNACE: Id = 74;
         pub const MONARCHS_GAZE: Id = 76;
         pub const ORBIT: Id = 80;
         pub const PALE_BLUE_DOT: Id = 81;
@@ -601,8 +602,10 @@ mod foundation_id {
         pub const HOTFIX: Id = 210;
         pub const ILLUSION: Id = 211;
         pub const IMBALANCED: Id = 212;
+        pub const MONARCHS_GAZE_STRENGTH_DOWN: Id = 220;
         pub const HELLRAISER: Id = 128;
         pub const INFERNO: Id = 129;
+        pub const INFERNO_DAMAGE: Id = 130;
         pub const JUGGLING: Id = 131;
         pub const MANGLE: Id = 132;
         pub const ONE_TWO_PUNCH: Id = 133;
@@ -662,6 +665,7 @@ mod foundation_id {
         pub const SURPRISE: Id = 252;
         pub const TENDER: Id = 259;
         pub const TERRITORIAL: Id = 260;
+        pub const THE_BOMB: Id = 261;
         pub const THIEVERY: Id = 262;
         pub const HEIST: Id = 205;
         pub const TORIC_TOUGHNESS: Id = 264;
@@ -1697,6 +1701,7 @@ pub struct Combat {
     pub orbs: Vec<Orb>,
     pub orb_slots: u8,
     pub history: History,
+    total_cards: i16,
     last_cards: i16,
     orbit_spent: i16,
     hits: Vec<i16>,
@@ -1740,6 +1745,7 @@ pub struct Combat {
     burning_sticks: bool,
     red_skull: bool,
     throwing_axe: bool,
+    vambrace: bool,
     paels_eye: bool,
     paels_legion: u8,
     history_course: Option<Card>,
