@@ -1,3 +1,4 @@
+import copy
 import contextvars
 import fcntl
 import functools
@@ -26,7 +27,7 @@ MAP_NODE_KINDS = 26
 PRECISIONS = ("fp32", "bf16")
 TRAINING_PRECISIONS = (*PRECISIONS, "bf16_with_fp32_dV")
 WINNING_CAPACITY = 0
-CHANGE = "Compact token schema with run-state pooling and dense card flags."
+CHANGE = "Encode Pumpkin Candle as an unbounded numeric counter."
 COLLECTION_POOLING = ("sum", "transformer", "global_tokens")
 EFFECT_POOLING = (
     "sum_into_actor", "transformer_into_actor", "sum_token", "transformer_token",
@@ -3399,6 +3400,33 @@ def optimizer_compatible(state, parameter_count):
         == parameter_count
 
 
+def _migrate_optimizer_parameter(state, old_names, new_names, name, source, row, source_shape):
+    groups = state["param_groups"]
+    split = lambda names: [names] if len(groups) == 1 else [
+        [key for key in names if not key.startswith(("policy.", "critic."))],
+        [key for key in names if key.startswith("policy.")],
+        [key for key in names if key.startswith("critic.")],
+    ]
+    old, new = split(old_names), split(new_names)
+    if len(groups) not in (1, 3) \
+            or [len(group["params"]) for group in groups] != list(map(len, old)):
+        return
+    index = next(index for index, names in enumerate(new) if name in names)
+    position = new[index].index(name)
+    if new[index][:position] + new[index][position + 1:] != old[index]:
+        return
+    source_group = next(index for index, names in enumerate(old) if source in names)
+    source_id = groups[source_group]["params"][old[source_group].index(source)]
+    parameter = max(parameter for group in groups for parameter in group["params"]) + 1
+    groups[index]["params"].insert(position, parameter)
+    if source_id in state["state"]:
+        state["state"][parameter] = {
+            key: value[row].reshape(-1, 1).clone()
+            if torch.is_tensor(value) and value.shape == source_shape else copy.deepcopy(value)
+            for key, value in state["state"][source_id].items()
+        }
+
+
 def optimizer_configuration(state):
     values = {
         (tuple(group.get("betas", ())), float(group.get("eps", math.nan)))
@@ -3491,9 +3519,16 @@ def load(path, target):
         layout = dict(live.token_layout(*dimensions))
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError("invalid checkpoint architecture") from error
-    if checkpoint.get("feature_version") != FEATURE_VERSION or layout["version"] != FEATURE_VERSION:
+    legacy = checkpoint.get("feature_version") == 58
+    saved_layout = dict(layout)
+    if legacy:
+        saved_layout["version"] = 58
+        saved_layout["relic_f"] = 0
+        saved_layout.pop("pumpkin_candle_relic")
+    if (not legacy and checkpoint.get("feature_version") != FEATURE_VERSION) \
+            or layout["version"] != FEATURE_VERSION:
         raise ValueError("incompatible feature version")
-    if checkpoint["fingerprint"] != live.fingerprint() or checkpoint["layout"] != layout:
+    if checkpoint["fingerprint"] != live.fingerprint() or checkpoint["layout"] != saved_layout:
         raise ValueError("checkpoint does not match simulator content")
     try:
         model = Agent(layout, *(config[key] for key in (
@@ -3507,6 +3542,18 @@ def load(path, target):
     if config != architecture(model):
         raise ValueError("incompatible model architecture")
     state = checkpoint["model"]
+    if legacy:
+        old_names = list(state)
+        source = f"concepts.tables.{SEMANTIC_NAMES.index('relic_counter_0')}.weight"
+        name = "encoders.relic.numeric.weight"
+        row = layout["pumpkin_candle_relic"] + 1
+        state[name] = state[source][row].unsqueeze(1).clone()
+        _migrate_optimizer_parameter(
+            checkpoint["optimizer"], old_names, list(model.state_dict()), name, source, row,
+            state[source].shape,
+        )
+        checkpoint["feature_version"] = FEATURE_VERSION
+        checkpoint["layout"] = layout
     missing, unexpected = model.load_state_dict(state, strict=True)
     if missing or unexpected:
         raise ValueError("incompatible model parameters")

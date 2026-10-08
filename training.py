@@ -2406,6 +2406,9 @@ def train(args):
         raise ValueError("new model versions require a new output directory")
     manifest["schema"] = 2
     manifest["model_version"] = model.model_version
+    manifest["feature_version"] = FEATURE_VERSION
+    manifest["layout"] = layout
+    manifest["change"] = CHANGE
     manifest["precision"] = args.precision
     manifest["parameters"] = sum(parameter.numel() for parameter in model.parameters())
     manifest["architecture"] = architecture(model)
@@ -3126,7 +3129,7 @@ def probe():
     layout = dict(env.token_layout())
     assert (layout["version"], layout["model_width"], layout["model_layers"],
             layout["model_heads"], layout["model_feedforward"], layout["state_width"],
-            layout["action_width"], layout["entity_summaries"]) == (58, 128, 4, 8, 384, 128, 128, 0)
+            layout["action_width"], layout["entity_summaries"]) == (59, 128, 4, 8, 384, 128, 128, 0)
     compact_layout = dict(env.token_layout(64, 2, 4, 128))
     assert tuple(compact_layout[key] for key in (
         "model_width", "model_layers", "model_heads", "model_feedforward",

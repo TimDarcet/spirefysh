@@ -83,7 +83,7 @@ struct ReplayState {
     fishing_rod: u8,
     rest_used: u8,
     girya: u8,
-    pumpkin_candle: u8,
+    pumpkin_candle: i32,
     paels_cards: Vec<Card>,
     pollinous_core: u8,
     fur_coat_act: Option<u8>,

@@ -2255,15 +2255,17 @@ fn v57_relic_counters_are_identity_specific_and_linear() {
 }
 
 #[test]
-#[should_panic(expected = "semantic row overflow domain=relic seed=555 relic=RELIC.PUMPKIN_CANDLE")]
-fn semantic_overflow_reports_the_domain_and_feature() {
+fn pumpkin_candle_counter_is_unbounded_numeric_input() {
     let content = foundation_content();
     let layout = Layout::new(&content);
-    let game = Game::new_character_ascension(&content, 555, 0, 10).unwrap();
+    let mut game = Game::new_character_ascension(&content, 555, 0, 10).unwrap();
+    game.pumpkin_candle = 300;
     let mut row = DomainRow::new(RELIC_DOMAIN, STATE_SCOPE);
     row.u[1] = content.relic_id("RELIC.PUMPKIN_CANDLE").unwrap() as u32;
-    row.s[0] = DOMAIN_WIDTHS[RELIC_DOMAIN].2 as i32;
+    row.s[0] = game.pumpkin_candle;
     populate_domain_features(&game, &content, layout, RELIC_DOMAIN, &mut row);
+    assert_eq!(row.f[0], 300.0);
+    assert_eq!(row.c.iter().filter(|&&code| code != 0).count(), 1);
 }
 
 #[test]
@@ -2398,7 +2400,7 @@ fn v55_action_and_phase_discriminants_are_exhaustive() {
 #[test]
 fn v56_layout_uses_explicit_token_dimensions_and_positions() {
     let layout = Layout::new(&foundation_content());
-    assert_eq!((VERSION, VALUE_MODEL_VERSION), (58, 77));
+    assert_eq!((VERSION, VALUE_MODEL_VERSION), (59, 77));
     assert_eq!(
         (
             DEFAULT_MODEL_WIDTH,

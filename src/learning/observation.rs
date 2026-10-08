@@ -12,7 +12,7 @@ use std::{
 };
 
 const MAGIC: &[u8; 8] = b"STSVALUE";
-const VERSION: u32 = 58;
+const VERSION: u32 = 59;
 const VALUE_MODEL_VERSION: u32 = 77;
 const TERMINAL_CATEGORIES: usize = 83;
 const POTENTIAL_WEIGHT_COUNT: usize = 13;
@@ -77,7 +77,7 @@ const DOMAIN_WIDTHS: [(usize, usize, usize, usize); 16] = [
     (8, 4, 5, 2),
     (6, 29, 1, 29),
     (20, 8, 7, 40),
-    (12, 6, 20, 0),
+    (12, 6, 20, 1),
     (6, 2, 1, 0),
     (6, 2, 4, 1),
     (4, 1, 2, 0),
@@ -1086,9 +1086,14 @@ fn populate_domain_features(
         RELIC_DOMAIN => {
             push_semantic(row, layout, Semantic::Relic, row.u[1]);
             if row.u[0] == 0 {
+                let pumpkin = content.relics[row.u[1] as usize].id == "RELIC.PUMPKIN_CANDLE";
+                if pumpkin {
+                    row.f[0] = row.s[0] as f32;
+                }
                 let counters = row
                     .s
                     .iter()
+                    .skip(pumpkin as usize)
                     .map(|&value| value.max(0) as usize)
                     .sum::<usize>();
                 assert!(
@@ -1109,6 +1114,7 @@ fn populate_domain_features(
                 ]
                 .into_iter()
                 .enumerate()
+                .skip(pumpkin as usize)
                 {
                     for _ in 0..row.s[slot].max(0) {
                         push_semantic(row, layout, namespace, row.u[1]);

@@ -5615,6 +5615,10 @@ impl Batch {
             ("normal_encounters".into(), 58),
             ("elite_encounters".into(), 14),
             ("boss_encounters".into(), 14),
+            (
+                "pumpkin_candle_relic".into(),
+                self.content.relic_id("RELIC.PUMPKIN_CANDLE").unwrap() as usize,
+            ),
         ]);
         for (name, (u, s, c, f)) in DOMAIN_NAMES.into_iter().zip(DOMAIN_WIDTHS) {
             out.insert(format!("{name}_u"), u);

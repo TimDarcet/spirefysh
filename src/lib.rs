@@ -2131,7 +2131,7 @@ pub struct Game {
     winged_boots: u8,
     rest_used: u8,
     girya: u8,
-    pumpkin_candle: u8,
+    pumpkin_candle: i32,
     fishing_rod: u8,
     astrolabe: bool,
     transform_niche: bool,

@@ -1235,25 +1235,6 @@ def _dashboard_runs(target, selected=None):
                 row.pop("description", None); row.pop("pipeline", None)
             version_manifest = manifest | manifest.get("version_history", {}).get(str(version), {})
             version_manifest["model_version"] = version
-            if version == MODEL_VERSION:
-                saved = version_manifest.get("architecture", {})
-                current = Agent(
-                    version_manifest["layout"],
-                    *(saved.get(key, default) for key, default in zip(
-                        ("width", "layers", "heads", "feedforward", "head_width"),
-                        (*DEFAULT_ARCHITECTURE, DEFAULT_ARCHITECTURE[0]),
-                    )),
-                    pooling=saved.get("pooling"), model_version=version,
-                    potential_weights=saved.get("potential_weights"),
-                    potential_mode=saved.get("potential_mode", "health_multiplier"),
-                )
-                version_manifest |= {
-                    "architecture": architecture(current),
-                    "feature_version": FEATURE_VERSION,
-                    "parameters": sum(parameter.numel() for parameter in current.parameters()),
-                }
-                if version == MODEL_VERSION:
-                    version_manifest["change"] = CHANGE
             if len(version_groups) > 1:
                 sessions = [row for row in manifest.get("sessions", []) if row["step"] <= version_reports[-1]["step"]]
                 version_manifest["sessions"] = sessions[-1:] or manifest.get("sessions", [])[:1]
