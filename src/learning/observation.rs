@@ -7601,6 +7601,9 @@ impl Hasher for ContentHasher {
     }
 }
 
+#[path = "labels.rs"]
+mod labels;
+
 #[path = "value_model.rs"]
 mod value_model;
 

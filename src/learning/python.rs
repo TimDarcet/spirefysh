@@ -5550,6 +5550,10 @@ impl Batch {
         Ok(batch)
     }
 
+    fn concept_labels(&self) -> Vec<String> {
+        labels::concept_labels(&self.content)
+    }
+
     #[pyo3(signature = (width=DEFAULT_MODEL_WIDTH, layers=DEFAULT_MODEL_LAYERS, heads=DEFAULT_MODEL_HEADS, feedforward=DEFAULT_MODEL_FEEDFORWARD))]
     fn token_layout(
         &self,

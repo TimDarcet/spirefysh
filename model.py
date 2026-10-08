@@ -1,7 +1,6 @@
 import copy
 import contextvars
 import fcntl
-import functools
 import hashlib
 import json
 import math
@@ -46,26 +45,14 @@ STAGES = [(0, bonus) for bonus in (24, 20, 16, 12, 8, 4, 3, 2, 1, 0)] + [
 ]
 
 _GRAPH_RECORDER = contextvars.ContextVar("model_graph_recorder", default=None)
-_GRAPH_SCOPES = contextvars.ContextVar("model_graph_scopes", default=())
 
 
-def graph_region(function):
-    @functools.wraps(function)
-    def wrapped(*args, **kwargs):
-        if _GRAPH_RECORDER.get() is None:
-            return function(*args, **kwargs)
-        name = function.__name__
-        if name in ("_collection", "_summarize") and len(args) > 4:
-            name += "." + str(args[4])
-        elif name == "_sequence" and len(args) > 5 and args[5] is args[0].global_transformer:
-            name = "global_transformer"
-        scope = _GRAPH_RECORDER.get().region(name)
-        token = _GRAPH_SCOPES.set((*_GRAPH_SCOPES.get(), scope))
-        try:
-            return function(*args, **kwargs)
-        finally:
-            _GRAPH_SCOPES.reset(token)
-    return wrapped
+def graph_name(value, name):
+    if (recorder := _GRAPH_RECORDER.get()) is not None:
+        recorder.name(value, name)
+    return value
+
+
 POTENTIAL_TERMS = (
     "health", "max_hp", "upgrades", "relics", "potions", "gold", "cards",
     "uncommon_relics", "rare_relics", "uncommon_potions", "rare_potions",
@@ -1825,7 +1812,7 @@ class ConceptEmbeddings(nn.Module):
                           *(table.weight[1:] for table in self.tables)))
 
     def local(self, name, index):
-        return self.tables[SEMANTIC_NAMES.index(name)].weight[index + 1]
+        return graph_name(self.tables[SEMANTIC_NAMES.index(name)].weight[index + 1], name)
 
 
 class TokenEncoder(nn.Module):
@@ -1992,7 +1979,6 @@ class Agent(nn.Module):
         value = score - torch.where(torch.isfinite(normalizer), normalizer, 0)[group]
         return torch.where(legal, value, torch.zeros_like(value))
 
-    @graph_region
     def encode_map(self, encoded, index):
         node_source, edge_source, levels, offsets, current, current_inverse, keys = index
         cacheable = not self.training and not self._trace_graph and node_source.device.type == "cpu"
@@ -2027,12 +2013,14 @@ class Agent(nn.Module):
                     self._graph_cache.pop(next(iter(self._graph_cache)))
         return nodes[current][current_inverse], nodes
 
-    @graph_region
     def encode_domains(self, domains, concepts):
+        for (name, *_), values in zip(TOKEN_SPECS, domains):
+            graph_name(values[0], name + " categorical IDs")
+            graph_name(values[1], name + " numeric features")
         learned = [
             (index, name, values)
             for index, ((name, *_), values) in enumerate(zip(TOKEN_SPECS, domains))
-            if name in self.encoders and name != "map_node"
+            if name in self.encoders and name not in ("map_node", "phase")
         ]
         if (concepts.device.type == "mps" and torch.is_autocast_enabled("mps")
                 and self.width == 128):
@@ -2055,6 +2043,11 @@ class Agent(nn.Module):
         encoded = [None] * len(domains)
         for output, (index, _name, values) in zip(outputs, learned):
             encoded[index] = output[:values[2]]
+        phase = domains[DOMAIN["phase"]]
+        projection = nn.functional.embedding(phase[0].long(), concepts).sum(1)
+        if self.encoders["phase"].numeric is not None:
+            projection = projection + self.encoders["phase"].numeric(phase[1].float())
+        encoded[DOMAIN["phase"]] = self.encoders["phase"].norm(projection[:phase[2]])
         potion = domains[DOMAIN["potion"]]
         encoded[DOMAIN["potion"]] = nn.functional.embedding(
             potion[0][:potion[2], 0].long(), concepts,
@@ -2062,10 +2055,11 @@ class Agent(nn.Module):
         node = domains[DOMAIN["map_node"]]
         node_semantic = nn.functional.embedding(node[0][:node[2]].long(), concepts).sum(1)
         encoded[DOMAIN["map_node"]] = self.encoders["map_node"].norm(
-            node_semantic + self.map_nodes(node[10][:node[2], 0]),
+            node_semantic + self.map_nodes(graph_name(node[10][:node[2], 0], "map_node kinds")),
         )
         encoded[DOMAIN["map_edge"]] = concepts.new_empty((0, self.width))
-        return tuple(encoded)
+        return tuple(graph_name(value, name + " encoding")
+                     for (name, *_), value in zip(TOKEN_SPECS, encoded)), projection
 
     def _tag(self, values, role, collection=None):
         tagged = values + self.concepts.local("token_role", role).to(values.dtype)
@@ -2106,17 +2100,10 @@ class Agent(nn.Module):
             source = source[predicate(u[source])]
         return encoded[domain][inverse[source]], row[source], u[source]
 
-    @graph_region
-    def _phases(self, domains, concepts):
-        semantic, numeric, _count, metadata, rows, _scope, inverse, root, *_ = \
-            domains[DOMAIN["phase"]]
-        encoder = self.encoders["phase"]
-        values = nn.functional.embedding(semantic.long(), concepts).sum(1)
-        if encoder.numeric is not None:
-            values = values + encoder.numeric(numeric.float())
-        return values[inverse[root]], rows[root], metadata[root]
+    def _phases(self, domains, projection):
+        *_, metadata, rows, _scope, inverse, root = domains[DOMAIN["phase"]][:8]
+        return projection[inverse[root]], rows[root], metadata[root]
 
-    @graph_region
     def _sequence(self, values, group, groups, seed, transformer, selected=None, layout=None):
         selected_count = selected
         real_tokens = len(values) + groups
@@ -2254,7 +2241,6 @@ class Agent(nn.Module):
             items = items[selected[inverse]]
         return sequence[:, 0], items
 
-    @graph_region
     def _summarize(self, values, group, groups, name, mode, transformer_name=None):
         if mode == "sum":
             summary = _GroupSum.apply(values, group, groups) \
@@ -2267,7 +2253,6 @@ class Agent(nn.Module):
                                         self.pool_transformers[transformer_name or name])
         return summary
 
-    @graph_region
     def _collection(self, values, rows, active, name):
         collection = ("deck", "hand", "draw", "discard", "exhaust", "relic", "potion", "orb").index(name)
         mode = self.pooling[name]
@@ -2277,7 +2262,6 @@ class Agent(nn.Module):
                                   name, mode)
         return self._tag(summary[active], 10, collection), active
 
-    @graph_region
     def _actors(self, domains, encoded, batch, concepts, plan):
         order, player_source, player_group, move_raw, move_order, move_packed_order, \
             move_present, move_batch_sizes, move_terminal, effect_plans, families = plan
@@ -2348,13 +2332,13 @@ class Agent(nn.Module):
         actors = self.actor_norm(self._tag(actors, 4))
         return actors, rows, u, extra_values, extra_rows
 
-    @graph_region
     def _actions(self, domains, encoded, values, index, nodes, concepts):
         semantic, numeric = values
         action_row, action_flat, _legal, policy_sequence, actions, path, action_count, \
             attachment_rows, *_ = index
         action = self.action_encoder(
-            semantic, numeric.float(), concepts.float(),
+            graph_name(semantic, "action categorical IDs"),
+            graph_name(numeric, "action numeric features").float(), concepts.float(),
         )[:action_count]
         if action.device.type == "mps":
             arguments = []
@@ -2386,7 +2370,6 @@ class Agent(nn.Module):
         action = self.action_norm(self._tag(action + attached, 9))
         return action, action_row[:action_count], action_flat[:action_count], actions, policy_sequence
 
-    @graph_region
     def _continuations(self, domains, encoded, plan):
         values, rows, u = self._domain_rows(domains, encoded, DOMAIN["continuation"])
         if not len(values):
@@ -2396,7 +2379,6 @@ class Agent(nn.Module):
         items.index_add_(0, group, values[order])
         return items, item_rows, plan[3:]
 
-    @graph_region
     def _packed_gru(self, values, batch_sizes, gru, parents=None):
         gates = _FastLinear.apply(values, gru.weight_ih_l0, gru.bias_ih_l0)
         if parents is not None:
@@ -2418,8 +2400,8 @@ class Agent(nn.Module):
             offset += size
         return state
 
-    @graph_region
-    def encode_state(self, domains, encoded, index, action_values, action_index, concepts, batch):
+    def encode_state(self, domains, encoded, phase_projection, index, action_values,
+                     action_index, concepts, batch):
         synchronize = torch.mps.synchronize if concepts.device.type == "mps" \
             and self.training and torch.is_grad_enabled() else lambda: None
         filters, actor_plan, continuation_plan, global_layout = action_index[8:]
@@ -2432,13 +2414,13 @@ class Agent(nn.Module):
         values, rows = [], []
         segments = getattr(self, "_explanation_segments", None)
         def add(value, row, name):
-            values.append(value); rows.append(row)
+            values.append(graph_name(value, name)); rows.append(row)
             if segments is not None:
                 segments.append((name, len(value)))
 
         run, run_rows, _ = self._domain_rows(domains, encoded, DOMAIN["run"])
-        seed = run.new_zeros((batch, self.width)).index_copy(0, run_rows, run)
-        phase, phase_rows, phase_u = self._phases(domains, concepts)
+        seed = graph_name(run.new_zeros((batch, self.width)).index_copy(0, run_rows, run), "run")
+        phase, phase_rows, phase_u = self._phases(domains, phase_projection)
         payload = phase.new_zeros((batch, self.width))
         for domain in range(len(TOKEN_SPECS)):
             item, item_rows, _ = self._domain_rows(
@@ -2567,7 +2549,6 @@ class Agent(nn.Module):
         return state, transformed if len(action) else action, \
             action_rows, action_flat, actions, policy_sequence
 
-    @graph_region
     def forward(self, character, _globals, domains, state_index, action_values, action_index,
                 return_state=False, policy_only=False, flat_policy=False, temperature=1):
         synchronize = torch.mps.synchronize if domains[0][0].device.type == "mps" \
@@ -2577,11 +2558,11 @@ class Agent(nn.Module):
             self._sequence_layouts.clear()
         if self._reuse_sequence_layouts:
             self._sequence_layout_index = 0
-        concepts = self.concepts.flattened()
-        encoded = self.encode_domains(domains, concepts)
+        concepts = graph_name(self.concepts.flattened(), "concepts")
+        encoded, phase_projection = self.encode_domains(domains, concepts)
         synchronize()
         state, action, action_row, action_flat, actions, sequence = self.encode_state(
-            domains, encoded, state_index, action_values, action_index, concepts,
+            domains, encoded, phase_projection, state_index, action_values, action_index, concepts,
             len(character),
         )
         scores = _norm_head(action, self.global_norm, self.policy) / temperature

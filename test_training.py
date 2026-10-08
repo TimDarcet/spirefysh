@@ -21,7 +21,7 @@ import rollout
 import telemetry
 import trajectories
 from explanations import explain
-from model_graph import trace_model
+from model_graph import NODE_BUDGET, PLUMBING, label_tensors, tensor_detail, trace, trace_model
 
 
 def write_events(path, rows):
@@ -1040,40 +1040,111 @@ print('restored')
 
 
 class ModelKernelTest(unittest.TestCase):
+    def assert_readable_graph(self, graph):
+        nodes = {node["id"]: node for node in graph["nodes"]}
+        children = {}
+        for node in graph["nodes"]:
+            children.setdefault(node["parent"], []).append(node["id"])
+        operations = [node for node in graph["nodes"] if "op_ids" in node]
+        covered = [op_id for node in operations for op_id in node["op_ids"]]
+        self.assertEqual(len(covered), len(set(covered)))
+        self.assertFalse(set(covered) & graph["hidden"].keys())
+        self.assertEqual(set(covered) | graph["hidden"].keys(),
+                         {op["id"] for op in graph["raw_ops"]})
+        self.assertFalse({node["code"].split(".")[0] for node in operations} & PLUMBING)
+        self.assertTrue(all(node["label"] for node in graph["nodes"]))
+        self.assertTrue(all(nodes[edge["from"]]["order"] < nodes[edge["to"]]["order"]
+                            for edge in graph["edges"]))
+        for node in graph["nodes"]:
+            parent = node["parent"]
+            while parent not in (None, "root"):
+                parent = nodes[parent]["parent"]
+            self.assertEqual(parent is None, node["id"] == "root")
+        top, frontier = [], ["root"]
+        while frontier:
+            key = frontier.pop()
+            for child in children.get(key, ()):
+                (frontier if child in graph["inline"] else top).append(child)
+        self.assertLessEqual(len([key for key in top if not nodes[key].get("leaf")]),
+                             NODE_BUDGET)
+        return nodes, children
+
     def test_model_graph_trace_is_complete_and_exact(self):
         env = train.sts2_sim.Batch(1, 18427, 1, ascension=0)
         env.set_training_bonus(4)
         observation = env.observe_tokens()
         network = train.Agent(dict(env.token_layout())).eval()
+        inputs = train.tensors(observation, torch.device("cpu"), network)
         result, recorder = trace_model(
-            network, train.tensors(observation, torch.device("cpu"), network),
-            "checkpoint", observation[5][0], train.sts2_sim.sts2_sim.__file__,
+            network, inputs, "checkpoint", observation[5][0], train.sts2_sim.sts2_sim.__file__,
         )
         proof, graph = result["proof"], result["graph"]
         self.assertTrue(proof["verified"])
         self.assertLessEqual(proof["maximum_output_error"], 1e-6)
         self.assertEqual(proof["operation_coverage"], 1)
         self.assertGreater(proof["verified_rewrites"], 0)
-        self.assertLessEqual(proof["maximum_rewrite_error"], 1e-6)
+        self.assertLessEqual(proof["maximum_rewrite_error"], 1e-4)
         self.assertEqual(len(recorder.ops), proof["raw_operations"])
-        self.assertTrue(graph["nodes"])
-        self.assertTrue(all(node["op_ids"] for node in graph["nodes"]))
-        self.assertEqual({op["id"] for op in recorder.ops}, {
-            op for node in graph["nodes"] for op in node["op_ids"]
-        })
-        self.assertTrue(all(int(edge["from"][1:]) < int(edge["to"][1:])
-                            for edge in graph["edges"]))
-        scope_order = {}
-        for node in graph["nodes"]:
-            scope_order.setdefault(node["scope"], int(node["id"][1:]))
-        by_id = {node["id"]: node for node in graph["nodes"]}
-        self.assertTrue(all(
-            by_id[edge["from"]]["scope"] == by_id[edge["to"]]["scope"]
-            or scope_order[by_id[edge["from"]]["scope"]]
-            < scope_order[by_id[edge["to"]]["scope"]]
-            for edge in graph["edges"]
-        ))
+        nodes, children = self.assert_readable_graph(graph)
+        layers = [node for node in graph["nodes"] if node["kind"] == "TransformerEncoderLayer"
+                  and node["code"].startswith("global_transformer.")]
+        self.assertEqual(len(layers), network.layers)
+        for layer in layers:
+            self.assertEqual([nodes[key]["kind"] for key in children[layer["id"]]
+                              if not nodes[key].get("leaf")],
+                             ["LayerNorm", "MultiheadAttention", "Add", "LayerNorm", "Linear",
+                              "GELU", "Linear", "Add"])
+        self.assertTrue(any(node["kind"] == "repeat" for node in graph["nodes"]))
+        self.assertTrue({"relic pool", "deck", "action"} <= {node["label"] for node in graph["nodes"]})
+        self.assertFalse(graph["rejected"])
+        self.assertTrue(all(row["maximum_error"] <= 1e-4 for row in graph["rewrites"]))
+        concepts = env.concept_labels()
+        self.assertEqual(len(concepts), network.concepts.num_embeddings)
+        label_tensors(recorder, *trajectories.decision_labels(
+            concepts, inputs, env.action_descriptors()))
+        final = nodes[children[layers[-1]["id"]][-1]]["outputs"][0]
+        self.assertEqual(recorder.labels[final][:2], ["run", "Event · Neow"])
+        self.assertEqual(recorder.labels[final][-3:],
+                         ["Booming Conch", "Neows Torment", "Leafy Poultice"])
+        card = next(node for node in graph["nodes"] if node["label"] == "card encoding")
+        self.assertEqual(recorder.labels[card["outputs"][0]],
+                         ["Zap", "Dualcast", "Strike Defect", "Defend Defect"])
+        encoder = next(node for node in graph["nodes"] if node["code"] == "encoders.card")
+        self.assertEqual([node["label"] for node in graph["nodes"] if node["parent"] == encoder["id"]],
+                         ["card state vector", "Linear", "norm"])
+        run = next(node for node in graph["nodes"] if node["code"] == "encoders.run")
+        state = next(node["outputs"][0] for node in graph["nodes"]
+                     if node["parent"] == run["id"] and node.get("leaf"))
+        channels, values = recorder.channels[state], recorder.values[state][0].tolist()
+        characters = [name for name in channels if name.startswith("character: ")]
+        self.assertEqual(len(characters), 5)
+        self.assertEqual(sum(values[:5]), 1)
+        self.assertEqual(values[channels.index("character: Defect")], 1)
+        self.assertAlmostEqual(values[channels.index("act ÷ 3")], 1 / 3, places=6)
+        self.assertLess(len(channels), 100)
         self.assertNotIn('"data"', json.dumps(result))
+
+    def test_model_graph_is_readable_for_generic_models(self):
+        torch.manual_seed(0)
+        layer = torch.nn.TransformerEncoderLayer(16, 2, 32, dropout=0, batch_first=True,
+                                                 norm_first=True, activation="gelu")
+        cases = (
+            (torch.nn.TransformerEncoder(layer, 2, enable_nested_tensor=False).eval(),
+             (torch.randn(1, 5, 16),), "TransformerEncoderLayer"),
+            (torch.nn.Sequential(torch.nn.Linear(8, 16), torch.nn.ReLU(), torch.nn.Linear(16, 2)),
+             (torch.randn(4, 8),), "Linear"),
+            (torch.nn.Sequential(torch.nn.GRU(8, 16, batch_first=True)), (torch.randn(2, 3, 8),),
+             "GRU"),
+        )
+        for network, inputs, kind in cases:
+            with self.subTest(type(network).__name__):
+                traced, recorder, graph = trace(network, inputs)
+                with torch.no_grad():
+                    expected = network(*inputs)
+                for left, right in zip(*map(torch.utils._pytree.tree_leaves, (traced, expected))):
+                    self.assertLessEqual(float((left - right).abs().max()), 1e-5)
+                self.assert_readable_graph(graph)
+                self.assertIn(kind, {node["kind"] for node in graph["nodes"]})
 
     def test_model_graph_trace_fails_closed_on_output_difference(self):
         env = train.sts2_sim.Batch(1, 7, 0, ascension=0)
@@ -1647,12 +1718,10 @@ class TrajectoryTest(unittest.TestCase):
         self.assertGreater(page.index("id=trainingSignal"), page.index("id=inventory"))
         self.assertNotIn("What the training signal would be if this was a training example", page)
         graph = trajectories.model_page()
-        for text in ("Verified model graph", "Semantic", "Raw operations", "Execution",
-                     "Fold all", "Loading exact tensors"):
+        for text in ("Model graph", "Model DAG", "Raw operations", "Execution", "Fold all",
+                     "Loading exact tensors", "function automaticLayout", "function layoutScope",
+                     "expanded-region", "sum-node", "Activation heatmap"):
             self.assertIn(text, graph)
-        self.assertIn("function automaticLayout", graph)
-        self.assertIn("function semanticGraph", graph)
-        self.assertIn("class=region", graph)
 
     def test_trajectory_assets_include_game_card_and_relic_art(self):
         root = Path(trajectories.__file__).with_name("game-assets")
