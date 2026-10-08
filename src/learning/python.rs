@@ -6488,7 +6488,10 @@ impl Batch {
                     game.run.floor,
                     game.run.hp,
                     game.run.max_hp,
-                    phase_index(&game.phase).map_or(u8::MAX, |phase| phase as u8),
+                    phase_index(&game.phase).map_or(
+                        if matches!(game.phase, Phase::Won) { 12 } else { 13 },
+                        |phase| phase as u8,
+                    ),
                     turn,
                     player_hp,
                     enemy_hp,
@@ -8204,6 +8207,15 @@ fn training_bonuses_replace_strength_and_dexterity_exactly() {
     assert_eq!(amounts(&batch), [7, 4]);
     batch.set_training_bonuses(0, 0);
     assert_eq!(amounts(&batch), [0, 0]);
+}
+
+#[test]
+fn stats_report_won_and_dead_phases() {
+    let mut batch = Batch::new(1, 1, Some(0), 32, 1, 10, 1).unwrap();
+    batch.games[0].phase = Phase::Won;
+    assert_eq!(batch.stats()[0].4, 12);
+    batch.games[0].phase = Phase::Dead;
+    assert_eq!(batch.stats()[0].4, 13);
 }
 
 #[test]
