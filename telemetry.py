@@ -1438,6 +1438,12 @@ def serve_dashboard(target, host, port):
     trajectories = TrajectorySource(target)
 
     class Handler(http.server.BaseHTTPRequestHandler):
+        def handle(self):
+            try:
+                super().handle()
+            except ConnectionError:
+                pass
+
         def do_GET(self):
             request = urlparse(self.path)
             try:
