@@ -1593,6 +1593,7 @@ class TrajectoryTest(unittest.TestCase):
         self.assertIn("width:min(280px,calc(100vw - 16px))", page)
         self.assertIn("function placePreview(event)", page)
         self.assertIn("addEventListener('pointerover',placePreview)", page)
+        self.assertIn("event.target.matches('input,select')", page)
         self.assertIn(".relic-icon{display:grid;place-items:center;width:46px", page)
         self.assertIn(".effect-icon{display:grid;place-items:center;width:34px", page)
         self.assertIn(".preview-description{display:block", page)
