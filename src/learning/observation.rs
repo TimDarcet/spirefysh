@@ -12,10 +12,9 @@ use std::{
 };
 
 const MAGIC: &[u8; 8] = b"STSVALUE";
-const VERSION: u32 = 59;
-const VALUE_MODEL_VERSION: u32 = 77;
+const VERSION: u32 = 60;
+const VALUE_MODEL_VERSION: u32 = 78;
 const TERMINAL_CATEGORIES: usize = 83;
-const POTENTIAL_WEIGHT_COUNT: usize = 13;
 const CARD_ZONES: usize = 5;
 const DECK_ZONE: usize = 0;
 const HAND_ZONE: usize = 1;
@@ -29,7 +28,7 @@ const HISTORY_COURSE_STATUS: u32 = 6;
 const PHASES: usize = 12;
 const MAP_NODE_KINDS: usize = 26;
 const ENCHANTMENTS: usize = 22;
-const PUBLIC_GLOBALS: usize = 0;
+const PUBLIC_GLOBALS: usize = 26;
 const DEFAULT_MODEL_WIDTH: usize = 128;
 const DEFAULT_MODEL_LAYERS: usize = 4;
 const DEFAULT_MODEL_HEADS: usize = 8;
@@ -302,20 +301,12 @@ struct CandidateRow {
     legal: bool,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
-struct Potential {
-    floor: f32,
-    health: f32,
-    resources: [f32; POTENTIAL_WEIGHT_COUNT],
-}
-
 #[derive(Clone, Debug, PartialEq)]
 struct Observation {
     character: u8,
     globals: Vec<f32>,
     domains: [DomainRows; 16],
     candidates: Vec<CandidateRow>,
-    potential: Potential,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -4404,24 +4395,6 @@ fn relic_state(game: &Game, content: &Content, id: Id) -> [f32; 4] {
     }
 }
 
-fn globals_len(_: Layout) -> usize {
-    PUBLIC_GLOBALS
-}
-
-fn observation_globals_with_bonuses(
-    _: &Game,
-    _: &Content,
-    _: Layout,
-    _: (i16, i16),
-    _: bool,
-) -> Vec<f32> {
-    Vec::new()
-}
-
-#[cfg(test)]
-fn observation_globals(game: &Game, content: &Content, layout: Layout, active: bool) -> Vec<f32> {
-    observation_globals_with_bonuses(game, content, layout, (0, 0), active)
-}
 
 fn action_kind(action: &Action) -> usize {
     match action {
@@ -7293,10 +7266,9 @@ fn build_observation_with_candidates(
     domains[MAP_EDGE_DOMAIN] = DomainRows::Shared(edges);
     Observation {
         character: game.run.character as u8,
-        globals: observation_globals_with_bonuses(game, content, layout, bonuses, true),
+        globals: run_features(game, content),
         domains,
         candidates,
-        potential: potential(game, content, false),
     }
 }
 
@@ -7476,9 +7448,9 @@ fn resample_canonical_combat_hidden(game: &mut Game, seed: u64) {
     }
 }
 
-fn potential(game: &Game, content: &Content, include_terminal: bool) -> Potential {
-    if !include_terminal && matches!(game.phase, Phase::Won | Phase::Dead) {
-        return Potential::default();
+fn run_features(game: &Game, content: &Content) -> Vec<f32> {
+    if matches!(game.phase, Phase::Won | Phase::Dead) {
+        return vec![0.0; PUBLIC_GLOBALS];
     }
     let hp = game
         .combat()
@@ -7487,7 +7459,6 @@ fn potential(game: &Game, content: &Content, include_terminal: bool) -> Potentia
     let relics = &game.run.relics;
     let deck = &game.run.deck;
     let resources = [
-        1.0,
         game.run.max_hp as f32,
         deck.iter()
             .map(|card| card.upgrades as usize)
@@ -7523,30 +7494,11 @@ fn potential(game: &Game, content: &Content, include_terminal: bool) -> Potentia
             .filter(|card| content.cards[card.id as usize].rarity == CardRarity::Rare)
             .count() as f32,
     ];
-    Potential {
-        floor: canonical_progress(game) as f32 / (TERMINAL_CATEGORIES - 1) as f32,
-        health: hp,
-        resources,
-    }
-}
-
-fn potential_value(
-    potential: &Potential,
-    weights: &[f32; POTENTIAL_WEIGHT_COUNT],
-    health_multiplier: bool,
-) -> f32 {
-    let resources = potential
-        .resources
-        .iter()
-        .zip(weights)
-        .map(|(term, weight)| term * weight)
-        .sum::<f32>();
-    potential.floor
-        + if health_multiplier {
-            potential.health * resources
-        } else {
-            potential.health * weights[0] + resources - weights[0]
-        }
+    [canonical_progress(game) as f32 / (TERMINAL_CATEGORIES - 1) as f32, hp]
+        .into_iter()
+        .chain(resources)
+        .chain(resources.map(|resource| hp * resource))
+        .collect()
 }
 
 struct ContentHasher(u64);

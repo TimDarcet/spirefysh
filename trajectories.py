@@ -13,7 +13,7 @@ import torch
 import sts2_sim
 from explanations import explain as explain_decision
 from model import CATEGORIES, MAX_PROGRESS, MODEL_VERSION, POTENTIAL_TERMS, STAGES, \
-    TOKEN_SPECS, export_value_model, load, predict, sha256_file, tensors
+    TOKEN_SPECS, export_value_model, load, potential_head, predict, sha256_file, tensors
 from model_graph import GraphCache, NUMERIC_CHANNELS, feature_schema, label_tensors, \
     linear_weight, tensor_detail, trace_model
 
@@ -54,7 +54,7 @@ def _metadata(trace):
 
 
 def validate_trace(trace):
-    if trace.get("trajectory_schema") != 1:
+    if trace.get("trajectory_schema") not in (1, 2):
         raise ValueError("unsupported trajectory schema")
     choices = trace.get("choices")
     fields = ("log_policies", "critic_values", "canonical_progress", "phases",
@@ -85,10 +85,6 @@ def _training_config(manifest, trace):
     return {
         "gae_gamma": float(training.get("gae_gamma", 1)),
         "gae_lambda": float(training.get("gae_lambda", 1)),
-        "terminal_potential": bool(training.get("terminal_potential", False)),
-        "potential_mode": manifest.get("architecture", {}).get(
-            "potential_mode", "health_multiplier",
-        ),
         "clip": float(training.get("clip", .2)),
         "value_weight": float(training.get("value_weight", .5)),
         "entropy_weight": (float(training["entropy_weight"])
@@ -96,9 +92,10 @@ def _training_config(manifest, trace):
         "boss_floor_increments": [float(training.get(
             f"boss_{boss}_floor_increment", default,
         )) for boss, default in enumerate(BOSS_FLOOR_INCREMENTS, 1)],
-        "potential_weights": list(manifest.get("architecture", {}).get(
-            "potential_weights", [0.] * len(POTENTIAL_TERMS),
-        )),
+        "potential_head": potential_head(
+            [float(training.get(f"potential_{term}_weight", 0.)) for term in POTENTIAL_TERMS],
+            training.get("potential_mode", "health_multiplier"),
+        ),
         "session_id": session.get("id") if session else sessions[-1].get("id")
         if sessions else None,
     }
@@ -127,20 +124,15 @@ def _add_training_signals(trace, steps, config):
             index = actionable[position]
             step = steps[index]
             following_return, following_advantage = discounted_return, gae
-            next_potential = steps[actionable[position + 1]]["potential"] \
-                if position + 1 < len(actionable) else steps[-1].get("successor_potential", 0.)
-            reward = gamma * next_potential - step["potential"]
-            if position + 1 == len(actionable):
-                reward += terminal_value
+            reward = terminal_value if position + 1 == len(actionable) else 0.
             delta = reward + gamma * next_value - step["critic_value"]
             gae = delta + gamma * gae_lambda * gae
             discounted_return = reward + gamma * discounted_return
             values[index] = {
-                "reward": reward, "terminal_reward": terminal_value
-                if position + 1 == len(actionable) else 0.,
+                "reward": reward,
                 "next_actionable_index": actionable[position + 1]
                 if position + 1 < len(actionable) else None,
-                "next_potential": next_potential, "next_critic_value": next_value,
+                "next_critic_value": next_value,
                 "next_return": following_return, "next_advantage": following_advantage,
                 "return": discounted_return, "td_error": delta, "advantage": gae,
                 "critic_error": step["critic_value"] - discounted_return,
@@ -156,8 +148,7 @@ def _add_training_signals(trace, steps, config):
         step["training_signal"] = {
             "eligible": eligible, "reason": reason,
             "critic_value": step["critic_value"], "potential": step["potential"],
-            "state_value": step["critic_value"] + step["potential"],
-            "environment_reward": step["environment_reward"],
+            "network_value": step["critic_value"] - step["potential"],
             "entropy": step["policy_entropy"],
             "selected_log_probability": step["actions"][step["choice"]]["log_probability"],
             "potential_components": step["potential_components"],
@@ -172,30 +163,19 @@ def replay_trace(trace, config=None):
         ascension=int(trace["ascension"]),
     )
     env.set_training_bonus(int(trace["bonus"]))
-    env.set_potential_weights(config["potential_weights"])
-    env.set_potential_mode(config["potential_mode"])
-    env.set_terminal_potential(config["terminal_potential"])
     if env.fingerprint() != int(trace["fingerprint"]):
         raise ValueError("trajectory does not match simulator content")
+    resources = POTENTIAL_TERMS[1:]
+    names = ["floor", "health", *resources, *(f"health_{name}" for name in resources)]
     steps = []
     for index, choice in enumerate(trace["choices"]):
-        env.observe_tokens()
+        features = env.observe_tokens()[1][0].tolist()
         state = json.loads(env.state(0))
-        base = state.get("common", state)
-        health = max(0., float(state.get("player", base)["hp"]))
-        floor, resources = env.potential_components(0)
-        factor = health if config["potential_mode"] == "health_multiplier" else 1.
         potential_components = [
-            {"name": name, "weight": weight,
-             "feature": resource / factor if factor else 0.,
-             "weighted_feature": weight * resource / factor if factor else 0.,
-             "resource": resource,
-             "contribution": weight * resource}
-            for name, weight, resource in zip(
-                POTENTIAL_TERMS, config["potential_weights"], resources,
-            )
+            {"name": name, "weight": weight, "feature": feature, "contribution": weight * feature}
+            for name, weight, feature in zip(names, config["potential_head"], features)
         ]
-        potential = floor + sum(row["contribution"] for row in potential_components)
+        potential = sum(row["contribution"] for row in potential_components)
         actions = env.action_descriptors()
         previews = [json.loads(value) if value else None for value in env.action_previews()]
         policy = trace["log_policies"][index]
@@ -223,19 +203,15 @@ def replay_trace(trace, config=None):
             ],
             "policy_entropy": entropy,
             "effective_actions": math.exp(entropy),
-            "critic_value": trace["critic_values"][index],
+            "critic_value": trace["critic_values"][index]
+            + (potential if trace["trajectory_schema"] == 1 else 0.),
             "canonical_progress": trace["canonical_progress"][index],
             "phase": trace["phases"][index],
             "policy_revision": trace["policy_revisions"][index],
             "potential": potential,
-            "potential_health": health,
-            "potential_floor": floor,
             "potential_components": potential_components,
         })
-        reward, done, successor_potential = env.step([choice])
-        steps[-1]["environment_reward"] = float(reward[0])
-        steps[-1]["done"] = bool(done[0])
-        steps[-1]["successor_potential"] = float(successor_potential[0])
+        steps[-1]["done"] = bool(env.step([choice])[1][0])
     _add_training_signals(trace, steps, config)
     return {"trace": trace, "steps": steps, "final_state": json.loads(env.state(0)),
             "training_config": config}
@@ -471,7 +447,7 @@ class TrajectorySource:
             for choice in trace["choices"][:step]:
                 env.observe_tokens(); env.step([int(choice)])
             observation = env.observe_tokens()
-            cache_key = digest, int(observation[5][0]), step
+            cache_key = digest, int(observation[4][0]), step
             graph_id = self.graph_keys.get(cache_key)
             if graph_id:
                 try:
@@ -488,7 +464,7 @@ class TrajectorySource:
                     or abs(float(critic.squeeze()) - float(trace["critic_values"][step])) > 1e-4:
                 raise RuntimeError("checkpoint does not reproduce this trajectory decision")
             summary, recorder = trace_model(
-                model, inputs, digest, observation[5][0], sts2_sim.sts2_sim.__file__, temperature,
+                model, inputs, digest, observation[4][0], sts2_sim.sts2_sim.__file__, temperature,
             )
             actions = env.action_descriptors()
             label_tensors(recorder, *decision_labels(env.concept_labels(), inputs, actions))
@@ -628,7 +604,7 @@ class TrajectorySource:
         env.set_training_bonus(bonus)
         env.load_policy(policy)
         trace = {
-            "trajectory_schema": 1, "id": f"generated:{uuid.uuid4().hex}",
+            "trajectory_schema": 2, "id": f"generated:{uuid.uuid4().hex}",
             "source": "generated", "time": time.time(), "checkpoint": checkpoint,
             "seed": int(env.seeds()[0]), "character": character, "stage": stage,
             "ascension": ascension, "bonus": bonus, "temperature": temperature,
@@ -748,15 +724,15 @@ const spriteAliases={battle_friend_v1_0:'battle_friend_v1',battle_friend_v2_0:'b
 function placePreview(event){const source=event.target.closest?.('.action-name,.item,.keyword,.relic-icon,.effect-icon'),tip=source?.querySelector(':scope>.preview');if(!tip)return;requestAnimationFrame(()=>{if(!source.matches(':hover'))return;const anchor=source.getBoundingClientRect(),box=tip.getBoundingClientRect(),margin=8;tip.style.left=Math.min(innerWidth-box.width-margin,Math.max(margin,anchor.left+(anchor.width-box.width)/2))+'px';tip.style.top=(anchor.bottom+box.height<=innerHeight-margin?anchor.bottom:Math.max(margin,anchor.top-box.height))+'px'})}
 function actionText(action){const name=display(action.preview||action.label||action.kind);return action.kind.startsWith('RemoveCard(')?`${action.kind} (${name})`:action.kind==='use_potion'?`Drink ${name}`:action.kind==='discard_potion'?`Discard ${name}`:name}function actionThing(action){return thing(action.preview||action.label||action.kind,actionText(action))}
 const expandedSignal=new Set;function shown(value){if(typeof value!=='number'||!Number.isFinite(value))return'—';if(value===0)return'0';return value.toExponential(5).replace(/\.?0+e/,'e').replace('e+','e')}function term(id,latex,value,note,definition){return{id,latex,value,note,definition}}function time(offset){return offset?`t+${offset}`:'t'}function nextRow(row){const index=row.training_signal.next_actionable_index;return index===null||index===undefined?null:current.steps[index]}
-function potentialTerm(row,offset){const at=time(offset),s=row.training_signal,multiplied=current.training_config.potential_mode==='health_multiplier',leaves=(s.potential_components||[]).map((item,index)=>{const name=item.name.replaceAll('_','\\_'),weight=term(`weight-${row.index}-${index}`,`w_{\\mathrm{${name}}}`,item.weight,'Configured potential weight.'),feature=term(`feature-${row.index}-${index}`,`x_{\\mathrm{${name}}}(s_{${at}})`,item.feature,'Raw resource feature.');return term(`potential-${row.index}-${index}`,`w_{\\mathrm{${name}}}x_{\\mathrm{${name}}}`,item.weighted_feature,'Weighted potential term.',[weight,'\\cdot',feature])}),resources=term(`resources-${row.index}`,'\\sum_k w_kx_k',leaves.reduce((sum,item)=>sum+item.value,0),'Weighted resource sum.',leaves.flatMap((item,index)=>index?['+',item]:[item])),floor=term(`floor-${row.index}`,`F(s_{${at}})/(C-1)`,row.potential_floor,'Normalized canonical progress.');return term(`potential-${row.index}`,`\\Phi(s_{${at}})`,s.potential,'Fixed progress and resource potential.',multiplied?[floor,'+',term(`health-${row.index}`,`\\mathrm{HP}(s_{${at}})`,row.potential_health,'Current combat or run health.'),'\\,',resources]:[floor,'+',resources])}
-function rewardTerm(row,offset){const at=time(offset),s=row.training_signal,next=nextRow(row),nextPotential=next?potentialTerm(next,offset+1):term(`potential-end-${row.index}`,`\\Phi(s_{t+${offset+1}})`,s.next_potential,'Terminal successor potential.');return term(`reward-${row.index}`,`r_{${at}}`,s.reward,'Potential-shaped learner reward.',()=>[term(`gamma-r-${row.index}`,'\\gamma',current.training_config.gae_gamma,'Reward discount.'),'\\,',nextPotential,'-',potentialTerm(row,offset),'+',term(`terminal-${row.index}`,`T_{${at}}`,s.terminal_reward,'Normalized terminal-floor reward, nonzero only at the last actionable state.')])}
+function potentialTerm(row,offset){const at=time(offset),s=row.training_signal,leaves=s.potential_components.filter(item=>item.weight).map((item,index)=>{const name=item.name.replaceAll('_','\\_'),weight=term(`weight-${row.index}-${index}`,`w_{\\mathrm{${name}}}`,item.weight,'Potential-head weight.'),feature=term(`feature-${row.index}-${index}`,`x_{\\mathrm{${name}}}(s_{${at}})`,item.feature,'Run feature.');return term(`potential-${row.index}-${index}`,`w_{\\mathrm{${name}}}x_{\\mathrm{${name}}}`,item.contribution,'Weighted run feature.',[weight,'\\cdot',feature])});return term(`potential-${row.index}`,`\\Phi(s_{${at}})`,s.potential,'Linear potential head of the critic, at its configured initialization.',leaves.flatMap((item,index)=>index?['+',item]:[item]))}
+function rewardTerm(row,offset){const at=time(offset);return term(`reward-${row.index}`,`r_{${at}}`,row.training_signal.reward,'Normalized terminal-floor reward, nonzero only at the last actionable state.')}
 function returnTerm(row,offset){const at=time(offset);return term(`return-${row.index}`,`G_{${at}}`,row.training_signal.return,'Discounted critic target.',()=>{const next=nextRow(row),following=next?returnTerm(next,offset+1):term(`return-end-${row.index}`,`G_{t+${offset+1}}`,0,'Zero after the terminal actionable state.');return[rewardTerm(row,offset),'+',term(`gamma-g-${row.index}`,'\\gamma',current.training_config.gae_gamma,'Return discount.'),'\\,',following]})}
-function criticTerm(row,offset){return term(`value-${row.index}`,`v_\\theta(s_{${time(offset)}})`,row.training_signal.critic_value,'Captured trainable critic residual.')}
-function deltaTerm(row,offset){const at=time(offset),next=nextRow(row),nextValue=next?criticTerm(next,offset+1):term(`value-end-${row.index}`,`v_\\theta(s_{t+${offset+1}})`,0,'Zero after the terminal actionable state.');return term(`delta-${row.index}`,`\\delta_{${at}}`,row.training_signal.td_error,'One-step temporal-difference error.',()=>[rewardTerm(row,offset),'+',term(`gamma-d-${row.index}`,'\\gamma',current.training_config.gae_gamma,'Value discount.'),'\\,',nextValue,'-',criticTerm(row,offset)])}
+function criticTerm(row,offset){const at=time(offset);return term(`value-${row.index}`,`V_\\theta(s_{${at}})`,row.training_signal.critic_value,'Captured critic value.',()=>[term(`network-${row.index}`,`f_\\theta(s_{${at}})`,row.training_signal.network_value,'Network critic output.'),'+',potentialTerm(row,offset)])}
+function deltaTerm(row,offset){const at=time(offset),next=nextRow(row),nextValue=next?criticTerm(next,offset+1):term(`value-end-${row.index}`,`V_\\theta(s_{t+${offset+1}})`,0,'Zero after the terminal actionable state.');return term(`delta-${row.index}`,`\\delta_{${at}}`,row.training_signal.td_error,'One-step temporal-difference error.',()=>[rewardTerm(row,offset),'+',term(`gamma-d-${row.index}`,'\\gamma',current.training_config.gae_gamma,'Value discount.'),'\\,',nextValue,'-',criticTerm(row,offset)])}
 function advantageTerm(row,offset){const at=time(offset);return term(`advantage-${row.index}`,`A_{${at}}`,row.training_signal.advantage,'Raw generalized advantage estimate.',()=>{const next=nextRow(row),following=next?advantageTerm(next,offset+1):term(`advantage-end-${row.index}`,`A_{t+${offset+1}}`,0,'Zero after the terminal actionable state.');return[deltaTerm(row,offset),'+',term(`gamma-a-${row.index}`,'\\gamma',current.training_config.gae_gamma,'GAE discount.'),'\\,',term(`lambda-${row.index}`,'\\lambda',current.training_config.gae_lambda,'GAE trace decay.'),'\\,',following]})}
-function signalTree(row){const s=row.training_signal,c=current.training_config,unknown='Known only when this row is placed in a training batch.',potential=potentialTerm(row,0),criticValue=criticTerm(row,0),stateValue=term(`state-value-${row.index}`,'\\hat V(s_t)',s.state_value,'Total collection-time state value.',[criticValue,'+',potential]);if(!s.eligible)return[stateValue];const returned=returnTerm(row,0),advantage=advantageTerm(row,0),normalized=term('normalized','\\widehat A_t',null,unknown,['\\left(',advantage,'-',term('adv-mean','\\mu_{A,c}',null,'Per-character batch mean; '+unknown),'\\right)/\\left(',term('adv-std','\\sigma_{A,c}+10^{-8}',null,'Per-character batch standard deviation; '+unknown),'\\right)']),oldLog=term('old-log','\\log \\pi_{old}(a_t|s_t)',s.selected_log_probability,'Captured behavior log probability.'),newLog=term('new-log','\\log \\pi_\\theta(a_t|s_t)',null,'Depends on the learner checkpoint used at update time.'),ratio=term('ratio','\\rho_t',null,'Equals 1 at collection; recomputed from the learner policy at training time.',[term('exp','\\exp',null,'Exponential.'),'\\left(',newLog,'-',oldLog,'\\right)']),clipped=term('clipped','\\operatorname{clip}(\\rho_t,1-\\epsilon,1+\\epsilon)',null,unknown,[ratio,',\\quad',term('clip','\\epsilon',c.clip,'PPO clipping radius.')]),policy=term('policy-loss','\\ell_t^{PPO}',null,unknown,['-',term('minimum','\\min',null,'PPO uses the smaller surrogate objective.'),'\\left(',ratio,'\\,',normalized,',\\,',clipped,'\\,',normalized,'\\right)']),square=term('critic-square','(v_\\theta(s_t)-G_t)^2',s.critic_squared_error,'Collection-time squared critic error.',['\\left(',criticValue,'-',returned,'\\right)^2']),critic=term('critic-loss','c_V\\ell_t^V',null,unknown,[term('value-weight','c_V',c.value_weight,'Configured critic-loss weight.'),'\\,',term('balance','w_t',null,'Stateful critic-balance weight. '+unknown),'\\,',square]),entropyTerms=row.actions.map((action,index)=>term(`entropy-${index}`,`-p_${index}\\log p_${index}`,-action.probability*action.log_probability,`${label(action.label||action.kind)} entropy contribution.`)),entropy=term('entropy','H_t',s.entropy,'Entropy of the captured behavior policy.',entropyTerms.flatMap((item,index)=>index?['+',item]:[item])),entropyWeight=term('entropy-weight','c_H',c.entropy_weight,c.entropy_weight===null?'Scheduled from training progress; '+unknown:'Configured entropy weight.'),loss={id:'loss',latex:'\\ell_t',definition:[policy,'+',critic,'-',entropyWeight,'\\,',entropy]};return[loss,stateValue]}
+function signalTree(row){const s=row.training_signal,c=current.training_config,unknown='Known only when this row is placed in a training batch.',criticValue=criticTerm(row,0);if(!s.eligible)return[criticValue];const returned=returnTerm(row,0),advantage=advantageTerm(row,0),normalized=term('normalized','\\widehat A_t',null,unknown,['\\left(',advantage,'-',term('adv-mean','\\mu_{A,c}',null,'Per-character batch mean; '+unknown),'\\right)/\\left(',term('adv-std','\\sigma_{A,c}+10^{-8}',null,'Per-character batch standard deviation; '+unknown),'\\right)']),oldLog=term('old-log','\\log \\pi_{old}(a_t|s_t)',s.selected_log_probability,'Captured behavior log probability.'),newLog=term('new-log','\\log \\pi_\\theta(a_t|s_t)',null,'Depends on the learner checkpoint used at update time.'),ratio=term('ratio','\\rho_t',null,'Equals 1 at collection; recomputed from the learner policy at training time.',[term('exp','\\exp',null,'Exponential.'),'\\left(',newLog,'-',oldLog,'\\right)']),clipped=term('clipped','\\operatorname{clip}(\\rho_t,1-\\epsilon,1+\\epsilon)',null,unknown,[ratio,',\\quad',term('clip','\\epsilon',c.clip,'PPO clipping radius.')]),policy=term('policy-loss','\\ell_t^{PPO}',null,unknown,['-',term('minimum','\\min',null,'PPO uses the smaller surrogate objective.'),'\\left(',ratio,'\\,',normalized,',\\,',clipped,'\\,',normalized,'\\right)']),square=term('critic-square','(V_\\theta(s_t)-G_t)^2',s.critic_squared_error,'Collection-time squared critic error.',['\\left(',criticValue,'-',returned,'\\right)^2']),critic=term('critic-loss','c_V\\ell_t^V',null,unknown,[term('value-weight','c_V',c.value_weight,'Configured critic-loss weight.'),'\\,',term('balance','w_t',null,'Stateful critic-balance weight. '+unknown),'\\,',square]),entropyTerms=row.actions.map((action,index)=>term(`entropy-${index}`,`-p_${index}\\log p_${index}`,-action.probability*action.log_probability,`${label(action.label||action.kind)} entropy contribution.`)),entropy=term('entropy','H_t',s.entropy,'Entropy of the captured behavior policy.',entropyTerms.flatMap((item,index)=>index?['+',item]:[item])),entropyWeight=term('entropy-weight','c_H',c.entropy_weight,c.entropy_weight===null?'Scheduled from training progress; '+unknown:'Configured entropy weight.'),loss={id:'loss',latex:'\\ell_t',definition:[policy,'+',critic,'-',entropyWeight,'\\,',entropy]};return[loss,criticValue]}
 function math(node,latex,className,title){const span=document.createElement(node);latex=latex.replaceAll('\\left','').replaceAll('\\right','');if(className)span.className=className;if(title)span.title=title;if(window.katex)katex.render(latex,span,{throwOnError:false});else span.textContent=latex;return span}function renderFormula(node,depth=0){const wrap=document.createElement('div'),line=document.createElement('div'),definition=typeof node.definition==='function'?node.definition():node.definition||[];line.className='formula-line';line.style.marginLeft=`${depth*18}px`;line.append(math('span',node.latex,'formula-leaf',node.note));line.append(math('span','=','',null));for(const item of definition){if(typeof item==='string'){line.append(math('span',item));continue}const expandable=typeof item.definition==='function'||item.definition?.length,part=math(expandable?'button':'span',item.latex,expandable?'formula-term':'formula-leaf',`${shown(item.value)}${item.note?' · '+item.note:''}`);if(expandable){part.type='button';part.setAttribute('aria-expanded',expandedSignal.has(item.id));part.onclick=()=>{expandedSignal.has(item.id)?expandedSignal.delete(item.id):expandedSignal.add(item.id);renderTraining(current.steps[Number($('position').value)],false)}}line.append(part)}wrap.append(line);const seen=new Set;for(const item of definition)if(typeof item!=='string'&&(typeof item.definition==='function'||item.definition?.length)&&expandedSignal.has(item.id)&&!seen.has(item.id)){seen.add(item.id);wrap.append(renderFormula(item,depth+1))}return wrap}
-function renderTraining(row,reset=true){const section=$('trainingSignal');if(!row){section.hidden=true;return}if(reset)expandedSignal.clear();section.hidden=false;const s=row.training_signal,values=[['Total state value',s.state_value],['Critic residual',s.critic_value],['Environment reward',s.environment_reward],['Shaped reward',s.reward],['Return target',s.return],['Raw advantage',s.advantage]];$('signalSummary').innerHTML=`<div class=signal-values>${values.map(([name,value])=>`<span class=chip><b>${name}</b> ${shown(value)}</span>`).join('')}</div>`;$('signalNote').textContent=s.reason||'Captured values are exact; — marks quantities determined only when a training batch is assembled.';const tree=$('formulaTree');tree.replaceChildren(...signalTree(row).map(node=>renderFormula(node)))}
+function renderTraining(row,reset=true){const section=$('trainingSignal');if(!row){section.hidden=true;return}if(reset)expandedSignal.clear();section.hidden=false;const s=row.training_signal,values=[['Critic value',s.critic_value],['Potential head',s.potential],['Reward',s.reward],['Return target',s.return],['Raw advantage',s.advantage]];$('signalSummary').innerHTML=`<div class=signal-values>${values.map(([name,value])=>`<span class=chip><b>${name}</b> ${shown(value)}</span>`).join('')}</div>`;$('signalNote').textContent=s.reason||'Captured values are exact; — marks quantities determined only when a training batch is assembled.';const tree=$('formulaTree');tree.replaceChildren(...signalTree(row).map(node=>renderFormula(node)))}
 function phase(state,base,actions){if(state.event){const event=state.event,choices=actions.map(action=>`<li>${actionThing(action)} · ${(100*action.probability).toFixed(2)}%</li>`).join('');return `<section class=phase><h2>Current phase</h2><h3>${esc(label(event.id))}</h3><p>${esc(label(event.page))} screen · ${actions.length} resolved legal choice${actions.length===1?'':'s'}${event.resume?` · returns to ${esc(label(event.resume))}`:''}</p>${choices?`<ol>${choices}</ol>`:''}</section>`}if(state.turn!==undefined)return `<section class=phase><h2>Current phase</h2><h3>Combat · turn ${state.turn}</h3><p>${state.energy}/${state.max_energy} energy · ${state.stars} stars</p></section>`;return `<section class=phase><h2>Current phase</h2><h3>${esc(label(base.phase))}</h3><p>${esc(label(base.room))}</p></section>`}
 function show(){if(!current)return;const index=Number($('position').value),terminal=index===current.steps.length,row=terminal?{state:current.final_state}:current.steps[index],state=row.state,base=state.common||state,actions=terminal?[]:[...row.actions].sort((a,b)=>b.probability-a.probability);$('step').textContent=terminal?`Final · ${current.trace.outcome}`:`Decision ${index+1}/${current.steps.length}`;$('summary').innerHTML=`<h2>${esc(label(base.character))} · act ${base.act}, floor ${base.floor}</h2><p>Run HP ${base.hp}/${base.max_hp} · ${base.gold} gold${terminal?'':` · critic ${Number(row.critic_value).toFixed(4)} · entropy ${Number(row.policy_entropy).toFixed(4)} nats (${Number(row.effective_actions).toFixed(2)} effective actions) · progress ${row.canonical_progress} · policy ${row.policy_revision}`}</p>`;$('relics').innerHTML=(base.relics||[]).length?`<div class=relic-line>${base.relics.map(relic=>icon(relic,'relic-icon')).join('')}</div>`:'';$('phase').innerHTML=phase(state,base,actions);const allies=state.turn===undefined?'':actor(base.character,state.player,base.character)+(state.osty?.max_hp?actor('MONSTER.OSTY',state.osty,'MONSTER.OSTY'):'');$('state').innerHTML=state.turn===undefined?'':`<div class=state><div class=combatants><div class=friendlies>${allies}</div><div class=enemies>${(state.enemies||[]).map(enemy=>actor(enemy.id,enemy,enemy.id,enemy.intent)).join('')}</div></div><div class=combat-resources><section><b>Hand</b>${chips(state.hand)}${state.orbs?.length?`<b>Orbs</b>${chips(state.orbs)}`:''}</section><section><b>Draw / discard / exhaust</b><p>${state.draw?.length||0} / ${state.discard?.length||0} / ${state.exhaust?.length||0}</p></section></div></div>`;renderTraining(terminal?null:row);$('raw').textContent=JSON.stringify(state,null,2);$('actions').innerHTML=actions.map(action=>`<tr class="${action.selected?'selected':''}"><td>${action.selected?'✓ ':''}${action.index}</td><td><span class=action-name>${actionThing(action)}</span></td><td>${thing(action.source)}</td><td>${thing(action.target)}</td><td>${(100*action.probability).toFixed(2)}%</td><td>${Number(action.log_probability).toFixed(4)}</td></tr>`).join('');$('inventory').innerHTML=`<section class=inventory><h2>Run inventory</h2><b>Potions</b>${chips(base.potions)}<b>Deck</b>${chips(base.deck)}</section>`;$('previous').disabled=index===0;$('next').disabled=terminal;$('explain').disabled=terminal;$('modelGraph').disabled=terminal||!current.model_graph?.available;$('modelGraph').title=current.model_graph?.reason||'';if(!explanation||explanation.step!==index)$('explanation').hidden=true}
 function influenceTable(rows){return `<table class=influences><thead><tr><th>Token</th><th>Status</th><th>Δ margin</th><th>Δ probability</th><th>Δ critic</th><th>Flags</th><th></th></tr></thead><tbody>${rows.map(row=>`<tr><td>${thing(row.label)}</td><td>${esc(label(row.status))}</td><td>${row.margin_delta===undefined?'—':Number(row.margin_delta).toFixed(4)}</td><td>${row.chosen_probability_delta===undefined?'—':Number(row.chosen_probability_delta).toFixed(4)}${row.action_set_changed?' *':''}</td><td>${row.critic_delta===undefined?'—':Number(row.critic_delta).toFixed(4)}</td><td>${esc((row.flags||[]).map(label).join(', ')||row.reason||'')}</td><td>${row.status==='unavailable'?'':`<button class=compare-case data-case="${esc(row.id)}">Attention</button>`}</td></tr>`).join('')}</tbody></table>`}

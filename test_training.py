@@ -122,12 +122,8 @@ print('restored')
             "evaluation_max_steps", "evaluation_max_combat_steps",
         })
         self.assertFalse(args.capture_trajectories)
-        self.assertFalse(args.terminal_potential)
+        self.assertEqual(args.potential_learning_rate_multiplier, 0)
         self.assertEqual(args.potential_mode, "health_multiplier")
-        self.assertTrue(train.parser().parse_args([
-            "train", "--terminal-potential", "--potential-mode", "additive",
-            "--potential-bias-weight", ".01",
-        ]).terminal_potential)
         additive = train.parser().parse_args([
             "train", "--potential-mode", "additive", "--potential-health-weight", ".01",
         ])
@@ -830,9 +826,9 @@ print('restored')
             reports = train.MetricsProjector(root, run, manifest, 1).value()["reports"]
             self.assertEqual([row["step"] for row in reports], [120, 140])
 
-    def test_potential_gae(self):
+    def test_terminal_reward_gae(self):
         def values(canonical, expected, gamma=1, gae_lambda=1, won=False,
-                   potentials=None, terminal_potential=0, field="advantage", increments=None):
+                   field="advantage", increments=None):
             length = len(canonical)
             trajectory = {
                 "rows": [packed_row() for _ in range(length)], "choices": [0] * length,
@@ -842,8 +838,6 @@ print('restored')
                 "win_rewards": [0] * (length - 1) + [won],
                 "terminals": [False] * (length - 1) + [True],
                 "characters": [0] * length, "versions": [0] * length,
-                "potentials": np.zeros(length) if potentials is None else potentials,
-                "terminal_potential": terminal_potential,
             }
             dataset = train.ExperienceDataset()
             parameters = {} if increments is None else dict(zip(
@@ -872,29 +866,23 @@ print('restored')
             values([0, 72], np.array([0, 72]) / maximum, won=True),
             np.array([1, 10 / maximum]), atol=1e-7,
         )
-        potentials = np.array([.1, .2])
+        potentials, residual = np.random.default_rng(0).random((2, 6))
+        gamma, gae_lambda = .9, .7
+        shaped = gamma * np.append(potentials[1:], 0) - potentials
+        shaped[-1] += 3 / maximum
+        advantage, returns, gae, following = np.zeros(6), np.zeros(6), 0., 0.
+        for index in reversed(range(6)):
+            successor = residual[index + 1] if index < 5 else 0.
+            gae = shaped[index] + gamma * successor - residual[index] + gamma * gae_lambda * gae
+            following = shaped[index] + gamma * following
+            advantage[index], returns[index] = gae, following
+        canonical = [0, 1, 2, 3, 3, 3]
         np.testing.assert_allclose(
-            values([0, 72], 1 - potentials, won=True, potentials=potentials),
-            0, atol=1e-7,
+            values(canonical, residual + potentials, gamma, gae_lambda), advantage, atol=1e-6,
         )
         np.testing.assert_allclose(
-            values([0, 72], [0, 0], won=True, potentials=potentials,
-                   field="critic_target"),
-            1 - potentials, atol=1e-7,
-        )
-        np.testing.assert_allclose(
-            values([0, 0], [0, 0], gamma=.5, potentials=[.1, .2]),
-            [-.1, -.2], atol=1e-7,
-        )
-        np.testing.assert_allclose(
-            values([0, 0], [0, 0], gamma=.5, potentials=[.1, .2],
-                   field="critic_target"),
-            [-.1, -.2], atol=1e-7,
-        )
-        np.testing.assert_allclose(
-            values([0, 0], [0, 0], gamma=.5, potentials=[.1, .2],
-                   terminal_potential=.4, field="critic_target"),
-            [0, 0], atol=1e-7,
+            values(canonical, residual + potentials, gamma, gae_lambda, field="critic_target"),
+            returns + potentials, atol=1e-6,
         )
         np.testing.assert_allclose(
             values([25], [0], increments=(20, 21, 30)), [35 / maximum], atol=1e-7,
@@ -914,7 +902,7 @@ print('restored')
             "critic_values": [0] * 5, "canonical_progress": [0] * 5,
             "phases": [0] * 5, "win_rewards": [0, 0, 0, 0, 1],
             "terminals": [False, False, False, False, True], "characters": [0] * 5,
-            "versions": [10, 11, 12, 13, 14], "potentials": [0] * 5,
+            "versions": [10, 11, 12, 13, 14],
         }
         dataset = train.ExperienceDataset()
         counts = dataset.add({"trajectories": [trajectory]}, Namespace(
@@ -939,7 +927,7 @@ print('restored')
             key: [trajectory[key][index] for index in (1, 3)]
             for key in (
                 "rows", "choices", "old_log", "critic_values", "canonical_progress",
-                "phases", "win_rewards", "terminals", "characters", "versions", "potentials",
+                "phases", "win_rewards", "terminals", "characters", "versions",
             )
         } | {
             "sampled_length": 5, "sampled_positions": [1, 3],
@@ -965,7 +953,7 @@ print('restored')
                 "win_rewards": [0] * length,
                 "terminals": [False] * (length - 1) + [True],
                 "characters": [0] * length, "versions": versions,
-                "potentials": [0] * length, "terminal_floor": versions[0],
+                "terminal_floor": versions[0],
             }
 
         dataset = train.ExperienceDataset()
@@ -1007,7 +995,7 @@ print('restored')
             "choices": [0] * 3, "old_log": [0] * 3, "critic_values": [0] * 3,
             "canonical_progress": [0, 4, 7], "phases": [0] * 3,
             "win_rewards": [0] * 3, "terminals": [False, False, True],
-            "characters": [0] * 3, "versions": [0] * 3, "potentials": [0] * 3,
+            "characters": [0] * 3, "versions": [0] * 3,
             "terminal_floor": 15,
         }
         dataset = train.ExperienceDataset()
@@ -1076,7 +1064,7 @@ class ModelKernelTest(unittest.TestCase):
         network = train.Agent(dict(env.token_layout())).eval()
         inputs = train.tensors(observation, torch.device("cpu"), network)
         result, recorder = trace_model(
-            network, inputs, "checkpoint", observation[5][0], train.sts2_sim.sts2_sim.__file__,
+            network, inputs, "checkpoint", observation[4][0], train.sts2_sim.sts2_sim.__file__,
         )
         proof, graph = result["proof"], result["graph"]
         self.assertTrue(proof["verified"])
@@ -1161,7 +1149,7 @@ class ModelKernelTest(unittest.TestCase):
                 self.assertRaisesRegex(RuntimeError, "does not reproduce"):
             trace_model(
                 network, train.tensors(observation, torch.device("cpu"), network),
-                "checkpoint", observation[5][0], train.sts2_sim.sts2_sim.__file__,
+                "checkpoint", observation[4][0], train.sts2_sim.sts2_sim.__file__,
             )
 
     def test_card_context_ignores_device_padding(self):
@@ -1296,46 +1284,33 @@ class TrajectoryTest(unittest.TestCase):
             replay["steps"][0]["effective_actions"], len(replay["steps"][0]["actions"]),
         )
 
-    def test_replay_exposes_potential_components_and_environment_reward(self):
+    def test_replay_exposes_potential_head_components(self):
         weights = [(index - 6) * 1e-7 for index in range(len(train.POTENTIAL_TERMS))]
-        config = trajectories._training_config({
-            "architecture": {"potential_weights": weights},
-        }, self.trace())
-        replay = trajectories.replay_trace(self.trace(), config)
-        step = replay["steps"][0]
-        env = train.sts2_sim.Batch(1, 7, 0, ascension=0)
-        env.set_potential_weights(weights)
-        expected = float(env.observe_tokens()[4][0])
-        self.assertAlmostEqual(step["potential"], expected)
-        self.assertAlmostEqual(
-            step["potential_floor"] + sum(
-                row["contribution"] for row in step["potential_components"]
-            ), expected,
-        )
-        self.assertEqual(len(step["potential_components"]), len(train.POTENTIAL_TERMS))
-        self.assertEqual(step["potential_health"], 80)
-        self.assertEqual(step["potential_components"][0]["feature"], 1)
+        config = trajectories._training_config({"sessions": [{"id": 1, "training": {
+            f"potential_{term}_weight": weight
+            for term, weight in zip(train.POTENTIAL_TERMS, weights)
+        }}]}, self.trace())
+        step = trajectories.replay_trace(self.trace(), config)["steps"][0]
+        features = train.sts2_sim.Batch(1, 7, 0, ascension=0).observe_tokens()[1][0]
+        head = train.potential_head(weights, "health_multiplier")
+        self.assertEqual(len(step["potential_components"]), train.RUN_FEATURES)
+        self.assertAlmostEqual(step["potential"], float(np.dot(head, features)), places=6)
         np.testing.assert_allclose(
-            [row["feature"] for row in step["potential_components"][:7]],
-            [1, 80, 0, 1, 0, 99, 10],
+            [row["feature"] for row in step["potential_components"][1:8]],
+            [80, 80, 0, 1, 0, 99, 10],
         )
-        np.testing.assert_allclose([
-            row["weighted_feature"] * step["potential_health"]
-            for row in step["potential_components"]
-        ], [row["contribution"] for row in step["potential_components"]], atol=1e-9)
-        self.assertEqual(step["environment_reward"], 0)
+        self.assertAlmostEqual(step["critic_value"], .25 + step["potential"])
+        modern = self.trace() | {"trajectory_schema": 2}
+        self.assertEqual(trajectories.replay_trace(modern, config)["steps"][0]["critic_value"], .25)
 
     def test_training_signal_matches_actionable_gae_sequence(self):
         steps = [
             {"actions": [{}, {}], "critic_value": .1, "potential": .2,
-             "environment_reward": 0., "policy_entropy": .5, "choice": 0,
-             "potential_components": []},
+             "policy_entropy": .5, "choice": 0, "potential_components": []},
             {"actions": [{}], "critic_value": .8, "potential": .4,
-             "environment_reward": 0., "policy_entropy": 0., "choice": 0,
-             "potential_components": []},
+             "policy_entropy": 0., "choice": 0, "potential_components": []},
             {"actions": [{}, {}], "critic_value": .2, "potential": .3,
-             "environment_reward": 0., "policy_entropy": .4, "choice": 1,
-             "potential_components": []},
+             "policy_entropy": .4, "choice": 1, "potential_components": []},
         ]
         for step in steps:
             for action in step["actions"]:
@@ -1345,13 +1320,12 @@ class TrajectoryTest(unittest.TestCase):
                   "boss_floor_increments": list(trajectories.BOSS_FLOOR_INCREMENTS)}
         trajectories._add_training_signals(trace, steps, config)
         terminal = 12 / (train.CATEGORIES - 1)
-        last_reward = terminal - .3
-        first_reward = .9 * .3 - .2
-        last_delta = last_reward - .2
-        first_delta = first_reward + .9 * .2 - .1
-        self.assertAlmostEqual(steps[2]["training_signal"]["return"], last_reward)
-        self.assertAlmostEqual(steps[0]["training_signal"]["return"],
-                               first_reward + .9 * last_reward)
+        last_delta = terminal - .2
+        first_delta = .9 * .2 - .1
+        self.assertAlmostEqual(steps[2]["training_signal"]["return"], terminal)
+        self.assertAlmostEqual(steps[0]["training_signal"]["return"], .9 * terminal)
+        self.assertEqual(steps[0]["training_signal"]["reward"], 0)
+        self.assertAlmostEqual(steps[0]["training_signal"]["network_value"], .1 - .2)
         self.assertAlmostEqual(steps[0]["training_signal"]["advantage"],
                                first_delta + .9 * .8 * last_delta)
         self.assertEqual(steps[0]["training_signal"]["next_actionable_index"], 2)
@@ -1374,7 +1348,6 @@ class TrajectoryTest(unittest.TestCase):
     def test_training_signal_matches_experience_dataset(self):
         legal = [2, 1, 3, 2, 1]
         predicted = [.11, .8, -.2, .3, .9]
-        potentials = [.4, .8, -.1, .2, .7]
         canonical = [24, 25, 53, 54, 55]
         trajectory = {
             "rows": [packed_row(count) for count in legal], "choices": [0] * 5,
@@ -1382,7 +1355,7 @@ class TrajectoryTest(unittest.TestCase):
             "critic_values": predicted, "canonical_progress": canonical,
             "phases": [0] * 5, "win_rewards": [0] * 5,
             "terminals": [False] * 4 + [True], "characters": [0] * 5,
-            "versions": [0] * 5, "potentials": potentials,
+            "versions": [0] * 5,
         }
         args = Namespace(critic_only=False, gae_gamma=.9, gae_lambda=.8,
                          boss_1_floor_increment=12, boss_2_floor_increment=13,
@@ -1391,10 +1364,9 @@ class TrajectoryTest(unittest.TestCase):
         dataset.add({"trajectories": [trajectory]}, args)
         steps = [{
             "actions": [{"log_probability": -math.log(count)} for _ in range(count)],
-            "choice": 0, "critic_value": value, "potential": potential,
-            "potential_components": [], "environment_reward": 0.,
-            "policy_entropy": math.log(count),
-        } for count, value, potential in zip(legal, predicted, potentials)]
+            "choice": 0, "critic_value": value, "potential": 0.,
+            "potential_components": [], "policy_entropy": math.log(count),
+        } for count, value in zip(legal, predicted)]
         config = {"gae_gamma": args.gae_gamma, "gae_lambda": args.gae_lambda,
                   "boss_floor_increments": [12., 13., 14.]}
         trajectories._add_training_signals({
@@ -1450,27 +1422,23 @@ class TrajectoryTest(unittest.TestCase):
     def test_potential_modes(self):
         env = train.sts2_sim.Batch(1, 7, 0, ascension=0)
         weights = [1e-4] * len(train.POTENTIAL_TERMS)
-        env.set_potential_weights(weights)
-        multiplied = float(env.observe_tokens()[4][0])
-        env.set_potential_mode("additive")
-        additive = float(env.observe_tokens()[4][0])
-        self.assertGreater(multiplied, additive)
+        layout = dict(env.token_layout(*train.DEFAULT_ARCHITECTURE))
+        observation = env.observe_tokens()
+        multiplied, additive = (train.Agent(
+            layout, *train.DEFAULT_ARCHITECTURE, potential_weights=weights, potential_mode=mode,
+        ) for mode in ("health_multiplier", "additive"))
+        features = torch.as_tensor(observation[1])
+        self.assertGreater(float(multiplied.potential_value(features)),
+                           float(additive.potential_value(features)))
         with self.assertRaises(ValueError):
-            env.set_potential_mode("invalid")
-
-        model = train.Agent(
-            dict(env.token_layout(*train.DEFAULT_ARCHITECTURE)), *train.DEFAULT_ARCHITECTURE,
-            potential_weights=weights, potential_mode="additive",
-        )
-        self.assertEqual(train.architecture(model)["potential_mode"], "additive")
+            train.potential_head(weights, "invalid")
         with self.assertRaises(ValueError):
-            train.Agent(
-                dict(env.token_layout(*train.DEFAULT_ARCHITECTURE)),
-                *train.DEFAULT_ARCHITECTURE, model_version=train.MODEL_VERSION - 1,
-            )
-        env.set_potential_mode("health_multiplier")
-        env.load_policy(train.export_value_model(None, model, env.fingerprint(), 1, 0, True))
-        self.assertAlmostEqual(float(env.observe_tokens()[4][0]), additive)
+            train.Agent(layout, *train.DEFAULT_ARCHITECTURE,
+                        model_version=train.MODEL_VERSION - 1)
+        env.load_policy(train.export_value_model(None, additive, env.fingerprint(), 1, 0, True))
+        python = train.predict(additive, train.tensors(observation, torch.device("cpu"), additive),
+                               "fp32")[1]
+        self.assertAlmostEqual(env.policy_details([0], 1)[0][2], float(python[0]), places=5)
 
     def test_explanation_deletes_tokens_and_captures_attention(self):
         env = train.sts2_sim.Batch(1, 1, None, ascension=0)
@@ -1668,12 +1636,12 @@ class TrajectoryTest(unittest.TestCase):
         self.assertIn("!seen.has(item.id)", page)
         self.assertIn("function returnTerm(row,offset)", page)
         self.assertIn("function advantageTerm(row,offset)", page)
-        self.assertIn("\\\\mathrm{HP}(s_{${at}})", page)
-        self.assertIn("item.weighted_feature", page)
+        self.assertIn("f_\\\\theta(s_{${at}})", page)
+        self.assertIn("item.contribution", page)
         for formula in ("\\\\ell_t^{PPO}", "c_V\\\\ell_t^V", "\\\\widehat A_t",
                         "\\\\rho_t", "\\\\operatorname{clip}",
                         "\\\\delta_{${at}}", "G_{${at}}", "r_{${at}}",
-                        "\\\\sum_k w_kx_k"):
+                        "\\\\Phi(s_{${at}})"):
             self.assertIn(formula, page)
         self.assertIn("definition:[policy,'+',critic,'-',entropyWeight", page)
         self.assertIn("typeof node.definition==='function'", page)

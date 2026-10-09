@@ -150,7 +150,7 @@ def _capture(model, inputs, temperature, state, descriptors):
     return policy, critic.squeeze(), global_input["value"], labels, attention
 
 
-def _evaluate(model, sequence, labels, temperature, cases):
+def _evaluate(model, sequence, labels, temperature, cases, potential):
     results = []
     for start in range(0, len(cases), 32):
         removed = cases[start:start + 32]
@@ -172,7 +172,7 @@ def _evaluate(model, sequence, labels, temperature, cases):
             ) / temperature
             results.append((
                 ids, logits, logits.log_softmax(0),
-                _norm_head(transformed[row, :1], model.global_norm, model.critic)[0],
+                _norm_head(transformed[row, :1], model.global_norm, model.critic)[0] + potential,
             ))
     return results
 
@@ -248,7 +248,7 @@ def explain(model, observation, state, descriptors, trace, step, case_id=None):
     results = []
     with torch.no_grad():
         evaluated = _evaluate(model, sequence, labels, temperature,
-                              [spec[-1] for spec in specs])
+                              [spec[-1] for spec in specs], model.potential_value(inputs[1])[0])
         for spec, (ids, logits, log_policy, value) in zip(specs, evaluated):
             case_key, label, positions, protected, removed_actions, _removed = spec
             lookup = {action: index for index, action in enumerate(ids)}

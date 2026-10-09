@@ -70,11 +70,11 @@ def parser():
     run.add_argument("--learning-rate-warmup-steps", type=int, default=200)
     run.add_argument("--head-learning-rate-multiplier", type=float, default=1)
     run.add_argument("--critic-learning-rate-multiplier", type=float, default=1)
+    run.add_argument("--potential-learning-rate-multiplier", type=float, default=0)
     run.add_argument("--critic-only", action="store_true")
     run.add_argument("--freeze-backbone", action="store_true")
     run.add_argument("--gae-gamma", type=float, default=1.0)
     run.add_argument("--gae-lambda", type=float, default=1.0)
-    run.add_argument("--terminal-potential", action="store_true")
     run.add_argument("--potential-mode", choices=("health_multiplier", "additive"),
                      default="health_multiplier")
     for boss, default in enumerate(BOSS_FLOOR_INCREMENTS, 1):

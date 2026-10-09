@@ -58,6 +58,19 @@ POTENTIAL_TERMS = (
     "uncommon_relics", "rare_relics", "uncommon_potions", "rare_potions",
     "uncommon_cards", "rare_cards",
 )
+RUN_FEATURES = 2 * len(POTENTIAL_TERMS)
+
+
+def potential_head(weights, mode):
+    health, *resources = weights
+    if len(resources) + 1 != len(POTENTIAL_TERMS) or not all(map(math.isfinite, weights)):
+        raise ValueError("invalid potential weights")
+    if mode not in ("health_multiplier", "additive"):
+        raise ValueError("invalid potential mode")
+    zeros = [0.] * len(resources)
+    return [1., health] + (zeros + resources if mode == "health_multiplier" else resources + zeros)
+
+
 OPTIMIZER_CONFIG = {"type": "Adam", "betas": (.9, .99), "eps": 1e-5}
 
 _ACCELERATOR_LOCK = None
@@ -1847,7 +1860,7 @@ class Agent(nn.Module):
                                           ("_c", semantic), ("_f", numeric))}
         expected |= {"domain_count": len(TOKEN_SPECS), "action_u": ACTION_FIELDS[0],
                      "action_s": ACTION_FIELDS[1], "action_c": ACTION_FIELDS[2],
-                     "action_f": ACTION_FIELDS[3], "globals": 0, "model_width": width,
+                     "action_f": ACTION_FIELDS[3], "globals": RUN_FEATURES, "model_width": width,
                      "model_layers": layers, "model_heads": heads,
                      "model_feedforward": feedforward, "action_width": width}
         if any(self.layout.get(key) != value for key, value in expected.items()):
@@ -1860,15 +1873,7 @@ class Agent(nn.Module):
         self.width, self.layers, self.heads, self.feedforward = width, layers, heads, feedforward
         self.head_width = width
         self.state_width = width
-        self.potential_weights = tuple(potential_weights or (0.,) * len(POTENTIAL_TERMS))
-        if len(self.potential_weights) != len(POTENTIAL_TERMS) \
-                or not all(map(math.isfinite, self.potential_weights)):
-            raise ValueError("invalid potential weights")
-        if potential_mode not in ("health_multiplier", "additive"):
-            raise ValueError("invalid potential mode")
-        if model_version < 75 and potential_mode != "health_multiplier":
-            raise ValueError("additive potential requires model version 75")
-        self.potential_mode = potential_mode
+        head = potential_head(potential_weights or (0.,) * len(POTENTIAL_TERMS), potential_mode)
         self.card_zones = 5
         self.entity_collections = 0
         if pooling and set(pooling) - POOLING_DEFAULTS.keys():
@@ -1937,6 +1942,9 @@ class Agent(nn.Module):
         nn.init.zeros_(self.policy.bias)
         nn.init.zeros_(self.critic.weight)
         nn.init.zeros_(self.critic.bias)
+        self.potential = nn.Linear(RUN_FEATURES, 1, bias=False)
+        with torch.no_grad():
+            self.potential.weight.copy_(torch.tensor([head]))
 
     def load_state_dict(self, state_dict, strict=True, assign=False):
         self._graph_cache.clear()
@@ -2549,7 +2557,7 @@ class Agent(nn.Module):
         return state, transformed if len(action) else action, \
             action_rows, action_flat, actions, policy_sequence
 
-    def forward(self, character, _globals, domains, state_index, action_values, action_index,
+    def forward(self, character, globals_, domains, state_index, action_values, action_index,
                 return_state=False, policy_only=False, flat_policy=False, temperature=1):
         synchronize = torch.mps.synchronize if domains[0][0].device.type == "mps" \
             and self.training and torch.is_grad_enabled() else lambda: None
@@ -2577,8 +2585,13 @@ class Agent(nn.Module):
             ).reshape(len(state), actions)
         if policy_only:
             return policy
-        output = policy, _norm_head(state, self.global_norm, self.critic)[:, None]
+        critic = _norm_head(state, self.global_norm, self.critic) + self.potential_value(globals_)
+        output = policy, critic[:, None]
         return (*output, self.global_norm(state)) if return_state else output
+
+    def potential_value(self, globals_):
+        with torch.autocast(globals_.device.type, enabled=False):
+            return self.potential(globals_.float()).squeeze(-1)
 
 
 def architecture(model):
@@ -2608,9 +2621,7 @@ def architecture(model):
         "position_caps": POSITION_CAPS,
         "pooling": model.pooling,
         "candidate_numeric": ACTION_FIELDS[3],
-        "value_heads": ["shaped_terminal_floor_scalar"],
-        "potential_weights": model.potential_weights,
-        "potential_mode": model.potential_mode,
+        "value_heads": ["terminal_floor_scalar"],
         "winning_reservoir": WINNING_CAPACITY,
     }
 
@@ -2631,7 +2642,7 @@ def predict(model, inputs, precision, temperature=1, policy_only=False, flat_pol
 
 
 def predict_cached(model, inputs, precision, temperature=1):
-    state, action, offsets, action_rows = inputs
+    globals_, state, action, offsets, action_rows = inputs
     kind = state.device.type
     dtype = torch.bfloat16 if precision != "fp32" else torch.float16
     with torch.autocast(kind, dtype=dtype, enabled=precision != "fp32"):
@@ -2640,15 +2651,17 @@ def predict_cached(model, inputs, precision, temperature=1):
             scores, torch.ones_like(scores, dtype=torch.bool),
             (offsets, action_rows, None, None),
         )
-        critic = model.critic(state)
-    return policy.float(), critic.float()
+        critic = model.critic(state).squeeze(-1) + model.potential_value(globals_)
+    return policy.float(), critic.float()[:, None]
 
 
 def cached_tensors(features, width):
-    rows = [np.frombuffer(row, "<f4").reshape(-1, width) for row in features]
+    values = [np.frombuffer(row, "<f4") for row in features]
+    rows = [row[RUN_FEATURES:].reshape(-1, width) for row in values]
     lengths = np.asarray([len(row) - 1 for row in rows], np.int32)
     offsets = np.r_[0, np.cumsum(lengths, dtype=np.int64)].astype(np.int32)
     return (
+        torch.from_numpy(np.stack([row[:RUN_FEATURES] for row in values])),
         torch.from_numpy(np.stack([row[0] for row in rows])),
         torch.from_numpy(np.concatenate([row[1:] for row in rows])),
         torch.from_numpy(offsets),
@@ -3235,7 +3248,8 @@ def validate_packed(row):
     compressed = isinstance(exact, bytes)
     if not compressed:
         exact = np.asarray(exact)
-    if globals_.dtype != np.float32 or globals_.shape != (0,) or not np.isfinite(globals_).all() \
+    if globals_.dtype != np.float32 or globals_.shape != (RUN_FEATURES,) \
+            or not np.isfinite(globals_).all() \
             or counts.dtype != np.uint32 or counts.ndim != 1 \
             or not compressed and (exact.dtype != np.uint32 or exact.ndim != 1) \
             or actions.dtype != np.uint32 or actions.ndim != 2:
@@ -3274,17 +3288,17 @@ def tensors(observation, target, model):
 
 
 def _pack_batch(observation):
-    if len(observation) < 6:
+    if len(observation) < 5:
         raise ValueError("observation lacks its Rust digest")
-    if len(observation) > 6:
-        return observation[6]
+    if len(observation) > 5:
+        return observation[5]
     character = np.asarray(observation[0], np.uint8)
     globals_ = np.asarray(observation[1], np.float32)
-    digests = np.asarray(observation[5])
+    digests = np.asarray(observation[4])
     represented = np.asarray(observation[3][4], bool)
     legal = np.asarray(observation[3][5], bool)
     batch = len(character)
-    if globals_.shape != (batch, 0) or not np.isfinite(globals_).all() \
+    if globals_.shape != (batch, RUN_FEATURES) or not np.isfinite(globals_).all() \
             or digests.dtype != np.uint64 or digests.shape != (batch,):
         raise ValueError("invalid observation digests")
     action_row, action_position = np.nonzero(represented)
@@ -3381,33 +3395,6 @@ def optimizer_compatible(state, parameter_count):
         == parameter_count
 
 
-def _migrate_optimizer_parameter(state, old_names, new_names, name, source, row, source_shape):
-    groups = state["param_groups"]
-    split = lambda names: [names] if len(groups) == 1 else [
-        [key for key in names if not key.startswith(("policy.", "critic."))],
-        [key for key in names if key.startswith("policy.")],
-        [key for key in names if key.startswith("critic.")],
-    ]
-    old, new = split(old_names), split(new_names)
-    if len(groups) not in (1, 3) \
-            or [len(group["params"]) for group in groups] != list(map(len, old)):
-        return
-    index = next(index for index, names in enumerate(new) if name in names)
-    position = new[index].index(name)
-    if new[index][:position] + new[index][position + 1:] != old[index]:
-        return
-    source_group = next(index for index, names in enumerate(old) if source in names)
-    source_id = groups[source_group]["params"][old[source_group].index(source)]
-    parameter = max(parameter for group in groups for parameter in group["params"]) + 1
-    groups[index]["params"].insert(position, parameter)
-    if source_id in state["state"]:
-        state["state"][parameter] = {
-            key: value[row].reshape(-1, 1).clone()
-            if torch.is_tensor(value) and value.shape == source_shape else copy.deepcopy(value)
-            for key, value in state["state"][source_id].items()
-        }
-
-
 def optimizer_configuration(state):
     values = {
         (tuple(group.get("betas", ())), float(group.get("eps", math.nan)))
@@ -3491,7 +3478,8 @@ def load(path, target):
             path = committed
     checkpoint = torch.load(path, map_location=target, weights_only=False)
     version = checkpoint.get("model_version")
-    if checkpoint.get("schema") != 1 or version != MODEL_VERSION:
+    legacy = (version, checkpoint.get("feature_version")) == (77, 59)
+    if checkpoint.get("schema") != 1 or version != MODEL_VERSION and not legacy:
         raise ValueError("incompatible checkpoint")
     config = checkpoint.get("architecture", {})
     try:
@@ -3500,12 +3488,15 @@ def load(path, target):
         layout = dict(live.token_layout(*dimensions))
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError("invalid checkpoint architecture") from error
-    legacy = checkpoint.get("feature_version") == 58
     saved_layout = dict(layout)
+    potential = {}
     if legacy:
-        saved_layout["version"] = 58
-        saved_layout["relic_f"] = 0
-        saved_layout.pop("pumpkin_candle_relic")
+        saved_layout |= {"version": 59, "globals": 0}
+        potential = {"potential_weights": config.pop("potential_weights"),
+                     "potential_mode": config.pop("potential_mode", "health_multiplier")}
+        config |= {"globals": layout["globals"], "value_heads": ["terminal_floor_scalar"]}
+        if (checkpoint.get("winning_reservoir") or {}).get("rows"):
+            raise ValueError("legacy winning reservoir rows lack run features")
     if (not legacy and checkpoint.get("feature_version") != FEATURE_VERSION) \
             or layout["version"] != FEATURE_VERSION:
         raise ValueError("incompatible feature version")
@@ -3514,27 +3505,22 @@ def load(path, target):
     try:
         model = Agent(layout, *(config[key] for key in (
             "width", "layers", "heads", "feedforward", "head_width"
-        )), pooling=config["pooling"], model_version=version,
-                      potential_weights=config["potential_weights"],
-                      potential_mode=config.get("potential_mode", "health_multiplier")).to(target)
+        )), pooling=config["pooling"], **potential).to(target)
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError("invalid checkpoint architecture") from error
-    config.setdefault("potential_mode", "health_multiplier")
     if config != architecture(model):
         raise ValueError("incompatible model architecture")
     state = checkpoint["model"]
     if legacy:
-        old_names = list(state)
-        source = f"concepts.tables.{SEMANTIC_NAMES.index('relic_counter_0')}.weight"
-        name = "encoders.relic.numeric.weight"
-        row = layout["pumpkin_candle_relic"] + 1
-        state[name] = state[source][row].unsqueeze(1).clone()
-        _migrate_optimizer_parameter(
-            checkpoint["optimizer"], old_names, list(model.state_dict()), name, source, row,
-            state[source].shape,
-        )
-        checkpoint["feature_version"] = FEATURE_VERSION
-        checkpoint["layout"] = layout
+        state["potential.weight"] = model.potential.weight.detach().clone()
+        groups = checkpoint["optimizer"]["param_groups"]
+        parameter = sum(len(group["params"]) for group in groups)
+        if len(groups) == 1:
+            groups[0]["params"].append(parameter)
+        else:
+            groups.append(copy.deepcopy(groups[-1]) | {"params": [parameter]})
+        checkpoint |= {"model_version": MODEL_VERSION, "feature_version": FEATURE_VERSION,
+                       "layout": layout}
     missing, unexpected = model.load_state_dict(state, strict=True)
     if missing or unexpected:
         raise ValueError("incompatible model parameters")
@@ -3566,9 +3552,9 @@ def export_value_model(path, model, fingerprint, temperature, bias, actor=False)
              ("sum", "transformer").index(mode))
             for index, mode in enumerate(model.pooling.values())
         ]),
-        bytes([actor | (model.potential_mode == "additive") << 1]),
+        bytes([actor]),
         struct.pack("<2f", temperature, bias),
-        struct.pack(f"<{len(POTENTIAL_TERMS)}f", *model.potential_weights),
+        struct.pack(f"<{RUN_FEATURES}f", *model.potential.weight.reshape(-1).tolist()),
     ]
 
     values = []

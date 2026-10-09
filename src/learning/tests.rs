@@ -399,19 +399,19 @@ fn direct_event_combat_does_not_consume_encounter_bags() {
 }
 
 #[test]
-fn potential_has_a_common_terminal_value() {
+fn run_features_are_zero_at_terminal_states() {
     let content = foundation_content();
     let mut game = Game::new_character_ascension(&content, 12, 0, 10).unwrap();
     game.begin_act(&content, 0).unwrap();
-    game.phase = Phase::Won;
-    assert_eq!(potential(&game, &content, false), Potential::default());
-    assert_ne!(potential(&game, &content, true), Potential::default());
-    game.phase = Phase::Dead;
-    assert_eq!(potential(&game, &content, false), Potential::default());
+    assert!(run_features(&game, &content).iter().any(|&feature| feature != 0.0));
+    for phase in [Phase::Won, Phase::Dead] {
+        game.phase = phase;
+        assert_eq!(run_features(&game, &content), vec![0.0; PUBLIC_GLOBALS]);
+    }
 }
 
 #[test]
-fn potential_is_floor_plus_hp_weighted_run_resources() {
+fn run_features_are_floor_hp_resources_and_hp_weighted_resources() {
     let content = foundation_content();
     let mut game = Game::new_character_ascension(&content, 12, 0, 10).unwrap();
     game.begin_act(&content, 0).unwrap();
@@ -451,21 +451,15 @@ fn potential_is_floor_plus_hp_weighted_run_resources() {
         Some(crate::foundation::RARE_POTIONS[0]),
         None,
     ];
-    let value = potential(&game, &content, false);
+    let features = run_features(&game, &content);
+    assert_eq!(features.len(), PUBLIC_GLOBALS);
     assert_eq!(
-        value.floor,
+        features[0],
         canonical_progress(&game) as f32 / (TERMINAL_CATEGORIES - 1) as f32
     );
-    assert_eq!(value.health, 7.0);
-    assert_eq!(value.resources.iter().sum::<f32>(), 221.0);
-    assert_eq!(
-        potential_value(&value, &[1.0; POTENTIAL_WEIGHT_COUNT], true),
-        value.floor + 1547.0
-    );
-    assert_eq!(
-        potential_value(&value, &[1.0; POTENTIAL_WEIGHT_COUNT], false),
-        value.floor + 227.0
-    );
+    assert_eq!(features[1], 7.0);
+    assert_eq!(features[2..14].iter().sum::<f32>(), 220.0);
+    assert_eq!(features[14..].iter().sum::<f32>(), 7.0 * 220.0);
 }
 
 #[test]
@@ -644,18 +638,7 @@ fn combat_search_selects_best_clear_in_layer() {
 }
 
 #[test]
-fn mixed_active_metadata_has_fixed_width() {
-    let content = foundation_content();
-    let layout = Layout::new(&content);
-    let game = Game::new_character_ascension(&content, 40, 0, 10).unwrap();
-    let rows = [true, false].map(|active| observation_globals(&game, &content, layout, active));
-    assert_eq!(PUBLIC_GLOBALS, 0);
-    assert_eq!(globals_len(layout), PUBLIC_GLOBALS);
-    assert!(rows.into_iter().all(|row| row.is_empty()));
-}
-
-#[test]
-fn v62_packed_observation_has_no_direct_globals_and_is_digest_protected() {
+fn v62_packed_observation_carries_run_features_and_is_digest_protected() {
     let content = foundation_content();
     let layout = Layout::new(&content);
     let mut game = Game::new_character_ascension(&content, 600, 0, 10).unwrap();
@@ -664,7 +647,7 @@ fn v62_packed_observation_has_no_direct_globals_and_is_digest_protected() {
     let (globals, counts, mut exact, actions, digest) = packed_observation(&observation);
     assert_eq!(observation_digest(&observation), digest);
     assert_eq!(globals, observation.globals);
-    assert_eq!(globals.len(), PUBLIC_GLOBALS);
+    assert_eq!(globals, run_features(&game, &content));
     assert!(globals.iter().all(|value| value.is_finite()));
     assert_eq!(
         packed_observation_digest(observation.character, &globals, &counts, &exact, &actions),
@@ -2400,7 +2383,7 @@ fn v55_action_and_phase_discriminants_are_exhaustive() {
 #[test]
 fn v56_layout_uses_explicit_token_dimensions_and_positions() {
     let layout = Layout::new(&foundation_content());
-    assert_eq!((VERSION, VALUE_MODEL_VERSION), (59, 77));
+    assert_eq!((VERSION, VALUE_MODEL_VERSION), (60, 78));
     assert_eq!(
         (
             DEFAULT_MODEL_WIDTH,

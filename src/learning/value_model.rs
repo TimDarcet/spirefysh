@@ -236,8 +236,7 @@ pub struct ValueModel {
     critic: LinearWeights,
     temperature: f32,
     bias: f32,
-    potential_weights: [f32; POTENTIAL_WEIGHT_COUNT],
-    potential_health_multiplier: bool,
+    potential: Vec<f32>,
     encode_caches: Vec<Mutex<EncodingCache>>,
 }
 
@@ -291,7 +290,6 @@ impl ValueModel {
         let pooling = <[u8; 11]>::try_from(take_bytes(&mut input, 11)?).unwrap();
         let flags = take_bytes(&mut input, 1)?[0];
         let actor = flags & 1 != 0;
-        let potential_health_multiplier = model_version < 75 || flags & 2 == 0;
         let layout = Layout::new(content);
         let (width, layers, heads, feedforward) = (
             width as usize,
@@ -315,15 +313,11 @@ impl ValueModel {
         }
         let temperature = read_f32(&mut input)?;
         let bias = read_f32(&mut input)?;
-        let potential_weights = <[f32; POTENTIAL_WEIGHT_COUNT]>::try_from(read_f32s(
-            &mut input,
-            POTENTIAL_WEIGHT_COUNT,
-        )?)
-        .unwrap();
+        let potential = read_f32s(&mut input, PUBLIC_GLOBALS)?;
         if !temperature.is_finite()
             || temperature <= 0.0
             || !bias.is_finite()
-            || potential_weights.iter().any(|weight| !weight.is_finite())
+            || potential.iter().any(|weight| !weight.is_finite())
         {
             return Err(invalid("invalid value calibration"));
         }
@@ -416,8 +410,7 @@ impl ValueModel {
             critic,
             temperature,
             bias,
-            potential_weights,
-            potential_health_multiplier,
+            potential,
             encode_caches: (0..16).map(|_| Mutex::default()).collect(),
         })
     }
@@ -1479,6 +1472,15 @@ impl ValueModel {
             .collect()
     }
 
+    fn potential(&self, observation: &Observation) -> f32 {
+        observation
+            .globals
+            .iter()
+            .zip(&self.potential)
+            .map(|(feature, weight)| feature * weight)
+            .sum()
+    }
+
     fn state(&self, observation: &Observation) -> Vec<f32> {
         self.state_actions(observation, &mut EncodingCache::default())
             .0
@@ -1489,7 +1491,7 @@ impl ValueModel {
         observation: &Observation,
         temperature: f32,
         cache: &mut EncodingCache,
-    ) -> io::Result<(Vec<f32>, f32, f32, Vec<f32>)> {
+    ) -> io::Result<(Vec<f32>, f32, f32)> {
         let policy = self
             .policy
             .as_ref()
@@ -1504,18 +1506,11 @@ impl ValueModel {
             .collect::<Vec<_>>();
         let normalizer = log_sum_exp(&raw);
         let scores = raw.into_iter().map(|score| score - normalizer).collect();
-        let shaped = self.critic.apply(&state)[0];
-        let expected = shaped
-            + potential_value(
-                &observation.potential,
-                &self.potential_weights,
-                self.potential_health_multiplier,
-            );
+        let expected = self.critic.apply(&state)[0] + self.potential(observation);
         Ok((
             scores,
             sigmoid(expected / self.temperature + self.bias),
             expected,
-            vec![shaped],
         ))
     }
 
@@ -1526,7 +1521,7 @@ impl ValueModel {
         temperature: f32,
         rollout_temperature: Option<f32>,
         values: bool,
-    ) -> io::Result<Vec<(Vec<f32>, f32, f32, Vec<f32>, Option<Vec<f32>>)>> {
+    ) -> io::Result<Vec<(Vec<f32>, f32, f32, Option<Vec<f32>>)>> {
         let policy = self
             .policy
             .as_ref()
@@ -1548,20 +1543,12 @@ impl ValueModel {
                     .map(|score| score - normalizer)
                     .collect::<Vec<_>>()
             };
-            let shaped = values.then(|| self.critic.apply(state)[0]);
-            let expected = shaped.map_or(0.0, |value| {
-                value
-                    + potential_value(
-                        &observation.potential,
-                        &self.potential_weights,
-                        self.potential_health_multiplier,
-                    )
-            });
+            let expected = values
+                .then(|| self.critic.apply(state)[0] + self.potential(observation));
             (
                 scores(temperature),
-                shaped.map_or(0.0, |_| sigmoid(expected / self.temperature + self.bias)),
-                expected,
-                shaped.into_iter().collect(),
+                expected.map_or(0.0, |value| sigmoid(value / self.temperature + self.bias)),
+                expected.unwrap_or(0.0),
                 rollout_temperature.map(scores),
             )
         };
@@ -1579,12 +1566,7 @@ impl ValueModel {
             _ => {}
         }
         let observation = build_observation(game, content, self.layout, (0, 0));
-        let value = self.critic.apply(&self.state(&observation))[0]
-            + potential_value(
-                &observation.potential,
-                &self.potential_weights,
-                self.potential_health_multiplier,
-            );
+        let value = self.critic.apply(&self.state(&observation))[0] + self.potential(&observation);
         sigmoid(value / self.temperature + self.bias)
     }
 }

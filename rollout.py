@@ -282,11 +282,6 @@ class RolloutCollector:
             args.envs, seed, None, ascension=ascension, seed_stride=stride,
         )
         self.env.set_training_bonus(bonus)
-        self.env.set_potential_weights([
-            getattr(args, f"potential_{term}_weight") for term in POTENTIAL_TERMS
-        ])
-        self.env.set_potential_mode(getattr(args, "potential_mode", "health_multiplier"))
-        self.env.set_terminal_potential(getattr(args, "terminal_potential", False))
         self.observation = self.env.observe_tokens(flat=True)
         self.episode_steps = np.zeros(args.envs, np.int32)
         self.combat_steps = np.zeros(args.envs, np.int32)
@@ -357,7 +352,7 @@ class RolloutCollector:
                           and self.traces[index] is None), None)
             if index is not None:
                 self.traces[index] = {
-                    "trajectory_schema": 1,
+                    "trajectory_schema": 2,
                     "id": (f"{self.sampler_session}:{self.worker}:{self.generation}:"
                            f"{self.iteration}:{seeds[index]}"),
                     "sampler_session": self.sampler_session,
@@ -408,7 +403,7 @@ class RolloutCollector:
         episodes = [[] for _ in range(5)]
         sample_keys = (
             "rows", "choices", "old_log", "critic_values", "canonical_progress",
-            "phases", "win_rewards", "terminals", "characters", "versions", "potentials",
+            "phases", "win_rewards", "terminals", "characters", "versions",
         ) + (("features",) if native and args.cache_features else ())
         def materialize(trajectory):
             samples = trajectory.pop("samples")
@@ -419,7 +414,7 @@ class RolloutCollector:
                         if packed_legal_count(step[0][index]) > 1]
             columns = tuple(
                 [history[position][column][index] for position in selected]
-                if column in (0, 11) else
+                if column in (0, 10) else
                 np.asarray([history[position][column] if column == 9
                             else history[position][column][index] for position in selected])
                 for column in range(len(sample_keys))
@@ -500,14 +495,12 @@ class RolloutCollector:
                 )
                 characters, choice, log_probability, critic_value, step_rows, \
                     step_experts, step_search_stats, *cached = result
-                raw_reward, done, stats, next_legal, in_combat, canonical, phases, potentials, \
-                    terminal_potentials, *cached = cached
+                raw_reward, done, stats, next_legal, in_combat, canonical, phases, *cached = cached
                 step_features = cached[0] if cached else None
                 if heartbeat is not None:
                     heartbeat[self.worker] = time.monotonic()
                 characters = np.asarray(characters, np.uint8)
                 critic_value = np.asarray(critic_value, np.float32)
-                potentials = np.asarray(potentials, np.float32)
                 search_stats += np.asarray(step_search_stats, np.int64)
                 for expert in step_experts:
                     row, target, _visits, _depth, *consistency = expert
@@ -523,7 +516,6 @@ class RolloutCollector:
                 canonical = np.asarray([row[9] for row in state_stats], np.uint8)
                 phases = np.asarray([row[4] for row in state_stats], np.uint8)
                 characters = np.asarray(self.observation[0], np.uint8)
-                potentials = np.asarray(self.observation[4], np.float32)
                 self.mark_phase("policy")
                 choice, log_probability, policy, critic_value, trace_details = act(
                     model, self.observation, target, True, precision, self.torch_rng,
@@ -545,8 +537,7 @@ class RolloutCollector:
                 self.traces[index]["phases"].append(int(phases[index]))
                 self.traces[index]["policy_revisions"].append(int(version))
             self.reservoir.record(
-                step_rows, choice, log_probability, policy,
-                critic_value + potentials, self.rng,
+                step_rows, choice, log_probability, policy, critic_value, self.rng,
             )
             in_combat = np.asarray(in_combat, bool) if native else np.asarray([
                 row[4] == 1 for row in self.env.stats()
@@ -554,7 +545,7 @@ class RolloutCollector:
             self.combat_steps = np.where(in_combat, self.combat_steps + 1, 0)
             if not native:
                 self.mark_phase("environment")
-                raw_reward, done, terminal_potentials = self.env.step(choice.tolist())
+                raw_reward, done = self.env.step(choice.tolist())
                 self.mark_phase("processing")
             raw_reward = np.array(raw_reward, np.float32, copy=True)
             done = np.asarray(done, bool)
@@ -578,7 +569,7 @@ class RolloutCollector:
             if native:
                 self.native_steps.append((
                     list(step_rows), choice, log_probability, critic_value, canonical, phases,
-                    raw_reward, done, characters, version, potentials,
+                    raw_reward, done, characters, version,
                 ) + ((list(step_features),) if args.cache_features else ()))
             else:
                 for index, row in enumerate(step_rows):
@@ -589,7 +580,7 @@ class RolloutCollector:
                     trajectory["samples"].append((
                         row, choice[index], log_probability[index], critic_value[index],
                         canonical[index], phases[index], raw_reward[index], done[index],
-                        characters[index], version, potentials[index],
+                        characters[index], version,
                     ))
             if boundary.any():
                 reset = np.flatnonzero(boundary).tolist()
@@ -640,7 +631,7 @@ class RolloutCollector:
                         suffix = native_columns(history, index, length - len(history))
                         trajectory = {key: (
                             [value for chunk in (*prefixes, suffix)
-                             for value in chunk[2][column]] if column in (0, 11) else
+                             for value in chunk[2][column]] if column in (0, 10) else
                             np.concatenate([chunk[2][column] for chunk in (*prefixes, suffix)])
                         ) for column, key in enumerate(sample_keys)}
                         trajectory["sampled_length"] = length
@@ -652,7 +643,6 @@ class RolloutCollector:
                         trajectory["terminal_category"] = int(canonical[index])
                         trajectory["completion_seconds"] = completion_seconds
                         trajectory["terminal_floor"] = terminal_floor
-                        trajectory["terminal_potential"] = float(terminal_potentials[index])
                         finished.append(trajectory)
                     elif native:
                         discarded_steps += length
@@ -660,7 +650,6 @@ class RolloutCollector:
                         trajectory = self.trajectories[index]
                         trajectory["completion_seconds"] = completion_seconds
                         trajectory["terminal_floor"] = terminal_floor
-                        trajectory["terminal_potential"] = float(terminal_potentials[index])
                         trajectory.pop("started")
                         finished.append(materialize(trajectory))
                     else:
@@ -669,7 +658,7 @@ class RolloutCollector:
                         for step in history:
                             step[0][index] = None
                             if args.cache_features:
-                                step[11][index] = None
+                                step[10][index] = None
                         self.native_prefixes[index].clear()
                     self.trajectories[index] = None
                     self.action_history[index].clear()
@@ -695,7 +684,7 @@ class RolloutCollector:
                             for step in history:
                                 step[0][index] = None
                                 if args.cache_features:
-                                    step[11][index] = None
+                                    step[10][index] = None
                             self.native_starts[index] = cutoff
                 drop = int(self.native_starts.min())
                 if drop:

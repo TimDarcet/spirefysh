@@ -1293,9 +1293,6 @@ struct Batch {
     first_teacher: Option<(usize, usize)>,
     training_strength: i16,
     training_dexterity: i16,
-    potential_weights: [f32; POTENTIAL_WEIGHT_COUNT],
-    potential_health_multiplier: bool,
-    terminal_potential: bool,
     resample_archive: bool,
     archive_depth: usize,
     policy: Option<ValueModel>,
@@ -1320,7 +1317,6 @@ struct SearchEdge {
 
 struct SearchNode {
     value: f32,
-    potential: f32,
     value_samples: u32,
     packed: Option<Vec<u8>>,
     action_count: usize,
@@ -1335,7 +1331,6 @@ impl SearchNode {
         candidates: Vec<CandidateRow>,
         log_policy: &[f32],
         value: f32,
-        potential: f32,
         depth: usize,
         behavior_exponent: f32,
         packed: Option<Vec<u8>>,
@@ -1390,7 +1385,6 @@ impl SearchNode {
         }
         Self {
             value,
-            potential,
             value_samples: 1,
             packed,
             action_count,
@@ -1533,9 +1527,6 @@ struct SearchTree {
     turns: usize,
     max_depth: usize,
     nodes: Vec<SearchNode>,
-    potential_weights: [f32; POTENTIAL_WEIGHT_COUNT],
-    potential_health_multiplier: bool,
-    terminal_potential: bool,
     lookup: FastMap<(u64, usize), usize>,
     games: Option<Vec<Game>>,
     progress: bool,
@@ -1578,9 +1569,6 @@ impl SearchTree {
         layout: Layout,
         log_policy: &[f32],
         value: f32,
-        potential_weights: [f32; POTENTIAL_WEIGHT_COUNT],
-        potential_health_multiplier: bool,
-        terminal_potential: bool,
         budget: usize,
         turns: usize,
         max_depth: usize,
@@ -1607,11 +1595,6 @@ impl SearchTree {
             observation.candidates.clone(),
             log_policy,
             value,
-            potential_value(
-                &observation.potential,
-                &potential_weights,
-                potential_health_multiplier,
-            ),
             0,
             behavior_exponent,
             Some(compact_packed_observation_known(observation, Some(digest))),
@@ -1627,9 +1610,6 @@ impl SearchTree {
             turns,
             max_depth,
             nodes,
-            potential_weights,
-            potential_health_multiplier,
-            terminal_potential,
             lookup,
             games,
             progress,
@@ -1648,17 +1628,8 @@ impl SearchTree {
                 })
     }
 
-    fn terminal_value(&self, game: &Game, content: &Content) -> f32 {
+    fn terminal_value(&self, game: &Game) -> f32 {
         search_terminal_value(game, self.progress).unwrap()
-            + if self.terminal_potential {
-                potential_value(
-                    &potential(game, content, true),
-                    &self.potential_weights,
-                    self.potential_health_multiplier,
-                )
-            } else {
-                0.0
-            }
     }
 
     fn simulate(
@@ -1725,7 +1696,7 @@ impl SearchTree {
                 let value = if self.heuristic {
                     heuristic_combat_value(&game)
                 } else {
-                    self.terminal_value(&game, content)
+                    self.terminal_value(&game)
                 };
                 path.steps.push(SearchStep {
                     node,
@@ -1900,16 +1871,10 @@ impl SearchTree {
         }
         let index = self.nodes.len();
         self.lookup.insert(key, index);
-        let potential = potential_value(
-            &observation.potential,
-            &self.potential_weights,
-            self.potential_health_multiplier,
-        );
         self.nodes.push(SearchNode::new(
             observation.candidates,
             log_policy,
             value,
-            potential,
             depth,
             self.behavior_exponent,
             packed,
@@ -2048,10 +2013,6 @@ impl SearchTree {
         }
         let mut children = children.into_iter().collect::<Vec<_>>();
         children.sort_by_key(|&(child, _)| child);
-        let child_potential = children
-            .iter()
-            .map(|(child, weight)| self.nodes[*child].potential * weight)
-            .sum::<f32>();
         let (packed, weights) = children
             .into_iter()
             .map(|(child, weight)| {
@@ -2069,10 +2030,7 @@ impl SearchTree {
             packed,
             weights,
             self_weight,
-            terminal_value: terminal_value
-                + self_weight * self.nodes[node].potential
-                + child_potential
-                - self.nodes[node].potential,
+            terminal_value,
         }
     }
 }
@@ -2180,7 +2138,7 @@ fn rollout_combat(
     model: &ValueModel,
     trees: &[SearchTree],
     leaves: &mut [PendingLeaf],
-    initial: &[(Vec<f32>, f32, f32, Vec<f32>, Option<Vec<f32>>)],
+    initial: &[(Vec<f32>, f32, f32, Option<Vec<f32>>)],
     content: &Content,
     layout: Layout,
     bonuses: (i16, i16),
@@ -2231,7 +2189,7 @@ fn rollout_combat(
                         1.0 + 0.1 * heuristic_combat_value(game)
                     }
                 } else {
-                    tree.terminal_value(game, content)
+                    tree.terminal_value(game)
                 });
                 stats.rollout_completed += 1;
             } else if game.combat().is_none() {
@@ -2264,7 +2222,7 @@ fn rollout_combat(
                     stats.rollout_completed += 1;
                 } else {
                     let choice = sample_policy(
-                        output.4.as_ref().expect("combat rollout policy missing"),
+                        output.3.as_ref().expect("combat rollout policy missing"),
                         random,
                     )
                     .ok_or_else(|| "combat rollout has no legal action".to_owned())?;
@@ -2553,7 +2511,7 @@ fn run_mcts(
         let started = std::time::Instant::now();
         expansions.iter_mut().for_each(Vec::clear);
         rollout_expansions.iter_mut().for_each(Vec::clear);
-        for (index, (mut leaf, (policy, win, progress, _, _))) in
+        for (index, (mut leaf, (policy, win, progress, _))) in
             leaves.drain(..).zip(evaluated).enumerate()
         {
             let value = if let Some(rollouts) = &rollout_values {
@@ -2611,7 +2569,7 @@ fn mcts_targets(
     model: &ValueModel,
     games: &[Game],
     observations: &[Observation],
-    outputs: &[(Vec<f32>, f32, f32, Vec<f32>, Option<Vec<f32>>)],
+    outputs: &[(Vec<f32>, f32, f32, Option<Vec<f32>>)],
     turn_starts: &[bool],
     content: &Content,
     layout: Layout,
@@ -2631,7 +2589,6 @@ fn mcts_targets(
     policy_temperature: f32,
     value_consistency: bool,
     heuristic: bool,
-    terminal_potential: bool,
     timeout: f64,
 ) -> Result<(Vec<ExpertTarget>, SearchStats), String> {
     let turn_start_count = observations
@@ -2653,7 +2610,7 @@ fn mcts_targets(
         .zip(outputs)
         .zip(turn_starts)
         .filter_map(
-            |(((game, observation), (log_policy, _, progress, _, _)), turn_start)| {
+            |(((game, observation), (log_policy, _, progress, _)), turn_start)| {
                 if !turn_start
                     || observation
                         .candidates
@@ -2695,9 +2652,6 @@ fn mcts_targets(
                     layout,
                     &prior,
                     *progress,
-                    model.potential_weights,
-                    model.potential_health_multiplier,
-                    terminal_potential,
                     budget,
                     turns,
                     max_depth,
@@ -3075,7 +3029,7 @@ impl ExactSearch<'_> {
         Ok(pending
             .drain(..)
             .zip(evaluated)
-            .map(|((weight, count, game, _), (_, win, progress, _))| {
+            .map(|((weight, count, game, _), (_, win, progress))| {
                 let value = if self.progress { progress } else { win };
                 if let Some(game) = game.as_ref() {
                     self.record_leaf(game, count, depth, rng, value);
@@ -3114,7 +3068,7 @@ impl ExactSearch<'_> {
                 }
             })
             .collect::<Vec<_>>();
-        let node = SearchNode::new(row.candidates.clone(), &policy, 0.0, 0.0, depth, 1.0, None);
+        let node = SearchNode::new(row.candidates.clone(), &policy, 0.0, depth, 1.0, None);
         if node.edges.is_empty() {
             return self.leaf(&particles, Some(&row), depth, rng);
         }
@@ -3304,7 +3258,7 @@ fn search_diagnostic(
     q_temperature: f32,
 ) -> Result<serde_json::Value, String> {
     let observation = build_observation(game, content, layout, bonuses);
-    let (log_policy, win, progress_value, _) = model
+    let (log_policy, win, progress_value) = model
         .evaluate(
             &observation,
             policy_temperature,
@@ -3335,9 +3289,6 @@ fn search_diagnostic(
         layout,
         &prior,
         value,
-        model.potential_weights,
-        model.potential_health_multiplier,
-        false,
         simulations,
         turns,
         max_depth,
@@ -5533,9 +5484,6 @@ impl Batch {
             first_teacher: None,
             training_strength: 0,
             training_dexterity: 0,
-            potential_weights: [0.0; POTENTIAL_WEIGHT_COUNT],
-            potential_health_multiplier: true,
-            terminal_potential: false,
             resample_archive: true,
             archive_depth: 0,
             policy: None,
@@ -5568,7 +5516,7 @@ impl Batch {
         let mut out = std::collections::BTreeMap::from([
             ("version".into(), VERSION as usize),
             ("characters".into(), self.layout.characters),
-            ("globals".into(), globals_len(self.layout)),
+            ("globals".into(), PUBLIC_GLOBALS),
             ("model_width".into(), width),
             ("model_layers".into(), layers),
             ("model_heads".into(), heads),
@@ -5745,21 +5693,6 @@ impl Batch {
         Ok(game_state(game, &self.content).to_string())
     }
 
-    fn potential_components(&self, index: usize) -> PyResult<(f32, Vec<f32>)> {
-        let game = self
-            .games
-            .get(index)
-            .ok_or_else(|| PyValueError::new_err("invalid environment index"))?;
-        let value = potential(game, &self.content, false);
-        let mut resources = value.resources;
-        if self.potential_health_multiplier {
-            resources.iter_mut().for_each(|term| *term *= value.health);
-        } else {
-            resources[0] = value.health;
-        }
-        Ok((value.floor, resources.to_vec()))
-    }
-
     fn root_ids(&self) -> Vec<usize> {
         self.root_ids.clone()
     }
@@ -5794,31 +5727,6 @@ impl Batch {
         }
         (self.training_strength, self.training_dexterity) = bonuses;
         self.plans.iter_mut().for_each(Vec::clear);
-    }
-
-    fn set_potential_weights(&mut self, weights: Vec<f32>) -> PyResult<()> {
-        if weights.len() != POTENTIAL_WEIGHT_COUNT
-            || weights.iter().any(|weight| !weight.is_finite())
-        {
-            return Err(PyValueError::new_err(
-                "potential weights must be 13 finite numbers",
-            ));
-        }
-        self.potential_weights = weights.try_into().unwrap();
-        Ok(())
-    }
-
-    fn set_potential_mode(&mut self, mode: &str) -> PyResult<()> {
-        self.potential_health_multiplier = match mode {
-            "health_multiplier" => true,
-            "additive" => false,
-            _ => return Err(PyValueError::new_err("invalid potential mode")),
-        };
-        Ok(())
-    }
-
-    fn set_terminal_potential(&mut self, enabled: bool) {
-        self.terminal_potential = enabled;
     }
 
     fn set_archive_resampling(&mut self, enabled: bool) {
@@ -6656,8 +6564,6 @@ impl Batch {
         let layout = self.layout;
         let content = &self.content;
         let bonuses = (self.training_strength, self.training_dexterity);
-        let potential_weights = self.potential_weights;
-        let potential_health_multiplier = self.potential_health_multiplier;
         let active = active.unwrap_or_else(|| vec![true; self.games.len()]);
         if active.len() != self.games.len() {
             return Err(PyValueError::new_err("invalid active mask"));
@@ -6683,8 +6589,7 @@ impl Batch {
         });
         let batches = rows.len();
         let mut characters = vec![u8::MAX; batches];
-        let mut globals = vec![0.0; batches * globals_len(layout)];
-        let mut potentials = vec![0.0; batches];
+        let mut globals = vec![0.0; batches * PUBLIC_GLOBALS];
         let mut digests = vec![0u64; batches];
         let max_actions = rows
             .iter()
@@ -6705,13 +6610,8 @@ impl Batch {
                 continue;
             };
             characters[batch] = row.character;
-            globals[batch * globals_len(layout)..(batch + 1) * globals_len(layout)]
+            globals[batch * PUBLIC_GLOBALS..(batch + 1) * PUBLIC_GLOBALS]
                 .copy_from_slice(&row.globals);
-            potentials[batch] = potential_value(
-                &row.potential,
-                &potential_weights,
-                potential_health_multiplier,
-            );
             for (position, candidate) in row.candidates.iter().enumerate() {
                 let base = batch * max_actions + position;
                 if !flat {
@@ -6867,7 +6767,7 @@ impl Batch {
                     row.unwrap_or_else(|| {
                         (
                             u8::MAX,
-                            vec![0.0; globals_len(layout)],
+                            vec![0.0; PUBLIC_GLOBALS],
                             vec![0; DOMAIN_NAMES.len()],
                             Vec::new(),
                             Vec::new(),
@@ -6917,15 +6817,12 @@ impl Batch {
                     ndarray::Array1::from_vec(characters)
                         .into_pyarray(py)
                         .into_any(),
-                    ndarray::Array2::from_shape_vec((batches, globals_len(layout)), globals)
+                    ndarray::Array2::from_shape_vec((batches, PUBLIC_GLOBALS), globals)
                         .unwrap()
                         .into_pyarray(py)
                         .into_any(),
                     PyTuple::new(py, packed_domains)?.into_any(),
                     actions.into_any(),
-                    ndarray::Array1::from_vec(potentials)
-                        .into_pyarray(py)
-                        .into_any(),
                     ndarray::Array1::from_vec(digests)
                         .into_pyarray(py)
                         .into_any(),
@@ -7045,15 +6942,12 @@ impl Batch {
                 ndarray::Array1::from_vec(characters)
                     .into_pyarray(py)
                     .into_any(),
-                ndarray::Array2::from_shape_vec((batches, globals_len(layout)), globals)
+                ndarray::Array2::from_shape_vec((batches, PUBLIC_GLOBALS), globals)
                     .unwrap()
                     .into_pyarray(py)
                     .into_any(),
                 domains.into_any(),
                 actions.into_any(),
-                ndarray::Array1::from_vec(potentials)
-                    .into_pyarray(py)
-                    .into_any(),
                 ndarray::Array1::from_vec(digests)
                     .into_pyarray(py)
                     .into_any(),
@@ -7064,7 +6958,6 @@ impl Batch {
     fn load_policy(&mut self, data: &[u8]) -> PyResult<()> {
         let policy = ValueModel::from_bytes(data, &self.content)
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
-        self.potential_health_multiplier = policy.potential_health_multiplier;
         self.policy = Some(policy);
         Ok(())
     }
@@ -7106,7 +6999,7 @@ impl Batch {
         Ok(indices
             .into_iter()
             .zip(outputs)
-            .map(|(index, (log_policy, _, _, values, _))| (index, log_policy, values[0]))
+            .map(|(index, (log_policy, _, expected, _))| (index, log_policy, expected))
             .collect())
     }
 
@@ -7285,7 +7178,6 @@ impl Batch {
                             observation.candidates.clone(),
                             &policy,
                             0.0,
-                            0.0,
                             0,
                             1.0,
                             None,
@@ -7438,9 +7330,6 @@ impl Batch {
         let content = &self.content;
         let layout = self.layout;
         let bonuses = (self.training_strength, self.training_dexterity);
-        let potential_weights = self.potential_weights;
-        let potential_health_multiplier = self.potential_health_multiplier;
-        let terminal_potential = self.terminal_potential;
         let skip_forced = (cache_features || skip_forced) && !search_enabled;
         self.map_caches.resize_with(self.games.len(), || None);
         let rows = py.allow_threads(|| {
@@ -7448,7 +7337,6 @@ impl Batch {
                 .par_iter()
                 .zip(self.map_caches.par_iter_mut())
                 .map(|(game, map_cache)| {
-                    let potential = potential(game, content, false);
                     let (mut actions, legal) = candidate_actions(game, content);
                     if !skip_forced || actions.len() != 1 {
                         let map = cached_canonical_map(game, content, layout, map_cache);
@@ -7464,7 +7352,7 @@ impl Batch {
                     }
                     Observation {
                         character: game.run.character as u8,
-                        globals: Vec::new(),
+                        globals: run_features(game, content),
                         domains: std::array::from_fn(|_| DomainRows::Owned(Vec::new())),
                         candidates: vec![CandidateRow {
                             action: actions.pop().unwrap(),
@@ -7474,7 +7362,6 @@ impl Batch {
                             f: [0.0; ACTION_F],
                             legal: true,
                         }],
-                        potential,
                     }
                 })
                 .collect::<Vec<_>>()
@@ -7531,7 +7418,6 @@ impl Batch {
                         temperature,
                         mcts_value_consistency,
                         mcts_heuristic,
-                        terminal_potential,
                         mcts_timeout,
                     )
                 })
@@ -7587,16 +7473,6 @@ impl Batch {
         let mut cached_features = Vec::with_capacity(rows.len());
         let mut selected_actions = Vec::with_capacity(rows.len());
         let mut action_kinds = Vec::with_capacity(rows.len());
-        let potentials = rows
-            .iter()
-            .map(|row| {
-                potential_value(
-                    &row.potential,
-                    &potential_weights,
-                    potential_health_multiplier,
-                )
-            })
-            .collect::<Vec<_>>();
         self.actions.clear();
         if advance {
             self.actions.resize_with(rows.len(), Vec::new);
@@ -7618,8 +7494,7 @@ impl Batch {
                 packed_rows.push(PyBytes::new(py, &packed));
                 continue;
             }
-            let ((state, actions), (log_policy, _win, _expected, values, _)) =
-                evaluated.next().unwrap();
+            let ((state, actions), (log_policy, _win, expected, _)) = evaluated.next().unwrap();
             let choice = if sample {
                 sample_policy(&log_policy, &mut random)
             } else {
@@ -7634,7 +7509,7 @@ impl Batch {
             characters.push(row.character);
             choices.push(choice as i64);
             log_probabilities.push(log_policy[choice]);
-            critic_values.push(values[0]);
+            critic_values.push(expected);
             action_kinds.push(row.candidates[choice].u[0]);
             if advance {
                 selected_actions.push(row.candidates[choice].action.clone());
@@ -7647,8 +7522,9 @@ impl Batch {
                 );
             }
             if cache_features {
-                let mut bytes = Vec::with_capacity((actions.len() + 1) * state.len() * 4);
-                for value in std::iter::once(&state).chain(&actions) {
+                let mut bytes =
+                    Vec::with_capacity((PUBLIC_GLOBALS + (actions.len() + 1) * state.len()) * 4);
+                for value in [&row.globals, &state].into_iter().chain(&actions) {
                     #[cfg(target_endian = "little")]
                     bytes.extend_from_slice(unsafe {
                         std::slice::from_raw_parts(value.as_ptr().cast(), value.len() * 4)
@@ -7788,11 +7664,6 @@ impl Batch {
                                 matches!(game.phase, Phase::Won | Phase::Dead),
                                 was_combat,
                                 !was_combat && game.combat().is_some(),
-                                potential_value(
-                                    &potential(game, content, terminal_potential),
-                                    &potential_weights,
-                                    potential_health_multiplier,
-                                ),
                             ))
                         })
                         .collect::<Result<Vec<_>, String>>()
@@ -7820,7 +7691,6 @@ impl Batch {
             let rewards = results.iter().map(|result| result.0).collect::<Vec<_>>();
             let done = results.iter().map(|result| result.1).collect::<Vec<_>>();
             let in_combat = results.iter().map(|result| result.2).collect::<Vec<_>>();
-            let terminal_potentials = results.iter().map(|result| result.4).collect::<Vec<_>>();
             let stats = self.stats();
             let legal = self
                 .games
@@ -7848,12 +7718,6 @@ impl Batch {
                     .into_pyarray(py)
                     .into_any(),
                 ndarray::Array1::from_vec(phases)
-                    .into_pyarray(py)
-                    .into_any(),
-                ndarray::Array1::from_vec(potentials)
-                    .into_pyarray(py)
-                    .into_any(),
-                ndarray::Array1::from_vec(terminal_potentials)
                     .into_pyarray(py)
                     .into_any(),
             ]);
@@ -7891,7 +7755,7 @@ impl Batch {
         py: Python<'_>,
         choices: Vec<usize>,
         active: Option<Vec<bool>>,
-    ) -> PyResult<(Vec<f32>, Vec<bool>, Vec<f32>)> {
+    ) -> PyResult<(Vec<f32>, Vec<bool>)> {
         if choices.len() != self.games.len() || self.actions.len() != self.games.len() {
             return Err(PyValueError::new_err("observe before step"));
         }
@@ -7926,9 +7790,6 @@ impl Batch {
             .map(|action| matches!(action, Some(Action::Path(_))))
             .collect::<Vec<_>>();
         let content = &self.content;
-        let potential_weights = self.potential_weights;
-        let potential_health_multiplier = self.potential_health_multiplier;
-        let terminal_potential = self.terminal_potential;
         let results = py
             .allow_threads(|| {
                 self.games
@@ -7936,23 +7797,14 @@ impl Batch {
                     .zip(selected.into_par_iter())
                     .map(|(game, action)| {
                         let Some(action) = action else {
-                            return Ok((0.0, false, 0.0, false));
+                            return Ok((0.0, false, false));
                         };
                         let was_combat = game.combat().is_some();
                         game.step(content, action)
                             .map_err(|error| format!("{error:?}"))?;
                         let reward = matches!(game.phase, Phase::Won) as u8 as f32;
                         let done = matches!(game.phase, Phase::Won | Phase::Dead);
-                        Ok((
-                            reward,
-                            done,
-                            potential_value(
-                                &potential(game, content, terminal_potential),
-                                &potential_weights,
-                                potential_health_multiplier,
-                            ),
-                            !was_combat && game.combat().is_some(),
-                        ))
+                        Ok((reward, done, !was_combat && game.combat().is_some()))
                     })
                     .collect::<Result<Vec<_>, String>>()
             })
@@ -7966,7 +7818,7 @@ impl Batch {
             }
         }
         for (game, result) in self.games.iter_mut().zip(&results) {
-            if result.3 {
+            if result.2 {
                 apply_training_bonuses(
                     game,
                     &self.content,
@@ -7975,15 +7827,10 @@ impl Batch {
                 );
             }
         }
-        let mut rewards = Vec::with_capacity(results.len());
-        let mut done = Vec::with_capacity(results.len());
-        let mut potentials = Vec::with_capacity(results.len());
-        for (reward, terminal, value, _) in results {
-            rewards.push(reward);
-            done.push(terminal);
-            potentials.push(value);
-        }
-        Ok((rewards, done, potentials))
+        Ok(results
+            .into_iter()
+            .map(|(reward, done, _)| (reward, done))
+            .unzip())
     }
 
     #[pyo3(signature = (indices, archive_probability=0.0))]

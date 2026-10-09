@@ -280,7 +280,7 @@ class ExperienceDataset:
             "advantage": np.empty(0, np.float32),
             "critic_target": np.empty(0, np.float32),
             "value": np.empty(0, np.float32), "canonical": np.empty(0, np.int8),
-            "terminal": np.empty(0, np.int8), "potential": np.empty(0, np.float32),
+            "terminal": np.empty(0, np.int8),
             "phase": np.empty(0, np.int8), "character": np.empty(0, np.int8),
             "priority": np.empty(0, np.float32),
             "version": np.empty(0, np.int64), "id": np.empty(0, np.int64),
@@ -304,7 +304,7 @@ class ExperienceDataset:
             return 0, 0, 0
         fields = (
             "rows", "choices", "old_log", "critic_values", "canonical_progress",
-            "phases", "win_rewards", "terminals", "characters", "versions", "potentials",
+            "phases", "win_rewards", "terminals", "characters", "versions",
         )
         trajectories = []
         trajectory_floors = []
@@ -333,13 +333,10 @@ class ExperienceDataset:
             terminal = np.asarray(trajectory["terminals"], bool)
             predicted = np.asarray(trajectory["critic_values"], np.float32)
             canonical = np.asarray(trajectory["canonical_progress"], np.int64)
-            potential = np.asarray(trajectory["potentials"], np.float32)
-            terminal_potential = float(trajectory.get("terminal_potential", 0.))
             ended = bool(trajectory.get("terminal", terminal[-1]))
             if (terminal[:-1].any() or not ended
                     or predicted.shape != (stored,) or not np.isfinite(predicted).all()
-                    or canonical.min() < 0 or canonical.max() > MAX_PROGRESS
-                    or not np.isfinite(potential).all() or not math.isfinite(terminal_potential)):
+                    or canonical.min() < 0 or canonical.max() > MAX_PROGRESS):
                 raise ValueError("invalid trajectory terminal")
             if cached and len(trajectory.get("features", ())) != stored:
                 raise ValueError("invalid cached features")
@@ -397,8 +394,6 @@ class ExperienceDataset:
             start, end = end, end + length
             predicted = np.asarray(trajectory["critic_values"], np.float32)[indices]
             canonical = np.asarray(trajectory["canonical_progress"], np.int64)[indices]
-            potential = np.asarray(trajectory["potentials"], np.float32)[indices]
-            terminal_potential = float(trajectory.get("terminal_potential", 0.))
             terminal_value = terminal_floor(
                 category, category == CATEGORIES - 1, args,
             ) / (CATEGORIES - 1)
@@ -406,8 +401,8 @@ class ExperienceDataset:
             wins[start:end] = category == CATEGORIES - 1
             values[start:end] = predicted
             terminal[end - 1] = True
-            reward = args.gae_gamma * np.append(potential[1:], terminal_potential) - potential
-            reward[-1] += terminal_value
+            reward = np.zeros(length, np.float32)
+            reward[-1] = terminal_value
             gae = next_value = discounted_return = 0.
             for index in range(length - 1, -1, -1):
                 delta = reward[index] + args.gae_gamma * next_value - predicted[index]
@@ -422,7 +417,7 @@ class ExperienceDataset:
             "old": joined("old_log", np.float32),
             "advantage": advantage, "critic_target": targets, "value": values,
             "canonical": joined("canonical_progress", np.int8),
-            "terminal": terminal_categories, "potential": joined("potentials", np.float32),
+            "terminal": terminal_categories,
             "phase": joined("phases", np.int8),
             "character": joined("characters", np.int8),
             "priority": priority.astype(np.float32),
@@ -1626,10 +1621,9 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 publish()
                 continue
             post_kl = proposals[-1] if proposals else kl_value
-            base_prediction = prediction_cpu + values["potential"][fresh_cpu]
-            expected = float(base_prediction.mean())
+            expected = float(prediction_cpu.mean())
             win_probability = float(np.clip(
-                (base_prediction - MAX_PROGRESS / (CATEGORIES - 1))
+                (prediction_cpu - MAX_PROGRESS / (CATEGORIES - 1))
                 / (1 - MAX_PROGRESS / (CATEGORIES - 1)), 0, 1,
             ).mean())
             trained += fresh_rows; updates += 1
@@ -1817,7 +1811,7 @@ def evaluate(model, args, target, seed=None, runs=None, stage=None, max_steps=No
                 choice = np.zeros(count, np.int64); choice[indices] = selected
                 in_combat = np.asarray([row[4] == 1 for row in env.stats()])
                 combat_steps = np.where(active & in_combat, combat_steps + 1, 0)
-                _, done, _ = env.step(choice.tolist(), active.tolist())
+                _, done = env.step(choice.tolist(), active.tolist())
                 done = np.asarray(done, bool)
                 steps += active
                 still_combat = np.asarray([row[4] == 1 for row in env.stats()])
@@ -1960,7 +1954,7 @@ def evaluate_search_policies(args):
                     combat_steps = np.where(active & in_combat, combat_steps + 1, 0)
                     turn_depth[active & in_combat] += 1
                     previous_turn = np.where(active & in_combat, turns, -1)
-                    _, done, _ = env.step(choices.tolist(), active.tolist())
+                    _, done = env.step(choices.tolist(), active.tolist())
                     done = np.asarray(done, bool); steps += active
                     final = env.stats()
                     still_combat = np.asarray([row[4] == 1 for row in final])
@@ -2050,8 +2044,6 @@ def critic_diagnostics(args):
                 character, ascension=ascension,
             )
             env.set_training_bonus(bonus)
-            env.set_potential_weights(model.potential_weights)
-            env.set_potential_mode(model.potential_mode)
             env.load_policy(policy)
             active = np.ones(count, bool)
             histories = [[] for _ in range(count)]
@@ -2170,19 +2162,20 @@ def load_stage_bests(output, development, checkpoints, best):
     return stages
 
 
-def optimizer_groups(model, policy_multiplier, critic_multiplier):
+def optimizer_groups(model, policy_multiplier, critic_multiplier, potential_multiplier):
     parameters = list(model.parameters())
-    policy = {id(parameter) for parameter in model.policy.parameters()}
-    critic = {id(parameter) for parameter in model.critic.parameters()}
-    indices = [
-        [index for index, parameter in enumerate(parameters)
-         if id(parameter) not in policy | critic],
-        [index for index, parameter in enumerate(parameters) if id(parameter) in policy],
-        [index for index, parameter in enumerate(parameters) if id(parameter) in critic],
+    heads = [{id(parameter) for parameter in module.parameters()}
+             for module in (model.policy, model.critic, model.potential)]
+    indices = [[index for index, parameter in enumerate(parameters)
+                if not any(id(parameter) in head for head in heads)]] + [
+        [index for index, parameter in enumerate(parameters) if id(parameter) in head]
+        for head in heads
     ]
     return [
         {"params": [parameters[index] for index in group], "lr_scale": scale}
-        for group, scale in zip(indices, (1., policy_multiplier, critic_multiplier))
+        for group, scale in zip(
+            indices, (1., policy_multiplier, critic_multiplier, potential_multiplier),
+        )
     ], indices
 
 
@@ -2213,8 +2206,8 @@ def repartition_optimizer(state, index_groups, selected=None):
         for scale in [template.get("lr_scale", 1.)]
     ]
     if selected is not None:
-        groups = [groups[selected]]
-        parameters = set(groups[0]["params"])
+        groups = [groups[index] for index in selected]
+        parameters = {parameter for group in groups for parameter in group["params"]}
         state["state"] = {key: value for key, value in state["state"].items()
                           if key in parameters}
     state["param_groups"] = groups
@@ -2252,7 +2245,8 @@ def train(args):
     if (args.winning_capacity < 0 or args.priority_decay <= 0
             or args.search_consistency_weight < 0 or args.search_consistency_batch < 1):
         raise ValueError("invalid replay setting")
-    if min(args.head_learning_rate_multiplier, args.critic_learning_rate_multiplier) <= 0:
+    if min(args.head_learning_rate_multiplier, args.critic_learning_rate_multiplier) <= 0 \
+            or args.potential_learning_rate_multiplier < 0:
         raise ValueError("invalid head learning-rate multiplier")
     if not all(math.isfinite(getattr(args, f"potential_{term}_weight"))
                for term in POTENTIAL_TERMS):
@@ -2309,10 +2303,6 @@ def train(args):
         }
         if any(model.pooling[name] != mode for name, mode in requested_pooling.items()):
             raise ValueError("checkpoint pooling configuration cannot be changed")
-        if model.potential_weights != potential_weights:
-            raise ValueError("checkpoint potential weights cannot be changed")
-        if model.potential_mode != args.potential_mode:
-            raise ValueError("checkpoint potential mode cannot be changed")
         args.width, args.layers, args.heads, args.feedforward = loaded
     else:
         config = tuple(value if value is not None else default for value, default in zip(
@@ -2334,10 +2324,12 @@ def train(args):
     fused_optimizer = target.type != "cpu"
     parameter_groups, group_indices = optimizer_groups(
         model, args.head_learning_rate_multiplier, args.critic_learning_rate_multiplier,
+        args.potential_learning_rate_multiplier,
     )
     if args.critic_only:
         model.requires_grad_(False); model.critic.requires_grad_(True)
-        parameter_groups = [{"params": list(model.critic.parameters()), "lr_scale": 1.}]
+        parameter_groups = parameter_groups[2:]
+    model.potential.requires_grad_(args.potential_learning_rate_multiplier > 0)
     if source:
         require_optimizer_config(source)
     optimizer = torch.optim.Adam(
@@ -2345,18 +2337,19 @@ def train(args):
         betas=OPTIMIZER_CONFIG["betas"], eps=OPTIMIZER_CONFIG["eps"],
     )
     optimizer_restored = bool(source and (
-        optimizer_compatible(source["optimizer"], len(tuple(model.critic.parameters())))
+        optimizer_compatible(source["optimizer"], len(group_indices[2]) + len(group_indices[3]))
         if args.critic_only else source["_optimizer_compatible"]
         and repartition_optimizer(source["optimizer"], group_indices)
     ))
     if args.critic_only and source and not optimizer_restored:
-        optimizer_restored = repartition_optimizer(source["optimizer"], group_indices, 2)
+        optimizer_restored = repartition_optimizer(source["optimizer"], group_indices, (2, 3))
     if optimizer_restored:
         optimizer.load_state_dict(source["optimizer"])
         torch.set_rng_state(source["torch_rng"].cpu())
-    scales = (args.critic_learning_rate_multiplier,) if args.critic_only else (
+    scales = (
         1., args.head_learning_rate_multiplier, args.critic_learning_rate_multiplier,
-    )
+        args.potential_learning_rate_multiplier,
+    )[2 if args.critic_only else 0:]
     for group, scale in zip(optimizer.param_groups, scales):
         group["lr"] = args.learning_rate * scale
         group["lr_scale"] = scale
@@ -2402,7 +2395,7 @@ def train(args):
         raise ValueError("training seed cannot change within a run")
     if parent and not parent.get("run_id") and continuing:
         parent["run_id"] = manifest["run_id"]
-    if continuing and manifest.get("model_version") != model.model_version:
+    if continuing and manifest.get("model_version") not in (model.model_version, 77):
         raise ValueError("new model versions require a new output directory")
     manifest["schema"] = 2
     manifest["model_version"] = model.model_version
@@ -2859,7 +2852,7 @@ def compare_search(args):
 
 
 def value_dataset(model, args, target, seed, runs, deadline):
-    states = []; targets = []; terminal_values = []; potentials = []; characters = []
+    states = []; terminal_values = []; characters = []
     reports = []
     model.eval()
     for character in range(5):
@@ -2869,8 +2862,6 @@ def value_dataset(model, args, target, seed, runs, deadline):
                 raise TimeoutError("finalization exceeded --hours")
             count = min(args.batch, runs - start)
             env = sts2_sim.Batch(count, seed + character * 1_000_000 + start, character, ascension=10)
-            env.set_potential_weights(model.potential_weights)
-            env.set_potential_mode(model.potential_mode)
             active = np.ones(count, bool)
             episode_steps = np.zeros(count, np.int32)
             combat_steps = np.zeros(count, np.int32)
@@ -2905,16 +2896,15 @@ def value_dataset(model, args, target, seed, runs, deadline):
                 choice = np.zeros(count, np.int64); choice[indices] = selected
                 for index in np.flatnonzero(active):
                     seen[index] += 1
-                    sample = packed[index], float(observation[4][index])
                     if len(pending[index]) < args.states_per_run:
-                        pending[index].append(sample)
+                        pending[index].append(packed[index])
                     else:
                         slot = int(rng.integers(seen[index]))
                         if slot < args.states_per_run:
-                            pending[index][slot] = sample
+                            pending[index][slot] = packed[index]
                 in_combat = np.asarray([row[4] == 1 for row in env.stats()])
                 combat_steps = np.where(active & in_combat, combat_steps + 1, 0)
-                _, done, _ = env.step(choice.tolist(), active.tolist())
+                _, done = env.step(choice.tolist(), active.tolist())
                 done = np.asarray(done, bool); episode_steps += active
                 stats = env.stats()
                 still_combat = np.asarray([row[4] == 1 for row in stats])
@@ -2927,10 +2917,8 @@ def value_dataset(model, args, target, seed, runs, deadline):
                     won = int(stats[index][4] == 12)
                     terminal = CATEGORIES - 1 if won else int(stats[index][9])
                     value = terminal / (CATEGORIES - 1)
-                    rows, row_potentials = zip(*pending[index]) if pending[index] else ((), ())
-                    states.extend(rows); potentials.extend(row_potentials)
-                    targets.extend(value - potential for potential in row_potentials)
-                    terminal_values.extend([value] * len(rows))
+                    states.extend(pending[index])
+                    terminal_values.extend([value] * len(pending[index]))
                     characters.extend([character] * len(pending[index]))
                     outcomes.append(won); floors.append((stats[index][0] - 1) * 17 + stats[index][1])
                 for index in np.flatnonzero(capped):
@@ -2943,18 +2931,17 @@ def value_dataset(model, args, target, seed, runs, deadline):
         })
     if not states:
         raise RuntimeError("no resolved trajectories")
-    return (states, np.asarray(targets, np.float32), np.asarray(terminal_values, np.float32),
-            np.asarray(potentials, np.float32), np.asarray(characters), reports)
+    return states, np.asarray(terminal_values, np.float32), np.asarray(characters), reports
 
 
-def value_predictions(model, states, potentials, batch, target):
+def value_predictions(model, states, batch, target):
     values = []
     model.eval()
     with torch.no_grad():
         for start in range(0, len(states), batch):
             inputs = unpack(states[start : start + batch], target, model)
             values.extend(critic_value(model(*inputs[:6])[1]).cpu().tolist())
-    return np.asarray(values, np.float32) + potentials
+    return np.asarray(values, np.float32)
 
 
 def calibration(logits, labels):
@@ -3029,7 +3016,7 @@ def finalize(args):
     if args.precision != "fp32" and target.type not in ("mps", "cuda"):
         raise ValueError(f"{args.precision} requires MPS or CUDA")
     fit = value_dataset(model, args, target, args.fit_seed, args.fit_runs, deadline)
-    fit_states, fit_report = len(fit[0]), fit[5]
+    fit_states, fit_report = len(fit[0]), fit[3]
     for parameter in model.parameters():
         parameter.requires_grad_(False)
     for parameter in model.critic.parameters():
@@ -3049,27 +3036,25 @@ def finalize(args):
             optimizer.zero_grad(set_to_none=True); loss.backward(); optimizer.step()
     del fit
     calibrate = value_dataset(model, args, target, args.calibration_seed, args.calibration_runs, deadline)
-    calibration_values = value_predictions(
-        model, calibrate[0], calibrate[3], args.head_batch, target
-    )
-    calibration_labels = (calibrate[2] == 1).astype(np.float32)
+    calibration_values = value_predictions(model, calibrate[0], args.head_batch, target)
+    calibration_labels = (calibrate[1] == 1).astype(np.float32)
     temperature, bias = calibration(calibration_values, calibration_labels)
     base_rates = [
-        float(calibration_labels[calibrate[4] == character].mean())
-        if (calibrate[4] == character).any() else float(calibration_labels.mean())
+        float(calibration_labels[calibrate[2] == character].mean())
+        if (calibrate[2] == character).any() else float(calibration_labels.mean())
         for character in range(5)
     ]
     calibration_metrics = value_metrics(
-        calibration_values, calibration_labels, calibrate[4], temperature, bias, base_rates
+        calibration_values, calibration_labels, calibrate[2], temperature, bias, base_rates
     )
-    calibration_report = calibrate[5]
+    calibration_report = calibrate[3]
     del calibrate
     test = value_dataset(model, args, target, args.test_seed, args.test_runs, deadline)
-    test_values = value_predictions(model, test[0], test[3], args.head_batch, target)
+    test_values = value_predictions(model, test[0], args.head_batch, target)
     test_metrics = value_metrics(
-        test_values, test[2] == 1, test[4], temperature, bias, base_rates
+        test_values, test[1] == 1, test[2], temperature, bias, base_rates
     )
-    test_metrics["held_out_win_each_character"] = all(row["wins"] for row in test[5])
+    test_metrics["held_out_win_each_character"] = all(row["wins"] for row in test[3])
     if not test_metrics["held_out_win_each_character"]:
         raise RuntimeError("final test requires a held-out win for every character")
     if not test_metrics["beats_constant"] or not all(
@@ -3079,13 +3064,10 @@ def finalize(args):
     output = Path(args.output)
     digest = export_value_model(output, model, checkpoint["fingerprint"], temperature, bias)
     parity_env = sts2_sim.Batch(8, args.test_seed + 99_000_000, None, ascension=10)
-    parity_env.set_potential_weights(model.potential_weights)
-    parity_env.set_potential_mode(model.potential_mode)
     parity_observation = parity_env.observe_tokens()
     parity_inputs = tensors(parity_observation, target, model)
     with torch.no_grad():
-        base = critic_value(predict(model, parity_inputs, "fp32")[1]).cpu().numpy() \
-            + np.asarray(parity_observation[4])
+        base = critic_value(predict(model, parity_inputs, "fp32")[1]).cpu().numpy()
         python_values = torch.from_numpy(base / temperature + bias).sigmoid().numpy()
     rust_values = np.asarray(parity_env.rust_values(str(output)))
     parity_error = float(np.max(np.abs(python_values - rust_values)))
@@ -3105,7 +3087,7 @@ def finalize(args):
         "rust_pytorch_max_abs": parity_error,
         "fit": {"trajectories": fit_report, "states": fit_states},
         "calibration": calibration_metrics | {"trajectories": calibration_report, "base_rates": base_rates},
-        "test": test_metrics | {"trajectories": test[5]},
+        "test": test_metrics | {"trajectories": test[3]},
         "supported_states": "states visited by this frozen player-visible policy",
     }
     atomic_json(output.with_suffix(".json"), report)
@@ -3129,7 +3111,7 @@ def probe():
     layout = dict(env.token_layout())
     assert (layout["version"], layout["model_width"], layout["model_layers"],
             layout["model_heads"], layout["model_feedforward"], layout["state_width"],
-            layout["action_width"], layout["entity_summaries"]) == (59, 128, 4, 8, 384, 128, 128, 0)
+            layout["action_width"], layout["entity_summaries"]) == (60, 128, 4, 8, 384, 128, 128, 0)
     compact_layout = dict(env.token_layout(64, 2, 4, 128))
     assert tuple(compact_layout[key] for key in (
         "model_width", "model_layers", "model_heads", "model_feedforward",
@@ -3219,7 +3201,7 @@ def probe():
             exported = Path(parity_directory) / f"{number}.bin"
             export_value_model(exported, model, env.fingerprint(), 1, 0)
             rust = np.asarray(env.rust_values(str(exported)))
-            python = (critic_value(critic) + torch.as_tensor(combat[4])).sigmoid().numpy()
+            python = critic_value(critic).sigmoid().numpy()
             assert np.max(np.abs(python - rust)) <= 1e-5
 
     model = Agent(layout).eval()
@@ -3254,7 +3236,7 @@ def probe():
         permuted_domains.append(tuple(values))
     permuted_actions = tuple(np.asarray(value)[:, permutation] for value in combat[3])
     permuted_observation = (combat[0], combat[1], tuple(permuted_domains),
-                            permuted_actions, combat[4], combat[5])
+                            permuted_actions, combat[4])
     with torch.no_grad():
         permuted = predict(model, tensors(permuted_observation, target, model), "fp32")
     assert torch.allclose(original[0], permuted[0][:, inverse], atol=1e-6)
@@ -3269,12 +3251,10 @@ def probe():
     torch.manual_seed(12)
     model = Agent(layout, pooling=mixed, potential_weights=(.001,) + (0.,) * 12).eval()
     model.critic.weight.data.normal_(std=.1); model.critic.bias.data.normal_(std=.1)
-    env.set_potential_weights(model.potential_weights)
-    env.set_potential_mode(model.potential_mode)
     combat = env.observe_tokens()
     inputs = tensors(combat, target, model)
     with torch.no_grad():
-        base = critic_value(predict(model, inputs, "fp32")[1]).numpy() + combat[4]
+        base = critic_value(predict(model, inputs, "fp32")[1]).numpy()
         python = torch.from_numpy(base / .83 - .17).sigmoid().numpy()
     with tempfile.TemporaryDirectory() as directory:
         exported = Path(directory) / "value.bin"
@@ -3299,7 +3279,7 @@ def probe():
             expected = predict(model, tensors(combat, target, model), "fp32", flat_policy=True)
             actual = predict_cached(model, cached_inputs, "fp32")
         assert all(torch.allclose(left, right, atol=1e-5) for left, right in zip(actual, expected))
-        groups, group_indices = optimizer_groups(model, 1, 1)
+        groups, group_indices = optimizer_groups(model, 1, 1, 0)
         optimizer = torch.optim.Adam(groups)
         sum(parameter.sum() for parameter in model.critic.parameters()).backward()
         optimizer.step()
@@ -3314,7 +3294,7 @@ def probe():
         assert restored.pooling == model.pooling
         assert loaded["_optimizer_compatible"]
         critic_state = copy.deepcopy(optimizer_state)
-        assert repartition_optimizer(critic_state, group_indices, 2)
+        assert repartition_optimizer(critic_state, group_indices, (2,))
         critic_optimizer = torch.optim.Adam(restored.critic.parameters())
         critic_optimizer.load_state_dict(critic_state)
         assert len(critic_optimizer.state) == len(tuple(restored.critic.parameters()))
@@ -3328,15 +3308,13 @@ def probe():
             pass
         compact = Agent(compact_layout, 64, 2, 4, 128).eval()
         compact.critic.weight.data.normal_(std=.1)
-        env.set_potential_weights(compact.potential_weights)
-        env.set_potential_mode(compact.potential_mode)
         compact_observation = env.observe_tokens()
         compact_path = Path(directory) / "compact.bin"
         export_value_model(compact_path, compact, env.fingerprint(), 1, 0)
         with torch.no_grad():
             compact_python = critic_value(predict(
                 compact, tensors(compact_observation, target, compact), "fp32",
-            )[1]) + torch.as_tensor(compact_observation[4])
+            )[1])
             compact_python = compact_python.sigmoid().numpy()
         compact_rust = np.asarray(env.rust_values(str(compact_path)))
         assert np.max(np.abs(compact_python - compact_rust)) < 1e-5
