@@ -212,7 +212,7 @@ pub struct ValueModel {
     map_node_embedding: Vec<f32>,
     summary_seed: Vec<Vec<f32>>,
     pool_layers: Vec<Option<TransformerLayer>>,
-    relic_pool_projection: LinearWeights,
+    pool_projections: Vec<LinearWeights>,
     pael_cards: LinearWeights,
     move_gru: GruWeights,
     continuation_gru: Option<GruWeights>,
@@ -338,7 +338,9 @@ impl ValueModel {
         let summary_seed = (0..11)
             .map(|_| read_f32s(&mut input, width))
             .collect::<io::Result<Vec<_>>>()?;
-        let relic_pool_projection = LinearWeights::read_without_bias(&mut input, width, width)?;
+        let pool_projections = (0..3)
+            .map(|_| LinearWeights::read(&mut input, width, width))
+            .collect::<io::Result<Vec<_>>>()?;
         let pael_cards = LinearWeights::read_without_bias(&mut input, width, width)?;
         let mut pool_layers = Vec::with_capacity(11);
         for (index, &mode) in pooling.iter().enumerate() {
@@ -386,7 +388,7 @@ impl ValueModel {
             map_node_embedding,
             summary_seed,
             pool_layers,
-            relic_pool_projection,
+            pool_projections,
             pael_cards,
             move_gru,
             continuation_gru,
@@ -479,20 +481,9 @@ impl ValueModel {
         )
     }
 
-    fn tag(&self, mut value: Vec<f32>, role: u32, collection: Option<u32>) -> Vec<f32> {
-        for (sum, embedding) in value
-            .iter_mut()
-            .zip(self.embedding(Semantic::TokenRole, role))
-        {
+    fn tag(&self, mut value: Vec<f32>, semantic: Semantic, index: u32) -> Vec<f32> {
+        for (sum, embedding) in value.iter_mut().zip(self.embedding(semantic, index)) {
             *sum += embedding;
-        }
-        if let Some(collection) = collection {
-            for (sum, embedding) in value
-                .iter_mut()
-                .zip(self.embedding(Semantic::Collection, collection))
-            {
-                *sum += embedding;
-            }
         }
         value
     }
@@ -1086,13 +1077,13 @@ impl ValueModel {
         if mode == 2 {
             return values
                 .into_iter()
-                .map(|value| self.tag(value, 5, Some(collection)))
+                .map(|value| self.tag(value, Semantic::Collection, collection))
                 .collect();
         }
         vec![self.tag(
             self.summarize(name, mode, std::mem::take(&mut values)),
-            10,
-            Some(collection),
+            Semantic::Collection,
+            collection,
         )]
     }
 
@@ -1102,15 +1093,14 @@ impl ValueModel {
         cache: &mut EncodingCache,
         domain: usize,
         zone: impl Fn(u32) -> bool,
-        role: u32,
-        projection: Option<&LinearWeights>,
+        pool: usize,
     ) -> Vec<f32> {
         let rows = observation.domains[domain]
             .iter()
             .filter(|row| row.scope == STATE_SCOPE && zone(row.u[0]))
             .collect::<Vec<_>>();
         let mut key = (0xcbf2_9ce4_8422_2325, 0x9e37_79b9_7f4a_7c15);
-        for value in std::iter::once(role).chain(rows.iter().flat_map(|row| {
+        for value in std::iter::once(pool as u32).chain(rows.iter().flat_map(|row| {
             row.u
                 .iter()
                 .copied()
@@ -1127,14 +1117,7 @@ impl ValueModel {
             .map(|row| self.encode(cache, domain, row))
             .collect();
         let summary = self.summarize(0, 0, values);
-        let value = self.tag(
-            match projection {
-                Some(layer) => layer.apply(&summary),
-                None => summary,
-            },
-            role,
-            None,
-        );
+        let value = self.pool_projections[pool].apply(&summary);
         cache.summaries.insert(key, value.clone());
         value
     }
@@ -1188,14 +1171,23 @@ impl ValueModel {
                         .map(|row| self.encode(cache, domain, row)),
                 );
             }
+            if owner == 1 {
+                effects.extend(
+                    observation.domains[CARD_DOMAIN]
+                        .iter()
+                        .filter(|row| {
+                            row.scope == STATE_SCOPE
+                                && matches!(row.u[0], NIGHTMARE_ZONE | HISTORY_COURSE_ZONE)
+                        })
+                        .map(|row| self.encode(cache, CARD_DOMAIN, row)),
+                );
+            }
             let index = if actor.u[1] == 2 { 8 } else { 9 };
             let mode = self.pooling[index];
             if mode == 4 {
-                effects_out.extend(
-                    effects
-                        .into_iter()
-                        .map(|effect| self.tag(effect, 6, Some(if index == 8 { 9 } else { 8 }))),
-                );
+                effects_out.extend(effects.into_iter().map(|effect| {
+                    self.tag(effect, Semantic::Collection, if index == 8 { 9 } else { 8 })
+                }));
             } else {
                 let pooled =
                     self.summarize(index, if mode.is_multiple_of(2) { 0 } else { 1 }, effects);
@@ -1205,10 +1197,13 @@ impl ValueModel {
                         .zip(pooled)
                         .for_each(|(left, right)| *left += right);
                 } else {
-                    effects_out.push(self.tag(pooled, 6, Some(if index == 8 { 9 } else { 8 })));
+                    effects_out.push(self.tag(
+                        pooled,
+                        Semantic::Collection,
+                        if index == 8 { 9 } else { 8 },
+                    ));
                 }
             }
-            value = self.tag(value, 4, None);
             layer_norm(&mut value, &self.actor_norm_w, &self.actor_norm_b);
             values.push(value);
         }
@@ -1238,6 +1233,26 @@ impl ValueModel {
                 .iter_mut()
                 .zip(encoded)
                 .for_each(|(left, right)| *left += right);
+        }
+        for domain in [CARD_DOMAIN, RELIC_DOMAIN, POTION_DOMAIN] {
+            for row in observation.domains[domain]
+                .iter()
+                .filter(|row| row.scope <= -3)
+            {
+                let item = (-3 - row.scope) as u32;
+                let encoded = self.encode(cache, domain, row);
+                let encoded = if domain == CARD_DOMAIN {
+                    self.card_context(row, encoded)
+                } else {
+                    encoded
+                };
+                if let Some((_, value)) = items.iter_mut().find(|(id, _)| *id == item) {
+                    value
+                        .iter_mut()
+                        .zip(encoded)
+                        .for_each(|(left, right)| *left += right);
+                }
+            }
         }
         items.into_iter().map(|(_, value)| value).collect()
     }
@@ -1269,23 +1284,15 @@ impl ValueModel {
             }
         }
         let bags = [
-            self.bag(
-                observation,
-                cache,
-                RELIC_DOMAIN,
-                |zone| zone == 1,
-                1,
-                Some(&self.relic_pool_projection),
-            ),
+            self.bag(observation, cache, RELIC_DOMAIN, |zone| zone == 1, 0),
             self.bag(
                 observation,
                 cache,
                 ENCOUNTER_DOMAIN,
                 |zone| matches!(zone, 1 | 2),
-                2,
-                None,
+                1,
             ),
-            self.bag(observation, cache, EVENT_DOMAIN, |zone| zone == 0, 3, None),
+            self.bag(observation, cache, EVENT_DOMAIN, |zone| zone == 0, 2),
         ];
         let run = self.encode(cache, RUN_DOMAIN, run[0]);
         let mut tokens = Vec::new();
@@ -1304,7 +1311,7 @@ impl ValueModel {
             );
             tokens.push(phase);
         }
-        tokens.push(self.tag(map, 0, None));
+        tokens.push(self.tag(map, Semantic::TokenRole, 0));
         tokens.extend(bags);
         let cards = state_rows(CARD_DOMAIN);
         let deck = cards
@@ -1358,19 +1365,19 @@ impl ValueModel {
             tokens.extend(
                 continuations
                     .into_iter()
-                    .map(|value| self.tag(value, 7, Some(10))),
+                    .map(|value| self.tag(value, Semantic::Collection, 10)),
             );
         } else {
             tokens.push(self.tag(
                 self.summarize(10, self.pooling[10], continuations),
+                Semantic::Collection,
                 10,
-                Some(10),
             ));
         }
         tokens.extend(
             state_rows(CRYSTAL_DOMAIN)
                 .into_iter()
-                .map(|row| self.tag(self.encode(cache, CRYSTAL_DOMAIN, row), 8, None)),
+                .map(|row| self.encode(cache, CRYSTAL_DOMAIN, row)),
         );
         if !state_rows(ACTOR_DOMAIN).is_empty() {
             let (actors, effects) = self.actors(observation, cache);
@@ -1417,7 +1424,6 @@ impl ValueModel {
                     .zip(&nodes.nodes[&candidate.u[4]])
                     .for_each(|(left, right)| *left += right);
             }
-            action = self.tag(action, 9, None);
             layer_norm(&mut action, &self.action_norm_w, &self.action_norm_b);
             tokens.push(action);
         }
@@ -1543,8 +1549,8 @@ impl ValueModel {
                     .map(|score| score - normalizer)
                     .collect::<Vec<_>>()
             };
-            let expected = values
-                .then(|| self.critic.apply(state)[0] + self.potential(observation));
+            let expected =
+                values.then(|| self.critic.apply(state)[0] + self.potential(observation));
             (
                 scores(temperature),
                 expected.map_or(0.0, |value| sigmoid(value / self.temperature + self.bias)),

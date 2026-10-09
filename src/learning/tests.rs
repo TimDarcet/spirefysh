@@ -403,7 +403,11 @@ fn run_features_are_zero_at_terminal_states() {
     let content = foundation_content();
     let mut game = Game::new_character_ascension(&content, 12, 0, 10).unwrap();
     game.begin_act(&content, 0).unwrap();
-    assert!(run_features(&game, &content).iter().any(|&feature| feature != 0.0));
+    assert!(
+        run_features(&game, &content)
+            .iter()
+            .any(|&feature| feature != 0.0)
+    );
     for phase in [Phase::Won, Phase::Dead] {
         game.phase = phase;
         assert_eq!(run_features(&game, &content), vec![0.0; PUBLIC_GLOBALS]);
@@ -1618,6 +1622,17 @@ fn v57_map_has_only_real_nodes_and_untyped_edges() {
     );
 }
 
+fn continuation_rows(game: &Game, content: &Content) -> [Vec<DomainRow>; 16] {
+    let mut domains = std::array::from_fn(|_| Vec::new());
+    continuation_domains(
+        game,
+        content,
+        &mut domains,
+        &mut CardEncoding::new(game, content),
+    );
+    domains
+}
+
 #[test]
 fn v57_control_and_resolving_play_state_are_continuations() {
     let content = foundation_content();
@@ -1639,12 +1654,20 @@ fn v57_control_and_resolving_play_state_are_continuations() {
         .push(ControlContinuation::StartExtraPlayerTurnAfterResolution);
     game.run_queue.push(RunEffect::FinishCooking);
     game.reward_continuation = Some(RewardContinuation::AddRandomCurse);
-    let rows = continuation_domains(&game, &content);
+    let domains = continuation_rows(&game, &content);
+    let rows = &domains[CONTINUATION_DOMAIN];
+    let playing = rows
+        .iter()
+        .find(|row| row.u[0] == 9 && row.u[1] == 0 && row.u[11..14] == [3, 2, 4])
+        .unwrap();
+    assert_eq!(playing.u[23], 1);
     assert!(
-        rows.iter()
-            .any(|row| row.u[0] == 9 && row.u[1] == 0 && row.u[11..14] == [3, 2, 4])
+        domains[CARD_DOMAIN]
+            .iter()
+            .any(|row| row.scope == -3 - playing.u[2] as i32
+                && row.u[0] == CONTINUATION_CARD_ZONE
+                && row.u[4] == card.id as u32)
     );
-    assert!(rows.iter().any(|row| row.u[0] == 5 && row.u[23] == 1));
     assert!(rows.iter().any(|row| row.u[0] == 0 && row.u[1] == 36));
     for variant in 2..=3 {
         assert!(rows.iter().any(|row| row.u[0] == 9 && row.u[1] == variant));
@@ -1657,7 +1680,7 @@ fn v56_continuation_booleans_and_discard_counts_do_not_alias() {
     let layout = Layout::new(&content);
     let game = Game::new_character_ascension(&content, 565, 0, 10).unwrap();
     let effect = |effect| {
-        let mut tree = ContinuationBuilder::for_game(&game, STATE_SCOPE);
+        let mut tree = ContinuationBuilder::new(STATE_SCOPE);
         tree.effect(effect, NO_NODE, 0, 0, 0, 0, None);
         let mut row = tree.rows.remove(0);
         populate_domain_features(&game, &content, layout, CONTINUATION_DOMAIN, &mut row);
@@ -1710,9 +1733,34 @@ fn v56_continuation_booleans_and_discard_counts_do_not_alias() {
     };
     assert_ne!(select(false, false), select(true, false));
     assert_ne!(select(false, false), select(false, true));
+    let concepts = |(mut c, _): (Vec<u32>, Vec<f32>)| {
+        c.sort();
+        c
+    };
+    assert_ne!(concepts(select(true, false)), concepts(select(false, true)));
+    assert_ne!(
+        concepts(effect(Effect::OfferColorless(3, true, false))),
+        concepts(effect(Effect::OfferColorless(3, false, true)))
+    );
+    assert_ne!(
+        concepts(effect(Effect::PassiveLightning(2))),
+        concepts(select(false, false))
+    );
+    assert_ne!(
+        effect(Effect::PassiveLightning(1)).1,
+        effect(Effect::PassiveLightning(2)).1
+    );
+    assert_ne!(
+        effect(Effect::CopyCard(Pile::Hand, 1)).1,
+        effect(Effect::CopyCard(Pile::Hand, 2)).1
+    );
+    assert_eq!(
+        effect(Effect::CopyCard(Pile::Hand, 1)).1,
+        effect(Effect::CopyCard(Pile::Draw, 1)).1
+    );
 
     let run_effect = |effect| {
-        let mut tree = ContinuationBuilder::for_game(&game, STATE_SCOPE);
+        let mut tree = ContinuationBuilder::new(STATE_SCOPE);
         tree.run_effect(effect, &content, NO_NODE, 0, 0, 0, 0);
         let mut row = tree.rows.remove(0);
         populate_domain_features(&game, &content, layout, CONTINUATION_DOMAIN, &mut row);
@@ -1722,6 +1770,52 @@ fn v56_continuation_booleans_and_discard_counts_do_not_alias() {
         run_effect(RunEffect::RandomPotionReward(false)),
         run_effect(RunEffect::RandomPotionReward(true))
     );
+}
+
+#[test]
+fn v61_status_cards_are_card_rows_and_enemy_properties_are_actor_features() {
+    let content = foundation_content();
+    let layout = Layout::new(&content);
+    let mut game = Game::new_character_ascension(&content, 610, 0, 10).unwrap();
+    game.begin_act(&content, 0).unwrap();
+    game.start_combat(&content, content.acts[0].encounters[0])
+        .unwrap();
+    let Phase::Combat(combat) = &mut game.phase else {
+        unreachable!()
+    };
+    let card = combat.hand[0];
+    combat.nightmares.push((card, 2));
+    combat.history_course = Some(card);
+    combat.hits[0] = 3;
+    combat.enemies[0].value = 12;
+    combat.enemies[0].repeats = 2;
+    let observation = build_observation(&game, &content, layout, (0, 0));
+    let zone_count = |zone| {
+        observation.domains[CARD_DOMAIN]
+            .iter()
+            .filter(|row| {
+                row.scope == STATE_SCOPE && row.u[0] == zone && row.u[4] == card.id as u32
+            })
+            .count()
+    };
+    assert_eq!(
+        (zone_count(NIGHTMARE_ZONE), zone_count(HISTORY_COURSE_ZONE)),
+        (2, 1)
+    );
+    let concepts = |zone| {
+        let row = observation.domains[CARD_DOMAIN]
+            .iter()
+            .find(|row| row.u[0] == zone)
+            .unwrap();
+        row.c.clone()
+    };
+    assert_ne!(concepts(NIGHTMARE_ZONE), concepts(HISTORY_COURSE_ZONE));
+    assert!(observation.domains[STATUS_DOMAIN].is_empty());
+    let enemy = observation.domains[ACTOR_DOMAIN]
+        .iter()
+        .find(|row| row.u[0] == 3)
+        .unwrap();
+    assert_eq!(enemy.f[12..], [12.0 / 30.0, 3.0 / 10.0, 2.0 / 10.0]);
 }
 
 #[test]
@@ -2383,7 +2477,7 @@ fn v55_action_and_phase_discriminants_are_exhaustive() {
 #[test]
 fn v56_layout_uses_explicit_token_dimensions_and_positions() {
     let layout = Layout::new(&foundation_content());
-    assert_eq!((VERSION, VALUE_MODEL_VERSION), (60, 78));
+    assert_eq!((VERSION, VALUE_MODEL_VERSION), (61, 79));
     assert_eq!(
         (
             DEFAULT_MODEL_WIDTH,
@@ -2473,7 +2567,10 @@ fn v57_actions_are_legal_only_and_only_suspended_offers_are_phase_local() {
     let observation = build_observation(&game, &content, layout, (0, 0));
     assert_eq!(observation.domains[PHASE_DOMAIN].len(), 2);
     assert!(observation.domains[CONTINUATION_DOMAIN].iter().any(|row| {
-        row.scope == PHASE_SCOPE && row.u[0] == 5 && row.u[11] == card.id as u32 && row.s[5] == 100
+        row.scope == PHASE_SCOPE && row.u[0] == 8 && row.u[1] == 8 && row.s[0] == 100
+    }));
+    assert!(observation.domains[CARD_DOMAIN].iter().any(|row| {
+        row.scope == PHASE_SCOPE && row.u[0] == CONTINUATION_CARD_ZONE && row.u[4] == card.id as u32
     }));
     let position = layout.semantic_offsets[Semantic::ContinuationPosition as usize];
     let position_end = position + layout.semantic_sizes[Semantic::ContinuationPosition as usize];
@@ -2614,7 +2711,8 @@ fn v56_continuations_are_flat_execution_items() {
             context: Context::player(),
         },
     ];
-    let rows = continuation_domains(&game, &content);
+    let domains = continuation_rows(&game, &content);
+    let rows = &domains[CONTINUATION_DOMAIN];
     let items = rows
         .iter()
         .map(|row| row.u[2])
@@ -2654,8 +2752,9 @@ fn v56_continuation_amounts_use_declared_scales_and_current_values() {
             ..Context::player()
         },
     });
-    let mut rows = continuation_domains(&game, &content);
-    for row in &mut rows {
+    let mut domains = continuation_rows(&game, &content);
+    let rows = &mut domains[CONTINUATION_DOMAIN];
+    for row in rows.iter_mut() {
         populate_domain_features(&game, &content, layout, CONTINUATION_DOMAIN, row);
     }
     let effect = rows
