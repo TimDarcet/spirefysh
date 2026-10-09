@@ -5560,10 +5560,6 @@ impl Batch {
             ("enemy_owner_start".into(), 3),
             ("card_zones".into(), CARD_ZONES),
             ("card_candidate_zone".into(), ATTACHED_CARD_ZONE),
-            (
-                "history_course_status".into(),
-                HISTORY_COURSE_STATUS as usize,
-            ),
             ("normal_encounters".into(), 58),
             ("elite_encounters".into(), 14),
             ("boss_encounters".into(), 14),

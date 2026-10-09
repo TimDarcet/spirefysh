@@ -1419,6 +1419,29 @@ class TrajectoryTest(unittest.TestCase):
         self.assertAlmostEqual(policy[int(result[1][0])], float(result[2][0]), places=5)
         self.assertTrue(math.isfinite(critic))
 
+    def test_native_value_model_matches_python_model(self):
+        torch.manual_seed(0)
+        model = train.Agent(dict(train.sts2_sim.Batch(1, 0, 0).token_layout())).eval()
+        with torch.no_grad():
+            for parameter in model.parameters():
+                parameter.add_(torch.randn_like(parameter) * .05)
+        for seed in range(3):
+            env = train.sts2_sim.Batch(1, seed, seed, ascension=0)
+            env.load_policy(train.export_value_model(None, model, env.fingerprint(), 1, 0, True))
+            for _step in range(80):
+                if not env.has_legal_actions()[0]:
+                    break
+                _, policy, critic = env.policy_details([0], .8)[0]
+                with torch.no_grad():
+                    expected, expected_critic = train.predict(
+                        model, train.tensors(env.observe_tokens(), torch.device("cpu"), model),
+                        "fp32", .8, flat_policy=True,
+                    )
+                np.testing.assert_allclose(policy, expected.numpy(), atol=1e-5)
+                np.testing.assert_allclose(critic, float(expected_critic.squeeze()),
+                                           rtol=1e-6, atol=1e-5)
+                env.step(env.teacher())
+
     def test_potential_modes(self):
         env = train.sts2_sim.Batch(1, 7, 0, ascension=0)
         weights = [1e-4] * len(train.POTENTIAL_TERMS)

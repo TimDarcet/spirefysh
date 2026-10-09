@@ -2,7 +2,7 @@ use super::*;
 
 // Tables mirror effect_index, event_effect_index, action_kind, *_payload, room_index,
 // target_index, pile_index and phase_index; the model tags token roles and collections.
-const EFFECTS: [&str; 119] = [
+const EFFECTS: [&str; 120] = [
     "Attack",
     "AttackMany",
     "OstyAttack",
@@ -121,7 +121,8 @@ const EFFECTS: [&str; 119] = [
     "CapHandCosts",
     "RecycleHand",
     "EndTurn",
-    "PassiveLightning / Select",
+    "Select",
+    "PassiveLightning",
 ];
 
 const RUN_EFFECTS: [&str; 37] = [
@@ -419,19 +420,7 @@ const CONTINUATION_KINDS: [&str; 10] = [
     "kind 9",
 ];
 
-const TOKEN_ROLES: [&str; 11] = [
-    "current map node",
-    "relic pool",
-    "encounter pool",
-    "event pool",
-    "actor",
-    "collection item",
-    "actor effect",
-    "continuation item",
-    "crystal",
-    "action",
-    "pooled summary",
-];
+const TOKEN_ROLES: [&str; 1] = ["current map node"];
 
 const COLLECTIONS: [&str; 11] = [
     "deck",

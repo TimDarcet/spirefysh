@@ -26,7 +26,9 @@ MAP_NODE_KINDS = 26
 PRECISIONS = ("fp32", "bf16")
 TRAINING_PRECISIONS = (*PRECISIONS, "bf16_with_fp32_dV")
 WINNING_CAPACITY = 0
-CHANGE = "Encode Pumpkin Candle as an unbounded numeric counter."
+CHANGE = "Drop absorbed token roles; biased Linear per pool summary; continuation, nightmare and history-course cards as card rows; enemy properties as actor features; one Boolean code per flag; no IDs as numbers; unknown-elite weight ÷10 000."
+POOLS = ("relic_pool", "encounter_pool", "event_pool")
+STATUS_CARD_ZONES = (6, 7)
 COLLECTION_POOLING = ("sum", "transformer", "global_tokens")
 EFFECT_POOLING = (
     "sum_into_actor", "transformer_into_actor", "sum_token", "transformer_token",
@@ -1898,7 +1900,7 @@ class Agent(nn.Module):
         self.summary_seed = nn.ParameterDict({name: nn.Parameter(torch.randn(width) * .02)
                                               for name in summary_names})
         self.map_nodes = nn.Embedding(MAP_NODE_KINDS, width)
-        self.relic_pool_projection = nn.Linear(width, width, bias=False)
+        self.pool_projections = nn.ModuleDict({name: nn.Linear(width, width) for name in POOLS})
 
         def transformer(layer_count=1):
             layer = nn.TransformerEncoderLayer(
@@ -2069,10 +2071,8 @@ class Agent(nn.Module):
         return tuple(graph_name(value, name + " encoding")
                      for (name, *_), value in zip(TOKEN_SPECS, encoded)), projection
 
-    def _tag(self, values, role, collection=None):
-        tagged = values + self.concepts.local("token_role", role).to(values.dtype)
-        return tagged if collection is None else \
-            tagged + self.concepts.local("collection", collection).to(values.dtype)
+    def _tag(self, values, collection):
+        return values + self.concepts.local("collection", collection).to(values.dtype)
 
     def _card_context(self, values, metadata):
         if not len(values):
@@ -2265,10 +2265,10 @@ class Agent(nn.Module):
         collection = ("deck", "hand", "draw", "discard", "exhaust", "relic", "potion", "orb").index(name)
         mode = self.pooling[name]
         if mode == "global_tokens":
-            return self._tag(values, 5, collection), rows
+            return self._tag(values, collection), rows
         summary = self._summarize(values, rows, int(active.max().item()) + 1 if len(active) else 0,
                                   name, mode)
-        return self._tag(summary[active], 10, collection), active
+        return self._tag(summary[active], collection), active
 
     def _actors(self, domains, encoded, batch, concepts, plan):
         order, player_source, player_group, move_raw, move_order, move_packed_order, \
@@ -2313,7 +2313,7 @@ class Agent(nn.Module):
 
         effect_values = []
         for domain, source in zip(
-            (DOMAIN["power"], DOMAIN["status"]), effect_plans,
+            (DOMAIN["power"], DOMAIN["status"], DOMAIN["card"]), effect_plans,
         ):
             values, _effect_rows, _effect_u = self._domain_rows(domains, encoded, domain)
             effect_values.append(values[source])
@@ -2327,7 +2327,7 @@ class Agent(nn.Module):
             values = effects[effect_source]
             mode = self.pooling[name]
             if mode == "global_tokens":
-                extra_values.append(self._tag(values, 6, 8 + (name == "enemy_effect")))
+                extra_values.append(self._tag(values, 8 + (name == "enemy_effect")))
                 extra_rows.append(rows[effect_actor])
                 continue
             pooled_mode = "transformer" if mode.startswith("transformer") else "sum"
@@ -2335,9 +2335,9 @@ class Agent(nn.Module):
             if mode.endswith("into_actor"):
                 actors = actors.index_add(0, actor_index, summary.to(actors.dtype))
             else:
-                extra_values.append(self._tag(summary, 6, 8 + (name == "enemy_effect")))
+                extra_values.append(self._tag(summary, 8 + (name == "enemy_effect")))
                 extra_rows.append(rows[actor_index])
-        actors = self.actor_norm(self._tag(actors, 4))
+        actors = self.actor_norm(actors)
         return actors, rows, u, extra_values, extra_rows
 
     def _actions(self, domains, encoded, values, index, nodes, concepts):
@@ -2375,17 +2375,22 @@ class Agent(nn.Module):
             present = path[:action_count] >= 0
             if present.any():
                 attached[present] += nodes[path[:action_count][present]]
-        action = self.action_norm(self._tag(action + attached, 9))
+        action = self.action_norm(action + attached)
         return action, action_row[:action_count], action_flat[:action_count], actions, policy_sequence
 
     def _continuations(self, domains, encoded, plan):
         values, rows, u = self._domain_rows(domains, encoded, DOMAIN["continuation"])
         if not len(values):
-            return values, rows, plan[3:]
+            return values, rows, plan[3:-1]
         order, group, item_rows, groups, *_ = plan
         items = values.new_zeros((groups, self.width))
         items.index_add_(0, group, values[order])
-        return items, item_rows, plan[3:]
+        for domain, source, item in plan[-1]:
+            linked = encoded[domain][domains[domain][6][source]]
+            if domain == DOMAIN["card"]:
+                linked = self._card_context(linked, domains[domain][3][source])
+            items.index_add_(0, item, linked.to(items.dtype))
+        return items, item_rows, plan[3:-1]
 
     def _packed_gru(self, values, batch_sizes, gru, parents=None):
         gates = _FastLinear.apply(values, gru.weight_ih_l0, gru.bias_ih_l0)
@@ -2439,16 +2444,12 @@ class Agent(nn.Module):
         suspended = phase_u[:, 0] != 0
         phase = phase + suspended[:, None] * payload[phase_rows].to(phase.dtype)
         add(self.encoders["phase"].norm(phase), phase_rows, "phase")
-        add(self._tag(current, 0), torch.arange(batch, device=current.device), "map")
+        add(current + self.concepts.local("token_role", 0).to(current.dtype),
+            torch.arange(batch, device=current.device), "map")
         synchronize()
 
-        pool_specs = (
-            ("relic_pool", DOMAIN["relic"], 0),
-            ("encounter_pool", DOMAIN["encounter"], 1),
-            ("event_pool", DOMAIN["event"], 2),
-        )
-        for name, domain, filtered in pool_specs:
-            source, pooled = filters[filtered]
+        pool_domains = DOMAIN["relic"], DOMAIN["encounter"], DOMAIN["event"]
+        for name, domain, (source, pooled) in zip(POOLS, pool_domains, filters):
             if encoded[domain].device.type == "mps":
                 pooled_source, item_rows, inverse, groups = pooled
                 summary = _IndexedGroupSum.apply(
@@ -2461,10 +2462,8 @@ class Agent(nn.Module):
                 summary = self._summarize(
                     item, item_rows, batch, name, "sum",
                 )
-            if name == "relic_pool":
-                summary = self.relic_pool_projection(summary)
-            role = ("relic_pool", "encounter_pool", "event_pool").index(name) + 1
-            add(self._tag(summary, role), torch.arange(batch, device=summary.device), name)
+            add(self.pool_projections[name](summary), torch.arange(batch, device=summary.device),
+                name)
         synchronize()
 
         actors, actor_rows, actor_u, effect_values, effect_rows = self._actors(
@@ -2511,7 +2510,7 @@ class Agent(nn.Module):
         )
         mode = self.pooling["continuation"]
         if mode == "global_tokens":
-            add(self._tag(continuation, 7, 10), continuation_rows, "continuation")
+            add(self._tag(continuation, 10), continuation_rows, "continuation")
         elif mode == "gru":
             _groups, maximum, position, present, last, packed_order, packed_present, \
                 batch_sizes = continuation_gru
@@ -2532,14 +2531,14 @@ class Agent(nn.Module):
                     )
             else:
                 summary = continuation.new_zeros((batch, self.width))
-            add(self._tag(summary, 10, 10),
+            add(self._tag(summary, 10),
                 torch.arange(batch, device=run.device), "continuation")
         else:
             add(self._tag(self._summarize(
-                    continuation, continuation_rows, batch, "continuation", mode), 10, 10),
+                    continuation, continuation_rows, batch, "continuation", mode), 10),
                 torch.arange(batch, device=run.device), "continuation")
         crystal, crystal_rows, _ = self._domain_rows(domains, encoded, DOMAIN["crystal"])
-        add(self._tag(crystal, 8), crystal_rows, "crystal")
+        add(crystal, crystal_rows, "crystal")
         add(action, action_rows, "action")
         synchronize()
 
@@ -3098,11 +3097,13 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
                                  for index in range(move_counts.max(initial=0)))
     effect_plans = []
     effect_groups = []
-    for domain in (DOMAIN["power"], DOMAIN["status"]):
+    for domain in (DOMAIN["power"], DOMAIN["status"], DOMAIN["card"]):
         effect_u, _s, _c, _f, effect_row, effect_scope = domains[domain]
         effect_source = np.flatnonzero(effect_scope == -1)
-        effect_keys = effect_row[effect_source].astype(np.int64) * (1 << 20) \
-            + effect_u[effect_source, 0]
+        owner = effect_u[effect_source, 0]
+        if domain == DOMAIN["card"]:
+            owner = np.where(np.isin(owner, STATUS_CARD_ZONES), 1, -1)
+        effect_keys = effect_row[effect_source].astype(np.int64) * (1 << 20) + owner
         group = np.searchsorted(actor_keys, effect_keys)
         valid = group < len(actor_keys)
         valid &= actor_keys[np.minimum(group, max(0, len(actor_keys) - 1))] == effect_keys \
@@ -3171,6 +3172,20 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
         continuation_plan += tensor(packed_order), tensor(present[length_order]), batch_sizes
     else:
         continuation_plan += tensor(np.empty(0, np.int64)), tensor(present), ()
+    item_keys = keys[first]
+    item_order = np.argsort(item_keys, kind="stable")
+    links = []
+    for name in ("card", "relic", "potion"):
+        _u, _s, _c, _f, linked_row, linked_scope = domains[DOMAIN[name]]
+        source = np.flatnonzero(linked_scope <= -3)
+        if len(source):
+            key = linked_row[source].astype(np.int64) * (1 << 32) + (-3 - linked_scope[source])
+            found = np.searchsorted(item_keys[item_order], key).clip(max=max(len(item_keys) - 1, 0))
+            position = item_order[found] if len(item_keys) else found
+            if not len(item_keys) or not np.array_equal(item_keys[position], key):
+                raise ValueError(f"{name} row references an absent continuation item")
+            links.append((DOMAIN[name], tensor(source), tensor(position)))
+    continuation_plan += (tuple(links),)
     all_rows = np.arange(batch)
     combat_rows = actor_rows[actor_u[actor_source, 1] == 0]
     phase_domain = domains[DOMAIN["phase"]]
@@ -3600,7 +3615,9 @@ def export_value_model(path, model, fingerprint, temperature, bias, actor=False)
     add_encoder(model.action_encoder)
     for name in POOLING_DEFAULTS:
         add(model.summary_seed[name])
-    add_linear(model.relic_pool_projection); add_linear(model.pael_cards)
+    for name in POOLS:
+        add_linear(model.pool_projections[name])
+    add_linear(model.pael_cards)
     for index, (name, mode) in enumerate(model.pooling.items()):
         if (index < 8 and mode == "transformer") \
                 or (index < 10 and mode.startswith("transformer")) \

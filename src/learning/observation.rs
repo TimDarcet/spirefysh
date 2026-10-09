@@ -12,8 +12,8 @@ use std::{
 };
 
 const MAGIC: &[u8; 8] = b"STSVALUE";
-const VERSION: u32 = 60;
-const VALUE_MODEL_VERSION: u32 = 78;
+const VERSION: u32 = 61;
+const VALUE_MODEL_VERSION: u32 = 79;
 const TERMINAL_CATEGORIES: usize = 83;
 const CARD_ZONES: usize = 5;
 const DECK_ZONE: usize = 0;
@@ -23,7 +23,11 @@ const DISCARD_ZONE: usize = 3;
 const EXHAUST_ZONE: usize = 4;
 const ATTACHED_CARD_ZONE: usize = CARD_ZONES;
 const PAEL_ZONE: usize = 8;
-const HISTORY_COURSE_STATUS: u32 = 6;
+const CONTINUATION_CARD_ZONE: u32 = 9;
+const CONTINUATION_RELIC_ZONE: u32 = 12;
+const CONTINUATION_POTION_ZONE: u32 = 5;
+const NIGHTMARE_ZONE: u32 = 6;
+const HISTORY_COURSE_ZONE: u32 = 7;
 
 const PHASES: usize = 12;
 const MAP_NODE_KINDS: usize = 26;
@@ -71,11 +75,11 @@ const DOMAIN_NAMES: [&str; 16] = [
 const DOMAIN_WIDTHS: [(usize, usize, usize, usize); 16] = [
     (23, 16, 1, 22),
     (16, 8, 42, 4),
-    (20, 16, 3, 40),
-    (12, 11, 4, 12),
+    (20, 16, 4, 40),
+    (12, 11, 5, 15),
     (8, 4, 5, 2),
     (6, 29, 1, 29),
-    (20, 8, 7, 40),
+    (3, 3, 2, 3),
     (12, 6, 20, 1),
     (6, 2, 1, 0),
     (6, 2, 4, 1),
@@ -172,6 +176,7 @@ enum Semantic {
     Requirement,
     TinkerRider,
     ConveyorDish,
+    EventAction,
     Boolean,
     TokenRole,
     Collection,
@@ -238,6 +243,7 @@ const SEMANTIC_NAMES: [&str; Semantic::Count as usize] = [
     "requirement",
     "tinker_rider",
     "conveyor_dish",
+    "event_action",
     "boolean",
     "token_role",
     "collection",
@@ -351,7 +357,7 @@ impl Layout {
             (Semantic::Pile, 5),
             (Semantic::Phase, PHASES),
             (Semantic::Action, ACTION_KINDS),
-            (Semantic::Effect, 119),
+            (Semantic::Effect, 120),
             (Semantic::RunEffect, 37),
             (Semantic::Condition, 23),
             (Semantic::Filter, 16),
@@ -390,8 +396,9 @@ impl Layout {
             (Semantic::Requirement, 4),
             (Semantic::TinkerRider, 9),
             (Semantic::ConveyorDish, 8),
+            (Semantic::EventAction, 13),
             (Semantic::Boolean, 184),
-            (Semantic::TokenRole, 11),
+            (Semantic::TokenRole, 1),
             (Semantic::Collection, 11),
         ] {
             semantic_sizes[namespace as usize] = size as u32;
@@ -571,6 +578,8 @@ fn push_effect_semantics(row: &mut DomainRow, layout: Layout) {
     let card = |row: &mut DomainRow, slot| {
         push_semantic(row, layout, Semantic::Card, base_card_id(row.u[slot]))
     };
+    let flag =
+        |row: &mut DomainRow, slot, field| push_boolean(row, layout, field, row.u[slot] != 0);
     match variant {
         0 | 2 => {
             target(row);
@@ -614,11 +623,11 @@ fn push_effect_semantics(row: &mut DomainRow, layout: Layout) {
         44 => {
             pile(row, 11);
             push_semantic(row, layout, Semantic::CardType, row.u[12]);
-            push_semantic(row, layout, Semantic::Boolean, row.u[14]);
+            flag(row, 14, 6);
         }
         45 | 54 => {
             pile(row, 11);
-            push_semantic(row, layout, Semantic::Boolean, row.u[12]);
+            flag(row, 12, 7);
             push_scale_semantics(row, layout, 13, 14);
         }
         46 => {
@@ -626,14 +635,14 @@ fn push_effect_semantics(row: &mut DomainRow, layout: Layout) {
             push_scale_semantics(row, layout, 12, 13);
         }
         47 => {
-            push_semantic(row, layout, Semantic::Boolean, row.u[12]);
-            push_semantic(row, layout, Semantic::Boolean, row.u[13]);
+            flag(row, 12, 8);
+            flag(row, 13, 9);
         }
-        48 => push_semantic(row, layout, Semantic::Boolean, row.u[12]),
+        48 => flag(row, 12, 10),
         50 | 51 => {
             push_semantic(row, layout, Semantic::CardType, row.u[11]);
             if variant == 51 {
-                push_semantic(row, layout, Semantic::Boolean, row.u[13]);
+                flag(row, 13, 11);
             }
         }
         52 => {
@@ -643,13 +652,13 @@ fn push_effect_semantics(row: &mut DomainRow, layout: Layout) {
         }
         53 | 64 => {
             pile(row, 11);
-            push_semantic(row, layout, Semantic::Boolean, row.u[13]);
+            flag(row, 13, 12);
         }
         74 => pile(row, 11),
-        75 | 86 => push_semantic(row, layout, Semantic::Boolean, row.u[12]),
+        75 | 86 => flag(row, 12, 13),
         90 => {
             pile(row, 11);
-            push_semantic(row, layout, Semantic::Boolean, row.u[13]);
+            flag(row, 13, 14);
         }
         55 => {
             pile(row, 11);
@@ -661,7 +670,7 @@ fn push_effect_semantics(row: &mut DomainRow, layout: Layout) {
             pile(row, 11);
             push_filter_semantics(row, layout, 12, 13);
             if variant == 58 {
-                push_semantic(row, layout, Semantic::Boolean, row.u[14]);
+                flag(row, 14, 15);
                 push_op_semantics(row, layout, 15, 16);
             }
             push_scale_semantics(row, layout, 18, 19);
@@ -671,11 +680,11 @@ fn push_effect_semantics(row: &mut DomainRow, layout: Layout) {
         65 | 77 => {
             card(row, 11);
             if variant == 65 {
-                push_semantic(row, layout, Semantic::Boolean, row.u[14]);
+                flag(row, 14, 16);
             }
         }
         69 => {
-            push_semantic(row, layout, Semantic::Boolean, row.u[11]);
+            flag(row, 11, 17);
             push_scale_semantics(row, layout, 12, 13);
         }
         82 => {
@@ -692,7 +701,7 @@ fn push_effect_semantics(row: &mut DomainRow, layout: Layout) {
         91 => card(row, 13),
         92 => push_condition_semantics(row, layout, 11, 12),
         93 => push_scale_semantics(row, layout, 11, 12),
-        97 => push_semantic(row, layout, Semantic::Boolean, row.u[11]),
+        97 => flag(row, 11, 18),
         111 => {
             card(row, 11);
             push_scale_semantics(row, layout, 12, 13);
@@ -700,8 +709,8 @@ fn push_effect_semantics(row: &mut DomainRow, layout: Layout) {
         118 => {
             pile(row, 11);
             push_filter_semantics(row, layout, 12, 13);
-            push_semantic(row, layout, Semantic::Boolean, row.u[16]);
-            push_semantic(row, layout, Semantic::Boolean, row.u[17]);
+            flag(row, 16, 19);
+            flag(row, 17, 21);
             push_op_semantics(row, layout, 18, 19);
         }
         _ => {}
@@ -755,7 +764,7 @@ fn populate_domain_features(
                 sf(row.s[4], 10_000.0),
                 sf(row.s[5], 100.0),
                 sf(row.s[6], 1_000.0),
-                sf(row.s[7], 1_000.0),
+                sf(row.s[7], 10_000.0),
                 sf(row.s[8], 1_000.0),
                 sf(row.s[9], 1_000.0),
             ]);
@@ -913,6 +922,11 @@ fn populate_domain_features(
             if row.u[11] > 0 {
                 push_semantic(row, layout, Semantic::Enchantment, row.u[11] - 1);
             }
+            match row.u[0] {
+                NIGHTMARE_ZONE => push_semantic(row, layout, Semantic::StatusKind, 1),
+                HISTORY_COURSE_ZONE => push_semantic(row, layout, Semantic::StatusKind, 6),
+                _ => {}
+            }
             row.f[..6].copy_from_slice(&[
                 sf(row.s[0], 10.0),
                 sf(row.s[1], 30.0),
@@ -952,6 +966,9 @@ fn populate_domain_features(
                         enemy_move_id(content, row.u[2] as Id, row.u[4] as usize),
                     );
                 }
+                if row.u[9] > 0 {
+                    push_boolean(row, layout, 24, row.u[9] == 2);
+                }
             }
             row.f[..3].copy_from_slice(&[
                 sf(row.s[0], 30.0),
@@ -972,6 +989,11 @@ fn populate_domain_features(
             row.f[9] = row.s[0] as f32 / max_hp;
             row.f[10] = (row.s[1] - row.s[0]) as f32 / max_hp;
             row.f[11] = row.s[2] as f32 / max_hp;
+            row.f[12..].copy_from_slice(&[
+                sf(row.s[3], 30.0),
+                sf(row.s[4], 10.0),
+                row.u[7] as f32 / 10.0,
+            ]);
         }
         POWER_DOMAIN => {
             if row.u[0] >= 3 {
@@ -1015,63 +1037,18 @@ fn populate_domain_features(
             }
         }
         STATUS_DOMAIN => {
-            if row.u[0] >= 3 {
-                let position = row.u[0] - 3;
-                push_semantic(row, layout, Semantic::EnemyPosition, position.min(32));
-                if let Some(enemy) = game
-                    .combat()
-                    .and_then(|combat| combat.enemies.get(position as usize))
-                {
-                    push_semantic(row, layout, Semantic::Enemy, enemy.creature.id as u32);
-                }
-            } else {
-                push_semantic(row, layout, Semantic::ActorKind, row.u[0].saturating_sub(1));
-            }
+            push_semantic(row, layout, Semantic::ActorKind, 0);
             push_semantic(row, layout, Semantic::StatusKind, row.u[1]);
-            if matches!(row.u[1], 1 | HISTORY_COURSE_STATUS) {
-                push_semantic(
-                    row,
-                    layout,
-                    Semantic::Card,
-                    card_version_id(content, row.u[3] as Id, row.u[4] > 0, row.u[11] as u8),
-                );
-                if row.u[10] > 0 {
-                    push_semantic(row, layout, Semantic::Enchantment, row.u[10] - 1);
-                }
-                put_card_flags(row, 6, row.u[5], row.u[6], row.u[8], row.u[9]);
-            }
             match row.u[1] {
-                1 => row.f[..6].copy_from_slice(&[
-                    sf(row.s[0], 5.0),
-                    sf(row.s[1], 10.0),
-                    sf(row.s[2], 30.0),
-                    sf(row.s[3], 10.0),
-                    sf(row.s[4], 30.0),
-                    sf(row.s[5], 30.0),
-                ]),
                 2 => row.f[..2].copy_from_slice(&[sf(row.s[0], 10.0), sf(row.s[1], 30.0)]),
                 3 => row.f[..2].copy_from_slice(&[sf(row.s[0], 10.0), sf(row.s[1], 5.0)]),
-                4 => row.f[..3].copy_from_slice(&[
+                4 => row.f.copy_from_slice(&[
                     sf(row.s[0], 10.0),
                     sf(row.s[1], 30.0),
                     sf(row.s[2], 10.0),
                 ]),
-                5 | 8 => row.f[0] = sf(row.s[0], 30.0),
-                9..=11 => row.f[0] = sf(row.s[0], 10.0),
+                5 => row.f[0] = sf(row.s[0], 30.0),
                 _ => {}
-            }
-            if matches!(row.u[1], 1 | HISTORY_COURSE_STATUS) {
-                if row.u[17] > 0 {
-                    push_semantic(row, layout, Semantic::DeckOrigin, (row.u[17] - 1).min(256));
-                }
-                if row.u[18] > 0 {
-                    push_semantic(
-                        row,
-                        layout,
-                        Semantic::Card,
-                        card_version_id(content, row.u[3] as Id, row.u[18] > 1, row.u[11] as u8),
-                    );
-                }
             }
         }
         RELIC_DOMAIN => {
@@ -1188,7 +1165,7 @@ fn populate_domain_features(
         }
         CONTINUATION_DOMAIN => {
             push_semantic(row, layout, Semantic::ContinuationKind, row.u[0]);
-            push_semantic(row, layout, Semantic::Boolean, row.u[10]);
+            push_boolean(row, layout, 22, row.u[10] != 0);
             let namespace = match row.u[0] {
                 0 => Semantic::RunEffect,
                 1 => Semantic::Effect,
@@ -1209,7 +1186,8 @@ fn populate_domain_features(
                     9 => push_semantic(row, layout, Semantic::Card, base_card_id(row.u[11])),
                     10 => push_semantic(row, layout, Semantic::Relic, row.u[11]),
                     11 | 12 => push_semantic(row, layout, Semantic::Potion, row.u[11]),
-                    13 => push_semantic(row, layout, Semantic::Boolean, row.u[11]),
+                    13 => push_boolean(row, layout, 23, row.u[11] != 0),
+                    35 => push_semantic(row, layout, Semantic::EventAction, row.u[11]),
                     15 => push_semantic(row, layout, Semantic::Rarity, row.u[11]),
                     21 => push_bits(row, layout, Semantic::TagBit, row.u[12]),
                     28 if row.u[11] > 0 => {
@@ -1278,43 +1256,8 @@ fn populate_domain_features(
                     }
                     _ => {}
                 },
-                5 => {
-                    push_semantic(
-                        row,
-                        layout,
-                        Semantic::Card,
-                        card_version_id(content, row.u[11] as Id, row.u[12] > 0, row.u[19] as u8),
-                    );
-                    if row.u[18] > 0 {
-                        push_semantic(row, layout, Semantic::Enchantment, row.u[18] - 1);
-                    }
-                    push_boolean(row, layout, 90, row.u[23] != 0);
-                    if row.u[20] > 0 {
-                        push_semantic(row, layout, Semantic::DeckOrigin, (row.u[20] - 1).min(256));
-                    }
-                    if row.u[21] > 0 {
-                        push_semantic(
-                            row,
-                            layout,
-                            Semantic::Card,
-                            card_version_id(
-                                content,
-                                row.u[11] as Id,
-                                row.u[21] > 0,
-                                row.u[19] as u8,
-                            ),
-                        );
-                    }
-                }
-                6 => {
-                    push_semantic(row, layout, Semantic::Power, row.u[11]);
-                    push_semantic(row, layout, Semantic::Boolean, row.u[12]);
-                }
                 7 => push_semantic(row, layout, Semantic::Requirement, row.u[11]),
                 8 => match row.u[1] {
-                    0 => push_semantic(row, layout, Semantic::Card, base_card_id(row.u[11])),
-                    1 | 3 | 5 => push_semantic(row, layout, Semantic::Relic, row.u[11]),
-                    4 | 6 => push_semantic(row, layout, Semantic::Potion, row.u[11]),
                     2 => match row.u[11] {
                         0 => push_semantic(row, layout, Semantic::Room, row.u[12]),
                         1 => {
@@ -1337,9 +1280,7 @@ fn populate_domain_features(
                     3 | 6 | 7 | 8 => row.f[0] = sf(row.s[0], 30.0),
                     4 => put_continuation_numbers(row, &[11], 100.0),
                     9 | 12 | 28 => put_continuation_numbers(row, &[12], 10.0),
-                    14 | 21 | 22 | 23 | 24 | 26 | 30 | 35 => {
-                        put_continuation_numbers(row, &[11], 10.0)
-                    }
+                    14 | 21 | 22 | 23 | 24 | 26 | 30 => put_continuation_numbers(row, &[11], 10.0),
                     29 => {
                         put_continuation_numbers(row, &[12], 10.0);
                         row.f[0] = sf(row.s[0], 30.0);
@@ -1351,13 +1292,14 @@ fn populate_domain_features(
                     0 | 2 => put_continuation_numbers(row, &[15], 10.0),
                     21 | 39 | 104 | 108 | 113 | 114 => row.f[0] = sf(row.s[0], 10.0),
                     28 => row.f[0] = sf(row.s[0], 30.0),
-                    32 | 33 | 35 | 47 | 48 | 49 | 57 | 59 | 74 | 75 | 81 | 83 | 84 | 86 | 94
-                    | 100 | 101 | 102 => put_continuation_numbers(row, &[11], 10.0),
+                    32 | 33 | 35 | 47 | 48 | 49 | 57 | 59 | 75 | 81 | 83 | 84 | 86 | 94 | 100
+                    | 101 | 102 | 119 => put_continuation_numbers(row, &[11], 10.0),
                     41 | 42 | 43 | 44 | 66 => put_continuation_numbers(row, &[13], 10.0),
-                    50 | 51 | 53 | 62 | 64 | 89 | 90 | 95 => {
+                    50 | 51 | 53 | 62 | 64 | 74 | 89 | 90 | 95 => {
                         put_continuation_numbers(row, &[12], 10.0)
                     }
-                    65 | 91 | 96 | 116 => put_continuation_numbers(row, &[11, 12], 10.0),
+                    65 => put_continuation_numbers(row, &[12, 13], 10.0),
+                    91 | 96 | 116 => put_continuation_numbers(row, &[11, 12], 10.0),
                     118 => put_continuation_numbers(row, &[14, 15], 10.0),
                     _ => {}
                 },
@@ -1371,7 +1313,8 @@ fn populate_domain_features(
                         row.f[0] = sf(row.s[0], 1_000.0);
                         row.f[1] = sf(row.s[1], 10.0);
                     }
-                    6 | 7 | 8 | 10 => put_continuation_numbers(row, &[11], 10.0),
+                    6 | 7 | 10 => put_continuation_numbers(row, &[11], 10.0),
+                    8 => put_continuation_numbers(row, &[12], 10.0),
                     9 => {
                         put_continuation_numbers(row, &[12], 10.0);
                         row.f[0] = sf(row.s[0], 30.0);
@@ -1385,24 +1328,12 @@ fn populate_domain_features(
                         _ => 0.0,
                     }
                 }
-                8 if matches!(row.u[1], 5..=7) => row.f[0] = sf(row.s[0], 1_000.0),
+                8 if matches!(row.u[1], 5..=8) => row.f[0] = sf(row.s[0], 1_000.0),
                 9 if row.u[1] == 0 => put_continuation_numbers(row, &[11, 12, 13], 10.0),
                 _ => {}
             }
-            if row.u[0] == 5 {
-                row.f[..10].copy_from_slice(&[
-                    0.0,
-                    row.u[15] as f32 / 5.0,
-                    0.0,
-                    0.0,
-                    sf(row.s[0], 10.0),
-                    sf(row.s[1], 30.0),
-                    sf(row.s[2], 10.0),
-                    sf(row.s[3], 30.0),
-                    sf(row.s[4], 30.0),
-                    sf(row.s[5], 1_000.0),
-                ]);
-                put_card_flags(row, 24, row.u[13], row.u[14], row.u[16], row.u[17]);
+            if matches!(row.u[0], 3 | 9) {
+                push_boolean(row, layout, 90, row.u[23] != 0);
             }
         }
         MAP_NODE_DOMAIN => {
@@ -4165,7 +4096,7 @@ fn effect_index(effect: &Effect) -> usize {
         Effect::PassiveFirst(..) => 101,
         Effect::PassiveLast(..) => 102,
         Effect::PassiveAll => 103,
-        Effect::PassiveLightning(..) => 118,
+        Effect::PassiveLightning(..) => 119,
         Effect::OrbSlots(..) => 104,
         Effect::Stars(..) => 105,
         Effect::Forge(..) => 106,
@@ -4394,7 +4325,6 @@ fn relic_state(game: &Game, content: &Content, id: Id) -> [f32; 4] {
         _ => [0.0; 4],
     }
 }
-
 
 fn action_kind(action: &Action) -> usize {
     match action {
@@ -4651,6 +4581,31 @@ fn state_card_domains(
                         (0, 0, card, 0)
                     }
                 }),
+        );
+        let nightmares = combat
+            .nightmares
+            .iter()
+            .flat_map(|&(card, count)| std::iter::repeat_n((0, 0, card, 0), count as usize));
+        push_cards(
+            domains,
+            game,
+            content,
+            encoding,
+            STATE_SCOPE,
+            NIGHTMARE_ZONE,
+            0,
+            nightmares,
+        );
+        let history_course = combat.history_course.map(|card| (0, 0, card, 0));
+        push_cards(
+            domains,
+            game,
+            content,
+            encoding,
+            STATE_SCOPE,
+            HISTORY_COURSE_ZONE,
+            0,
+            history_course,
         );
     }
 }
@@ -4916,12 +4871,7 @@ fn run_domain_row(game: &Game, bonuses: (i16, i16), current: u32) -> DomainRow {
     row
 }
 
-fn push_actor_domains(
-    game: &Game,
-    content: &Content,
-    encoding: &CardEncoding,
-    domains: &mut [Vec<DomainRow>; 16],
-) {
+fn push_actor_domains(game: &Game, content: &Content, domains: &mut [Vec<DomainRow>; 16]) {
     let Some(combat) = game.combat() else { return };
     let mut actor = |owner: u32, kind: u32, creature: &Creature, enemy: Option<&Enemy>| {
         let mut row = DomainRow::new(ACTOR_DOMAIN, STATE_SCOPE);
@@ -5020,41 +4970,6 @@ fn push_actor_domains(
             false,
             &enemy.creature.powers,
         );
-        if enemy.stunned {
-            push_status_domain(&mut domains[STATUS_DOMAIN], owner, 7, 0, &[]);
-        }
-        if enemy.value != 0 {
-            push_status_domain(
-                &mut domains[STATUS_DOMAIN],
-                owner,
-                8,
-                0,
-                &[enemy.value as i32],
-            );
-        }
-        if let Some(&hits) = combat.hits.get(index)
-            && hits != 0
-        {
-            push_status_domain(&mut domains[STATUS_DOMAIN], owner, 9, 0, &[hits as i32]);
-        }
-        if enemy.repeats != 0 {
-            push_status_domain(
-                &mut domains[STATUS_DOMAIN],
-                owner,
-                10,
-                0,
-                &[enemy.repeats as i32],
-            );
-        }
-        if content.enemies[enemy.creature.id as usize].id == "MONSTER.WRIGGLER" {
-            push_status_domain(
-                &mut domains[STATUS_DOMAIN],
-                owner,
-                11,
-                0,
-                &[((index % 2) + 1) as i32],
-            );
-        }
         for (order, &movement) in enemy.move_history.iter().enumerate() {
             let mut row = DomainRow::new(HISTORY_DOMAIN, STATE_SCOPE);
             row.u[..5].copy_from_slice(&[
@@ -5105,28 +5020,6 @@ fn push_actor_domains(
     if game.damage_taken {
         push_status_domain(&mut domains[STATUS_DOMAIN], 1, 0, 0, &[]);
     }
-    for (order, &(card, count)) in combat.nightmares.iter().enumerate() {
-        domains[STATUS_DOMAIN].push(card_status_domain_row(
-            game,
-            content,
-            encoding,
-            1,
-            order,
-            card,
-            count as i32,
-        ));
-    }
-    if let Some(card) = combat.history_course {
-        domains[STATUS_DOMAIN].push(card_status_domain_row(
-            game,
-            content,
-            encoding,
-            HISTORY_COURSE_STATUS,
-            0,
-            card,
-            1,
-        ));
-    }
     for (order, &(turns, amount)) in combat.bombs.iter().enumerate() {
         push_status_domain(
             &mut domains[STATUS_DOMAIN],
@@ -5157,53 +5050,6 @@ fn push_actor_domains(
     for (order, &amount) in combat.boulders.iter().enumerate() {
         push_status_domain(&mut domains[STATUS_DOMAIN], 1, 5, order, &[amount as i32]);
     }
-}
-
-fn card_status_domain_row(
-    game: &Game,
-    content: &Content,
-    encoding: &CardEncoding,
-    kind: u32,
-    order: usize,
-    card: Card,
-    count: i32,
-) -> DomainRow {
-    let def = content.cards[card.id as usize];
-    let combat = game.combat().unwrap();
-    let (master, dampened) =
-        card_relation(card, &game.run.deck, &encoding.masters, &combat.dampened);
-    let mut row = DomainRow::new(STATUS_DOMAIN, STATE_SCOPE);
-    row.u.copy_from_slice(&[
-        1,
-        kind,
-        order as u32 + 1,
-        card.id as u32,
-        card.upgrades as u32,
-        card.flags as u32,
-        card.turn_flags as u32,
-        card.replays as u32,
-        card.free as u32,
-        card.cost_override.is_some() as u32,
-        card.enchantment.map_or(0, |value| value as u32 + 1),
-        card.variant as u32,
-        card.card_type(def) as u32,
-        def.rarity as u32,
-        target_index(card.target(def)),
-        card.flags(def) as u32,
-        def.tags as u32,
-        master as u32,
-        dampened as u32,
-        0,
-    ]);
-    row.s[..6].copy_from_slice(&[
-        count,
-        card.cost_delta as i32,
-        card.value as i32,
-        card.cost_override.unwrap_or_default() as i32,
-        card.enchantment_amount as i32,
-        card.enchantment_value as i32,
-    ]);
-    row
 }
 
 fn push_power_domains(
@@ -5634,11 +5480,17 @@ fn op_payload(op: CardOp) -> (u32, u32, u32, i32) {
     }
 }
 
+enum Payload {
+    Card(Card),
+    Relic(Id),
+    Potion(Id),
+}
+
 struct ContinuationBuilder {
     rows: Vec<DomainRow>,
     next: u32,
     scope: i32,
-    card_relations: HashMap<u32, (u32, u32)>,
+    payloads: Vec<(usize, Payload)>,
 }
 
 impl ContinuationBuilder {
@@ -5647,29 +5499,54 @@ impl ContinuationBuilder {
             rows: Vec::new(),
             next: 0,
             scope,
-            card_relations: HashMap::new(),
+            payloads: Vec::new(),
         }
     }
 
-    fn for_game(game: &Game, scope: i32) -> Self {
-        let masters = master_cards(&game.run.deck);
-        let dampened = game
-            .combat()
-            .map_or(&[][..], |combat| combat.dampened.as_slice());
-        let card_relations = game
-            .run
-            .deck
-            .iter()
-            .filter(|card| card.instance != 0)
-            .map(|&card| {
-                let (master, upgrades) = card_relation(card, &game.run.deck, &masters, dampened);
-                (card.instance, (master as u32, upgrades as u32))
-            })
-            .collect();
-        Self {
-            card_relations,
-            ..Self::new(scope)
+    fn push(
+        self,
+        domains: &mut [Vec<DomainRow>; 16],
+        game: &Game,
+        content: &Content,
+        encoding: &mut CardEncoding,
+    ) {
+        for (owner, payload) in self.payloads {
+            let scope = if self.scope == STATE_SCOPE {
+                -3 - self.rows[owner].u[2] as i32
+            } else {
+                self.scope
+            };
+            match payload {
+                Payload::Card(card) => domains[CARD_DOMAIN].push(card_domain_row(
+                    game,
+                    content,
+                    encoding,
+                    scope,
+                    CONTINUATION_CARD_ZONE,
+                    0,
+                    0,
+                    0,
+                    card,
+                    0,
+                )),
+                Payload::Relic(id) => {
+                    let mut row = DomainRow::new(RELIC_DOMAIN, scope);
+                    row.u[..4].copy_from_slice(&[
+                        CONTINUATION_RELIC_ZONE,
+                        id as u32,
+                        0,
+                        crate::game::relic_group(id).unwrap_or(4) as u32,
+                    ]);
+                    domains[RELIC_DOMAIN].push(row);
+                }
+                Payload::Potion(id) => {
+                    let mut row = DomainRow::new(POTION_DOMAIN, scope);
+                    row.u[..5].copy_from_slice(&[CONTINUATION_POTION_ZONE, 0, id as u32 + 1, 0, 0]);
+                    domains[POTION_DOMAIN].push(row);
+                }
+            }
         }
+        domains[CONTINUATION_DOMAIN].extend(self.rows);
     }
 
     fn row(
@@ -6039,7 +5916,7 @@ impl ContinuationBuilder {
                     self.effect(child, frame, 1, path + 1, 0, order as u32, evaluation);
                 }
             }
-            Effect::AutoPlay(card) => self.card(card, frame, path + 1, 0),
+            Effect::AutoPlay(card) => self.card(card, index),
             Effect::Select(pile, filter, values, first, second, op) => {
                 let (filter, arg, signed) = filter_payload(filter);
                 let (op, op_arg, op_arg2, op_signed) = op_payload(op);
@@ -6063,35 +5940,8 @@ impl ContinuationBuilder {
         }
     }
 
-    fn card(&mut self, card: Card, parent: u32, path: u32, order: u32) {
-        let relation = self
-            .card_relations
-            .get(&card.instance)
-            .copied()
-            .unwrap_or_default();
-        let index = self.row(5, 0, parent, 0, path, 0, order, 0);
-        let row = &mut self.rows[index];
-        row.u[11..23].copy_from_slice(&[
-            card.id as u32,
-            card.upgrades as u32,
-            card.flags as u32,
-            card.turn_flags as u32,
-            card.replays as u32,
-            card.free as u32,
-            card.cost_override.is_some() as u32,
-            card.enchantment.map_or(0, |value| value as u32 + 1),
-            card.variant as u32,
-            relation.0,
-            relation.1,
-            0,
-        ]);
-        row.s[..5].copy_from_slice(&[
-            card.cost_delta as i32,
-            card.value as i32,
-            card.cost_override.unwrap_or_default() as i32,
-            card.enchantment_amount as i32,
-            card.enchantment_value as i32,
-        ]);
+    fn card(&mut self, card: Card, owner: usize) {
+        self.payloads.push((owner, Payload::Card(card)));
     }
 
     fn card_reward(&mut self, reward: CardReward, parent: u32, path: u32, order: u32) {
@@ -6179,15 +6029,21 @@ impl ContinuationBuilder {
             }
             RunEffect::RandomPotionReward(flag) => row.u[11] = flag as u32,
             RunEffect::RandomCard(values) => {
-                for (order, name) in values.iter().enumerate() {
-                    let child = self.row(8, 0, frame, 1, path + 1, 0, order as u32, 0);
-                    self.rows[child].u[11] = card_id(name);
+                for name in values {
+                    let id = card_id(name) as Id;
+                    self.card(
+                        Card {
+                            id,
+                            ..Card::default()
+                        },
+                        index,
+                    );
                 }
             }
             RunEffect::RandomRelic(values) => {
-                for (order, name) in values.iter().enumerate() {
-                    let child = self.row(8, 1, frame, 1, path + 1, 0, order as u32, 0);
-                    self.rows[child].u[11] = relic_id(name);
+                for name in values {
+                    self.payloads
+                        .push((index, Payload::Relic(relic_id(name) as Id)));
                 }
             }
             RunEffect::RemoveCards(count, tag) => {
@@ -6287,38 +6143,36 @@ impl ContinuationBuilder {
         match phase {
             Phase::Rewards(rewards) => {
                 self.rows[index].s[..2].copy_from_slice(&[rewards.gold, rewards.removals as i32]);
-                let mut order = 0;
                 for &card in &rewards.cards {
-                    self.card(card, frame, 2, order);
-                    order += 1;
+                    self.card(card, index);
                 }
-                for reward in &rewards.card_rewards {
-                    self.card_reward(*reward, frame, 2, order);
-                    order += 1;
+                for (order, reward) in rewards.card_rewards.iter().enumerate() {
+                    self.card_reward(*reward, frame, 2, order as u32);
                 }
                 for &id in &rewards.relics {
-                    let child = self.row(8, 3, frame, 1, 2, 0, order, 0);
-                    self.rows[child].u[11] = id as u32;
-                    order += 1;
+                    self.payloads.push((index, Payload::Relic(id)));
                 }
                 for &id in &rewards.potions {
-                    let child = self.row(8, 4, frame, 1, 2, 0, order, 0);
-                    self.rows[child].u[11] = id as u32;
-                    order += 1;
+                    self.payloads.push((index, Payload::Potion(id)));
                 }
             }
             Phase::Shop(items) => {
                 for (order, item) in items.iter().enumerate() {
                     match item {
                         ShopItem::Card(card, price) => {
-                            self.card(*card, frame, 2, order as u32);
-                            self.rows.last_mut().unwrap().s[5] = *price;
-                        }
-                        ShopItem::Relic(id, price) | ShopItem::Potion(id, price) => {
-                            let variant = matches!(item, ShopItem::Potion(..)) as u32 + 5;
-                            let child = self.row(8, variant, frame, 1, 2, 0, order as u32, 0);
-                            self.rows[child].u[11] = *id as u32;
+                            let child = self.row(8, 8, frame, 1, 2, 0, order as u32, 0);
                             self.rows[child].s[0] = *price;
+                            self.card(*card, child);
+                        }
+                        ShopItem::Relic(id, price) => {
+                            let child = self.row(8, 5, frame, 1, 2, 0, order as u32, 0);
+                            self.rows[child].s[0] = *price;
+                            self.payloads.push((child, Payload::Relic(*id)));
+                        }
+                        ShopItem::Potion(id, price) => {
+                            let child = self.row(8, 6, frame, 1, 2, 0, order as u32, 0);
+                            self.rows[child].s[0] = *price;
+                            self.payloads.push((child, Payload::Potion(*id)));
                         }
                         ShopItem::Remove(price) => {
                             let child = self.row(8, 7, frame, 1, 2, 0, order as u32, 0);
@@ -6361,17 +6215,13 @@ impl ContinuationBuilder {
             }
             Phase::ChooseCards(cards, count, optional) => {
                 self.rows[index].u[11..13].copy_from_slice(&[*count as u32, *optional as u32]);
-                for (order, &card) in cards.iter().enumerate() {
-                    self.card(card, frame, 2, order as u32);
+                for &card in cards {
+                    self.card(card, index);
                 }
             }
             Phase::ChooseBundles(bundles) => {
-                for (bundle, cards) in bundles.iter().enumerate() {
-                    for (order, &card) in cards.iter().enumerate() {
-                        let before = self.rows.len();
-                        self.card(card, frame, 2, order as u32);
-                        self.rows[before].u[7] = bundle as u32;
-                    }
+                for &card in bundles.iter().flatten() {
+                    self.card(card, index);
                 }
             }
             Phase::Map | Phase::Rest | Phase::Won | Phase::Dead => {}
@@ -6436,16 +6286,26 @@ fn normalized_effect(
     }
 }
 
-fn phase_continuation_domains(game: &Game, content: &Content) -> Vec<DomainRow> {
-    let mut out = ContinuationBuilder::for_game(game, PHASE_SCOPE);
+fn phase_continuation_domains(
+    game: &Game,
+    content: &Content,
+    domains: &mut [Vec<DomainRow>; 16],
+    encoding: &mut CardEncoding,
+) {
+    let mut out = ContinuationBuilder::new(PHASE_SCOPE);
     if let Some(phase) = &game.resume {
         out.resume_phase(phase, content, NO_NODE);
     }
-    out.rows
+    out.push(domains, game, content, encoding);
 }
 
-fn continuation_domains(game: &Game, content: &Content) -> Vec<DomainRow> {
-    let mut out = ContinuationBuilder::for_game(game, STATE_SCOPE);
+fn continuation_domains(
+    game: &Game,
+    content: &Content,
+    domains: &mut [Vec<DomainRow>; 16],
+    encoding: &mut CardEncoding,
+) {
+    let mut out = ContinuationBuilder::new(STATE_SCOPE);
     let mut order = 0;
     for &effect in game.run_queue.iter().rev() {
         let before = out.rows.len();
@@ -6469,9 +6329,9 @@ fn continuation_domains(game: &Game, content: &Content) -> Vec<DomainRow> {
             let before = out.rows.len();
             let item = out.row(3, 0, NO_NODE, 0, 0, 0, order, 1);
             out.rows[item].u[11] = play.plays as u32;
-            out.card(play.card, out.rows[item].u[2], 0, 0);
+            out.card(play.card, item);
             if combat.unsettling_lamp == Some(play.card.id) {
-                out.rows.last_mut().unwrap().u[23] = 1;
+                out.rows[item].u[23] = 1;
             }
             let frame = out.rows[before].u[2];
             group_continuation_item(&mut out.rows[before..], frame, order);
@@ -6485,9 +6345,9 @@ fn continuation_domains(game: &Game, content: &Content) -> Vec<DomainRow> {
                 combat.card_stars.max(0) as u32,
                 combat.card_plays as u32,
             ]);
-            out.card(card, out.rows[item].u[2], 1, 0);
+            out.card(card, item);
             if combat.unsettling_lamp == Some(card.id) {
-                out.rows.last_mut().unwrap().u[23] = 1;
+                out.rows[item].u[23] = 1;
             }
             let frame = out.rows[before].u[2];
             group_continuation_item(&mut out.rows[before..], frame, order);
@@ -6516,14 +6376,19 @@ fn continuation_domains(game: &Game, content: &Content) -> Vec<DomainRow> {
         let before = out.rows.len();
         match item {
             ShopItem::Card(card, price) => {
-                out.card(*card, NO_NODE, 0, order);
-                out.rows[before].s[5] = *price;
-            }
-            ShopItem::Relic(id, price) | ShopItem::Potion(id, price) => {
-                let variant = 5 + matches!(item, ShopItem::Potion(..)) as u32;
-                let row = out.row(8, variant, NO_NODE, 0, 0, 0, order, 0);
-                out.rows[row].u[11] = *id as u32;
+                let row = out.row(8, 8, NO_NODE, 0, 0, 0, order, 0);
                 out.rows[row].s[0] = *price;
+                out.card(*card, row);
+            }
+            ShopItem::Relic(id, price) => {
+                let row = out.row(8, 5, NO_NODE, 0, 0, 0, order, 0);
+                out.rows[row].s[0] = *price;
+                out.payloads.push((row, Payload::Relic(*id)));
+            }
+            ShopItem::Potion(id, price) => {
+                let row = out.row(8, 6, NO_NODE, 0, 0, 0, order, 0);
+                out.rows[row].s[0] = *price;
+                out.payloads.push((row, Payload::Potion(*id)));
             }
             ShopItem::Remove(price) => {
                 let row = out.row(8, 7, NO_NODE, 0, 0, 0, order, 0);
@@ -6534,7 +6399,7 @@ fn continuation_domains(game: &Game, content: &Content) -> Vec<DomainRow> {
         group_continuation_item(&mut out.rows[before..], frame, order);
         order += 1;
     }
-    out.rows
+    out.push(domains, game, content, encoding);
 }
 
 fn candidate_card(
@@ -6734,10 +6599,10 @@ fn candidate_domain_rows(
                         domains[POTION_DOMAIN].push(row);
                     }
                     ShopItem::Remove(price) => {
-                        let mut continuation = ContinuationBuilder::for_game(game, scope);
+                        let mut continuation = ContinuationBuilder::new(scope);
                         let item = continuation.row(8, 7, NO_NODE, 0, 0, 0, 0, 0);
                         continuation.rows[item].s[0] = *price;
-                        domains[CONTINUATION_DOMAIN].extend(continuation.rows);
+                        continuation.push(domains, game, content, encoding);
                     }
                     ShopItem::Card(..) => {}
                 }
@@ -6756,9 +6621,9 @@ fn candidate_domain_rows(
                 event.s[0] = payload.unwrap_or_default();
                 domains[EVENT_DOMAIN].push(event);
                 if let Some(option) = options.get(*index) {
-                    let mut continuation = ContinuationBuilder::for_game(game, scope);
+                    let mut continuation = ContinuationBuilder::new(scope);
                     continuation.option(*option, content, NO_NODE, 0, *index as u32);
-                    domains[CONTINUATION_DOMAIN].extend(continuation.rows);
+                    continuation.push(domains, game, content, encoding);
                 }
                 if let Some(id) = ancient_offer(game, content, *index) {
                     let mut row = DomainRow::new(RELIC_DOMAIN, scope);
@@ -6830,7 +6695,7 @@ fn candidate_domain_rows(
         }
         Action::RerollCards => {
             if let Phase::Rewards(rewards) = &game.phase {
-                let mut continuation = ContinuationBuilder::for_game(game, scope);
+                let mut continuation = ContinuationBuilder::new(scope);
                 for (order, reward) in rewards.card_rewards.iter().enumerate() {
                     let frame = continuation.row(8, 2, NO_NODE, 0, 0, 0, order as u32, 0);
                     match reward {
@@ -6852,7 +6717,7 @@ fn candidate_domain_rows(
                         }
                     }
                 }
-                domains[CONTINUATION_DOMAIN].extend(continuation.rows);
+                continuation.push(domains, game, content, encoding);
             }
         }
         _ => {}
@@ -7224,10 +7089,10 @@ fn build_observation_with_candidates(
     }
     let mut card_encoding = CardEncoding::new(game, content);
     state_card_domains(game, content, &mut card_encoding, &mut domains);
-    push_actor_domains(game, content, &card_encoding, &mut domains);
+    push_actor_domains(game, content, &mut domains);
     push_collection_domains(game, content, layout, &mut domains);
-    domains[CONTINUATION_DOMAIN] = continuation_domains(game, content);
-    domains[CONTINUATION_DOMAIN].extend(phase_continuation_domains(game, content));
+    continuation_domains(game, content, &mut domains, &mut card_encoding);
+    phase_continuation_domains(game, content, &mut domains, &mut card_encoding);
     assert!(!actions.is_empty() || matches!(game.phase, Phase::Won | Phase::Dead));
     let candidates = actions
         .iter()
@@ -7494,11 +7359,14 @@ fn run_features(game: &Game, content: &Content) -> Vec<f32> {
             .filter(|card| content.cards[card.id as usize].rarity == CardRarity::Rare)
             .count() as f32,
     ];
-    [canonical_progress(game) as f32 / (TERMINAL_CATEGORIES - 1) as f32, hp]
-        .into_iter()
-        .chain(resources)
-        .chain(resources.map(|resource| hp * resource))
-        .collect()
+    [
+        canonical_progress(game) as f32 / (TERMINAL_CATEGORIES - 1) as f32,
+        hp,
+    ]
+    .into_iter()
+    .chain(resources)
+    .chain(resources.map(|resource| hp * resource))
+    .collect()
 }
 
 struct ContentHasher(u64);
