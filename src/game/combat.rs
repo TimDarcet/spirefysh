@@ -1611,6 +1611,16 @@ impl Game {
                 return;
             }
         }
+        if let Some(power) = self
+            .combat_mut()
+            .unwrap()
+            .player
+            .powers
+            .iter_mut()
+            .find(|power| power.id == power_id::HELLRAISER)
+        {
+            power.value = 0;
+        }
         for enemy in &mut self.combat_mut().unwrap().enemies {
             enemy
                 .creature
@@ -2476,8 +2486,32 @@ impl Game {
         }
         card.turn_flags |= draw_flags;
         let combat = self.combat_mut().unwrap();
-        let hellraiser = combat.player.power(power_id::HELLRAISER) > 0
+        let mut hellraiser = combat.player.power(power_id::HELLRAISER) > 0
             && content.cards[card.id as usize].tags & STRIKE_TAG != 0;
+        if hellraiser {
+            let infinite = combat
+                .enemies
+                .iter()
+                .filter(|enemy| enemy.creature.hp > 0)
+                .all(|enemy| {
+                    enemy.creature.max_hp == i16::MAX
+                        || enemy.creature.powers.iter().any(|power| {
+                            power.id == power_id::HARDENED_SHELL && power.value >= power.amount
+                        })
+                });
+            let power = combat
+                .player
+                .powers
+                .iter_mut()
+                .find(|power| power.id == power_id::HELLRAISER)
+                .unwrap();
+            if infinite {
+                hellraiser = power.value < 9;
+                power.value = power.value.saturating_add(1);
+            } else {
+                power.value = 0;
+            }
+        }
         if !hellraiser {
             combat.hand.push(card);
         }
@@ -3193,9 +3227,13 @@ impl Game {
             }
             Effect::DrawUntilNot(kind) => {
                 let base = self.combat().unwrap().queue.len();
-                if self
-                    .draw(content, 1, pending.context, false, 0)
-                    .is_some_and(|card| content.cards[card.id as usize].card_type == kind)
+                let defeated = self.combat().unwrap().enemies.iter().all(|enemy| {
+                    enemy.creature.hp <= 0 || enemy.creature.power(power_id::MINION) > 0
+                });
+                if !defeated
+                    && self
+                        .draw(content, 1, pending.context, false, 0)
+                        .is_some_and(|card| content.cards[card.id as usize].card_type == kind)
                 {
                     self.combat_mut().unwrap().queue.insert(
                         base,
@@ -7436,6 +7474,7 @@ impl Game {
             }
             false
         } else if flags & RETURN_TO_DRAW != 0 {
+            card.flags &= !RETURN_TO_DRAW;
             combat.push_draw(card);
             false
         } else if flags & EXHAUST != 0 || corruption {
@@ -7691,12 +7730,12 @@ impl Game {
     fn return_bolas(&mut self, content: &Content) {
         let id = content.card_id("CARD.BOLAS").unwrap();
         let mut returned = Vec::new();
-        let combat = self.combat_mut().unwrap();
-        for pile in [&mut combat.draw, &mut combat.discard, &mut combat.exhaust] {
+        for pile in [Pile::Draw, Pile::Discard, Pile::Exhaust] {
             let mut index = 0;
-            while index < pile.len() {
-                if pile[index].id == id && pile[index].value > 0 {
-                    returned.push(pile.remove(index));
+            while index < cards(self.combat().unwrap(), pile).len() {
+                let card = cards(self.combat().unwrap(), pile)[index];
+                if card.id == id && card.value > 0 {
+                    returned.push(self.remove_pile(pile, index));
                 } else {
                     index += 1;
                 }

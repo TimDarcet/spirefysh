@@ -173,6 +173,189 @@ fn i_am_invincible_waits_for_end_turn() {
 }
 
 #[test]
+fn nostalgia_returns_i_am_invincible_to_draw_only_once() {
+    let content = foundation_content();
+    let mut game = Game::new_character_ascension(&content, 1, 3, 0).unwrap();
+    game.begin_act(&content, 0).unwrap();
+    game.start_combat(&content, content.acts[0].encounters[0])
+        .unwrap();
+    let combat = game.combat_mut().unwrap();
+    combat.hand = vec![Card {
+        id: card_id::I_AM_INVINCIBLE,
+        ..Card::default()
+    }];
+    combat.draw.clear();
+    combat.forget_draw_order();
+    combat.energy = 3;
+    combat.enemies[0].creature.hp = 100;
+    combat.player.add_power(power_id::NOSTALGIA, 1);
+
+    game.step(
+        &content,
+        Action::Play {
+            hand: 0,
+            target: None,
+        },
+    )
+    .unwrap();
+    let top = *game.combat().unwrap().draw.last().unwrap();
+    assert_eq!(top.id, card_id::I_AM_INVINCIBLE);
+    assert_eq!(top.flags & RETURN_TO_DRAW, 0);
+
+    game.step(&content, Action::EndTurn).unwrap();
+}
+
+#[test]
+fn pillage_with_hellraiser_stops_drawing_once_enemies_are_dead() {
+    let content = foundation_content();
+    let ironclad = content
+        .characters
+        .iter()
+        .position(|character| character.id == "CHARACTER.IRONCLAD")
+        .unwrap() as Id;
+    let mut game = Game::new_character_ascension(&content, 1, ironclad, 0).unwrap();
+    game.begin_act(&content, 0).unwrap();
+    game.start_combat(&content, content.acts[0].encounters[0])
+        .unwrap();
+    let card = |name| Card {
+        id: content.card_id(name).unwrap(),
+        ..Card::default()
+    };
+    let combat = game.combat_mut().unwrap();
+    combat.choice = None;
+    combat.hand = vec![card("CARD.PILLAGE")];
+    combat.draw.clear();
+    combat.discard = vec![card("CARD.STRIKE_IRONCLAD"), card("CARD.STRIKE_IRONCLAD")];
+    combat.forget_draw_order();
+    combat.energy = 3;
+    for enemy in &mut combat.enemies {
+        enemy.creature.hp = 40;
+        enemy.creature.block = 0;
+    }
+    combat.player.add_power(power_id::HELLRAISER, 1);
+    let pillage = Action::Play {
+        hand: 0,
+        target: Some(0),
+    };
+
+    game.expected_action_outcome(&content, &pillage);
+    game.step(&content, pillage).unwrap();
+
+    assert!(
+        game.combat()
+            .is_none_or(|combat| combat.enemies.iter().all(|enemy| enemy.creature.hp <= 0))
+    );
+}
+
+#[test]
+fn hellraiser_caps_auto_plays_against_a_hardened_shell() {
+    let content = foundation_content();
+    let ironclad = content
+        .characters
+        .iter()
+        .position(|character| character.id == "CHARACTER.IRONCLAD")
+        .unwrap() as Id;
+    let colony = content
+        .encounters()
+        .iter()
+        .position(|encounter| encounter.id == "ENCOUNTER.SKULKING_COLONY_ELITE")
+        .unwrap() as Id;
+    let mut game = Game::new_character_ascension(&content, 1, ironclad, 0).unwrap();
+    game.begin_act(&content, 0).unwrap();
+    game.start_combat(&content, colony).unwrap();
+    let strike = Card {
+        id: content.card_id("CARD.STRIKE_IRONCLAD").unwrap(),
+        ..Card::default()
+    };
+    let combat = game.combat_mut().unwrap();
+    combat.choice = None;
+    combat.hand = vec![Card {
+        id: content.card_id("CARD.PILLAGE").unwrap(),
+        ..Card::default()
+    }];
+    combat.draw.clear();
+    combat.discard = vec![strike, strike];
+    combat.forget_draw_order();
+    combat.energy = 3;
+    combat.player.add_power(power_id::HELLRAISER, 1);
+    let pillage = Action::Play {
+        hand: 0,
+        target: Some(0),
+    };
+
+    let hp = combat.enemies[0].creature.hp;
+
+    game.expected_action_outcome(&content, &pillage);
+    game.step(&content, pillage).unwrap();
+
+    let combat = game.combat().unwrap();
+    assert_eq!(combat.enemies[0].creature.hp, hp - 20);
+    assert_eq!(combat.player.power(power_id::HELLRAISER), 1);
+    assert!(combat.hand.iter().all(|card| card.id == strike.id));
+}
+
+#[test]
+fn returning_bolas_from_a_known_draw_pile_keeps_known_counts() {
+    let content = foundation_content();
+    let mut game = Game::new_character_ascension(&content, 1, 3, 0).unwrap();
+    game.begin_act(&content, 0).unwrap();
+    game.start_combat(&content, content.acts[0].encounters[0])
+        .unwrap();
+    let bolas = content.card_id("CARD.BOLAS").unwrap();
+    let cosmic = content.card_id("CARD.COSMIC_INDIFFERENCE").unwrap();
+    let combat = game.combat_mut().unwrap();
+    combat.choice = None;
+    combat.hand = [bolas, cosmic, cosmic]
+        .map(|id| Card {
+            id,
+            ..Card::default()
+        })
+        .to_vec();
+    combat.draw.clear();
+    combat.discard.clear();
+    combat.forget_draw_order();
+    combat.energy = 10;
+    combat.enemies[0].creature.hp = 100;
+    combat.enemies[0].creature.max_hp = 100;
+
+    game.step(
+        &content,
+        Action::Play {
+            hand: 0,
+            target: Some(0),
+        },
+    )
+    .unwrap();
+    game.step(
+        &content,
+        Action::Play {
+            hand: 0,
+            target: None,
+        },
+    )
+    .unwrap();
+    game.step(
+        &content,
+        Action::Play {
+            hand: 0,
+            target: None,
+        },
+    )
+    .unwrap();
+    let combat = game.combat().unwrap();
+    assert_eq!(
+        combat.draw.iter().map(|card| card.id).collect::<Vec<_>>(),
+        [bolas, cosmic]
+    );
+    assert_eq!(combat.known_draw_top, 2);
+
+    game.step(&content, Action::EndTurn).unwrap();
+    let combat = game.combat().unwrap();
+    assert!(combat.known_draw_bottom + combat.known_draw_top <= combat.draw.len());
+    assert!(combat.hand.iter().any(|card| card.id == bolas));
+}
+
+#[test]
 fn uproar_auto_plays_a_draw_pile_attack() {
     let content = foundation_content();
     let mut game = Game::new_character_ascension(&content, 1, 1, 0).unwrap();
