@@ -1126,11 +1126,12 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 "last_packet_policy_revision": sampler_versions[worker],
                 "diagnostic": sampler_diagnostic(diagnostics, worker, collector_args.envs),
             }, "WARNING")
-            if (sampler_restarts[worker] >= args.sampler_restarts or stop.is_set()
-                    or time.monotonic() >= deadline or decisions >= budget):
+            if stop.is_set() or time.monotonic() >= deadline or decisions >= budget:
                 sampler_exhausted[worker] = True
                 watchdog_pending[worker] = False
                 continue
+            if sampler_restarts[worker] >= args.sampler_restarts:
+                raise RuntimeError(f"sampler {worker} exhausted {args.sampler_restarts} restarts")
             sampler_restarts[worker] += 1
             sampler_generations[worker] += 1
             while True:
