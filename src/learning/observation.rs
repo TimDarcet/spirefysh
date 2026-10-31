@@ -4084,6 +4084,7 @@ fn effect_index(effect: &Effect) -> usize {
         | Effect::PlacePlayed(..)
         | Effect::CheckEmptyHand
         | Effect::SideTurnStart
+        | Effect::TickPoison
         | Effect::MummifiedHand
         | Effect::Rampart
         | Effect::ReturnLate(..) => 80,
@@ -5710,6 +5711,7 @@ impl ContinuationBuilder {
             | Effect::PlacePlayed(..)
             | Effect::CheckEmptyHand
             | Effect::SideTurnStart
+            | Effect::TickPoison
             | Effect::MummifiedHand
             | Effect::ReturnLate(..)
             | Effect::PassiveAll

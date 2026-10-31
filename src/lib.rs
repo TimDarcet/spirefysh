@@ -415,6 +415,8 @@ pub enum Effect {
     CheckEmptyHand,
     /// AfterSideTurnStart bookkeeping: Pael's Legion cools down, Letter Opener's count resets.
     SideTurnStart,
+    /// The player's Poison ticks (AfterSideTurnStart, in power order).
+    TickPoison,
     /// Mummified Hand frees a random hand card (AfterCardPlayed, in relic order).
     MummifiedHand,
     ReturnLate(bool, i16),
@@ -1473,6 +1475,7 @@ impl Content {
             | Effect::BoulderTick
             | Effect::CheckEmptyHand
             | Effect::SideTurnStart
+            | Effect::TickPoison
             | Effect::MummifiedHand
             | Effect::ReturnLate(..)
             | Effect::WhisperingEarring(_)
@@ -1947,7 +1950,7 @@ struct Choice {
     optional: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Run {
     pub ascension: u8,
     pub character: Id,
@@ -2049,7 +2052,7 @@ struct DamageResult {
     dealt: i16,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct Rng([u64; 4], u64);
 
 impl Rng {

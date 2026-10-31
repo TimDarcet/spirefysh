@@ -358,12 +358,6 @@ impl Game {
             target_instance: target.map(|slot| combat.enemies[slot].instance),
         };
         let fan_shiv = def.id == "CARD.SHIV" && combat.player.power(power_id::FAN_OF_KNIVES) > 0;
-        if card.enchantment == Some(Enchantment::Sown) && card.enchantment_value > 0 {
-            if combat.player.power(power_id::NO_ENERGY_GAIN) == 0 {
-                combat.energy = combat.energy.saturating_add(card.enchantment_amount);
-            }
-            combat.playing.as_mut().unwrap().enchantment_value = 0;
-        }
         if fetch {
             combat.queue.push(Pending {
                 effect: Effect::Draw(1),
@@ -397,6 +391,13 @@ impl Game {
                 effect: Effect::LoseHp(Target::Player, Amount::fixed(2, 2)),
                 context,
             }),
+            Some(Enchantment::Sown) if card.enchantment_value > 0 => {
+                combat.playing.as_mut().unwrap().enchantment_value = 0;
+                combat.queue.push(Pending {
+                    effect: Effect::Energy(card.enchantment_amount as i8),
+                    context,
+                });
+            }
             Some(Enchantment::Swift) if card.enchantment_value > 0 => {
                 combat.playing.as_mut().unwrap().enchantment_value = 0;
                 let draw = card.enchantment_amount.max(0) as u8;
@@ -1042,6 +1043,10 @@ impl Game {
         if combat.turn == 3 {
             combat.max_energy += paels_flesh;
         }
+        // Bread's +1 max energy skips turn 1; its turn-1 loss comes in AfterSideTurnStart.
+        if combat.turn == 2 {
+            combat.max_energy += bread as i16;
+        }
         let clarity = (combat.player.power(power_id::CLARITY) > 0) as u8;
         if clarity > 0 {
             combat.player.consume_power(power_id::CLARITY);
@@ -1116,9 +1121,7 @@ impl Game {
             + fake_happy_flower
             + tea_set
             + art_of_war * (combat.turn > 1 && prior_attacks == 0) as i16
-            + seal_of_gold as i16
-            // Bread's +1 max energy starts on turn 2; its turn-1 loss comes in AfterSideTurnStart.
-            - (bread && combat.turn == 1) as i16;
+            + seal_of_gold as i16;
         combat.last_cards = combat.history.cards;
         combat.hits.fill(0);
         // HP-loss events, ethereal plays (Pull From Below) and generated cards (Supermassive)
@@ -1196,7 +1199,6 @@ impl Game {
         for block in toric_blocks {
             self.gain_block(content, Actor::Player, block, None, false);
         }
-        self.poison(content, Actor::Player);
         // Aggression fetches its attacks BeforeSideTurnStart, ahead of the BeforeHandDraw cards
         // (Infinite Blades).
         if self.creature(Actor::Player).power(121) > 0 {
@@ -1596,6 +1598,7 @@ impl Game {
         for power in &self.creature(Actor::Player).powers {
             let amount = Amount::fixed(power.amount, power.amount);
             match power.id {
+                power_id::POISON if power.amount > 0 => side.push(Effect::TickPoison),
                 power_id::FURNACE if power.amount > 0 => side.push(Effect::Forge(amount)),
                 power_id::NOXIOUS_FUMES if power.amount > 0 => side.push(Effect::ApplyPower(
                     Target::AllEnemies,
@@ -4685,9 +4688,15 @@ impl Game {
                     self.rngs.combat_card_generation.shuffle(&mut pool);
                 }
                 for id in pool.into_iter().take(count as usize) {
+                    // Free cards shuffled into the draw pile (Metamorphosis) stay free all combat.
                     let card = Card {
                         id,
-                        free,
+                        free: free && pile != Pile::Draw,
+                        flags: if free && pile == Pile::Draw {
+                            FREE_COMBAT
+                        } else {
+                            0
+                        },
                         ..Card::default()
                     };
                     // Cards generated into the draw pile land at random positions.
@@ -5589,6 +5598,7 @@ impl Game {
             }
             Effect::CheckEmptyHand => self.unceasing_top(content),
             Effect::MummifiedHand => self.mummified_hand(content),
+            Effect::TickPoison => self.poison(content, Actor::Player),
             Effect::SideTurnStart => {
                 let combat = self.combat_mut().unwrap();
                 combat.paels_legion = combat.paels_legion.saturating_sub(1);
@@ -6672,6 +6682,13 @@ impl Game {
             let expected = self.incoming_damage_amount(content, source, base, kind);
             debug_assert_eq!(amount, expected);
         }
+        // Thorns strikes back in BeforeDamageReceived; the hit still lands.
+        if powered || card.is_some_and(|card| content.cards[card as usize].id == "CARD.OMNISLICE") {
+            let thorns = self.creature(target).kind(content, PowerKind::Thorns);
+            if thorns > 0 {
+                self.damage(content, target, source, thorns, DamageKind::Unpowered, None);
+            }
+        }
         let block_target = if target == Actor::Osty {
             Actor::Player
         } else {
@@ -6935,12 +6952,6 @@ impl Game {
                 );
             }
         }
-        if powered || card.is_some_and(|card| content.cards[card as usize].id == "CARD.OMNISLICE") {
-            let thorns = self.creature(target).kind(content, PowerKind::Thorns);
-            if thorns > 0 {
-                self.damage(content, target, source, thorns, DamageKind::Unpowered, None);
-            }
-        }
         // A killed hive no longer reacts: its powers are gone by AfterDamageReceived.
         if powered && matches!(source, Actor::Player | Actor::Osty) && self.creature(target).hp > 0
         {
@@ -7062,6 +7073,11 @@ impl Game {
             ),
             _ => (0, false, 0, 0),
         };
+        // A Waterfall Giant with Steam Eruption prevents its removal, which most AfterDeath hooks
+        // check (not Gremlin Horn or Crab Rage).
+        let prevented = matches!(actor, Actor::Enemy(_))
+            && self.creature(actor).power(power_id::STEAM_ERUPTION) > 0
+            && content.enemies[self.creature(actor).id as usize].id == "MONSTER.WATERFALL_GIANT";
         // Crab Rage is an enemy AfterDeath hook, after the player's relics (Gremlin Horn).
         let mut enraged = Vec::new();
         if let Actor::Enemy(dead) = actor {
@@ -7081,6 +7097,7 @@ impl Game {
                 .enumerate()
                 .filter(|(index, enemy)| {
                     *index != dead
+                        && !prevented
                         && enemy.creature.hp > 0
                         && enemy.creature.power(power_id::RAVENOUS) > 0
                 })
@@ -7092,11 +7109,8 @@ impl Game {
                     .add_power(power_id::STRENGTH, amount);
                 self.combat_mut().unwrap().enemies[index].stunned = true;
             }
-            let steam = self.creature(actor).power(power_id::STEAM_ERUPTION);
-            if steam > 0
-                && content.enemies[self.combat().unwrap().enemies[dead].creature.id as usize].id
-                    == "MONSTER.WATERFALL_GIANT"
-            {
+            if prevented {
+                let steam = self.creature(actor).power(power_id::STEAM_ERUPTION);
                 // Death strips its other powers; Steam Eruption stays until the About to Blow
                 // move stores it as the blast.
                 let creature = self.creature_mut(actor);
@@ -7111,9 +7125,6 @@ impl Game {
                 enemy.repeats = 1;
                 enemy.move_history.push(7);
                 enemy.value = steam;
-                // AfterDeath still fires with the removal prevented.
-                self.gremlin_horn(content);
-                return;
             }
             enraged = self
                 .combat()
@@ -7195,7 +7206,7 @@ impl Game {
         ] {
             for card in pile
                 .iter_mut()
-                .filter(|card| card.id == card_id::MELANCHOLY)
+                .filter(|card| card.id == card_id::MELANCHOLY && !prevented)
             {
                 card.cost_delta = card.cost_delta.saturating_sub(1);
             }
@@ -7292,7 +7303,9 @@ impl Game {
                     power.id != power_id::CONSTRICT || power.value != index as i16 + 1
                 });
             }
-            self.trigger(content, Trigger::EnemyDied, actor, 0);
+            if !prevented {
+                self.trigger(content, Trigger::EnemyDied, actor, 0);
+            }
             // Its AfterDeath spawns (Stock, Surprise) still see it among the enemies.
             self.corpse_hp = Some(self.creature(actor).max_hp);
             if stock > 0 {
@@ -8363,8 +8376,16 @@ impl Game {
             if self.creature(actor).hp <= 0 || amount <= 0 {
                 break;
             }
+            // The hit's own hooks resolve before the decrement.
+            let base = self.combat().unwrap().queue.len();
             self.damage(content, actor, actor, amount, DamageKind::Unblockable, None);
-            self.resolve(content);
+            while self
+                .combat()
+                .is_some_and(|combat| combat.choice.is_none() && combat.queue.len() > base)
+            {
+                let pending = self.combat_mut().unwrap().queue.pop().unwrap();
+                self.apply(content, pending);
+            }
             if self.creature(actor).hp > 0 && self.creature(actor).power(power.id) > 0 {
                 self.creature_mut(actor).consume_power(power.id);
             }

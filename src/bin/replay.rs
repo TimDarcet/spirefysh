@@ -18,11 +18,17 @@ fn main() -> ExitCode {
         }
     };
     println!(
-        "{} decisions: {} replayed, {} unsupported, {} divergent",
+        "{} decisions: {} replayed, {} unsupported, {} divergent, {} resyncs, {} inferred, {} \
+         guessed, {} fallbacks, {} skipped",
         report.decisions,
         report.replayed,
         report.unsupported,
-        report.divergences.len()
+        report.divergences.len(),
+        report.tallied("resync"),
+        report.tallied("infer"),
+        report.tallied("guess"),
+        report.tallied("fallback"),
+        report.tallied("skip"),
     );
     for divergence in report.divergences.iter().take(limit) {
         println!(
@@ -40,6 +46,11 @@ fn main() -> ExitCode {
     }
     if report.divergences.len() > limit {
         println!("... {} more divergences", report.divergences.len() - limit);
+    }
+    if env::var_os("REPLAY_TALLY").is_some() {
+        for (kind, count) in &report.tally {
+            println!("tally {kind} {count}");
+        }
     }
     if report.divergences.is_empty() && report.unsupported == 0 {
         ExitCode::SUCCESS

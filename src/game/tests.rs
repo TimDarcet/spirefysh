@@ -3298,3 +3298,48 @@ fn hand_trick_picks_the_only_skill_without_asking() {
     assert!(combat.choice.is_none());
     assert_ne!(combat.hand[0].turn_flags & SLY, 0);
 }
+
+#[test]
+fn bread_raises_max_energy_from_turn_two() {
+    let content = foundation_content();
+    let mut game = Game::new_character_ascension(&content, 1, 1, 0).unwrap();
+    game.obtain_relic(&content, content.relic_id("RELIC.BREAD").unwrap());
+    game.begin_act(&content, 0).unwrap();
+    game.start_combat(&content, content.acts[0].encounters[0])
+        .unwrap();
+    let combat = game.combat().unwrap();
+    assert_eq!((combat.max_energy, combat.energy), (3, 1));
+    game.combat_mut().unwrap().player.hp = 999;
+    game.step(&content, Action::EndTurn).unwrap();
+    let combat = game.combat().unwrap();
+    assert_eq!((combat.max_energy, combat.energy), (4, 4));
+}
+
+#[test]
+fn metamorphosis_cards_are_free_all_combat() {
+    let content = foundation_content();
+    let mut game = Game::new_character_ascension(&content, 1, 1, 0).unwrap();
+    game.begin_act(&content, 0).unwrap();
+    game.start_combat(&content, content.acts[0].encounters[0])
+        .unwrap();
+    let combat = game.combat_mut().unwrap();
+    combat.draw.clear();
+    combat.hand = vec![Card {
+        id: content.card_id("CARD.METAMORPHOSIS").unwrap(),
+        ..Card::default()
+    }];
+    game.step(
+        &content,
+        Action::Play {
+            hand: 0,
+            target: None,
+        },
+    )
+    .unwrap();
+    let draw = &game.combat().unwrap().draw;
+    assert_eq!(draw.len(), 3);
+    assert!(
+        draw.iter()
+            .all(|card| card.flags & FREE_COMBAT != 0 && !card.free)
+    );
+}

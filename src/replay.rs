@@ -9,7 +9,8 @@ use serde_json::Value;
 #[cfg(feature = "python")]
 use serde_json::json;
 use std::{
-    collections::HashMap,
+    cell::RefCell,
+    collections::{BTreeMap, HashMap},
     fs::File,
     io::{self, BufRead, BufReader},
     path::Path,
@@ -29,6 +30,36 @@ pub struct ReplayReport {
     pub replayed: usize,
     pub unsupported: usize,
     pub divergences: Vec<Divergence>,
+    /// How often each kind of state was taken from the capture (`resync.`), picked from its
+    /// evidence (`infer.`), guessed without evidence (`guess.`), reconstructed for older captures
+    /// (`fallback.`) or left unchecked (`skip.`).
+    pub tally: BTreeMap<&'static str, usize>,
+}
+
+impl ReplayReport {
+    pub fn tallied(&self, category: &str) -> usize {
+        self.tally
+            .iter()
+            .filter(|(kind, _)| kind.split('.').next() == Some(category))
+            .map(|(_, count)| count)
+            .sum()
+    }
+}
+
+thread_local! {
+    static TALLY: RefCell<BTreeMap<&'static str, usize>> = RefCell::default();
+}
+
+fn tally(kind: &'static str) {
+    TALLY.with(|tally| *tally.borrow_mut().entry(kind).or_default() += 1);
+}
+
+/// Overwrites simulated state with the captured one, tallying `kind` when they differ.
+fn resync<T: PartialEq>(kind: &'static str, slot: &mut T, value: T) {
+    if *slot != value {
+        tally(kind);
+        *slot = value;
+    }
 }
 
 #[derive(Default)]
@@ -566,6 +597,7 @@ fn observe_happy_flower(
 pub fn replay_trace(path: impl AsRef<Path>) -> io::Result<ReplayReport> {
     let content = foundation_content();
     let mut report = ReplayReport::default();
+    TALLY.take();
     let mut history = TurnHistory::default();
     let mut replay_state = ReplayState::default();
     let mut pending: Option<(Value, Vec<Value>, u8)> = None;
@@ -724,6 +756,7 @@ pub fn replay_trace(path: impl AsRef<Path>) -> io::Result<ReplayReport> {
             flower,
         );
     }
+    report.tally = TALLY.take();
     Ok(report)
 }
 
@@ -786,6 +819,7 @@ fn replay_decision(
 ) -> Result<(), Vec<String>> {
     // An event option that started a fight is only recorded once that fight is over.
     if traced_action["kind"] == "event_option" && before["phase"] != "event" {
+        tally("skip.event_fight");
         return Ok(());
     }
     let mut game = match game_from_snapshot(
@@ -827,6 +861,7 @@ fn replay_decision(
                 .iter_mut()
                 .find(|card| card.instance == instance_id(source))
         {
+            tally("fallback.sovereign_blade_bonus");
             card.value = (before_hp - after_hp - 10).max(0) as i16;
         }
     }
@@ -841,8 +876,9 @@ fn replay_decision(
             if let Some(card) = combat
                 .hand
                 .iter_mut()
-                .find(|card| card.instance == instance)
+                .find(|card| card.instance == instance && card.turn_flags & ETHEREAL == 0)
             {
+                tally("fallback.ethereal_exhaust");
                 card.turn_flags |= ETHEREAL;
             }
         }
@@ -908,43 +944,40 @@ fn replay_decision(
             .map(|player| player.remove("legal_actions"));
         player
     };
-    let unchanged_shop =
-        traced_action["kind"] == "shop_purchase" && player_state(before) == player_state(after);
     // A claimed reward can grant nothing (gold under Ectoplasm); stepping would leave the screen.
-    let unchanged_reward = traced_action["kind"] == "take_reward"
-        && before["phase"] == after["phase"]
-        && player_state(before) == player_state(after);
+    let unchanged = match traced_action["kind"].as_str() {
+        Some("shop_purchase") => true,
+        Some("take_reward") => before["phase"] == after["phase"],
+        _ => false,
+    } && player_state(before) == player_state(after);
+    let parasol = (game.run.relics.iter())
+        .position(|&id| content.relics[id as usize].id == "RELIC.LORDS_PARASOL");
     // Lord's Parasol buys the shop asynchronously, after the traced map_node state.
-    let parasol = (traced_action["kind"] == "map_node" && after["phase"] == "shop")
-        .then(|| {
-            game.run
-                .relics
-                .iter()
-                .position(|&id| content.relics[id as usize].id == "RELIC.LORDS_PARASOL")
-        })
-        .flatten()
-        .map(|index| (index, game.run.relics.remove(index)));
+    let bought = parasol
+        .filter(|_| traced_action["kind"] == "map_node" && after["phase"] == "shop")
+        .map(|index| {
+            tally("resync.parasol_purchase");
+            (index, game.run.relics.remove(index))
+        });
     // Its purchases are then traced one by one, free of charge; The Courier's restocks still cost.
     let paid = before["players"][0]["gold"].as_i64() > after["players"][0]["gold"].as_i64();
     if traced_action["kind"] == "shop_purchase"
         && !paid
-        && game
-            .run
-            .relics
-            .iter()
-            .any(|&id| content.relics[id as usize].id == "RELIC.LORDS_PARASOL")
+        && parasol.is_some()
         && let Phase::Shop(items) = &mut game.phase
     {
+        tally("resync.parasol_prices");
         for item in items {
             *price_mut(item) = 0;
         }
     }
-    let stepped = if unchanged_shop || unchanged_reward {
+    let stepped = if unchanged {
+        tally("skip.unchanged_purchase");
         Ok(())
     } else {
         game.step(content, action)
     };
-    if let Some((index, id)) = parasol {
+    if let Some((index, id)) = bought {
         game.run.relics.insert(index, id);
     }
     if let Err(error) = stepped {
@@ -953,22 +986,22 @@ fn replay_decision(
     // A shop pickup's last reward (or skipping the rest) closes its screen and completes the
     // purchase, so The Courier refills the slot; the rebuilt reward screen doesn't know when that
     // is, the trace does.
-    if matches!(
+    let reward_closed = matches!(
         traced_action["kind"].as_str(),
         Some("take_reward" | "skip_rewards")
-    ) && game.courier_restock.is_some()
+    );
+    if reward_closed
+        && game.courier_restock.is_some()
         && array(&after["visible_offers"]).iter().any(|offer| {
             offer["id"]
                 .as_str()
                 .is_some_and(|id| id.starts_with("shop:"))
         })
     {
+        tally("infer.courier_restock");
         game.roll_courier_restock(content);
     }
-    if matches!(
-        traced_action["kind"].as_str(),
-        Some("take_reward" | "skip_rewards")
-    ) {
+    if reward_closed {
         let mut relics = game.run.relics.clone();
         for traced in array(&after["players"][0]["relics"]) {
             let Some(id) = traced["model_id"]
@@ -980,6 +1013,7 @@ fn replay_decision(
             if let Some(index) = relics.iter().position(|&current| current == id) {
                 relics.remove(index);
             } else {
+                tally("resync.reward_relic");
                 game.obtain_relic(content, id);
             }
         }
@@ -995,28 +1029,16 @@ fn replay_decision(
             if let Some(index) = deck.iter().position(|current| current == &key) {
                 deck.remove(index);
             } else {
+                tally("resync.reward_card");
                 game.add_card(content, value);
             }
         }
-        let mut niche = Rng::from_seed(
-            oracle_after["rng_seeds"]["run.Niche"]
-                .as_u64()
-                .unwrap_or_default(),
+        resync(
+            "resync.reward_niche_rng",
+            &mut game.rngs.niche,
+            traced_rng(oracle_after, "run.Niche"),
         );
-        niche.forward(
-            oracle_after["rng_counters"]["run.Niche"]
-                .as_u64()
-                .unwrap_or_default(),
-        );
-        game.rngs.niche = niche;
-        game.run.hp = number(&after["players"][0], "hit_points").unwrap_or_default() as i16;
-        game.run.max_hp = number(&after["players"][0], "max_hit_points").unwrap_or_default() as i16;
-        game.run.gold = number(&after["players"][0], "gold").unwrap_or_default() as i32;
-        sync_deck(content, &mut game, &after["players"][0]["deck"])?;
-        game.run.relics = ids(&content.relics, &after["players"][0]["relics"], |relic| {
-            relic.id
-        })
-        .map_err(|error| vec![error])?;
+        sync_run(content, &mut game, after, "resync.reward_run")?;
     }
     // An event fight runs on inside this decision; its own gold (Seal of Gold) may come after
     // the sync below, which already shows the fight's outcome.
@@ -1033,12 +1055,7 @@ fn replay_decision(
         "IMPROVEMENT",
     ];
     if traced_action["kind"] == "event_option" {
-        game.run.hp =
-            number(&after["players"][0], "hit_points").map_err(|error| vec![error])? as i16;
-        game.run.max_hp =
-            number(&after["players"][0], "max_hit_points").map_err(|error| vec![error])? as i16;
-        game.run.gold = number(&after["players"][0], "gold").map_err(|error| vec![error])? as i32;
-        sync_deck(content, &mut game, &after["players"][0]["deck"])?;
+        sync_run(content, &mut game, after, "resync.event_run")?;
         // Mad Science's rider comes from the chosen option.
         if let Some(rider) = traced_action["id"]
             .as_str()
@@ -1052,22 +1069,31 @@ fn replay_decision(
         {
             card.variant = (rider / 3 + 1) as u8 * 10 + rider as u8 + 1;
         }
-        game.run.relics = ids(&content.relics, &after["players"][0]["relics"], |relic| {
-            relic.id
-        })
-        .map_err(|error| vec![error])?;
     }
-    // An untraced pick from a potion's offer still generates a card (Regalite, ...); the hand
-    // is resynced below, so any offered card will do.
+    // An untraced pick from a potion's offer still generates a card (Regalite, ...): the one new
+    // in the traced hand, else any (the hand is resynced below).
     if traced_action["kind"] == "use_potion"
-        && game.combat().is_some_and(|combat| {
-            combat
-                .choice
-                .is_some_and(|choice| choice.op == CardOp::TakeOffer)
-                && !combat.offer.is_empty()
-        })
+        && let Some(combat) = game.combat()
+        && combat
+            .choice
+            .is_some_and(|choice| choice.op == CardOp::TakeOffer)
+        && !combat.offer.is_empty()
     {
-        game.step(content, Action::Choose(0))
+        let held = array(&before["players"][0]["hand"]);
+        let index = (combat.offer.iter().position(|offered| {
+            array(&after["players"][0]["hand"]).iter().any(|value| {
+                value["model_id"] == content.cards[offered.id as usize].id
+                    && !held
+                        .iter()
+                        .any(|old| old["instance_id"] == value["instance_id"])
+            })
+        }))
+        .inspect(|_| tally("infer.potion_offer"))
+        .unwrap_or_else(|| {
+            tally("guess.potion_offer");
+            0
+        });
+        game.step(content, Action::Choose(index))
             .map_err(|error| vec![format!("potion offer pick rejected: {error:?}")])?;
     }
     // Discard, exhaust, transform, put-on-top and auto-play picks (Gambler's Brew, an auto-played
@@ -1099,7 +1125,9 @@ fn replay_decision(
                         choice.op == CardOp::Move(Pile::Hand) && choice.pile == Pile::Discard
                     })
                 }) && game.step(content, Action::Choose(0)).is_ok()
-                {}
+                {
+                    tally("guess.potion_discard_to_hand");
+                }
                 let Phase::Combat(combat) = &mut game.phase else {
                     break;
                 };
@@ -1116,9 +1144,13 @@ fn replay_decision(
                 && !combat.hand.is_empty()
             {
                 // Nightmare still becomes a power; its card is recovered from next turn's copies.
+                tally("guess.potion_nightmare");
                 game.step(content, Action::Choose(0))
                     .map_err(|error| vec![format!("potion Nightmare pick rejected: {error:?}")])?;
             } else {
+                if combat.choice.is_some() {
+                    tally("skip.potion_choice");
+                }
                 combat.choice = None;
                 game.resolve(content);
             }
@@ -1135,33 +1167,35 @@ fn replay_decision(
         && let Phase::Combat(combat) = &mut game.phase
         && !combat.choice.is_some_and(|choice| inferred(choice.op))
     {
-        combat.hand = hand_cards(content, &after["players"][0]).map_err(|error| vec![error])?;
-        combat.discard =
-            cards(content, &after["players"][0]["discard_pile"]).map_err(|error| vec![error])?;
-        combat.exhaust =
-            cards(content, &after["players"][0]["exhaust_pile"]).map_err(|error| vec![error])?;
-        combat.draw = cards(content, &oracle_after["hidden_draw_order"])
-            .map_err(|error| vec![error])?
-            .into_iter()
-            .rev()
-            .collect();
+        let player = &after["players"][0];
+        let hand = hand_cards(content, player).map_err(|error| vec![error])?;
+        resync_pile("resync.potion_hand", &mut combat.hand, hand);
+        let discard = cards(content, &player["discard_pile"]).map_err(|error| vec![error])?;
+        resync_pile("resync.potion_discard", &mut combat.discard, discard);
+        let exhaust = cards(content, &player["exhaust_pile"]).map_err(|error| vec![error])?;
+        resync_pile("resync.potion_exhaust", &mut combat.exhaust, exhaust);
+        let draw =
+            cards(content, &oracle_after["hidden_draw_order"]).map_err(|error| vec![error])?;
+        resync_pile(
+            "resync.potion_draw",
+            &mut combat.draw,
+            draw.into_iter().rev().collect(),
+        );
         combat.choice = None;
-        let target = oracle_after["rng_counters"]["run.Shuffle"]
-            .as_u64()
-            .unwrap_or(game.rngs.shuffle.1);
-        if target > game.rngs.shuffle.1 {
-            game.rngs.shuffle.forward(target - game.rngs.shuffle.1);
-        }
+        forward_shuffle(&mut game, oracle_after, "resync.potion_shuffle_rng");
     }
-    if traced_action["kind"] == "play_card"
-        && array(&before["players"][0]["hand"]).iter().any(|card| {
-            card["instance_id"] == traced_action["source_id"]
-                && matches!(
-                    card["model_id"].as_str(),
-                    Some("CARD.MURDER" | "CARD.SOVEREIGN_BLADE")
-                )
-        })
-        && let Some(target) = traced_action["target_id"].as_str()
+    // Older captures lack the counts behind Murder's damage and Sown's status.
+    let old_capture = before["players"][0]["cards_drawn_this_combat"].is_null()
+        && traced_action["kind"] == "play_card";
+    let played: Vec<_> = (array(&before["players"][0]["hand"]).iter())
+        .filter(|card| old_capture && card["instance_id"] == traced_action["source_id"])
+        .collect();
+    if (played.iter()).any(|card| {
+        matches!(
+            card["model_id"].as_str(),
+            Some("CARD.MURDER" | "CARD.SOVEREIGN_BLADE")
+        )
+    }) && let Some(target) = traced_action["target_id"].as_str()
         && let Some(expected) = array(&after["combat"]["enemies"])
             .iter()
             .find(|enemy| enemy["instance_id"] == target)
@@ -1171,9 +1205,15 @@ fn replay_decision(
             .iter_mut()
             .find(|enemy| enemy.instance == instance_id(target))
     {
-        enemy.creature.hp = number(expected, "hit_points")
-            .unwrap_or(enemy.creature.hp as i64)
-            .min(i16::MAX as i64) as i16;
+        let hp = number(expected, "hit_points").unwrap_or(enemy.creature.hp as i64);
+        let hp = hp.min(i16::MAX as i64) as i16;
+        resync("fallback.murder_hp", &mut enemy.creature.hp, hp);
+    }
+    if (played.iter()).any(|card| card["enchantment_model_id"] == "ENCHANTMENT.SOWN")
+        && let Phase::Combat(combat) = &mut game.phase
+    {
+        let energy = number(&after["players"][0], "energy").unwrap_or(combat.energy as i64);
+        resync("fallback.sown_energy", &mut combat.energy, energy as i16);
     }
     // A fight already over at the next decision has its piles and enemies cleared, so the
     // simulated combat is kept instead.
@@ -1190,6 +1230,7 @@ fn replay_decision(
             happy_flower,
         )
         .map_err(|error| vec![error])?;
+        tally("resync.event_fight");
         game.phase = expected.phase;
         // The combat comes from the capture, so its turn-1 rolls (untraced Toolbox pick,
         // auto-plays) do too.
@@ -1201,16 +1242,6 @@ fn replay_decision(
         game.rngs.combat_targets = expected.rngs.combat_targets;
         game.rngs.monster_ai = expected.rngs.monster_ai;
         game.rngs.shuffle = expected.rngs.shuffle;
-    }
-    if traced_action["kind"] == "play_card"
-        && array(&before["players"][0]["hand"]).iter().any(|card| {
-            card["instance_id"] == traced_action["source_id"]
-                && card["enchantment_model_id"] == "ENCHANTMENT.SOWN"
-        })
-        && let Phase::Combat(combat) = &mut game.phase
-    {
-        combat.energy =
-            number(&after["players"][0], "energy").unwrap_or(combat.energy as i64) as i16;
     }
     if before["phase"] != "combat"
         && !matches!(
@@ -1261,10 +1292,12 @@ fn replay_decision(
         let index = if let Some(index) = index {
             index
         } else {
+            tally("resync.bundle_offer");
             game.phase = Phase::ChooseBundles(vec![selected]);
             0
         };
         if !added.is_empty() {
+            tally("infer.bundle");
             game.step(content, Action::Choose(index))
                 .map_err(|error| vec![format!("inferred bundle rejected: {error:?}")])?;
         }
@@ -1349,6 +1382,32 @@ fn replay_decision(
     let mut inferred_choice = false;
     // A fight won without any decision (event fights) settles past the combat entirely.
     let fight_over = combat_ended || after["phase"] != "combat";
+    // An offered card must be one the game ends up with an extra copy of.
+    let extra = |combat: &Combat, id: Id| {
+        let traced = traced_cards(&after["players"][0], oracle_after)
+            .into_iter()
+            .filter(|value| value["model_id"] == content.cards[id as usize].id)
+            .count();
+        let simulated = [&combat.hand, &combat.discard, &combat.exhaust, &combat.draw]
+            .into_iter()
+            .flatten()
+            .filter(|card| card.id == id)
+            .count();
+        traced > simulated
+    };
+    let found = |piles: [&Value; 4], card: &Card| {
+        piles.into_iter().flat_map(array).any(|value| {
+            card.instance == instance_id(value["instance_id"].as_str().unwrap_or_default())
+        })
+    };
+    fn piles<'a>(state: &'a Value, oracle: &'a Value) -> [&'a Value; 4] {
+        [
+            &state["players"][0]["hand"],
+            &state["players"][0]["discard_pile"],
+            &state["players"][0]["exhaust_pile"],
+            &oracle["hidden_draw_order"],
+        ]
+    }
     while game.combat().is_some() {
         let Some(choice) = game.combat().and_then(|combat| combat.choice) else {
             break;
@@ -1361,6 +1420,7 @@ fn replay_decision(
                     .iter()
                     .position(|card| eligible(content, &card, choice.filter, choice.op))
             });
+            tally("guess.nightmare");
             let action = index.map_or(Action::Done, Action::Choose);
             game.step(content, action)
                 .map_err(|error| vec![format!("inferred choice rejected: {error:?}")])?;
@@ -1416,6 +1476,7 @@ fn replay_decision(
                     after > before as i64
                 };
                 if let Some(index) = source.iter().position(gained) {
+                    tally("infer.knowledge_demon");
                     return Some(index);
                 }
             }
@@ -1474,6 +1535,7 @@ fn replay_decision(
                             .or_else(|| source.iter().position(|card| same(card, value)))
                     })
                 {
+                    tally("infer.discard_seen");
                     return Some(next);
                 }
                 // The pile keeps the discard order up to its first card from elsewhere.
@@ -1548,42 +1610,39 @@ fn replay_decision(
                         .copied()
                         .unwrap_or(taken_rank)
                 };
-                return (0..source.len()).min_by_key(|&i| order(&source[i]));
+                return (0..source.len())
+                    .min_by_key(|&i| order(&source[i]))
+                    .inspect(|_| tally("infer.discard_order"));
             }
-            if choice.op == CardOp::Upgrade {
-                return source.iter().position(|card| {
+            if matches!(choice.op, CardOp::Upgrade | CardOp::Transfigure) {
+                let upgrade = choice.op == CardOp::Upgrade;
+                let (kind, key) = if upgrade {
+                    ("infer.upgraded", "upgrade")
+                } else {
+                    ("infer.transfigured", "base_replay_count")
+                };
+                return (source.iter().position(|card| {
                     expected.iter().any(|value| {
                         card.instance
                             == instance_id(value["instance_id"].as_str().unwrap_or_default())
-                            && card.upgrades != value["upgrade"].as_u64().unwrap_or_default() as u8
+                            && if upgrade { card.upgrades } else { card.replays }
+                                != value[key].as_u64().unwrap_or_default() as u8
                     })
-                });
-            }
-            if choice.op == CardOp::Transfigure {
-                return source.iter().position(|card| {
-                    expected.iter().any(|value| {
-                        card.instance
-                            == instance_id(value["instance_id"].as_str().unwrap_or_default())
-                            && card.replays
-                                != value["base_replay_count"].as_u64().unwrap_or_default() as u8
-                    })
-                });
+                }))
+                .inspect(|_| tally(kind));
             }
             if let Some(flag) = flag {
+                let free = |card: &Card| {
+                    card.flags(content.cards[card.id as usize]) & flag == 0
+                        && card.turn_flags & flag == 0
+                        && eligible(content, &card, choice.filter, choice.op)
+                };
                 let find = |value: &Value| {
                     let instance = instance_id(value["instance_id"].as_str().unwrap_or_default());
-                    source.iter().position(|card| {
-                        card.instance == instance
-                            && card.flags(content.cards[card.id as usize]) & flag == 0
-                            && card.turn_flags & flag == 0
-                            && eligible(content, &card, choice.filter, choice.op)
-                    })
+                    (source.iter()).position(|card| card.instance == instance && free(card))
                 };
-                // AutoSlay always retains; a retained card that a turn-start discard (Tools of
-                // the Trade) removed is the last one in the discard pile.
-                return expected
-                    .iter()
-                    .find_map(find)
+                return (expected.iter().find_map(find))
+                    .inspect(|_| tally("infer.flagged"))
                     .or_else(|| {
                         // The marked card may already have been played on (Whispering Earring).
                         let marker = match flag {
@@ -1600,20 +1659,24 @@ fn replay_decision(
                         .flat_map(array)
                         .filter(|value| value[marker] == true)
                         .collect();
-                        marked.iter().copied().find_map(find).or_else(|| {
-                            // Turn-1 instance ids can differ; fall back to the model.
-                            marked.iter().find_map(|value| {
-                                source.iter().position(|card| {
-                                    value["model_id"] == content.cards[card.id as usize].id
-                                        && value["upgrade"].as_u64() == Some(card.upgrades as u64)
-                                        && card.flags(content.cards[card.id as usize]) & flag == 0
-                                        && card.turn_flags & flag == 0
-                                        && eligible(content, &card, choice.filter, choice.op)
-                                })
+                        (marked.iter().copied().find_map(find))
+                            .inspect(|_| tally("infer.flagged_marked"))
+                            .or_else(|| {
+                                // Turn-1 instance ids can differ; fall back to the model.
+                                (marked.iter().find_map(|value| {
+                                    source.iter().position(|card| {
+                                        value["model_id"] == content.cards[card.id as usize].id
+                                            && value["upgrade"].as_u64()
+                                                == Some(card.upgrades as u64)
+                                            && free(card)
+                                    })
+                                }))
+                                .inspect(|_| tally("infer.flagged_model"))
                             })
-                        })
                     })
                     .or_else(|| {
+                        // AutoSlay always retains; a retained card that a turn-start discard
+                        // (Tools of the Trade) removed is the last one in the discard pile.
                         (flag == RETAIN && combat.player.power(power_id::TOOLS_OF_THE_TRADE) > 0)
                             .then(|| {
                                 array(&after["players"][0]["discard_pile"])
@@ -1622,32 +1685,18 @@ fn replay_decision(
                                     .find_map(find)
                             })
                             .flatten()
+                            .inspect(|_| tally("infer.flagged_discarded"))
                     })
                     .or_else(|| {
                         // A retained card that Entropy then transformed is in no pile afterwards.
-                        (flag == RETAIN && combat.player.power(power_id::ENTROPY) > 0).then(
-                            || {
+                        (flag == RETAIN && combat.player.power(power_id::ENTROPY) > 0)
+                            .then(|| {
                                 source.iter().position(|card| {
                                     eligible(content, &card, choice.filter, choice.op)
-                                        && ![
-                                            &after["players"][0]["hand"],
-                                            &after["players"][0]["discard_pile"],
-                                            &after["players"][0]["exhaust_pile"],
-                                            &oracle_after["hidden_draw_order"],
-                                        ]
-                                        .into_iter()
-                                        .flat_map(array)
-                                        .any(|value| {
-                                            card.instance
-                                                == instance_id(
-                                                    value["instance_id"]
-                                                        .as_str()
-                                                        .unwrap_or_default(),
-                                                )
-                                        })
+                                        && !found(piles(after, oracle_after), card)
                                 })
-                            },
-                        )?
+                            })?
+                            .inspect(|_| tally("infer.flagged_transformed"))
                     });
             }
             // AutoSlay picks draw-pile cards at random: prefer one fetched to hand, then exhausted
@@ -1685,6 +1734,7 @@ fn replay_decision(
                         && !spent_before.contains(&card.instance)
                         && !instances(before, "hand").contains(&card.instance)
                 }) {
+                    tally("infer.tyranny_fetched");
                     return Some(index);
                 }
             }
@@ -1700,37 +1750,17 @@ fn replay_decision(
                             .as_str()
                             .and_then(|id| content.card_id(id));
                         let upgrades = value["upgrade"].as_u64().unwrap_or_default() as u8;
-                        // An offered card must be one the game ends up with an extra copy of.
-                        let extra = |id: Id| {
-                            let player = &after["players"][0];
-                            let traced = [
-                                &player["hand"],
-                                &player["discard_pile"],
-                                &player["exhaust_pile"],
-                                &player["play_pile"],
-                                &oracle_after["hidden_draw_order"],
-                            ]
-                            .into_iter()
-                            .flat_map(array)
-                            .filter(|value| value["model_id"] == content.cards[id as usize].id)
-                            .count();
-                            let simulated = [&combat.hand, &combat.discard, &combat.exhaust]
-                                .into_iter()
-                                .chain([&combat.draw])
-                                .flat_map(|pile| pile.iter())
-                                .filter(|card| card.id == id)
-                                .count();
-                            traced > simulated
-                        };
                         (choice.pile != Pile::Offer)
                             .then(|| source.iter().position(|card| card.instance == instance))
                             .flatten()
+                            .inspect(|_| tally("infer.arrived"))
                             .or_else(|| {
-                                source.iter().position(|card| {
+                                (source.iter().position(|card| {
                                     model == Some(card.id)
                                         && card.upgrades == upgrades
-                                        && (choice.pile != Pile::Offer || extra(card.id))
-                                })
+                                        && (choice.pile != Pile::Offer || extra(combat, card.id))
+                                }))
+                                .inspect(|_| tally("infer.arrived_model"))
                             })
                     })
                     .flatten()
@@ -1747,30 +1777,13 @@ fn replay_decision(
                         };
                         // Prefer a card the game already had that vanished from every pile (it was
                         // transformed); a card generated this step may carry another instance id.
-                        let found = |piles: [&Value; 4], card: &Card| {
-                            piles.into_iter().flat_map(array).any(|value| {
-                                card.instance
-                                    == instance_id(
-                                        value["instance_id"].as_str().unwrap_or_default(),
-                                    )
-                            })
-                        };
-                        fn piles<'a>(state: &'a Value, oracle: &'a Value) -> [&'a Value; 4] {
-                            [
-                                &state["players"][0]["hand"],
-                                &state["players"][0]["discard_pile"],
-                                &state["players"][0]["exhaust_pile"],
-                                &oracle["hidden_draw_order"],
-                            ]
-                        }
-                        source
-                            .iter()
-                            .position(|card| {
-                                gone(card)
-                                    && found(piles(before, oracle_before), card)
-                                    && !found(piles(after, oracle_after), card)
-                            })
-                            .or_else(|| source.iter().position(gone))
+                        (source.iter().position(|card| {
+                            gone(card)
+                                && found(piles(before, oracle_before), card)
+                                && !found(piles(after, oracle_after), card)
+                        }))
+                        .inspect(|_| tally("infer.vanished"))
+                        .or_else(|| (source.iter().position(gone)).inspect(|_| tally("infer.left")))
                     })?
                 })
         });
@@ -1781,22 +1794,18 @@ fn replay_decision(
             && let Some(last) = array(&after["players"][0]["hand"]).last()
         {
             let instance = instance_id(last["instance_id"].as_str().unwrap_or_default());
-            index = game.combat().and_then(|combat| {
+            index = (game.combat().and_then(|combat| {
                 combat
                     .hand
                     .iter()
                     .position(|card| card.instance == instance)
-            });
+            }))
+            .inspect(|_| tally("infer.redrawn"));
         }
         // A taken offer may already have been played on (Whispering Earring): pick the offered
         // card the game has more copies of than the simulator, the earliest generated one if
         // several (Infernal Blade's card comes after the turn-start offer).
         if index.is_none() && choice.pile == Pile::Offer && choice.op == CardOp::TakeOffer {
-            let piles = ["hand", "discard_pile", "exhaust_pile"]
-                .map(|pile| array(&after["players"][0][pile]))
-                .into_iter()
-                .chain([array(&oracle_after["hidden_draw_order"])])
-                .collect::<Vec<_>>();
             index = game.combat().and_then(|combat| {
                 let simulated: Vec<&Card> = [Pile::Hand, Pile::Discard, Pile::Exhaust, Pile::Draw]
                     .into_iter()
@@ -1805,9 +1814,9 @@ fn replay_decision(
                 (0..combat.offer.len())
                     .filter_map(|i| {
                         let offered = combat.offer[i].id;
-                        let mut traced: Vec<u32> = piles
-                            .iter()
-                            .flat_map(|pile| pile.iter())
+                        let mut traced: Vec<u32> = piles(after, oracle_after)
+                            .into_iter()
+                            .flat_map(array)
                             .filter(|value| value["model_id"] == content.cards[offered as usize].id)
                             .map(|value| {
                                 instance_id(value["instance_id"].as_str().unwrap_or_default())
@@ -1821,6 +1830,7 @@ fn replay_decision(
                     .min()
                     .map(|(_, i)| i)
             });
+            index = index.inspect(|_| tally("infer.offer_newest"));
         }
         // A taken power card that was already played leaves no copy, only its power.
         if index.is_none() && choice.pile == Pile::Offer && choice.op == CardOp::TakeOffer {
@@ -1840,6 +1850,7 @@ fn replay_decision(
                             .any(|x| content.powers[x.id as usize].id == power)
                 })
             });
+            index = index.inspect(|_| tally("infer.offer_power"));
         }
         // Otherwise try each offered card and keep the one whose outcome matches the traced
         // player powers and energy (a played power card like Prowess leaves no copy).
@@ -1863,6 +1874,7 @@ fn replay_decision(
                     diff.is_empty() && player["energy"].as_i64() == Some(combat.energy as i64)
                 })
             });
+            index = index.inspect(|_| tally("guess.offer_trial"));
         }
         // The profile's unlocked pool can differ from the simulator's (Toolbox): take the card
         // the game has one more copy of than the simulator, even if it wasn't offered here.
@@ -1871,17 +1883,7 @@ fn replay_decision(
             && choice.op == CardOp::TakeOffer
             && let Some(combat) = game.combat()
         {
-            let player = &after["players"][0];
-            let traced: Vec<&Value> = [
-                &player["hand"],
-                &player["discard_pile"],
-                &player["exhaust_pile"],
-                &player["play_pile"],
-                &oracle_after["hidden_draw_order"],
-            ]
-            .into_iter()
-            .flat_map(|pile| array(pile))
-            .collect();
+            let traced = traced_cards(&after["players"][0], oracle_after);
             let simulated = |id: &Value| {
                 [&combat.hand, &combat.discard, &combat.exhaust, &combat.draw]
                     .iter()
@@ -1898,6 +1900,7 @@ fn replay_decision(
             }) {
                 let selected = card(content, value).map_err(|error| vec![error])?;
                 if let Phase::Combat(combat) = &mut game.phase {
+                    tally("resync.offer_unoffered");
                     combat.offer = vec![selected];
                     index = Some(0);
                 }
@@ -1917,6 +1920,7 @@ fn replay_decision(
         {
             let selected = card(content, value).map_err(|error| vec![error])?;
             if let Phase::Combat(combat) = &mut game.phase {
+                tally("resync.offer_arrived");
                 combat.offer = vec![selected];
                 index = Some(0);
             }
@@ -1927,31 +1931,9 @@ fn replay_decision(
             && choice.op == CardOp::TakeOffer
             && let Some(combat) = game.combat()
         {
-            let count = |id: Id, piles: &[&Value]| {
-                piles
-                    .iter()
-                    .flat_map(|pile| array(pile))
-                    .filter(|value| value["model_id"] == content.cards[id as usize].id)
-                    .count()
-            };
-            let player = &after["players"][0];
-            index = combat.offer.iter().position(|offered| {
-                let sim = [&combat.hand, &combat.discard, &combat.exhaust, &combat.draw]
-                    .iter()
-                    .flat_map(|pile| pile.iter())
-                    .filter(|card| card.id == offered.id)
-                    .count();
-                count(
-                    offered.id,
-                    &[
-                        &player["hand"],
-                        &player["discard_pile"],
-                        &player["exhaust_pile"],
-                        &player["play_pile"],
-                        &oracle_after["hidden_draw_order"],
-                    ],
-                ) > sim
-            });
+            index = (combat.offer.iter())
+                .position(|offered| extra(combat, offered.id))
+                .inspect(|_| tally("infer.offer_copy"));
         }
         if choice.op == CardOp::TakeFetched
             && let Some(index) = index
@@ -1959,6 +1941,9 @@ fn replay_decision(
         {
             combat.draw[index].turn_flags |= FETCHED;
         }
+        let count = game
+            .combat()
+            .map_or(0, |combat| replay_pile(combat, choice.pile).len());
         // Once combat ended the traced piles are cleared; prefer a choice that ends the fight,
         // then one whose rng use matches the game (a discarded Sly Ricochet rolls targets).
         let ends = |i: usize| {
@@ -1974,33 +1959,22 @@ fn replay_decision(
         };
         if fight_over
             && index.and_then(ends) != Some(0)
-            && let Some(count) = game
-                .combat()
-                .map(|combat| replay_pile(combat, choice.pile).len())
             && let Some((winner, misses)) = (0..count)
                 .filter_map(|i| Some((i, ends(i)?)))
                 .min_by_key(|&(_, misses)| misses)
             && index.and_then(ends).is_none_or(|current| misses < current)
         {
+            tally("guess.fight_end");
             index = Some(winner);
         }
         // With the piles cleared there is no evidence left; any pick keeps the replay going.
-        if fight_over
-            && index.is_none()
-            && game
-                .combat()
-                .is_some_and(|combat| !replay_pile(combat, choice.pile).is_empty())
-        {
+        if fight_over && index.is_none() && count > 0 {
+            tally("guess.fight_over_first");
             index = Some(0);
         }
         // No pile evidence (the pick was played right away, e.g. Graveblast under Beat Down): take
         // the pick that best matches the game.
-        if index.is_none()
-            && !fight_over
-            && let Some(count) = game
-                .combat()
-                .map(|combat| replay_pile(combat, choice.pile).len())
-        {
+        if index.is_none() && !fight_over {
             index = (0..count)
                 .filter_map(|i| {
                     let mut trial = game.clone();
@@ -2011,7 +1985,8 @@ fn replay_decision(
                     ))
                 })
                 .min_by_key(|&(_, misses)| misses)
-                .map(|(i, _)| i);
+                .map(|(i, _)| i)
+                .inspect(|_| tally("guess.fewest_misses"));
         }
         // Several cards can fit the pile evidence (Decisions, Decisions' skill left the hand along
         // with the card its True Grit exhausted): prefer the pick whose rng use matches the game.
@@ -2064,15 +2039,13 @@ fn replay_decision(
                     .unwrap_or_else(|| score(&trial))
             };
             let current_misses = misses(current);
-            let count = game
-                .combat()
-                .map_or(0, |combat| replay_pile(combat, choice.pile).len());
             if current_misses != (0, 0)
                 && let Some((better, _)) = (0..count)
                     .map(|i| (i, misses(i)))
                     .filter(|&(_, m)| m < current_misses)
                     .min_by_key(|&(_, m)| m)
             {
+                tally("guess.rng_override");
                 index = Some(better);
             }
         }
@@ -2086,15 +2059,15 @@ fn replay_decision(
             })
         };
         if index.is_some_and(|i| !pickable(i)) {
-            let count = game
-                .combat()
-                .map_or(0, |combat| replay_pile(combat, choice.pile).len());
-            index = (0..count).find(|&i| pickable(i));
+            index = (0..count)
+                .find(|&i| pickable(i))
+                .inspect(|_| tally("guess.first_eligible"));
         }
         if let Some(index) = index {
             game.step(content, Action::Choose(index))
                 .map_err(|error| vec![format!("inferred choice rejected: {error:?}")])?;
         } else if choice.optional {
+            tally("guess.declined");
             game.step(content, Action::Done)
                 .map_err(|error| vec![format!("inferred choice rejection: {error:?}")])?;
         } else {
@@ -2102,21 +2075,20 @@ fn replay_decision(
         }
     }
     if inferred_choice && let Phase::Combat(combat) = &mut game.phase {
-        combat.hand = hand_cards(content, &after["players"][0]).map_err(|error| vec![error])?;
-        combat.discard =
-            cards(content, &after["players"][0]["discard_pile"]).map_err(|error| vec![error])?;
-        combat.draw = cards(content, &oracle_after["hidden_draw_order"])
-            .map_err(|error| vec![error])?
-            .into_iter()
-            .rev()
-            .collect();
+        let player = &after["players"][0];
+        let hand = hand_cards(content, player).map_err(|error| vec![error])?;
+        resync_pile("resync.choice_hand", &mut combat.hand, hand);
+        let discard = cards(content, &player["discard_pile"]).map_err(|error| vec![error])?;
+        resync_pile("resync.choice_discard", &mut combat.discard, discard);
+        let draw =
+            cards(content, &oracle_after["hidden_draw_order"]).map_err(|error| vec![error])?;
+        resync_pile(
+            "resync.choice_draw",
+            &mut combat.draw,
+            draw.into_iter().rev().collect(),
+        );
         // The piles now come from the capture, so the shuffle rng follows them.
-        let target = oracle_after["rng_counters"]["run.Shuffle"]
-            .as_u64()
-            .unwrap_or(game.rngs.shuffle.1);
-        if target > game.rngs.shuffle.1 {
-            game.rngs.shuffle.forward(target - game.rngs.shuffle.1);
-        }
+        forward_shuffle(&mut game, oracle_after, "resync.choice_shuffle_rng");
     }
     if array(&after["combat"]["enemies"]).iter().any(|enemy| {
         !array(&before["combat"]["enemies"])
@@ -2135,28 +2107,42 @@ fn replay_decision(
             happy_flower,
         )
         .map_err(|error| vec![error])?;
+        let old: Vec<u32> = array(&before["combat"]["enemies"])
+            .iter()
+            .map(|enemy| instance_id(enemy["instance_id"].as_str().unwrap_or_default()))
+            .collect();
         if let (Phase::Combat(actual), Phase::Combat(expected)) = (&mut game.phase, expected.phase)
         {
-            for enemy in expected.enemies.into_iter().filter(|enemy| {
-                !array(&before["combat"]["enemies"]).iter().any(|before| {
-                    enemy.instance
-                        == instance_id(before["instance_id"].as_str().unwrap_or_default())
-                })
-            }) {
+            for enemy in
+                (expected.enemies.into_iter()).filter(|enemy| !old.contains(&enemy.instance))
+            {
+                let key = |enemy: &Enemy| {
+                    let creature = &enemy.creature;
+                    let mut powers: Vec<_> = creature
+                        .powers
+                        .iter()
+                        .map(|power| (power.id, power.amount))
+                        .collect();
+                    powers.sort_unstable();
+                    let stats = (creature.id, creature.hp, creature.max_hp, creature.block);
+                    (stats, enemy.move_index, powers)
+                };
                 if let Some(index) = actual
                     .enemies
                     .iter()
                     .position(|current| current.instance == enemy.instance)
                 {
+                    if key(&actual.enemies[index]) != key(&enemy) {
+                        tally("resync.spawned_enemy");
+                    }
                     actual.enemies[index] = enemy;
-                } else if let Some(index) = actual.enemies.iter().position(|current| {
-                    !array(&before["combat"]["enemies"]).iter().any(|before| {
-                        current.instance
-                            == instance_id(before["instance_id"].as_str().unwrap_or_default())
-                    })
-                }) {
+                } else if let Some(index) =
+                    (actual.enemies.iter()).position(|current| !old.contains(&current.instance))
+                {
+                    tally("resync.spawned_enemy_instance");
                     actual.enemies[index] = enemy;
                 } else {
+                    tally("resync.spawned_enemy_missing");
                     actual.enemies.push(enemy);
                 }
             }
@@ -2170,23 +2156,26 @@ fn replay_decision(
             let move_id = oracle_after["enemy_move_ids"][&instance]
                 .as_str()
                 .unwrap_or_default();
-            enemy.stunned = move_id == "STUNNED";
+            resync(
+                "resync.enemy_stunned",
+                &mut enemy.stunned,
+                move_id == "STUNNED",
+            );
             if let Some(expected) = array(&after["combat"]["enemies"]).iter().find(|expected| {
                 expected["instance_id"] == instance.as_str()
                     && expected["hit_points"].as_i64().unwrap_or_default() > 0
             }) {
-                enemy.move_index = infer_move(
-                    &content.enemies[enemy.creature.id as usize],
-                    expected,
-                    move_id,
-                );
+                let enemy_def = &content.enemies[enemy.creature.id as usize];
+                let move_index = infer_move(enemy_def, expected, move_id);
+                resync("resync.enemy_move", &mut enemy.move_index, move_index);
             }
         }
         if array(&before["players"][0]["powers"])
             .iter()
             .any(|power| power["model_id"] == "POWER.ENTROPY_POWER")
         {
-            combat.hand = hand_cards(content, &after["players"][0]).map_err(|error| vec![error])?;
+            let hand = hand_cards(content, &after["players"][0]).map_err(|error| vec![error])?;
+            resync_pile("resync.entropy_hand", &mut combat.hand, hand);
         }
     }
     'choices: for choice in traced_choices
@@ -2225,13 +2214,7 @@ fn replay_decision(
                     traced_action["kind"].as_str(),
                     Some("event_option" | "take_reward" | "skip_rewards")
                 ) {
-                    game.run.hp = number(&after["players"][0], "hit_points")
-                        .map_err(|error| vec![error])? as i16;
-                    game.run.max_hp = number(&after["players"][0], "max_hit_points")
-                        .map_err(|error| vec![error])? as i16;
-                    game.run.gold =
-                        number(&after["players"][0], "gold").map_err(|error| vec![error])? as i32;
-                    sync_deck(content, &mut game, &after["players"][0]["deck"])?;
+                    sync_run(content, &mut game, after, "resync.bundle_run")?;
                 }
                 continue 'choices;
             }
@@ -2281,6 +2264,7 @@ fn replay_decision(
                     })
                     .collect();
                 if !cards.is_empty() {
+                    tally("resync.card_offer");
                     game.phase = Phase::ChooseCards(
                         cards,
                         choice["action"]["maximum"].as_u64().unwrap_or(1) as u8,
@@ -2375,6 +2359,7 @@ fn replay_decision(
         let Some(index) = index else {
             break;
         };
+        tally("infer.deck_pick");
         let action = match game.phase {
             Phase::UpgradeCards(..) => Action::Smith(index),
             Phase::EnchantCards(..) => Action::Enchant(index),
@@ -2429,8 +2414,10 @@ fn replay_decision(
                         .position(|card| content.cards[card.id as usize].id == id)
                 });
             let index = if let Some(index) = index {
+                tally("infer.deck_card");
                 index
             } else {
+                tally("resync.card_offer");
                 game.phase = Phase::ChooseCards(
                     vec![card(content, traced).map_err(|error| vec![error])?],
                     1,
@@ -2503,6 +2490,7 @@ fn replay_decision(
     replay_state.courier_restock = game.courier_restock.clone();
     replay_state.fake_happy_flower = game.fake_happy_flower;
     if quarantined && before["phase"] == "combat" {
+        tally("skip.quarantined");
         return Ok(());
     }
     if game.combat().is_some_and(|combat| combat.choice.is_some()) {
@@ -2514,36 +2502,23 @@ fn replay_decision(
     // A potion used while a card replay still waits on its animation captures the game mid-play
     // (the card in the play pile, its hooks pending); the next decision compares instead.
     if !array(&after["players"][0]["play_pile"]).is_empty() {
+        tally("skip.mid_play");
         return Ok(());
     }
     // Event outcomes the simulator doesn't roll; synced last, as an event fight finished by
     // inferred choices above still rolls its own rewards (Battleworn Dummy).
     if traced_action["kind"] == "event_option" {
-        game.rngs.rewards = Rng::from_seed(
-            oracle_after["rng_seeds"]["player.1.Rewards"]
-                .as_u64()
-                .unwrap_or_default(),
-        );
-        game.rngs.rewards.forward(
-            oracle_after["rng_counters"]["player.1.Rewards"]
-                .as_u64()
-                .unwrap_or_default(),
-        );
-        game.rngs.niche = Rng::from_seed(
-            oracle_after["rng_seeds"]["run.Niche"]
-                .as_u64()
-                .unwrap_or_default(),
-        );
-        game.rngs.niche.forward(
-            oracle_after["rng_counters"]["run.Niche"]
-                .as_u64()
-                .unwrap_or_default(),
-        );
+        let rewards = traced_rng(oracle_after, "player.1.Rewards");
+        resync("resync.event_rewards_rng", &mut game.rngs.rewards, rewards);
+        let niche = traced_rng(oracle_after, "run.Niche");
+        resync("resync.event_niche_rng", &mut game.rngs.niche, niche);
         // The fight's own outcome (Battleworn Dummy's upgrades) is already in the synced deck.
         if event_fight && game.combat().is_none() {
-            game.run.gold =
-                number(&after["players"][0], "gold").map_err(|error| vec![error])? as i32;
-            sync_deck(content, &mut game, &after["players"][0]["deck"])?;
+            let gold = number(&after["players"][0], "gold").map_err(|error| vec![error])?;
+            resync("resync.event_fight_gold", &mut game.run.gold, gold as i32);
+            if sync_deck(content, &mut game, &after["players"][0]["deck"])? {
+                tally("resync.event_fight_deck");
+            }
         }
     }
     if let Some(combat) = game.combat() {
@@ -2557,8 +2532,64 @@ fn replay_decision(
     }
 }
 
+/// Takes hp, max hp, gold, deck and relics from the capture, tallying `kind` if any differed.
+fn sync_run(
+    content: &Content,
+    game: &mut Game,
+    after: &Value,
+    kind: &'static str,
+) -> Result<(), Vec<String>> {
+    let player = &after["players"][0];
+    let old = game.run.clone();
+    (game.run.hp, game.run.max_hp, game.run.gold, game.run.relics) = (
+        number(player, "hit_points").map_err(|error| vec![error])? as i16,
+        number(player, "max_hit_points").map_err(|error| vec![error])? as i16,
+        number(player, "gold").map_err(|error| vec![error])? as i32,
+        ids(&content.relics, &player["relics"], |relic| relic.id).map_err(|error| vec![error])?,
+    );
+    sync_deck(content, game, &player["deck"])?;
+    if game.run != old {
+        tally(kind);
+    }
+    Ok(())
+}
+
+/// Moves the shuffle rng up to the capture's (piles taken from it skipped its rolls).
+fn forward_shuffle(game: &mut Game, oracle: &Value, kind: &'static str) {
+    let target = oracle["rng_counters"]["run.Shuffle"]
+        .as_u64()
+        .unwrap_or(game.rngs.shuffle.1);
+    if target > game.rngs.shuffle.1 {
+        tally(kind);
+        game.rngs.shuffle.forward(target - game.rngs.shuffle.1);
+    }
+}
+
+/// Takes a pile from the capture, tallying `kind` if its cards differ the way `compare_pile`
+/// would see.
+fn resync_pile(kind: &'static str, pile: &mut Vec<Card>, cards: Vec<Card>) {
+    let key = |cards: &[Card]| -> Vec<_> {
+        cards
+            .iter()
+            .map(|card| (card.id, card.upgrades, card.enchantment))
+            .collect()
+    };
+    if key(pile) != key(&cards) {
+        tally(kind);
+    }
+    *pile = cards;
+}
+
+fn traced_rng(oracle: &Value, name: &str) -> Rng {
+    let mut rng = Rng::from_seed(oracle["rng_seeds"][name].as_u64().unwrap_or_default());
+    rng.forward(oracle["rng_counters"][name].as_u64().unwrap_or_default());
+    rng
+}
+
 /// Rebuilds the deck from a capture, which only shows Mad Science's type, keeping its variants.
-fn sync_deck(content: &Content, game: &mut Game, deck: &Value) -> Result<(), Vec<String>> {
+/// Returns whether it changed.
+fn sync_deck(content: &Content, game: &mut Game, deck: &Value) -> Result<bool, Vec<String>> {
+    let old = game.run.deck.clone();
     let mad_science = |card: &&mut Card| content.cards[card.id as usize].id == "CARD.MAD_SCIENCE";
     let variants: Vec<u8> = game
         .run
@@ -2571,7 +2602,7 @@ fn sync_deck(content: &Content, game: &mut Game, deck: &Value) -> Result<(), Vec
     for (card, variant) in game.run.deck.iter_mut().filter(mad_science).zip(variants) {
         card.variant = variant;
     }
-    Ok(())
+    Ok(game.run.deck != old)
 }
 
 fn replay_pile(combat: &Combat, pile: Pile) -> &[Card] {
@@ -2596,6 +2627,25 @@ fn game_from_snapshot(
     happy_flower: u8,
 ) -> Result<Game, String> {
     let player = &state["players"][0];
+    // Older captures lack these; the replay then reconstructs them.
+    if state["phase"] == "combat" {
+        for (value, kind) in [
+            (&player["cards_played_this_turn"], "fallback.play_counts"),
+            (&player["cards_played_this_turn_ids"], "fallback.play_list"),
+            (&player["used_relics"], "fallback.used_relics"),
+            (&player["orbs"], "fallback.orbs"),
+            (&player["stars_gained_this_turn"], "fallback.stars_gained"),
+            (&player["hp_lost_this_turn"], "fallback.hp_lost"),
+            (&player["paels_tooth_cards"], "fallback.paels_tooth"),
+            (&oracle["power_states"], "fallback.power_states"),
+            (&oracle["next_creature_id"], "fallback.creature_ids"),
+            (&oracle["relic_grab_bags"], "fallback.grab_bags"),
+        ] {
+            if value.is_null() {
+                tally(kind);
+            }
+        }
+    }
     let character = find_id(&content.characters, text(player, "character_id")?, |x| x.id)?;
     let mut deck = cards(content, &player["deck"])?;
     for (card, &variant) in deck
@@ -3001,8 +3051,10 @@ fn game_from_snapshot(
     let mut toric_blocks = if captured.len() == toric_count {
         captured
     } else if history.toric.len() == toric_count {
+        tally("fallback.toric_block");
         history.toric.iter().map(|x| x.1).collect::<Vec<_>>()
     } else {
+        tally("fallback.toric_block");
         fallback
     }
     .into_iter();
@@ -3126,23 +3178,16 @@ fn game_from_snapshot(
             oracle["card_deck_version_indices"]
                 .as_object()
                 .map_or(0, |indices| {
-                    [
-                        &player["hand"],
-                        &player["play_pile"],
-                        &player["discard_pile"],
-                        &player["exhaust_pile"],
-                        &oracle["hidden_draw_order"],
-                    ]
-                    .into_iter()
-                    .flat_map(array)
-                    .filter(|card| {
-                        !matches!(card["type"].as_str(), Some("Status" | "Curse"))
-                            && card["instance_id"]
-                                .as_str()
-                                .and_then(|instance| indices.get(instance))
-                                .is_some_and(Value::is_null)
-                    })
-                    .count() as i64
+                    traced_cards(player, oracle)
+                        .into_iter()
+                        .filter(|card| {
+                            !matches!(card["type"].as_str(), Some("Status" | "Curse"))
+                                && card["instance_id"]
+                                    .as_str()
+                                    .and_then(|instance| indices.get(instance))
+                                    .is_some_and(Value::is_null)
+                        })
+                        .count() as i64
                 })
         }) as i16;
     // One counter per Automation played, as the game keeps them instanced.
@@ -3199,10 +3244,13 @@ fn game_from_snapshot(
         .iter()
         .filter(|power| power.id == power_id::THE_BOMB && power.amount > 0)
         .map(|power| {
-            let damage = bomb_damages
-                .next()
-                .flatten()
-                .map_or(bomb_damage, |damage| damage as i16);
+            let damage = bomb_damages.next().flatten().map_or_else(
+                || {
+                    tally("fallback.bomb_damage");
+                    bomb_damage
+                },
+                |damage| damage as i16,
+            );
             (power.amount as u8, damage)
         })
         .collect();
@@ -3265,12 +3313,7 @@ fn game_from_snapshot(
         exhaust,
         offer: vec![],
         energy: number(player, "energy")? as i16,
-        // Bread's extra energy only starts on turn 2; the simulator counts it from turn 1.
-        max_energy: number(player, "max_energy")? as i16
-            + (combat_state["round"] == 1
-                && array(&player["relics"])
-                    .iter()
-                    .any(|relic| relic["model_id"] == "RELIC.BREAD")) as i16,
+        max_energy: number(player, "max_energy")? as i16,
         draw_per_turn: run.draw,
         stars: number(player, "stars")? as i16,
         turn: number(player, "turn_number").or_else(|_| number(combat_state, "round"))? as u16,
@@ -6083,6 +6126,19 @@ fn compare_powers(
     if actual != expected {
         diff.push(format!("{path}: simulator {actual:?} != game {expected:?}"));
     }
+}
+
+fn traced_cards<'a>(player: &'a Value, oracle: &'a Value) -> Vec<&'a Value> {
+    [
+        &player["hand"],
+        &player["discard_pile"],
+        &player["exhaust_pile"],
+        &player["play_pile"],
+        &oracle["hidden_draw_order"],
+    ]
+    .into_iter()
+    .flat_map(array)
+    .collect()
 }
 
 fn array(value: &Value) -> &[Value] {
