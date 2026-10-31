@@ -358,25 +358,55 @@ internal sealed class TraceCapture : IDisposable
                         "MegaCrit.Sts2.Core.Entities.CardRewardAlternatives.CardRewardAlternative"))
                 .ToArray();
             var legal = new[] { choice }.Concat(alternateActions.OfType<SemanticAction>()).ToArray();
-            _choiceOffer = new("choose_cards", legal, candidates, minimum, maximum, canSkip,
-                alternateActions);
-            var snapshot = Snapshotter.Capture(legal);
-            Resynchronize(snapshot, "card_choice");
-            Write(new TraceEvent(0, "choice_offered", null,
-                snapshot.Public, null, null,
-                snapshot.Oracle, null,
-                new Dictionary<string, object?>
-                {
-                    ["minimum"] = minimum,
-                    ["maximum"] = maximum,
-                    ["can_skip"] = canSkip,
-                    ["candidate_ids"] = candidates
-                })
+            Offer(new(legal, candidates, minimum, maximum, alternateActions), "card_choice", new()
             {
-                BeforePublicHash = snapshot.PublicHash,
-                BeforeOracleHash = snapshot.OracleHash
+                ["minimum"] = minimum,
+                ["maximum"] = maximum,
+                ["can_skip"] = canSkip,
+                ["candidate_ids"] = candidates
             });
         });
+    }
+
+    private void Offer(ChoiceOffer offer, string boundary, Dictionary<string, object?> metadata)
+    {
+        _choiceOffer = offer;
+        var snapshot = Snapshotter.Capture(offer.LegalActions);
+        Resynchronize(snapshot, boundary);
+        Write(new TraceEvent(0, "choice_offered", null, snapshot.Public, null, null, snapshot.Oracle, null, metadata)
+        {
+            BeforePublicHash = snapshot.PublicHash,
+            BeforeOracleHash = snapshot.OracleHash
+        });
+    }
+
+    public void OnSelectorPick(
+        string selector,
+        IReadOnlyList<CardModel> options,
+        int minimum,
+        int maximum,
+        IReadOnlyList<CardModel> selected)
+    {
+        if (!Enabled || options.Count == 0) return;
+        static string Model(CardModel card) => $"{card.Id}:{card.CurrentUpgradeLevel}";
+        try
+        {
+            Write(new TraceEvent(0, "choice_made", null, null, null, null, null, null,
+                new Dictionary<string, object?>
+                {
+                    ["selector"] = selector,
+                    ["minimum"] = minimum,
+                    ["maximum"] = maximum,
+                    ["candidate_ids"] = options.Select(SemanticAction.CardIdentity).ToArray(),
+                    ["candidate_models"] = options.Select(Model).ToArray(),
+                    ["selected_ids"] = selected.Select(SemanticAction.CardIdentity).ToArray(),
+                    ["selected_models"] = selected.Select(Model).ToArray()
+                }));
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine($"[Spirefysh] Selector pick not written: {exception.Message}");
+        }
     }
 
     // Scroll Boxes: each bundle is one option; the chosen bundle's cards become the selected ids.
@@ -391,28 +421,10 @@ internal sealed class TraceCapture : IDisposable
                 return;
             }
             var candidates = ids.SelectMany(bundle => bundle).ToArray();
-            var choice = new SemanticAction(
-                "choose_cards",
-                "choose-cards",
-                null,
-                null,
-                "PlayerChoiceResult",
-                CandidateIds: candidates,
-                Minimum: ids.Min(bundle => bundle.Length),
-                Maximum: ids.Max(bundle => bundle.Length),
-                CanSkip: false);
-            _choiceOffer = new("choose_bundle", [choice], candidates, choice.Minimum ?? 0, choice.Maximum ?? 0,
-                false, [], Bundles: ids);
-            var snapshot = Snapshotter.Capture(_choiceOffer.LegalActions);
-            Resynchronize(snapshot, "bundle_choice");
-            Write(new TraceEvent(0, "choice_offered", null,
-                snapshot.Public, null, null,
-                snapshot.Oracle, null,
-                new Dictionary<string, object?> { ["bundles"] = ids })
-            {
-                BeforePublicHash = snapshot.PublicHash,
-                BeforeOracleHash = snapshot.OracleHash
-            });
+            var (min, max) = (ids.Min(bundle => bundle.Length), ids.Max(bundle => bundle.Length));
+            var choice = new SemanticAction("choose_cards", "choose-cards", null, null, "PlayerChoiceResult",
+                CandidateIds: candidates, Minimum: min, Maximum: max, CanSkip: false);
+            Offer(new([choice], candidates, min, max, [], Bundles: ids), "bundle_choice", new() { ["bundles"] = ids });
         });
     }
 
@@ -701,12 +713,10 @@ internal sealed class TraceCapture : IDisposable
         bool IsNested);
 
     private sealed record ChoiceOffer(
-        string Kind,
         SemanticAction[] LegalActions,
         string[] CandidateIds,
         int Minimum,
         int Maximum,
-        bool CanSkip,
         SemanticAction?[] AlternativeActions,
         uint? ChoiceId = null,
         string[][]? Bundles = null);

@@ -19,6 +19,7 @@ using MegaCrit.Sts2.Core.Nodes.Screens.CardSelection;
 using MegaCrit.Sts2.Core.Rewards;
 using MegaCrit.Sts2.Core.Runs;
 using LiveCardSelector = MegaCrit.Sts2.Core.Nodes.Screens.CardSelection.ICardSelector;
+using AutomatedCardSelector = MegaCrit.Sts2.Core.TestSupport.ICardSelector;
 
 namespace Spirefysh.Bridge;
 
@@ -82,6 +83,15 @@ internal static class BridgePatches
             postfix: new HarmonyMethod(typeof(BridgePatches), nameof(AfterRunEnded)));
         PatchPrefix(harmony, typeof(RunManager),
             nameof(RunManager.Abandon), nameof(BeforeRunAbandoned));
+        // AutoSlay's (and Vakuu's) selector answers CardSelectCmd without a PlayerChoiceResult.
+        foreach (var method in typeof(CardSelectCmd).Assembly.GetTypes()
+                     .Where(type => type is { IsClass: true, IsAbstract: false } &&
+                                    typeof(AutomatedCardSelector).IsAssignableFrom(type))
+                     .Select(type => type.GetMethod(nameof(AutomatedCardSelector.GetSelectedCards),
+                         BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly))
+                     .OfType<MethodInfo>())
+            harmony.Patch(method,
+                postfix: new HarmonyMethod(typeof(BridgePatches), nameof(AfterSelectorPick)));
 
         foreach (var method in typeof(MerchantEntry).Assembly.GetTypes()
                      .Where(type => typeof(MerchantEntry).IsAssignableFrom(type))
@@ -131,6 +141,21 @@ internal static class BridgePatches
         OfferCards(candidates, prefs?.MinSelect ?? (canSkip ? 0 : 1), prefs?.MaxSelect ?? 1,
             canSkip);
     });
+
+    private static void AfterSelectorPick(object __instance, object[] __args,
+        System.Threading.Tasks.Task<IEnumerable<CardModel>> __result)
+    {
+        try
+        {
+            if (__result.IsCompletedSuccessfully && __args[0] is IEnumerable<CardModel> options)
+                _capture?.OnSelectorPick(__instance.GetType().Name, options.ToArray(), (int)__args[1],
+                    (int)__args[2], __result.Result.ToArray());
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine($"[Spirefysh] Selector pick not captured: {exception.Message}");
+        }
+    }
 
     private static void BeforeCardReward(CardReward __instance) =>
         Observe("card reward offer", () => _cardReward = __instance);

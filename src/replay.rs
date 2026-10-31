@@ -149,6 +149,8 @@ struct ReplayState {
     fake_happy_flower: u8,
     /// The discard piles seen by the choices offered during the decision being replayed.
     offered_discards: Vec<Value>,
+    /// The automated selector's picks (`choice_made`) during the decision being replayed.
+    picks: Vec<Value>,
 }
 
 impl Default for ReplayState {
@@ -205,6 +207,7 @@ impl Default for ReplayState {
             courier_restock: None,
             fake_happy_flower: 0,
             offered_discards: vec![],
+            picks: vec![],
         }
     }
 }
@@ -609,6 +612,7 @@ pub fn replay_trace(path: impl AsRef<Path>) -> io::Result<ReplayReport> {
     let mut flower_encounter = String::new();
     let mut flower_round = 0;
     let mut offered_discards = vec![];
+    let mut picks = vec![];
     for line in BufReader::new(File::open(path)?).lines() {
         let record: Value = serde_json::from_str(&line?)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
@@ -641,6 +645,9 @@ pub fn replay_trace(path: impl AsRef<Path>) -> io::Result<ReplayReport> {
         if record["kind"] != "decision" {
             if record["kind"] == "choice_offered" {
                 offered_discards.push(record["before"]["players"][0]["discard_pile"].clone());
+            }
+            if record["kind"] == "choice_made" {
+                picks.push(record["metadata"].clone());
             }
             if record["kind"] == "transition_quarantined" {
                 if record["action"]["kind"] == "choose_cards" {
@@ -743,6 +750,7 @@ pub fn replay_trace(path: impl AsRef<Path>) -> io::Result<ReplayReport> {
             gap_plays = 0;
         }
         replay_state.offered_discards = std::mem::take(&mut offered_discards);
+        replay_state.picks = std::mem::take(&mut picks);
         pending = Some((record, Vec::new(), record_flower));
     }
     if let Some((record, choices, flower)) = pending {
@@ -1070,6 +1078,7 @@ fn replay_decision(
             card.variant = (rider / 3 + 1) as u8 * 10 + rider as u8 + 1;
         }
     }
+    while step_traced_pick(content, &mut game, &mut replay_state.picks)? {}
     // An untraced pick from a potion's offer still generates a card (Regalite, ...): the one new
     // in the traced hand, else any (the hand is resynced below).
     if traced_action["kind"] == "use_potion"
@@ -1114,10 +1123,15 @@ fn replay_decision(
             .is_some_and(|combat| !combat.choice.is_some_and(|choice| inferred(choice.op)))
     {
         // Effects queued behind the picks (Reptile Trinket) still resolve; piles are resynced next.
-        while let Phase::Combat(combat) = &mut game.phase {
+        while game.combat().is_some() {
+            let traced = step_traced_pick(content, &mut game, &mut replay_state.picks)?;
+            let Phase::Combat(combat) = &mut game.phase else {
+                break;
+            };
             // AutoSlay's selector takes as many cards as allowed (Dredge under Distilled Chaos),
             // which later picks from that pile can see (Drain Power).
-            if combat.choice.is_some_and(|choice| {
+            if traced {
+            } else if combat.choice.is_some_and(|choice| {
                 choice.op == CardOp::Move(Pile::Hand) && choice.pile == Pile::Discard
             }) {
                 while game.combat().is_some_and(|combat| {
@@ -1423,6 +1437,9 @@ fn replay_decision(
             break;
         };
         inferred_choice = true;
+        if step_traced_pick(content, &mut game, &mut replay_state.picks)? {
+            continue;
+        }
         // Nightmare's pick only shows next turn, so any eligible card reproduces this step.
         if let CardOp::CopyNextTurn(_) = choice.op {
             let index = game.combat().and_then(|combat| {
@@ -2596,6 +2613,81 @@ fn resync_pile(kind: &'static str, pile: &mut Vec<Card>, cards: Vec<Card>) {
         tally(kind);
     }
     *pile = cards;
+}
+
+/// Answers the simulator's pending card choice with the traced pick it matches: one offering the
+/// same cards (earlier picks it never asked for are dropped), else the next one if its cards are
+/// there. Each picked card matches by instance, else by its rank among identical copies, else by
+/// model (the traced card's enchantment first).
+fn step_traced_pick(
+    content: &Content,
+    game: &mut Game,
+    picks: &mut Vec<Value>,
+) -> Result<bool, Vec<String>> {
+    // The pending choice's eligible cards: (pile index, instance, "MODEL:upgrades").
+    let offered = |game: &Game| {
+        let combat = game.combat()?;
+        let choice = combat.choice?;
+        Some(
+            replay_pile(combat, choice.pile)
+                .iter()
+                .enumerate()
+                .filter(|(_, card)| eligible(content, card, choice.filter, choice.op))
+                .map(|(index, card)| {
+                    let model = format!("{}:{}", content.cards[card.id as usize].id, card.upgrades);
+                    (index, card.instance, model)
+                })
+                .collect::<Vec<_>>(),
+        )
+    };
+    let Some(cards) = offered(game) else {
+        return Ok(false);
+    };
+    let mut models: Vec<_> = cards.iter().map(|(.., model)| model.as_str()).collect();
+    models.sort_unstable();
+    let fits = |pick: &Value| {
+        let mut candidates: Vec<_> = array(&pick["candidate_models"])
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        candidates.sort_unstable();
+        candidates == models
+    };
+    let present = |pick: &Value| {
+        array(&pick["selected_models"])
+            .iter()
+            .all(|model| models.contains(&model.as_str().unwrap_or_default()))
+    };
+    let Some(index) = picks
+        .iter()
+        .position(fits)
+        .or_else(|| picks.first().is_some_and(present).then_some(0))
+    else {
+        return Ok(false);
+    };
+    let pick = picks.drain(..=index).last().unwrap();
+    tally("trace.choice");
+    for (id, model) in array(&pick["selected_ids"])
+        .iter()
+        .zip(array(&pick["selected_models"]))
+    {
+        let Some(cards) = offered(game) else {
+            break;
+        };
+        let instance = instance_id(id.as_str().unwrap_or_default());
+        let same = |card: &&(usize, u32, String)| model.as_str() == Some(card.2.as_str());
+        let Some(&(index, ..)) = cards
+            .iter()
+            .filter(same)
+            .find(|card| card.1 == instance)
+            .or_else(|| cards.iter().find(same))
+        else {
+            break;
+        };
+        game.step(content, Action::Choose(index))
+            .map_err(|error| vec![format!("traced pick rejected: {error:?}")])?;
+    }
+    Ok(true)
 }
 
 /// The candidate of an untraced pick: the only one, else the one whose result the after state
@@ -6263,6 +6355,66 @@ fn instance_id(id: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_traced_pick_answers_the_choice_it_offered() {
+        let content = foundation_content();
+        let mut game = Game::new_character_ascension(&content, 1, 0, 0).unwrap();
+        game.begin_act(&content, 0).unwrap();
+        game.start_combat(&content, content.acts[0].encounters[0])
+            .unwrap();
+        let card = |id: &str, instance| Card {
+            id: content.card_id(id).unwrap(),
+            instance,
+            ..Card::default()
+        };
+        let Phase::Combat(combat) = &mut game.phase else {
+            unreachable!()
+        };
+        combat.hand = vec![
+            card("CARD.STRIKE_IRONCLAD", 5),
+            card("CARD.DEFEND_IRONCLAD", 6),
+            card("CARD.STRIKE_IRONCLAD", 7),
+        ];
+        combat.exhaust.clear();
+        combat.choice = Some(Choice {
+            pile: Pile::Hand,
+            filter: CardFilter::Any,
+            op: CardOp::Move(Pile::Exhaust),
+            remaining: 1,
+            optional: false,
+        });
+        let pick = |candidates: &[&str], id: &str, model: &str| {
+            serde_json::json!({
+                "candidate_models": candidates,
+                "selected_ids": [id],
+                "selected_models": [model],
+            })
+        };
+        let hand = [
+            "CARD.STRIKE_IRONCLAD:0",
+            "CARD.DEFEND_IRONCLAD:0",
+            "CARD.STRIKE_IRONCLAD:0",
+        ];
+        // An earlier pick the simulator never asked for is dropped; the match is by instance.
+        let mut picks = vec![
+            pick(&["CARD.BASH:0"], "combat-card:0", "CARD.BASH:0"),
+            pick(&hand, "combat-card:6", "CARD.STRIKE_IRONCLAD:0"),
+        ];
+        assert!(step_traced_pick(&content, &mut game, &mut picks).unwrap());
+        assert!(picks.is_empty());
+        let combat = game.combat().unwrap();
+        assert!(combat.choice.is_none());
+        assert_eq!(
+            combat
+                .exhaust
+                .iter()
+                .map(|card| card.instance)
+                .collect::<Vec<_>>(),
+            [7]
+        );
+        assert!(!step_traced_pick(&content, &mut game, &mut picks).unwrap());
+    }
 
     #[test]
     fn replay_reconstructs_distinct_a_b_and_c_b_encounter_bags() {
