@@ -3048,6 +3048,9 @@ fn preview_hooks(
         if matches!(
             trigger,
             Trigger::PowerPlayed | Trigger::CardDrawn | Trigger::CardGenerated
+        ) || matches!(
+            power.id,
+            power_id::STRANGLE | power_id::SERPENT_FORM | power_id::AFTERIMAGE
         ) {
             context.event = power.amount;
         }
@@ -3171,12 +3174,13 @@ fn played_card_preview(
     let cost = if scarf {
         0
     } else {
-        crate::game::energy_cost(combat, card, def, gauntlets)
+        crate::game::energy_cost(combat, card, def, gauntlets, true)
     };
     if let Some(power) = free {
         combat.player.consume_power(power);
     }
-    if card.flags(def) & ETHEREAL != 0 && combat.player.power(power_id::VEILPIERCER) > 0 {
+    if crate::game::is_ethereal(combat, card, def) && combat.player.power(power_id::VEILPIERCER) > 0
+    {
         combat.player.consume_power(power_id::VEILPIERCER);
     }
     if card_type == CardType::Attack && combat.player.power(power_id::FREE_ATTACK) > 0 {
@@ -3363,7 +3367,7 @@ fn played_card_preview(
         preview_gain_block(&projected, content, &mut preview, 4, attack_triggers);
     }
     let kusarigama = if card_type == CardType::Attack && relic("RELIC.KUSARIGAMA") {
-        (original.kusarigama as i16 + plays as i16) / 3
+        (original.attacks_mod3 as i16 + plays as i16) / 3
     } else {
         0
     };
@@ -3615,7 +3619,7 @@ fn modified_preview_damage(
                 .saturating_mul(100 + combat.enemies[target].creature.power(power_id::SLOW))
                 / 100;
         }
-        for _ in 0..source.power(power_id::DOUBLE_DAMAGE).max(0) {
+        if source.power(power_id::DOUBLE_DAMAGE) > 0 {
             damage = damage.saturating_mul(2);
         }
         if source.power(power_id::SHRINK) != 0 {
@@ -3671,11 +3675,6 @@ fn vulnerable_damage(game: &Game, content: &Content, target: usize, damage: i16)
     if enemy.kind(content, PowerKind::Vulnerable) == 0 {
         return damage;
     }
-    let base = if enemy.power(power_id::DEBILITATE) > 0 {
-        200
-    } else {
-        150
-    };
     let cruelty = combat.player.power(power_id::CRUELTY);
     let phrog = 25
         * game
@@ -3683,7 +3682,8 @@ fn vulnerable_damage(game: &Game, content: &Content, target: usize, damage: i16)
             .relics
             .iter()
             .any(|&id| content.relics[id as usize].id == "RELIC.PAPER_PHROG") as i16;
-    damage.saturating_mul(base + cruelty + phrog) / 100
+    let bonus = (50 + cruelty + phrog) * (1 + (enemy.power(power_id::DEBILITATE) > 0) as i16);
+    damage.saturating_mul(100 + bonus) / 100
 }
 
 fn resolved_hits(
@@ -3997,7 +3997,7 @@ fn effect_index(effect: &Effect) -> usize {
         Effect::OstyAttack(..) => 2,
         Effect::OstyAttackMany(..) => 3,
         Effect::MoveDamage(..) => 4,
-        Effect::Damage(..) => 5,
+        Effect::Damage(..) | Effect::BoulderTick => 5,
         Effect::Kill(..) => 6,
         Effect::Stun(..) => 7,
         Effect::DoomKill => 8,
@@ -4071,8 +4071,22 @@ fn effect_index(effect: &Effect) -> usize {
         Effect::DiscardHandDraw => 76,
         Effect::DiscardHandAdd(..) => 77,
         Effect::PlayExhaustedShivs => 78,
-        Effect::AutoPlay(..) => 79,
-        Effect::FinishAutoPlay => 80,
+        Effect::AutoPlay(..)
+        | Effect::Uproar
+        | Effect::Bombardments
+        | Effect::TurnStartOrbs
+        | Effect::ToastyMittens
+        | Effect::BurningSticks(..)
+        | Effect::Juggle
+        | Effect::ConfusedRoll(..) => 79,
+        Effect::FinishAutoPlay
+        | Effect::AutoPlayStep
+        | Effect::PlacePlayed(..)
+        | Effect::CheckEmptyHand
+        | Effect::SideTurnStart
+        | Effect::MummifiedHand
+        | Effect::Rampart
+        | Effect::ReturnLate(..) => 80,
         Effect::WhisperingEarring(..) => 81,
         Effect::MoveAll(..) => 82,
         Effect::DrawFiltered(..) => 83,
@@ -4204,7 +4218,7 @@ fn relic_state(game: &Game, content: &Content, id: Id) -> [f32; 4] {
         "RELIC.BOOK_OF_FIVE_RINGS" => [game.book_of_five_rings as f32, 0.0, 0.0, 0.0],
         "RELIC.EMBER_TEA" => [game.ember_tea as f32, 0.0, 0.0, 0.0],
         "RELIC.SWORD_OF_STONE" => [game.sword_of_stone as f32, 0.0, 0.0, 0.0],
-        "RELIC.MAW_BANK" => [flag(game.maw_bank), 0.0, 0.0, 0.0],
+        "RELIC.MAW_BANK" => [flag(game.maw_bank > 0), 0.0, 0.0, 0.0],
         "RELIC.LIZARD_TAIL" => [flag(game.lizard_tail), 0.0, 0.0, 0.0],
         "RELIC.SILKEN_TRESS" => [flag(game.silken_tress), 0.0, 0.0, 0.0],
         "RELIC.BONE_TEA" => [flag(game.bone_tea), 0.0, 0.0, 0.0],
@@ -4275,7 +4289,7 @@ fn relic_state(game: &Game, content: &Content, id: Id) -> [f32; 4] {
             0.0,
         ],
         "RELIC.KUSARIGAMA" => [
-            combat.map_or(0, |combat| combat.kusarigama) as f32,
+            combat.map_or(0, |combat| combat.attacks_mod3) as f32,
             0.0,
             0.0,
             0.0,
@@ -4287,7 +4301,7 @@ fn relic_state(game: &Game, content: &Content, id: Id) -> [f32; 4] {
             0.0,
         ],
         "RELIC.DIAMOND_DIADEM" => [
-            flag(combat.is_some_and(|combat| combat.diamond_diadem)),
+            flag(combat.is_some_and(|combat| combat.player.power(power_id::DIAMOND_DIADEM) > 0)),
             0.0,
             0.0,
             0.0,
@@ -5683,6 +5697,21 @@ impl ContinuationBuilder {
             | Effect::DiscardHandDraw
             | Effect::PlayExhaustedShivs
             | Effect::FinishAutoPlay
+            | Effect::AutoPlayStep
+            | Effect::Uproar
+            | Effect::Rampart
+            | Effect::Bombardments
+            | Effect::TurnStartOrbs
+            | Effect::ToastyMittens
+            | Effect::BurningSticks(..)
+            | Effect::Juggle
+            | Effect::ConfusedRoll(..)
+            | Effect::BoulderTick
+            | Effect::PlacePlayed(..)
+            | Effect::CheckEmptyHand
+            | Effect::SideTurnStart
+            | Effect::MummifiedHand
+            | Effect::ReturnLate(..)
             | Effect::PassiveAll
             | Effect::CapHandCosts
             | Effect::EndTurn => {}

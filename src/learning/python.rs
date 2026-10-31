@@ -6401,7 +6401,11 @@ impl Batch {
                     game.run.hp,
                     game.run.max_hp,
                     phase_index(&game.phase).map_or(
-                        if matches!(game.phase, Phase::Won) { 12 } else { 13 },
+                        if matches!(game.phase, Phase::Won) {
+                            12
+                        } else {
+                            13
+                        },
                         |phase| phase as u8,
                     ),
                     turn,

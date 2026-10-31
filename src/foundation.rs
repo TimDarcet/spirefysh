@@ -51,7 +51,7 @@ const FEEDING_FRENZY_HOOKS: &[Hook] = &[Hook {
     effects: effects![Effect::ApplyPower(
         Target::Source,
         power_id::STRENGTH,
-        Amount::scaled(Scale::Power(power_id::FEEDING_FRENZY), -1),
+        Amount::scaled(Scale::Event, -1),
     )],
 }];
 const HIGH_VOLTAGE_HOOKS: &[Hook] = &[Hook {
@@ -85,18 +85,6 @@ const CONSTRICT_HOOKS: &[Hook] = &[Hook {
         Amount::scaled(Scale::Power(power_id::CONSTRICT), 1),
     )],
 }];
-const MACHINE_LEARNING_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
-    effects: effects![Effect::Draw(1)],
-}];
-const NOXIOUS_FUMES_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
-    effects: effects![Effect::ApplyPower(
-        Target::AllEnemies,
-        7,
-        Amount::scaled(Scale::Power(19), 1),
-    )],
-}];
 const INFINITE_BLADES_HOOKS: &[Hook] = &[Hook {
     trigger: Trigger::TurnStart,
     effects: effects![Effect::Repeat(
@@ -124,7 +112,7 @@ const FURNACE_HOOKS: &[Hook] = &[Hook {
     effects: effects![Effect::Forge(Amount::scaled(Scale::Power(74), 1))],
 }];
 const GENESIS_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
+    trigger: Trigger::EnergyReset,
     effects: effects![Effect::Stars(Amount::scaled(Scale::Power(75), 1))],
 }];
 const KINGLY_PUNCH_HOOKS: &[Hook] = &[Hook {
@@ -163,13 +151,6 @@ const PLATING_HOOKS: &[Hook] = &[
         )],
     },
 ];
-const RAMPART_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
-    effects: effects![Effect::RawBlock(
-        Target::OtherEnemies,
-        Amount::scaled(Scale::Power(power_id::RAMPART), 1),
-    )],
-}];
 const PILLAR_OF_CREATION_HOOKS: &[Hook] = &[Hook {
     trigger: Trigger::CardGenerated,
     effects: effects![Effect::RawBlock(
@@ -201,14 +182,6 @@ const CALL_OF_THE_VOID_HOOKS: &[Hook] = &[Hook {
         ETHEREAL,
     )],
 }];
-const COUNTDOWN_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
-    effects: effects![Effect::ApplyPower(
-        Target::RandomEnemy,
-        94,
-        Amount::scaled(Scale::Power(98), 1),
-    )],
-}];
 const DEVOUR_LIFE_HOOKS: &[Hook] = &[Hook {
     trigger: Trigger::CardPlayed,
     effects: effects![Effect::If(
@@ -222,7 +195,7 @@ const ENFEEBLING_TOUCH_HOOKS: &[Hook] = &[Hook {
     effects: effects![Effect::ApplyPower(
         Target::Source,
         0,
-        Amount::scaled(Scale::Power(103), 1),
+        Amount::scaled(Scale::Event, 1),
     )],
 }];
 const HAUNT_HOOKS: &[Hook] = &[Hook {
@@ -253,7 +226,7 @@ const OBLIVION_HOOKS: &[Hook] = &[Hook {
     effects: effects![Effect::ApplyPower(
         Target::Source,
         94,
-        Amount::scaled(Scale::Power(112), 1),
+        Amount::scaled(Scale::Event, 1),
     )],
 }];
 const SENTRY_MODE_HOOKS: &[Hook] = &[Hook {
@@ -262,10 +235,6 @@ const SENTRY_MODE_HOOKS: &[Hook] = &[Hook {
         Amount::scaled(Scale::Power(115), 1),
         &[Effect::AddCard(Pile::Hand, 429, 1)],
     )],
-}];
-const AGGRESSION_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
-    effects: effects![Effect::Aggression(Amount::scaled(Scale::Power(121), 1))],
 }];
 const CRIMSON_MANTLE_HOOKS: &[Hook] = &[Hook {
     trigger: Trigger::TurnStart,
@@ -286,7 +255,7 @@ const MANGLE_HOOKS: &[Hook] = &[Hook {
     effects: effects![Effect::ApplyPower(
         Target::Source,
         0,
-        Amount::scaled(Scale::Power(132), 1),
+        Amount::scaled(Scale::Event, 1),
     )],
 }];
 const RAGE_HOOKS: &[Hook] = &[Hook {
@@ -309,7 +278,7 @@ const FLEX_POTION_HOOKS: &[Hook] = &[Hook {
     effects: effects![Effect::ApplyPower(
         Target::Source,
         power_id::STRENGTH,
-        Amount::scaled(Scale::Power(power_id::FLEX_POTION), -1),
+        Amount::scaled(Scale::Event, -1),
     )],
 }];
 const SPEED_POTION_HOOKS: &[Hook] = &[Hook {
@@ -348,7 +317,7 @@ const CRUSH_UNDER_HOOKS: &[Hook] = &[Hook {
     effects: effects![Effect::ApplyPower(
         Target::Source,
         0,
-        Amount::scaled(Scale::Power(power_id::CRUSH_UNDER), 1),
+        Amount::scaled(Scale::Event, 1),
     )],
 }];
 const DARK_SHACKLES_HOOKS: &[Hook] = &[Hook {
@@ -356,7 +325,7 @@ const DARK_SHACKLES_HOOKS: &[Hook] = &[Hook {
     effects: effects![Effect::ApplyPower(
         Target::Source,
         0,
-        Amount::scaled(Scale::Power(power_id::DARK_SHACKLES), 1),
+        Amount::scaled(Scale::Event, 1),
     )],
 }];
 const DYING_STAR_HOOKS: &[Hook] = &[Hook {
@@ -364,7 +333,7 @@ const DYING_STAR_HOOKS: &[Hook] = &[Hook {
     effects: effects![Effect::ApplyPower(
         Target::Source,
         0,
-        Amount::scaled(Scale::Power(power_id::DYING_STAR), 1),
+        Amount::scaled(Scale::Event, 1),
     )],
 }];
 const PIERCING_WAIL_HOOKS: &[Hook] = &[Hook {
@@ -372,7 +341,7 @@ const PIERCING_WAIL_HOOKS: &[Hook] = &[Hook {
     effects: effects![Effect::ApplyPower(
         Target::Source,
         0,
-        Amount::scaled(Scale::Power(power_id::PIERCING_WAIL), 1),
+        Amount::scaled(Scale::Event, 1),
     )],
 }];
 const SHACKLING_POTION_HOOKS: &[Hook] = &[Hook {
@@ -380,7 +349,7 @@ const SHACKLING_POTION_HOOKS: &[Hook] = &[Hook {
     effects: effects![Effect::ApplyPower(
         Target::Source,
         0,
-        Amount::scaled(Scale::Power(power_id::SHACKLING_POTION), 1),
+        Amount::scaled(Scale::Event, 1),
     )],
 }];
 const DRAW_NEXT_TURN_HOOKS: &[Hook] = &[Hook {
@@ -389,9 +358,9 @@ const DRAW_NEXT_TURN_HOOKS: &[Hook] = &[Hook {
 }];
 const AFTERIMAGE_HOOKS: &[Hook] = &[Hook {
     trigger: Trigger::CardPlayed,
-    effects: effects![Effect::Block(
+    effects: effects![Effect::RawBlock(
         Target::Source,
-        Amount::scaled(Scale::Power(46), 1),
+        Amount::scaled(Scale::Event, 1)
     )],
 }];
 const CORROSIVE_WAVE_HOOKS: &[Hook] = &[Hook {
@@ -402,27 +371,11 @@ const CORROSIVE_WAVE_HOOKS: &[Hook] = &[Hook {
         Amount::scaled(Scale::Power(48), 1),
     )],
 }];
-const SHADOW_STEP_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
-    effects: effects![Effect::ApplyPower(
-        Target::Source,
-        51,
-        Amount::scaled(Scale::Power(50), 1),
-    )],
-}];
-const WRAITH_FORM_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
-    effects: effects![Effect::ApplyPower(
-        Target::Source,
-        1,
-        Amount::scaled(Scale::Power(52), -1),
-    )],
-}];
 const SERPENT_FORM_HOOKS: &[Hook] = &[Hook {
     trigger: Trigger::CardPlayed,
     effects: effects![Effect::Damage(
         Target::RandomEnemy,
-        Amount::scaled(Scale::Power(53), 1),
+        Amount::scaled(Scale::Event, 1),
     )],
 }];
 const RESTORE_DEXTERITY_HOOKS: &[Hook] = &[Hook {
@@ -454,14 +407,14 @@ const REPTILE_TRINKET_HOOKS: &[Hook] = &[Hook {
     effects: effects![Effect::ApplyPower(
         Target::Source,
         power_id::STRENGTH,
-        Amount::scaled(Scale::Power(power_id::REPTILE_TRINKET), -1),
+        Amount::scaled(Scale::Event, -1),
     )],
 }];
 const STRANGLE_HOOKS: &[Hook] = &[Hook {
     trigger: Trigger::CardPlayed,
-    effects: effects![Effect::Damage(
+    effects: effects![Effect::LoseHp(
         Target::Source,
-        Amount::scaled(Scale::Power(55), 1),
+        Amount::scaled(Scale::Event, 1)
     )],
 }];
 const SPEEDSTER_HOOKS: &[Hook] = &[Hook {
@@ -471,14 +424,6 @@ const SPEEDSTER_HOOKS: &[Hook] = &[Hook {
         Amount::scaled(Scale::Event, 1),
     )],
 }];
-const BIASED_COGNITION_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
-    effects: effects![Effect::ApplyPower(
-        Target::Source,
-        17,
-        Amount::fixed(-1, -1),
-    )],
-}];
 const COOLANT_HOOKS: &[Hook] = &[Hook {
     trigger: Trigger::TurnStart,
     effects: effects![Effect::RawBlock(
@@ -486,62 +431,27 @@ const COOLANT_HOOKS: &[Hook] = &[Hook {
         Amount::scaled(Scale::OrbTypesPower(25), 1),
     )],
 }];
-const HAILSTORM_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnEnd,
-    effects: effects![Effect::If(
-        Condition::HasOrb(1),
-        &[Effect::Damage(
-            Target::AllEnemies,
-            Amount::scaled(Scale::Power(26), 1),
-        )],
-        &[],
-    )],
-}];
-const LOOP_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
-    effects: effects![Effect::Repeat(
-        Amount::scaled(Scale::Power(27), 1),
-        &[Effect::PassiveFirst(1)],
-    )],
-}];
-const SPINNER_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
-    effects: effects![Effect::Repeat(
-        Amount::scaled(Scale::Power(28), 1),
-        &[Effect::Channel(4, 1)],
-    )],
-}];
 const CONSUMING_SHADOW_HOOKS: &[Hook] = &[Hook {
     trigger: Trigger::TurnEnd,
     effects: effects![Effect::EvokeLast(Amount::scaled(Scale::Power(142), 1))],
 }];
 const LIGHTNING_ROD_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
+    trigger: Trigger::EnergyReset,
     effects: effects![
         Effect::Channel(0, 1),
         Effect::ApplyPower(Target::Player, 143, Amount::fixed(-1, -1)),
     ],
 }];
-const NO_BLOCK_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
-    effects: effects![Effect::ApplyPower(
-        Target::Player,
-        144,
-        Amount::fixed(-1, -1),
-    )],
+/// Juggling's copies, made when the play finishes, enter the hand in power order.
+const JUGGLING_HOOKS: &[Hook] = &[Hook {
+    trigger: Trigger::AttackPlayed,
+    effects: effects![Effect::Juggle],
 }];
 const CALAMITY_HOOKS: &[Hook] = &[Hook {
     trigger: Trigger::AttackPlayed,
     effects: effects![Effect::Repeat(
         Amount::scaled(Scale::Power(147), 1),
         &[Effect::RandomCard(Pile::Hand, CardType::Attack, 1, false)],
-    )],
-}];
-const MAYHEM_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
-    effects: effects![Effect::AutoPlayDraw(
-        Amount::scaled(Scale::Power(150), 1),
-        false,
     )],
 }];
 const PREP_TIME_HOOKS: &[Hook] = &[Hook {
@@ -584,13 +494,6 @@ const RADIANCE_HOOKS: &[Hook] = &[Hook {
         Effect::ApplyPower(Target::Source, 162, Amount::fixed(-1, -1)),
     ],
 }];
-const REGEN_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnEnd,
-    effects: effects![
-        Effect::Heal(Target::Source, Amount::scaled(Scale::Power(163), 1)),
-        Effect::ApplyPower(Target::Source, 163, Amount::fixed(-1, -1)),
-    ],
-}];
 const STORM_HOOKS: &[Hook] = &[Hook {
     trigger: Trigger::PowerPlayed,
     effects: effects![Effect::Repeat(
@@ -615,9 +518,13 @@ const ITERATION_HOOKS: &[Hook] = &[Hook {
 }];
 const SMOKESTACK_HOOKS: &[Hook] = &[Hook {
     trigger: Trigger::CardGenerated,
-    effects: effects![Effect::RawBlock(
-        Target::Source,
-        Amount::scaled(Scale::Power(34), 1),
+    effects: effects![Effect::If(
+        Condition::CardType(CardType::Status),
+        &[Effect::Damage(
+            Target::AllEnemies,
+            Amount::scaled(Scale::Power(34), 1),
+        )],
+        &[],
     )],
 }];
 const CREATIVE_AI_HOOKS: &[Hook] = &[Hook {
@@ -654,10 +561,6 @@ const FAKE_ANCHOR_HOOKS: &[Hook] = &[Hook {
     trigger: Trigger::CombatStart,
     effects: effects![Effect::RawBlock(Target::Player, Amount::fixed(4, 4))],
 }];
-const AKABEKO_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::CombatStart,
-    effects: effects![Effect::ApplyPower(Target::Player, 83, Amount::fixed(8, 8))],
-}];
 const NEOW_OPTIONS: &[EventOption] = &[
     EventOption {
         requirement: Requirement::Always,
@@ -672,20 +575,12 @@ const NEOW_OPTIONS: &[EventOption] = &[
         effects: &[RunEffect::AddRelic("RELIC.NEOWS_BONES")],
     },
 ];
-const BAG_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::CombatStart,
-    effects: effects![Effect::Draw(2)],
-}];
-const LANTERN_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::CombatStart,
-    effects: effects![Effect::Energy(1)],
-}];
 const VAJRA_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::CombatStart,
+    trigger: Trigger::RoomEntered,
     effects: effects![Effect::ApplyPower(Target::Player, 0, Amount::fixed(1, 1))],
 }];
 const STONE_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::CombatStart,
+    trigger: Trigger::RoomEntered,
     effects: effects![Effect::ApplyPower(Target::Player, 1, Amount::fixed(1, 1))],
 }];
 const DIVINE_RIGHT_HOOKS: &[Hook] = &[Hook {
@@ -702,7 +597,7 @@ const DIVINE_DESTINY_HOOKS: &[Hook] = &[Hook {
 }];
 const BOUND_PHYLACTERY_HOOKS: &[Hook] = &[
     Hook {
-        trigger: Trigger::CombatStart,
+        trigger: Trigger::RoomEntered,
         effects: effects![Effect::Summon(Amount::fixed(1, 1))],
     },
     Hook {
@@ -714,9 +609,24 @@ const BOUND_PHYLACTERY_HOOKS: &[Hook] = &[
         )],
     },
 ];
+const PHYLACTERY_UNBOUND_HOOKS: &[Hook] = &[
+    Hook {
+        trigger: Trigger::RoomEntered,
+        effects: effects![Effect::Summon(Amount::fixed(5, 5))],
+    },
+    Hook {
+        trigger: Trigger::TurnStart,
+        effects: effects![Effect::Summon(Amount::fixed(2, 2))],
+    },
+];
+// BeforeSideTurnStart on turn 1, so its Lightning precedes Symbiotic Virus's Dark.
 const CRACKED_CORE_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::CombatStart,
-    effects: effects![Effect::Channel(0, 1)],
+    trigger: Trigger::TurnStart,
+    effects: effects![Effect::If(
+        Condition::FirstTurn,
+        &[Effect::Channel(0, 1)],
+        &[],
+    )],
 }];
 const INFUSED_CORE_HOOKS: &[Hook] = &[Hook {
     trigger: Trigger::TurnStart,
@@ -727,7 +637,7 @@ const INFUSED_CORE_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const DATA_DISK_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::CombatStart,
+    trigger: Trigger::RoomEntered,
     effects: effects![Effect::ApplyPower(Target::Player, 17, Amount::fixed(1, 1))],
 }];
 const RUNIC_CAPACITOR_HOOKS: &[Hook] = &[Hook {
@@ -758,29 +668,9 @@ const BAG_OF_MARBLES_HOOKS: &[Hook] = &[Hook {
         &[],
     )],
 }];
-const BLOOD_VIAL_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
-    effects: effects![Effect::If(
-        Condition::FirstTurn,
-        &[Effect::Heal(Target::Player, Amount::fixed(2, 2))],
-        &[],
-    )],
-}];
-const FAKE_BLOOD_VIAL_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
-    effects: effects![Effect::If(
-        Condition::FirstTurn,
-        &[Effect::Heal(Target::Player, Amount::fixed(1, 1))],
-        &[],
-    )],
-}];
 const BRONZE_SCALES_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::CombatStart,
+    trigger: Trigger::RoomEntered,
     effects: effects![Effect::ApplyPower(Target::Player, 8, Amount::fixed(3, 3))],
-}];
-const MERCURY_HOURGLASS_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
-    effects: effects![Effect::Damage(Target::AllEnemies, Amount::fixed(3, 3))],
 }];
 const RED_MASK_HOOKS: &[Hook] = &[Hook {
     trigger: Trigger::TurnStart,
@@ -800,27 +690,18 @@ const BLACK_BLOOD_HOOKS: &[Hook] = &[Hook {
 }];
 const CLOAK_CLASP_HOOKS: &[Hook] = &[Hook {
     trigger: Trigger::TurnEnd,
-    effects: &[Effect::RawBlock(Target::Player, Amount::fixed(1, 1))],
+    effects: &[Effect::RawBlock(
+        Target::Player,
+        Amount::scaled(Scale::HandSize, 1),
+    )],
 }];
 const DAUGHTER_WIND_HOOKS: &[Hook] = &[Hook {
     trigger: Trigger::AttackPlayed,
     effects: &[Effect::RawBlock(Target::Player, Amount::fixed(1, 1))],
 }];
-const FENCING_MANUAL_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::CombatStart,
-    effects: &[Effect::Forge(Amount::fixed(10, 10))],
-}];
-const FESTIVE_POPPER_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::CombatStart,
-    effects: &[Effect::Damage(Target::AllEnemies, Amount::fixed(9, 9))],
-}];
 const LOST_WISP_HOOKS: &[Hook] = &[Hook {
     trigger: Trigger::PowerPlayed,
     effects: &[Effect::Damage(Target::AllEnemies, Amount::fixed(8, 8))],
-}];
-const SAI_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
-    effects: &[Effect::RawBlock(Target::Player, Amount::fixed(7, 7))],
 }];
 const BURN_HOOKS: &[Hook] = &[Hook {
     trigger: Trigger::TurnEnd,
@@ -855,18 +736,6 @@ const REGRET_HOOKS: &[Hook] = &[Hook {
         Amount::scaled(Scale::HandSize, 1),
     )],
 }];
-const VITAL_SPARK_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::CardPlayed,
-    effects: effects![Effect::If(
-        Condition::CardType(CardType::Skill),
-        effects![Effect::ApplyPower(
-            Target::Player,
-            267,
-            Amount::scaled(Scale::Power(265), 1),
-        )],
-        &[],
-    )],
-}];
 const SHAME_HOOKS: &[Hook] = &[Hook {
     trigger: Trigger::TurnEnd,
     effects: effects![Effect::ApplyPower(Target::Player, 4, Amount::fixed(1, 1))],
@@ -887,14 +756,6 @@ const VOID_HOOKS: &[Hook] = &[Hook {
     trigger: Trigger::CardDrawn,
     effects: effects![Effect::Energy(-1)],
 }];
-const DRUM_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::CardExhausted,
-    effects: effects![Effect::If(
-        Condition::Upgraded,
-        effects![Effect::Energy(3)],
-        effects![Effect::Energy(2)]
-    )],
-}];
 const EMPTY_HOOKS: &[Hook] = &[];
 const BURNING_BLOOD_HOOKS: &[Hook] = &[Hook {
     trigger: Trigger::Victory,
@@ -909,11 +770,15 @@ const ABACUS_HOOKS: &[Hook] = &[Hook {
     effects: effects![Effect::RawBlock(Target::Player, Amount::fixed(6, 6))],
 }];
 const TWISTED_FUNNEL_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::CombatStart,
-    effects: effects![Effect::ApplyPower(
-        Target::AllEnemies,
-        power_id::POISON,
-        Amount::fixed(4, 4),
+    trigger: Trigger::TurnStart,
+    effects: effects![Effect::If(
+        Condition::FirstTurn,
+        &[Effect::ApplyPower(
+            Target::AllEnemies,
+            power_id::POISON,
+            Amount::fixed(4, 4),
+        )],
+        &[],
     )],
 }];
 const FORGOTTEN_SOUL_HOOKS: &[Hook] = &[Hook {
@@ -959,21 +824,7 @@ const WIKI_AXEBOT_MOVES: &[MoveDef] = &[
         ],
     },
 ];
-const WIKI_BATTLE_FRIEND_V1_0_MOVES: &[MoveDef] = &[MoveDef {
-    intent: "Wait",
-    weight: 1,
-    max_repeats: 1,
-    next: &[],
-    effects: &[],
-}];
-const WIKI_BATTLE_FRIEND_V2_0_MOVES: &[MoveDef] = &[MoveDef {
-    intent: "Wait",
-    weight: 1,
-    max_repeats: 1,
-    next: &[],
-    effects: &[],
-}];
-const WIKI_BATTLE_FRIEND_V3_0_MOVES: &[MoveDef] = &[MoveDef {
+const WIKI_BATTLE_FRIEND_MOVES: &[MoveDef] = &[MoveDef {
     intent: "Wait",
     weight: 1,
     max_repeats: 1,
@@ -1618,7 +1469,7 @@ const WIKI_FLAIL_KNIGHT_MOVES: &[MoveDef] = &[
 const WIKI_FLYCONID_MOVES: &[MoveDef] = &[
     MoveDef {
         intent: "Vulnerable 2",
-        weight: 3,
+        weight: 1,
         max_repeats: 1,
         next: &[],
         effects: &[Effect::ApplyPower(
@@ -1629,7 +1480,7 @@ const WIKI_FLYCONID_MOVES: &[MoveDef] = &[
     },
     MoveDef {
         intent: "Attack 9, Frail 2",
-        weight: 2,
+        weight: 1,
         max_repeats: 1,
         next: &[],
         effects: &[
@@ -2037,7 +1888,7 @@ const WIKI_LAGAVULIN_MATRIARCH_MOVES: &[MoveDef] = &[
         ],
     },
     MoveDef {
-        intent: "Wake",
+        intent: "Stun",
         weight: 1,
         max_repeats: 1,
         next: &[1],
@@ -2856,12 +2707,13 @@ const WIKI_SLUMBERING_BEETLE_MOVES: &[MoveDef] = &[
             Effect::ApplyPower(Target::Source, power_id::STRENGTH, Amount::fixed(2, 2)),
         ],
     },
+    // Woken by damage: the stunned turn runs WakeUpMove, which drops Plating.
     MoveDef {
         intent: "Stun",
         weight: 1,
         max_repeats: 1,
         next: &[1],
-        effects: &[],
+        effects: &[Effect::RemovePower(Target::Source, 79)],
     },
 ];
 const WIKI_SNAPPING_JAXFRUIT_MOVES: &[MoveDef] = &[MoveDef {
@@ -4887,88 +4739,88 @@ const THE_UNDERDOCKS_ENCOUNTERS: &[Id] = &[77, 71, 72, 74, 87, 75, 103, 79, 89, 
 const THE_UNDERDOCKS_ELITES: &[Id] = &[78, 82, 85];
 const THE_UNDERDOCKS_BOSSES: &[Id] = &[76, 84, 90];
 const FOUNDATION_CARDS: &[Id] = &[
-    4,
-    5,
-    6,
-    7,
-    8,
-    9,
-    10,
-    11,
-    14,
-    15,
-    16,
-    17,
-    18,
-    19,
-    20,
-    21,
-    22,
-    24,
-    25,
-    26,
-    27,
-    28,
-    29,
-    30,
-    31,
-    32,
-    33,
-    34,
-    35,
-    36,
-    37,
-    38,
-    39,
-    40,
-    41,
-    42,
-    43,
-    44,
-    45,
-    46,
-    67,
-    68,
-    69,
-    70,
-    71,
-    72,
-    73,
-    74,
-    76,
-    77,
-    78,
-    122,
-    123,
-    124,
-    125,
-    126,
-    127,
     442,
+    14,
+    21,
+    69,
+    46,
+    16,
+    36,
+    35,
+    31,
+    26,
+    29,
+    28,
+    37,
+    73,
+    17,
     443,
+    39,
     444,
+    9,
+    card_id::CORRUPTION,
     445,
     446,
+    42,
+    45,
+    72,
     447,
+    127,
+    70,
     448,
+    74,
+    41,
+    123,
+    124,
     449,
+    67,
     450,
+    19,
     451,
+    38,
+    33,
+    22,
+    457,
     452,
+    15,
+    4,
+    44,
     453,
     454,
+    24,
+    10,
+    18,
     455,
+    11,
+    71,
+    78,
+    6,
+    125,
     456,
-    457,
     458,
+    76,
+    43,
+    122,
     459,
+    7,
+    77,
     460,
     461,
+    32,
     462,
+    40,
+    34,
+    68,
+    27,
+    8,
+    25,
+    20,
+    5,
     464,
     465,
+    30,
     466,
-    card_id::CORRUPTION,
+    126,
 ];
 const FOUNDATION_RELICS: &[Id] = &[
     19, 21, 1, 24, 12, 2, 26, 28, 29, 13, 40, 44, 45, 14, 48, 51, 52, 53, 54, 55, 57, 61, 69, 72,
@@ -5103,11 +4955,11 @@ const IRONCLAD_DECK: &[(Id, u8)] = &[
     (2, 0),
 ];
 const DEFECT_CARDS: &[Id] = &[
-    48, 49, 51, 52, 53, 54, 55, 85, 86, 87, 91, 97, 103, 112, 113, 115, 145, 146, 147, 148, 149,
-    150, 151, 152, 153, 154, 155, 156, 157, 164, 165, 166, 167, 168, 169, 170, 171, 172, 173, 174,
-    175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 189, 190, 191, 192, 193,
-    194, 195, 196, 197, 198, 199, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 467,
-    468, 469, 470, 471,
+    204, 185, 52, 153, 86, 193, 172, 97, 201, 175, 145, 171, 167, 147, 184, 53, 192, 156, 467, 194,
+    48, 206, 49, 146, 155, 211, 202, 173, 468, 180, 164, 55, 170, 54, 187, 165, 177, 195, 188, 168,
+    181, 148, 189, 200, 85, 469, 196, 157, 154, 470, 183, 166, 178, 150, 176, 51, 169, 190, 112,
+    179, 186, 174, 191, 210, 91, 203, 197, 198, 199, 152, 103, 87, 182, 205, 149, 113, 209, 208,
+    151, 115, 471, 207,
 ];
 const DEFECT_DECK: &[(Id, u8)] = &[
     (79, 0),
@@ -5122,11 +4974,11 @@ const DEFECT_DECK: &[(Id, u8)] = &[
     (50, 0),
 ];
 const SILENT_CARDS: &[Id] = &[
-    92, 93, 94, 95, 102, 104, 116, 119, 120, 132, 133, 134, 135, 136, 138, 139, 140, 141, 142, 143,
-    144, 158, 159, 160, 161, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 222, 223, 224, 225,
-    227, 229, 230, 231, 232, 233, 234, 235, 236, 237, 238, 239, 240, 241, 242, 243, 244, 245, 246,
-    247, 248, 249, 250, 251, 252, 253, 254, 255, 256, 257, 258, 259, 260, 261, 262, 263, 264, 265,
-    266, 267, 268, 269, 270,
+    229, 249, 161, 140, 95, 235, 242, 116, 132, 136, 261, 138, 227, 158, 255, 254, 236, 222, 139,
+    237, 133, 141, 134, 119, 135, 214, 256, 250, 215, 223, 104, 251, 212, 213, 232, 102, 94, 253,
+    258, 233, 259, 160, 270, 217, 93, 243, 264, 244, 220, 262, 260, 159, 268, 265, 216, 263, 120,
+    221, 219, 218, 142, 224, 234, 241, 239, 238, 144, 143, 230, 266, 245, 246, 92, 247, 225, 248,
+    252, 267, 231, 257, 269, 240,
 ];
 const SILENT_DECK: &[(Id, u8)] = &[
     (128, 0),
@@ -5143,11 +4995,11 @@ const SILENT_DECK: &[(Id, u8)] = &[
     (131, 0),
 ];
 const REGENT_CARDS: &[Id] = &[
-    108, 109, 111, 273, 274, 275, 276, 277, 278, 281, 282, 284, 285, 286, 288, 289, 290, 291, 292,
-    293, 294, 295, 296, 297, 298, 299, 300, 301, 302, 303, 304, 305, 307, 308, 309, 310, 311, 312,
-    313, 314, 315, 316, 318, 319, 320, 321, 322, 323, 324, 325, 326, 327, 328, 329, 330, 331, 332,
-    333, 334, 335, 336, 337, 338, 339, 340, 341, 342, 343, 344, 346, 347, 348, 349, 350, 351, 352,
-    353, 354, 355, 356,
+    273, 274, 275, 355, 281, 276, 277, 356, 278, 350, 108, 282, 284, 285, 286, 288, 289, 290, 109,
+    291, 292, 293, 294, 295, 296, 297, 298, 299, 300, 301, 302, 303, 304, 305, 307, 308, 309, 351,
+    310, 311, 111, 312, 313, 314, 315, 316, 352, 317, 318, 319, 320, 321, 322, 323, 324, 325, 326,
+    327, 328, 353, 329, 330, 331, 332, 333, 334, 335, 336, 337, 338, 354, 339, 340, 341, 342, 343,
+    344, 345, 346, 347, 348, 349,
 ];
 const REGENT_DECK: &[(Id, u8)] = &[
     (83, 0),
@@ -5174,11 +5026,11 @@ const NECROBINDER_DECK: &[(Id, u8)] = &[
     (358, 0),
 ];
 const NECROBINDER_CARDS: &[Id] = &[
-    105, 106, 121, 359, 360, 361, 362, 363, 364, 365, 366, 367, 369, 370, 371, 372, 373, 374, 375,
-    376, 377, 378, 379, 380, 381, 382, 383, 384, 385, 386, 387, 388, 389, 391, 393, 394, 395, 396,
-    397, 398, 400, 401, 402, 403, 404, 405, 406, 407, 408, 409, 410, 412, 413, 414, 415, 416, 417,
-    418, 419, 420, 421, 422, 423, 424, 425, 426, 427, 428, 430, 431, 432, 433, 434, 435, 436, 437,
-    438, 439, 440, 441,
+    359, 360, 361, 362, 363, 364, 365, 366, 367, 369, 370, 371, 372, 373, 374, 375, 376, 106, 377,
+    378, 379, 380, 381, 382, 383, 384, 385, 386, 387, 388, 389, 390, 391, 393, 394, 395, 396, 397,
+    398, 400, 401, 402, 403, 404, 405, 406, 407, 408, 409, 410, 411, 412, 413, 121, 414, 415, 416,
+    417, 418, 419, 420, 421, 422, 423, 424, 425, 426, 427, 428, 430, 431, 432, 433, 434, 435, 436,
+    437, 438, 439, 440, 441, 105,
 ];
 
 impl CardDef {
@@ -5429,7 +5281,7 @@ pub fn foundation_content() -> Content {
         CardDef {
             id: "CARD.CLASH",
             card_type: CardType::Attack,
-            rarity: CardRarity::Common,
+            rarity: CardRarity::Event,
             cost: [0, 0],
             star_cost: [-1, -1],
             target: Target::ChosenEnemy,
@@ -6188,14 +6040,11 @@ pub fn foundation_content() -> Content {
             [1, 1],
             Target::ChosenEnemy,
             [0, 0],
-            effects![
-                Effect::Attack(Target::ChosenEnemy, Amount::fixed(8, 10), 1),
-                Effect::If(
-                    Condition::TargetHasPower(3),
-                    &[Effect::Attack(Target::ChosenEnemy, Amount::fixed(8, 10), 1)],
-                    &[],
-                ),
-            ],
+            effects![Effect::If(
+                Condition::TargetHasPower(3),
+                &[Effect::Attack(Target::ChosenEnemy, Amount::fixed(8, 10), 2)],
+                &[Effect::Attack(Target::ChosenEnemy, Amount::fixed(8, 10), 1)],
+            )],
         ),
         uncommon_card(
             "CARD.BULLY",
@@ -6493,7 +6342,8 @@ pub fn foundation_content() -> Content {
                 Amount::fixed(2, 2),
                 effects![Effect::Attack(Target::RandomEnemy, Amount::fixed(7, 9), 1)]
             )],
-        ),
+        )
+        .with_rarity(CardRarity::Event),
         uncommon_card(
             "CARD.BOOT_SEQUENCE",
             CardType::Skill,
@@ -6521,15 +6371,12 @@ pub fn foundation_content() -> Content {
             [1, 1],
             Target::ChosenEnemy,
             [0, 0],
-            effects![
-                Effect::Attack(Target::ChosenEnemy, Amount::fixed(2, 2), 3),
-                Effect::If(
-                    Condition::Upgraded,
-                    effects![Effect::Attack(Target::ChosenEnemy, Amount::fixed(2, 2), 1)],
-                    &[]
-                )
-            ],
-        ),
+            effects![Effect::Repeat(
+                Amount::fixed(3, 4),
+                effects![Effect::Attack(Target::ChosenEnemy, Amount::fixed(2, 2), 1)]
+            )],
+        )
+        .with_rarity(CardRarity::Event),
         card(
             "CARD.SQUASH",
             CardType::Attack,
@@ -6540,7 +6387,8 @@ pub fn foundation_content() -> Content {
                 Effect::Attack(Target::ChosenEnemy, Amount::fixed(10, 12), 1),
                 Effect::ApplyPower(Target::ChosenEnemy, 3, Amount::fixed(2, 3))
             ],
-        ),
+        )
+        .with_rarity(CardRarity::Event),
         card(
             "CARD.EXTERMINATE",
             CardType::Attack,
@@ -6548,7 +6396,8 @@ pub fn foundation_content() -> Content {
             Target::AllEnemies,
             [0, 0],
             effects![Effect::Attack(Target::AllEnemies, Amount::fixed(3, 4), 4)],
-        ),
+        )
+        .with_rarity(CardRarity::Event),
         uncommon_card(
             "CARD.SCARE",
             CardType::Skill,
@@ -6579,11 +6428,11 @@ pub fn foundation_content() -> Content {
             [0, 0],
             Target::ChosenEnemy,
             [EXHAUST, EXHAUST],
-            effects![Effect::ApplyPower(
-                Target::ChosenEnemy,
-                3,
-                Amount::fixed(2, 3)
-            )],
+            effects![
+                Effect::RawBlock(Target::ChosenEnemy, Amount::fixed(-999, -999)),
+                Effect::RemovePower(Target::ChosenEnemy, 6),
+                Effect::ApplyPower(Target::ChosenEnemy, 3, Amount::fixed(2, 3))
+            ],
         ),
         card(
             "CARD.WISP",
@@ -6615,21 +6464,18 @@ pub fn foundation_content() -> Content {
                 Amount::fixed(14, 18),
                 1
             )],
-        ),
+        )
+        .with_rarity(CardRarity::Event),
         card(
             "CARD.CELESTIAL_MIGHT",
             CardType::Attack,
             [2, 2],
             Target::ChosenEnemy,
             [0, 0],
-            effects![
-                Effect::Attack(Target::ChosenEnemy, Amount::fixed(6, 6), 3),
-                Effect::If(
-                    Condition::Upgraded,
-                    effects![Effect::Attack(Target::ChosenEnemy, Amount::fixed(6, 6), 1)],
-                    &[]
-                )
-            ],
+            effects![Effect::Repeat(
+                Amount::fixed(3, 4),
+                effects![Effect::Attack(Target::ChosenEnemy, Amount::fixed(6, 6), 1)]
+            )],
         ),
         card(
             "CARD.COSMIC_INDIFFERENCE",
@@ -6649,7 +6495,8 @@ pub fn foundation_content() -> Content {
                 Target::Player,
                 Amount::scaled(Scale::Block, 1)
             )],
-        ),
+        )
+        .with_rarity(CardRarity::Event),
         uncommon_card(
             "CARD.KINGLY_KICK",
             CardType::Attack,
@@ -6738,7 +6585,8 @@ pub fn foundation_content() -> Content {
             Target::Player,
             [0, 0],
             effects![Effect::ApplyPower(Target::Player, 8, Amount::fixed(3, 5))],
-        ),
+        )
+        .with_rarity(CardRarity::Event),
         card(
             "CARD.DEADLY_POISON",
             CardType::Skill,
@@ -6830,8 +6678,7 @@ pub fn foundation_content() -> Content {
             Target::Player,
             [0, 0],
             effects![Effect::Draw(2)],
-        )
-        .with_hooks(DRUM_HOOKS),
+        ),
         card(
             "CARD.STRIKE_SILENT",
             CardType::Attack,
@@ -7299,14 +7146,17 @@ pub fn foundation_content() -> Content {
             [1, 1],
             Target::Player,
             [EXHAUST, 0],
-            effects![Effect::Select(
-                Pile::Discard,
-                CardFilter::Any,
-                [1, 1],
-                false,
-                false,
-                CardOp::Move(Pile::Hand)
-            )],
+            effects![
+                Effect::Block(Target::Player, Amount::fixed(3, 5)),
+                Effect::Select(
+                    Pile::Discard,
+                    CardFilter::Any,
+                    [1, 1],
+                    false,
+                    false,
+                    CardOp::Move(Pile::Hand)
+                )
+            ],
         ),
         rare_card(
             "CARD.REBOOT",
@@ -7387,7 +7237,7 @@ pub fn foundation_content() -> Content {
             effects![
                 Effect::ApplyPower(Target::Player, 0, Amount::fixed(2, 3)),
                 Effect::ApplyPower(Target::Player, 1, Amount::fixed(2, 3)),
-                Effect::OrbSlots(1)
+                Effect::OrbSlots(-1)
             ],
         ),
         card(
@@ -7604,7 +7454,28 @@ pub fn foundation_content() -> Content {
             [1, 1],
             Target::Player,
             [0, 0],
-            effects![Effect::Block(Target::Player, Amount::fixed(6, 7))],
+            effects![
+                Effect::Block(Target::Player, Amount::fixed(6, 7)),
+                Effect::If(
+                    Condition::Upgraded,
+                    effects![Effect::Select(
+                        Pile::Hand,
+                        CardFilter::Type(CardType::Status),
+                        [u8::MAX, u8::MAX],
+                        false,
+                        false,
+                        CardOp::Transform(552, 1)
+                    )],
+                    effects![Effect::Select(
+                        Pile::Hand,
+                        CardFilter::Type(CardType::Status),
+                        [u8::MAX, u8::MAX],
+                        false,
+                        false,
+                        CardOp::Transform(552, 0)
+                    )]
+                )
+            ],
         ),
         card(
             "CARD.BIASED_COGNITION",
@@ -7652,7 +7523,6 @@ pub fn foundation_content() -> Content {
                 Condition::Upgraded,
                 effects![
                     Effect::Channel(4, 1),
-                    Effect::OrbSlots(1),
                     Effect::ApplyPower(Target::Player, 28, Amount::fixed(1, 1))
                 ],
                 effects![Effect::ApplyPower(Target::Player, 28, Amount::fixed(1, 1))]
@@ -7960,7 +7830,8 @@ pub fn foundation_content() -> Content {
             Target::Player,
             [EXHAUST, EXHAUST],
             effects![Effect::RandomCard(Pile::Hand, CardType::Skill, 1, true)],
-        ),
+        )
+        .with_rarity(CardRarity::Event),
         rare_card(
             "CARD.ABRASIVE",
             CardType::Power,
@@ -8061,7 +7932,10 @@ pub fn foundation_content() -> Content {
             [1, 0],
             Target::Player,
             [0, 0],
-            effects![Effect::ApplyPower(Target::Player, 50, Amount::fixed(1, 1))],
+            effects![
+                Effect::Discard(u8::MAX, false),
+                Effect::ApplyPower(Target::Player, 50, Amount::fixed(1, 1))
+            ],
         ),
         card(
             "CARD.WRAITH_FORM",
@@ -8292,7 +8166,10 @@ pub fn foundation_content() -> Content {
             [1, 1],
             Target::AllEnemies,
             [0, 0],
-            effects![Effect::Damage(Target::AllEnemies, Amount::fixed(10, 13))],
+            effects![Effect::MoveDamage(
+                Target::AllEnemies,
+                Amount::fixed(10, 13)
+            )],
         ),
         uncommon_card(
             "CARD.UP_MY_SLEEVE",
@@ -8322,7 +8199,7 @@ pub fn foundation_content() -> Content {
                     CardFilter::TypeWithoutTurnFlag(CardType::Skill, SLY),
                     [1, 1],
                     false,
-                    true,
+                    false,
                     CardOp::TurnFlag(SLY)
                 )
             ],
@@ -8360,7 +8237,7 @@ pub fn foundation_content() -> Content {
                 CardFilter::Any,
                 [1, 1],
                 false,
-                true,
+                false,
                 CardOp::CopyNextTurn(3)
             )],
         ),
@@ -8573,7 +8450,14 @@ pub fn foundation_content() -> Content {
                     },
                     1
                 ),
-                Effect::Block(Target::Player, Amount::scaled(Scale::Power(82), 1))
+                Effect::If(
+                    Condition::SourceHasPower(82),
+                    &[Effect::Block(
+                        Target::Player,
+                        Amount::scaled(Scale::Power(82), 1)
+                    )],
+                    &[]
+                )
             ],
         ),
         card(
@@ -9909,7 +9793,7 @@ pub fn foundation_content() -> Content {
             CardType::Skill,
             [2, 1],
             Target::Player,
-            [EXHAUST, EXHAUST],
+            [0, 0],
             effects![Effect::If(
                 Condition::HandAtLeast(9),
                 effects![
@@ -10079,10 +9963,15 @@ pub fn foundation_content() -> Content {
             target: Target::AllEnemies,
             flags: [0, 0],
             playable: PlayCondition::OstyAlive,
-            effects: effects![
-                Effect::OstyAttack(Target::AllEnemies, Amount::fixed(11, 13), 1),
-                Effect::ApplyPower(Target::AllEnemies, 3, Amount::fixed(2, 3))
-            ],
+            // Without Osty (an auto-play) it does nothing at all.
+            effects: effects![Effect::If(
+                Condition::OstyAlive,
+                effects![
+                    Effect::OstyAttack(Target::AllEnemies, Amount::fixed(11, 13), 1),
+                    Effect::ApplyPower(Target::AllEnemies, 3, Amount::fixed(2, 3))
+                ],
+                &[]
+            )],
             hooks: EMPTY_HOOKS,
             tags: 0,
         }
@@ -11176,7 +11065,10 @@ pub fn foundation_content() -> Content {
             [0, 0],
             Target::ChosenEnemy,
             [0, 0],
-            effects![Effect::MoveDamage(Target::AllEnemies, Amount::fixed(8, 11))],
+            effects![Effect::MoveDamage(
+                Target::ChosenEnemy,
+                Amount::fixed(8, 11)
+            )],
         ),
         uncommon_card(
             "CARD.PANIC_BUTTON",
@@ -12104,13 +11996,13 @@ pub fn foundation_content() -> Content {
                 id: "POWER.MACHINE_LEARNING_POWER",
                 kind: PowerKind::Other,
                 debuff: false,
-                hooks: MACHINE_LEARNING_HOOKS,
+                hooks: EMPTY_HOOKS,
             },
             PowerDef {
                 id: "POWER.NOXIOUS_FUMES_POWER",
                 kind: PowerKind::Other,
                 debuff: false,
-                hooks: NOXIOUS_FUMES_HOOKS,
+                hooks: EMPTY_HOOKS,
             },
             PowerDef {
                 id: "POWER.INFINITE_BLADES_POWER",
@@ -12140,7 +12032,7 @@ pub fn foundation_content() -> Content {
                 id: "POWER.BIASED_COGNITION_POWER",
                 kind: PowerKind::Other,
                 debuff: false,
-                hooks: BIASED_COGNITION_HOOKS,
+                hooks: EMPTY_HOOKS,
             },
             PowerDef {
                 id: "POWER.COOLANT_POWER",
@@ -12152,19 +12044,19 @@ pub fn foundation_content() -> Content {
                 id: "POWER.HAILSTORM_POWER",
                 kind: PowerKind::Other,
                 debuff: false,
-                hooks: HAILSTORM_HOOKS,
+                hooks: EMPTY_HOOKS,
             },
             PowerDef {
                 id: "POWER.LOOP_POWER",
                 kind: PowerKind::Other,
                 debuff: false,
-                hooks: LOOP_HOOKS,
+                hooks: EMPTY_HOOKS,
             },
             PowerDef {
                 id: "POWER.SPINNER_POWER",
                 kind: PowerKind::Other,
                 debuff: false,
-                hooks: SPINNER_HOOKS,
+                hooks: EMPTY_HOOKS,
             },
             PowerDef {
                 id: "POWER.STORM_POWER",
@@ -12294,13 +12186,13 @@ pub fn foundation_content() -> Content {
             },
             PowerDef {
                 id: "POWER.SHADOW_STEP_POWER",
-                kind: PowerKind::OneShot(Trigger::TurnStart),
+                kind: PowerKind::Other,
                 debuff: false,
-                hooks: SHADOW_STEP_HOOKS,
+                hooks: EMPTY_HOOKS,
             },
             PowerDef {
                 id: "POWER.DOUBLE_DAMAGE_POWER",
-                kind: PowerKind::OneShot(Trigger::TurnEnd),
+                kind: PowerKind::Other,
                 debuff: false,
                 hooks: EMPTY_HOOKS,
             },
@@ -12308,7 +12200,7 @@ pub fn foundation_content() -> Content {
                 id: "POWER.WRAITH_FORM_POWER",
                 kind: PowerKind::Other,
                 debuff: false,
-                hooks: WRAITH_FORM_HOOKS,
+                hooks: EMPTY_HOOKS,
             },
             PowerDef {
                 id: "POWER.SERPENT_FORM_POWER",
@@ -12584,7 +12476,7 @@ pub fn foundation_content() -> Content {
                 id: "POWER.COUNTDOWN_POWER",
                 kind: PowerKind::Other,
                 debuff: false,
-                hooks: COUNTDOWN_HOOKS,
+                hooks: EMPTY_HOOKS,
             },
             PowerDef {
                 id: "POWER.DANSE_MACABRE_POWER",
@@ -12722,7 +12614,7 @@ pub fn foundation_content() -> Content {
                 id: "POWER.AGGRESSION_POWER",
                 kind: PowerKind::Other,
                 debuff: false,
-                hooks: AGGRESSION_HOOKS,
+                hooks: EMPTY_HOOKS,
             },
             PowerDef {
                 id: "POWER.COLOSSUS_POWER",
@@ -12782,7 +12674,7 @@ pub fn foundation_content() -> Content {
                 id: "POWER.JUGGLING_POWER",
                 kind: PowerKind::Other,
                 debuff: false,
-                hooks: EMPTY_HOOKS,
+                hooks: JUGGLING_HOOKS,
             },
             PowerDef {
                 id: "POWER.MANGLE_POWER",
@@ -12860,7 +12752,7 @@ pub fn foundation_content() -> Content {
                 id: "POWER.NO_BLOCK_POWER",
                 kind: PowerKind::Other,
                 debuff: true,
-                hooks: NO_BLOCK_HOOKS,
+                hooks: EMPTY_HOOKS,
             },
             PowerDef {
                 id: "POWER.THE_GAMBIT_POWER",
@@ -12896,7 +12788,7 @@ pub fn foundation_content() -> Content {
                 id: "POWER.MAYHEM_POWER",
                 kind: PowerKind::Other,
                 debuff: false,
-                hooks: MAYHEM_HOOKS,
+                hooks: EMPTY_HOOKS,
             },
             PowerDef {
                 id: "POWER.NOSTALGIA_POWER",
@@ -12974,7 +12866,7 @@ pub fn foundation_content() -> Content {
                 id: "POWER.REGEN_POWER",
                 kind: PowerKind::Other,
                 debuff: false,
-                hooks: REGEN_HOOKS,
+                hooks: EMPTY_HOOKS,
             },
             PowerDef {
                 id: "POWER.ADAPTABLE_POWER",
@@ -13376,7 +13268,7 @@ pub fn foundation_content() -> Content {
                 id: "POWER.RAMPART_POWER",
                 kind: PowerKind::Other,
                 debuff: false,
-                hooks: RAMPART_HOOKS,
+                hooks: EMPTY_HOOKS,
             },
             PowerDef {
                 id: "POWER.RAVENOUS_POWER",
@@ -13571,7 +13463,7 @@ pub fn foundation_content() -> Content {
                 hooks: EMPTY_HOOKS,
             },
             PowerDef {
-                id: "POWER.TIME_LIMIT_POWER",
+                id: "POWER.BATTLEWORN_DUMMY_TIME_LIMIT_POWER",
                 kind: PowerKind::Other,
                 debuff: false,
                 hooks: EMPTY_HOOKS,
@@ -13586,7 +13478,7 @@ pub fn foundation_content() -> Content {
                 id: "POWER.VITAL_SPARK_POWER",
                 kind: PowerKind::Other,
                 debuff: false,
-                hooks: VITAL_SPARK_HOOKS,
+                hooks: EMPTY_HOOKS,
             },
             PowerDef {
                 id: "POWER.WASTE_AWAY_POWER",
@@ -13624,11 +13516,11 @@ pub fn foundation_content() -> Content {
             },
             RelicDef {
                 id: "RELIC.BAG_OF_PREPARATION",
-                hooks: BAG_HOOKS,
+                hooks: EMPTY_HOOKS,
             },
             RelicDef {
                 id: "RELIC.LANTERN",
-                hooks: LANTERN_HOOKS,
+                hooks: EMPTY_HOOKS,
             },
             RelicDef {
                 id: "RELIC.VAJRA",
@@ -13644,7 +13536,7 @@ pub fn foundation_content() -> Content {
             },
             RelicDef {
                 id: "RELIC.RING_OF_THE_SNAKE",
-                hooks: BAG_HOOKS,
+                hooks: EMPTY_HOOKS,
             },
             RelicDef {
                 id: "RELIC.DATA_DISK",
@@ -13668,7 +13560,7 @@ pub fn foundation_content() -> Content {
             },
             RelicDef {
                 id: "RELIC.BLOOD_VIAL",
-                hooks: BLOOD_VIAL_HOOKS,
+                hooks: EMPTY_HOOKS,
             },
             RelicDef {
                 id: "RELIC.BRONZE_SCALES",
@@ -13676,7 +13568,7 @@ pub fn foundation_content() -> Content {
             },
             RelicDef {
                 id: "RELIC.MERCURY_HOURGLASS",
-                hooks: MERCURY_HOURGLASS_HOOKS,
+                hooks: EMPTY_HOOKS,
             },
             RelicDef {
                 id: "RELIC.RED_MASK",
@@ -13692,7 +13584,7 @@ pub fn foundation_content() -> Content {
             },
             RelicDef {
                 id: "RELIC.AKABEKO",
-                hooks: AKABEKO_HOOKS,
+                hooks: EMPTY_HOOKS,
             },
             RelicDef {
                 id: "RELIC.ALCHEMICAL_COFFER",
@@ -13948,11 +13840,11 @@ pub fn foundation_content() -> Content {
             },
             RelicDef {
                 id: "RELIC.FENCING_MANUAL",
-                hooks: FENCING_MANUAL_HOOKS,
+                hooks: EMPTY_HOOKS,
             },
             RelicDef {
                 id: "RELIC.FESTIVE_POPPER",
-                hooks: FESTIVE_POPPER_HOOKS,
+                hooks: EMPTY_HOOKS,
             },
             RelicDef {
                 id: "RELIC.FIDDLE",
@@ -14223,7 +14115,10 @@ pub fn foundation_content() -> Content {
             },
             RelicDef {
                 id: "RELIC.MUMMIFIED_HAND",
-                hooks: EMPTY_HOOKS,
+                hooks: &[Hook {
+                    trigger: Trigger::PowerPlayed,
+                    effects: &[Effect::MummifiedHand],
+                }],
             },
             RelicDef {
                 id: "RELIC.MUSIC_BOX",
@@ -14283,10 +14178,7 @@ pub fn foundation_content() -> Content {
             },
             RelicDef {
                 id: "RELIC.PAELS_BLOOD",
-                hooks: &[Hook {
-                    trigger: Trigger::TurnStart,
-                    effects: &[Effect::Draw(1)],
-                }],
+                hooks: EMPTY_HOOKS,
             },
             RelicDef {
                 id: "RELIC.PAELS_CLAW",
@@ -14370,7 +14262,7 @@ pub fn foundation_content() -> Content {
             },
             RelicDef {
                 id: "RELIC.PHYLACTERY_UNBOUND",
-                hooks: EMPTY_HOOKS,
+                hooks: PHYLACTERY_UNBOUND_HOOKS,
             },
             RelicDef {
                 id: "RELIC.PLANISPHERE",
@@ -14482,7 +14374,7 @@ pub fn foundation_content() -> Content {
             },
             RelicDef {
                 id: "RELIC.SAI",
-                hooks: SAI_HOOKS,
+                hooks: EMPTY_HOOKS,
             },
             RelicDef {
                 id: "RELIC.SAND_CASTLE",
@@ -14786,7 +14678,7 @@ pub fn foundation_content() -> Content {
             },
             RelicDef {
                 id: "RELIC.FAKE_BLOOD_VIAL",
-                hooks: FAKE_BLOOD_VIAL_HOOKS,
+                hooks: EMPTY_HOOKS,
             },
             RelicDef {
                 id: "RELIC.FAKE_HAPPY_FLOWER",
@@ -15219,9 +15111,10 @@ pub fn foundation_content() -> Content {
             },
             PotionDef {
                 id: "POTION.FOUL_POTION",
-                target: Target::ChosenEnemy,
+                target: Target::AllEnemies,
+                // In combat it damages every creature, the player included (block applies).
                 effects: effects![
-                    Effect::LoseHp(Target::Player, Amount::fixed(12, 12)),
+                    Effect::Damage(Target::Player, Amount::fixed(12, 12)),
                     Effect::Damage(Target::AllEnemies, Amount::fixed(12, 12)),
                 ],
             },
@@ -15276,24 +15169,24 @@ pub fn foundation_content() -> Content {
                 powers: NO_POWERS,
             },
             EnemyDef {
-                id: "MONSTER.BATTLE_FRIEND_V1_0",
+                id: "MONSTER.BATTLE_FRIEND_V1",
                 hp: 75..=75,
                 start: 0,
-                moves: WIKI_BATTLE_FRIEND_V1_0_MOVES,
+                moves: WIKI_BATTLE_FRIEND_MOVES,
                 powers: NO_POWERS,
             },
             EnemyDef {
-                id: "MONSTER.BATTLE_FRIEND_V2_0",
+                id: "MONSTER.BATTLE_FRIEND_V2",
                 hp: 150..=150,
                 start: 0,
-                moves: WIKI_BATTLE_FRIEND_V2_0_MOVES,
+                moves: WIKI_BATTLE_FRIEND_MOVES,
                 powers: NO_POWERS,
             },
             EnemyDef {
-                id: "MONSTER.BATTLE_FRIEND_V3_0",
+                id: "MONSTER.BATTLE_FRIEND_V3",
                 hp: 300..=300,
                 start: 0,
-                moves: WIKI_BATTLE_FRIEND_V3_0_MOVES,
+                moves: WIKI_BATTLE_FRIEND_MOVES,
                 powers: NO_POWERS,
             },
             EnemyDef {
@@ -16615,9 +16508,10 @@ pub fn foundation_content() -> Content {
                     Target::AllEnemies,
                     Amount::scaled(Scale::EventPower(17), 1),
                 )],
+                // Evoke deals twice the focused passive value.
                 evoke: effects![Effect::Damage(
                     Target::AllEnemies,
-                    Amount::scaled(Scale::Event, 2),
+                    Amount::scaled(Scale::EventPower(17), 2),
                 )],
             },
         ],

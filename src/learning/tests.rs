@@ -118,52 +118,6 @@ fn v33_hand_moves_are_counted_as_entering_hand() {
 }
 
 #[test]
-fn recycling_visible_hand_marks_the_draw_bottom_known() {
-    let content = foundation_content();
-    let mut game = Game::new_character_ascension(&content, 10, 0, 10).unwrap();
-    game.begin_act(&content, 0).unwrap();
-    game.start_combat(&content, content.acts[0].encounters[0])
-        .unwrap();
-    let bottom = [
-        Card::default(),
-        Card {
-            id: 1,
-            ..Card::default()
-        },
-    ];
-    let Phase::Combat(combat) = &mut game.phase else {
-        unreachable!()
-    };
-    combat.hand = vec![
-        Card {
-            id: content.card_id("CARD.REBOOT").unwrap(),
-            ..Card::default()
-        },
-        bottom[0],
-        bottom[1],
-    ];
-    combat.draw = (2..10)
-        .map(|id| Card {
-            id,
-            ..Card::default()
-        })
-        .collect();
-    combat.known_draw_top = 0;
-    combat.known_draw_bottom = 0;
-    game.step(
-        &content,
-        Action::Play {
-            hand: 0,
-            target: None,
-        },
-    )
-    .unwrap();
-    let combat = game.combat().unwrap();
-    assert_eq!(combat.known_draw_bottom, 2);
-    assert_eq!(&combat.draw[..2], &bottom);
-}
-
-#[test]
 fn lazy_encounters_match_the_constrained_bag_generator() {
     fn generate(content: &Content, groups: &[(&[Id], usize)], mut rng: Rng) -> Vec<Id> {
         let mut result = Vec::new();

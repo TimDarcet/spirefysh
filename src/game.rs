@@ -16,6 +16,64 @@ pub(crate) struct ActionOutcome {
 const MAX_EXPECTATION_BRANCHES: usize = 64;
 
 impl Combat {
+    /// Rebound's redirect is chosen when a play starts (ModifyCardPlayResultPileTypeAndPosition):
+    /// a discard-bound card starting under it goes to the top of the draw pile and uses one stack.
+    fn mark_rebound(&mut self, def: CardDef, card: &Card) {
+        let flags = card.flags(def);
+        if self.player.power(power_id::REBOUND) > 0
+            && card.card_type(def) != CardType::Power
+            && flags & (EXHAUST | RETURN_TO_HAND | RETURN_TO_DRAW) == 0
+        {
+            self.player.consume_power(power_id::REBOUND);
+            self.rebounds.push(card.instance);
+        }
+    }
+
+    /// Feral's return is also chosen when a play starts: the first zero-energy attacks to start
+    /// this turn go back to the hand, even if one auto-played inside them finishes first.
+    fn mark_feral(&mut self, card_type: CardType, energy: i16, card: &Card) {
+        if card_type == CardType::Attack
+            && energy == 0
+            && self.history.feral_returns < self.player.power(power_id::FERAL)
+        {
+            self.history.feral_returns += 1;
+            self.ferals.push(card.instance);
+        }
+    }
+
+    /// Takes a play's Feral mark.
+    fn take_feral(&mut self, card: &Card) -> bool {
+        self.ferals
+            .iter()
+            .position(|&id| id == card.instance)
+            .map(|index| self.ferals.swap_remove(index))
+            .is_some()
+    }
+
+    /// Stomp costs 1 less this turn for each attack played (its BeforeCardPlayed hook).
+    fn discount_stomps(&mut self, content: &Content) {
+        for pile in [
+            &mut self.draw,
+            &mut self.hand,
+            &mut self.discard,
+            &mut self.exhaust,
+        ] {
+            for card in pile.iter_mut() {
+                if content.cards[card.id as usize].id == "CARD.STOMP" {
+                    card.value += 1;
+                }
+            }
+        }
+        // Cards picked in advance (Cascade's) are still in their pile in the game.
+        for pending in &mut self.queue {
+            if let Effect::AutoPlay(card) = &mut pending.effect
+                && content.cards[card.id as usize].id == "CARD.STOMP"
+            {
+                card.value += 1;
+            }
+        }
+    }
+
     fn remove_draw(&mut self, index: usize) -> Card {
         let len = self.draw.len();
         assert!(index < len);
@@ -39,12 +97,6 @@ impl Combat {
         self.known_draw_top += 1;
     }
 
-    fn prepend_draw(&mut self, cards: Vec<Card>) {
-        assert!(self.known_draw_bottom + cards.len() <= u8::MAX as usize);
-        self.known_draw_bottom += cards.len();
-        self.draw.splice(0..0, cards);
-    }
-
     fn insert_unknown_draw(&mut self, index: usize, card: Card) {
         let len = self.draw.len();
         assert!(index <= len);
@@ -63,6 +115,24 @@ impl Combat {
         self.known_draw_bottom = 0;
     }
 }
+
+/// TemporaryStrengthPower subclasses that lower Strength, debuffs in the game.
+/// Player buffs that grant Strength until the turn ends (TemporaryStrengthPower).
+pub(crate) const TEMPORARY_STRENGTH: [Id; 3] = [
+    power_id::FLEX_POTION,
+    power_id::FEEDING_FRENZY,
+    power_id::REPTILE_TRINKET,
+];
+pub(crate) const TEMPORARY_STRENGTH_DOWN: [Id; 8] = [
+    power_id::CRUSH_UNDER,
+    power_id::DARK_SHACKLES,
+    power_id::DYING_STAR,
+    power_id::ENFEEBLING_TOUCH,
+    power_id::MANGLE,
+    power_id::MONARCHS_GAZE_STRENGTH_DOWN,
+    power_id::PIERCING_WAIL,
+    power_id::SHACKLING_POTION,
+];
 
 mod combat;
 mod run;
@@ -91,7 +161,13 @@ fn can_enchant(
         | Enchantment::Vigorous => def.card_type == CardType::Attack,
         Enchantment::Goopy => def.tags & DEFEND_TAG != 0,
         Enchantment::Imbued => def.card_type == CardType::Skill,
-        Enchantment::Nimble => effects_gain_block(def.effects),
+        Enchantment::RoyallyApproved => matches!(def.card_type, CardType::Attack | CardType::Skill),
+        // CardModel.GainsBlock: Mad Science only as a skill, Sovereign Blade only with Parry.
+        Enchantment::Nimble => match def.id {
+            "CARD.MAD_SCIENCE" => card.card_type(def) == CardType::Skill,
+            "CARD.SOVEREIGN_BLADE" => false,
+            _ => effects_gain_block(def.effects),
+        },
         Enchantment::Slither => def.cost[card.upgrades.min(1) as usize] >= 0,
         Enchantment::SoulsPower => card.flags(def) & EXHAUST != 0,
         Enchantment::Spiral => {
@@ -133,7 +209,12 @@ fn enchant_all(content: &Content, cards: &mut [Card], enchantment: Enchantment, 
 
 fn effects_gain_block(effects: &[Effect]) -> bool {
     effects.iter().any(|effect| match effect {
-        Effect::Block(..) | Effect::DodgeRoll(_) | Effect::ToricToughness(_) => true,
+        Effect::Block(..)
+        | Effect::RawBlock(Target::Player, _)
+        | Effect::DrawBlockIf(..)
+        | Effect::ExhaustForBlock(_)
+        | Effect::DodgeRoll(_)
+        | Effect::ToricToughness(_) => true,
         Effect::If(_, yes, no) => effects_gain_block(yes) || effects_gain_block(no),
         Effect::Repeat(_, effects) | Effect::Random(_, effects) => effects_gain_block(effects),
         _ => false,
@@ -142,17 +223,17 @@ fn effects_gain_block(effects: &[Effect]) -> bool {
 
 pub(crate) fn eligible(content: &Content, card: &&Card, filter: CardFilter, op: CardOp) -> bool {
     let def = content.cards[card.id as usize];
+    // A card's own type can differ from its definition's (Mad Science).
+    let card_type = card.card_type(def);
     let matches = match filter {
         CardFilter::Any => true,
-        CardFilter::Type(kind) => def.card_type == kind,
-        CardFilter::AttackOrPower => {
-            matches!(def.card_type, CardType::Attack | CardType::Power)
-        }
+        CardFilter::Type(kind) => card_type == kind,
+        CardFilter::AttackOrPower => matches!(card_type, CardType::Attack | CardType::Power),
         CardFilter::TypeWithoutTurnFlag(kind, flag) => {
-            def.card_type == kind && card.turn_flags & flag == 0
+            card_type == kind && card.turn_flags & flag == 0
         }
         CardFilter::WithoutFlag(flag) => card.flags(def) & flag == 0,
-        CardFilter::NotType(kind) => def.card_type != kind,
+        CardFilter::NotType(kind) => card_type != kind,
         CardFilter::Id(id) => card.id == id,
         CardFilter::Cost(cost) => card_cost(**card, def, 0) == cost as i16,
         CardFilter::PlayableCost(cost) => {
@@ -171,7 +252,7 @@ pub(crate) fn eligible(content: &Content, card: &&Card, filter: CardFilter, op: 
                 )
         }
         CardFilter::Colorless => {
-            content.colorless.contains(&card.id) || card.id == card_id::SOVEREIGN_BLADE
+            content.colorless.contains(&card.id) || VISUALLY_COLORLESS.contains(&def.id)
         }
         CardFilter::Rare => def.rarity == CardRarity::Rare,
         CardFilter::NoReplay => {
@@ -197,70 +278,120 @@ pub(crate) fn eligible(content: &Content, card: &&Card, filter: CardFilter, op: 
                 ))
 }
 
+/// Hex afflicts every card in combat with Ethereal.
+pub(crate) fn is_ethereal(combat: &Combat, card: Card, def: CardDef) -> bool {
+    card.flags(def) & ETHEREAL != 0 || combat.player.power(power_id::HEX) > 0
+}
+
 pub(crate) fn card_cost(card: Card, def: CardDef, energy: i16) -> i16 {
-    if card.free
-        || card.flags & FREE_COMBAT != 0
-        || card.enchantment == Some(Enchantment::TezcatarasEmber)
-    {
+    // X-cost cards always spend all energy, whatever their cost modifiers (GetAmountToSpend).
+    if def.cost[card.upgrades.min(1) as usize] < 0 {
+        return energy;
+    }
+    if card.free || card.flags & FREE_COMBAT != 0 {
         return 0;
     }
-    if let Some(cost) = card.cost_override {
-        return cost as i16;
-    }
-    let cost = def.cost[card.upgrades.min(1) as usize];
-    if cost < 0 {
-        energy
+    // Stomp's discounts are relative modifiers added after any absolute one (Snecko Eye).
+    let stomp = if def.id == "CARD.STOMP" {
+        card.value
     } else {
-        (cost as i16 + card.cost_delta as i16).max(0)
+        0
+    };
+    local_cost(card, def, stomp).max(0)
+}
+
+/// The cost after the card's own modifiers, before the final clamp at 0: global modifiers
+/// (Borrowed Time) add to it first (CardEnergyCost.GetWithModifiers).
+fn local_cost(card: Card, def: CardDef, stomp: i16) -> i16 {
+    match card.cost_override {
+        Some(cost) => cost as i16 - stomp,
+        None => base_cost(card, def) + card.cost_delta as i16 - stomp,
     }
 }
 
+/// Tezcatara's Ember lowers the base cost to 0; later cost modifiers still apply on top.
+pub(crate) fn base_cost(card: Card, def: CardDef) -> i16 {
+    if card.enchantment == Some(Enchantment::TezcatarasEmber) {
+        0
+    } else {
+        def.cost[card.upgrades.min(1) as usize] as i16
+    }
+}
+
+/// `in_play`: the card is in the hand or play pile, where Free Attack, Free Skill, Free Power
+/// and Veilpiercer apply.
 pub(crate) fn energy_cost(
     combat: &Combat,
     card: Card,
     def: CardDef,
     spiked_gauntlets: bool,
+    in_play: bool,
 ) -> i16 {
+    // X costs spend all energy before any cost modifier applies (GetAmountToSpend).
+    if def.cost[card.upgrades.min(1) as usize] < 0 {
+        return combat.energy;
+    }
     let card_type = card.card_type(def);
     let void_free = combat.history.manual_cards < combat.player.power(power_id::VOID_FORM);
     if void_free
-        || card_type == CardType::Power && combat.player.power(power_id::FREE_POWER) > 0
-        || card_type == CardType::Skill && combat.player.power(power_id::FREE_SKILL) > 0
+        || in_play && card_type == CardType::Power && combat.player.power(power_id::FREE_POWER) > 0
+        || in_play && card_type == CardType::Skill && combat.player.power(power_id::FREE_SKILL) > 0
         || card_type == CardType::Skill && combat.player.power(power_id::CORRUPTION) > 0
     {
         return 0;
     }
-    let cost = card_cost(card, def, combat.energy)
-        + combat.player.power(power_id::BORROWED_TIME)
-        + (card_type == CardType::Attack) as i16 * combat.player.power(power_id::TANGLED)
-        - (card_type == CardType::Power) as i16 * combat.player.power(power_id::CURIOUS)
+    // Flatten's free turn is an absolute local modifier set once Osty attacks: relative ones
+    // added before it (its value holds their sum, plus 1) are overridden, later ones still add.
+    // A captured shown cost already includes it. Global modifiers (Borrowed Time) still apply.
+    let flatten_free = card.id == card_id::FLATTEN
+        && combat.history.osty_attacks > 0
+        && card.cost_override.is_none()
+        && (card.cost_delta == 0 || card.value > 0);
+    let cost = if flatten_free {
+        (card.cost_delta as i16 - (card.value - 1).max(0)).max(0)
+    } else if card.free || card.flags & FREE_COMBAT != 0 {
+        0
+    } else {
+        let stomp = if def.id == "CARD.STOMP" {
+            card.value
+        } else {
+            0
+        };
+        local_cost(card, def, stomp)
+    } + combat.player.power(power_id::BORROWED_TIME)
+        + (card.affliction == Affliction::Entangled) as i16
+            * combat.player.power(power_id::TANGLED)
         + (card_type == CardType::Power && spiked_gauntlets) as i16;
-    if card.id == card_id::PINPOINT {
-        (cost - combat.history.skills).max(0)
-    } else if card.id == card_id::BANSHEES_CRY {
-        (cost - combat.history.ethereal * 2).max(0)
-    } else if card.id == card_id::FLATTEN && combat.history.osty_attacks > 0
-        || card.flags(def) & ETHEREAL != 0 && combat.player.power(power_id::VEILPIERCER) > 0
-        || card_type == CardType::Attack && combat.player.power(power_id::FREE_ATTACK) > 0
+    // Curious only lowers a power card that still costs something.
+    let curious = combat.player.power(power_id::CURIOUS);
+    let cost = cost - (card_type == CardType::Power && curious > 0 && cost > 0) as i16 * curious;
+    if in_play
+        && (is_ethereal(combat, card, def) && combat.player.power(power_id::VEILPIERCER) > 0
+            || card_type == CardType::Attack && combat.player.power(power_id::FREE_ATTACK) > 0)
     {
         0
+    } else if card.id == card_id::PINPOINT {
+        (cost - combat.history.skills).max(0)
     } else {
         cost.max(0)
     }
 }
 
 pub(crate) fn star_cost(combat: &Combat, card: Card, def: CardDef) -> i16 {
+    // Star X costs always take every star, even when the card is otherwise free.
+    if def.star_cost[card.upgrades.min(1) as usize] == -2 {
+        return combat.stars;
+    }
     if card.free
+        || card.free_stars
+        || card.free_stars_combat
         || card.flags & FREE_COMBAT != 0
         || card.enchantment == Some(Enchantment::TezcatarasEmber)
         || combat.history.manual_cards < combat.player.power(power_id::VOID_FORM)
     {
         return 0;
     }
-    match def.star_cost[card.upgrades.min(1) as usize] {
-        -2 => combat.stars,
-        cost => cost.max(0) as i16,
-    }
+    def.star_cost[card.upgrades.min(1) as usize].max(0) as i16
 }
 
 pub(crate) fn trigger_orbit(combat: &mut Combat, cost: i16) {
@@ -286,7 +417,9 @@ pub(crate) fn trigger_orbit(combat: &mut Combat, cost: i16) {
         .map(|power| power.value)
         .max()
         .unwrap_or(0);
-    combat.energy = combat.energy.saturating_add(gain);
+    if combat.player.power(power_id::NO_ENERGY_GAIN) == 0 {
+        combat.energy = combat.energy.saturating_add(gain);
+    }
 }
 
 fn cards(combat: &Combat, pile: Pile) -> &[Card] {
@@ -299,7 +432,7 @@ fn cards(combat: &Combat, pile: Pile) -> &[Card] {
     }
 }
 
-fn price(item: &ShopItem) -> i32 {
+pub(crate) fn price(item: &ShopItem) -> i32 {
     match item {
         ShopItem::Card(_, x)
         | ShopItem::Relic(_, x)
@@ -308,7 +441,7 @@ fn price(item: &ShopItem) -> i32 {
     }
 }
 
-fn price_mut(item: &mut ShopItem) -> &mut i32 {
+pub(crate) fn price_mut(item: &mut ShopItem) -> &mut i32 {
     match item {
         ShopItem::Card(_, x)
         | ShopItem::Relic(_, x)
@@ -327,6 +460,140 @@ pub(crate) fn relic_group(id: Id) -> Option<usize> {
         .iter()
         .position(|relics| relics.contains(&id))
 }
+
+/// Event and token cards drawn with the colorless frame (CardModel.VisualCardPool.IsColorless).
+const VISUALLY_COLORLESS: [&str; 31] = [
+    "CARD.APOTHEOSIS",
+    "CARD.APPARITION",
+    "CARD.BRIGHTEST_FLAME",
+    "CARD.BYRD_SWOOP",
+    "CARD.ENLIGHTENMENT",
+    "CARD.EXTERMINATE",
+    "CARD.FEEDING_FRENZY",
+    "CARD.MAD_SCIENCE",
+    "CARD.MAUL",
+    "CARD.METAMORPHOSIS",
+    "CARD.NEOWS_FURY",
+    "CARD.PECK",
+    "CARD.RELAX",
+    "CARD.SQUASH",
+    "CARD.TORIC_TOUGHNESS",
+    "CARD.WISH",
+    "CARD.WHISTLE",
+    "CARD.DISINTEGRATION",
+    "CARD.FUEL",
+    "CARD.GIANT_ROCK",
+    "CARD.LUMINESCE",
+    "CARD.MIND_ROT",
+    "CARD.MINION_DIVE_BOMB",
+    "CARD.MINION_SACRIFICE",
+    "CARD.MINION_STRIKE",
+    "CARD.SHIV",
+    "CARD.SLOTH",
+    "CARD.SOUL",
+    "CARD.SOVEREIGN_BLADE",
+    "CARD.SWEEPING_GAZE",
+    "CARD.WASTE_AWAY",
+];
+
+/// StatusCardPool and CurseCardPool in pool order: a status or curse transforms into another of
+/// its pool (in combat minus Frantic Escape and Soot, which can't be generated there).
+const STATUS_POOL: [&str; 12] = [
+    "CARD.BECKON",
+    "CARD.BURN",
+    "CARD.DAZED",
+    "CARD.DEBRIS",
+    "CARD.FRANTIC_ESCAPE",
+    "CARD.INFECTION",
+    "CARD.WITHER",
+    "CARD.SLIMED",
+    "CARD.SOOT",
+    "CARD.TOXIC",
+    "CARD.VOID",
+    "CARD.WOUND",
+];
+const CURSE_POOL: [&str; 18] = [
+    "CARD.ASCENDERS_BANE",
+    "CARD.BAD_LUCK",
+    "CARD.CLUMSY",
+    "CARD.CURSE_OF_THE_BELL",
+    "CARD.DEBT",
+    "CARD.DECAY",
+    "CARD.DOUBT",
+    "CARD.ENTHRALLED",
+    "CARD.FOLLY",
+    "CARD.GREED",
+    "CARD.GUILTY",
+    "CARD.INJURY",
+    "CARD.NORMALITY",
+    "CARD.POOR_SLEEP",
+    "CARD.REGRET",
+    "CARD.SHAME",
+    "CARD.SPORE_MIND",
+    "CARD.WRITHE",
+];
+
+/// CardFactory.GetDefaultTransformationOptions: the card's own pool (a basic card's is its
+/// character's; colorless for event, ancient and token cards), Common to Rare unless it is a
+/// status or curse.
+pub(crate) fn transform_options(content: &Content, old: Id) -> Vec<Id> {
+    let def = content.cards[old as usize];
+    let pool: Vec<Id> = match def.card_type {
+        CardType::Status => STATUS_POOL
+            .iter()
+            .filter_map(|id| content.card_id(id))
+            .collect(),
+        CardType::Curse => CURSE_POOL
+            .iter()
+            .filter_map(|id| content.card_id(id))
+            .collect(),
+        _ if matches!(def.rarity, CardRarity::Event | CardRarity::Ancient) => {
+            content.colorless().to_vec()
+        }
+        _ => content
+            .characters
+            .iter()
+            .find(|character| {
+                character.cards.contains(&old) || character.deck.iter().any(|&(id, _)| id == old)
+            })
+            .map_or_else(
+                || content.colorless().to_vec(),
+                |character| character.cards.to_vec(),
+            ),
+    };
+    let any_rarity = matches!(def.card_type, CardType::Status | CardType::Curse);
+    pool.into_iter()
+        .filter(|&id| {
+            id != old
+                && (any_rarity
+                    || matches!(
+                        content.cards[id as usize].rarity,
+                        CardRarity::Common | CardRarity::Uncommon | CardRarity::Rare
+                    ))
+        })
+        .collect()
+}
+
+/// The Fabricator's defensive bots, then its aggressive ones.
+pub(crate) const FABRICATOR_BOTS: [&str; 4] = [
+    "MONSTER.GUARDBOT",
+    "MONSTER.NOISEBOT",
+    "MONSTER.ZAPBOT",
+    "MONSTER.STABBOT",
+];
+
+/// Relics that raise max energy for the whole run.
+pub(crate) const ENERGY_RELICS: [&str; 9] = [
+    "RELIC.BLESSED_ANTLER",
+    "RELIC.BLOOD_SOAKED_ROSE",
+    "RELIC.ECTOPLASM",
+    "RELIC.PHILOSOPHERS_STONE",
+    "RELIC.PRISMATIC_GEM",
+    "RELIC.SOZU",
+    "RELIC.SPIKED_GAUNTLETS",
+    "RELIC.VELVET_CHOKER",
+    "RELIC.WHISPERING_EARRING",
+];
 
 pub(crate) fn event_page(id: Id, actions: &[u8]) -> Phase {
     Phase::Event(
@@ -392,17 +659,25 @@ fn push_effects(queue: &mut Vec<Pending>, effects: &'static [Effect], context: C
 }
 
 fn push_card_effects(queue: &mut Vec<Pending>, card: Card, def: CardDef, context: Context) {
+    if def.id == "CARD.UPROAR" {
+        queue.push(Pending {
+            effect: Effect::Uproar,
+            context,
+        });
+    }
     if def.id != "CARD.MAD_SCIENCE" {
         push_effects(queue, def.effects, context);
         return;
     }
     let rider = card.variant % 10;
     let mut effects = match card.card_type(def) {
-        CardType::Attack => vec![Effect::Attack(
-            Target::ChosenEnemy,
-            Amount::fixed(12, 12),
-            if rider == 2 { 3 } else { 1 },
-        )],
+        // Violence repeats the whole attack command, so Vigor only boosts the first.
+        CardType::Attack => {
+            vec![
+                Effect::Attack(Target::ChosenEnemy, Amount::fixed(12, 12), 1);
+                if rider == 2 { 3 } else { 1 }
+            ]
+        }
         CardType::Skill => vec![Effect::Block(Target::Player, Amount::fixed(8, 8))],
         CardType::Power => match rider {
             7 => vec![
