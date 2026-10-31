@@ -2775,10 +2775,8 @@ fn game_state(game: &Game, content: &Content) -> serde_json::Value {
             "id": content.cards[card.id as usize].id,
             "instance": card.instance,
             "upgrades": card.upgrades,
-            "cost_delta": card.cost_delta,
             "value": card.value,
-            "free": card.free,
-            "cost_override": card.cost_override,
+            "costs": card.cost_mods().map(|cost| (cost.amount, cost.kind)).collect::<Vec<_>>(),
         })
     };
     let powers = |creature: &Creature| {
@@ -2824,7 +2822,7 @@ fn game_state(game: &Game, content: &Content) -> serde_json::Value {
             "common": common,
             "turn": combat.turn,
             "energy": combat.energy,
-            "max_energy": combat.max_energy,
+            "max_energy": game.max_energy(content),
             "stars": combat.stars,
             "player": creature(&combat.player),
             "osty": creature(&combat.osty),

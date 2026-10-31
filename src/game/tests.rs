@@ -83,7 +83,17 @@ fn piercing_wail_does_not_zero_glomp() {
         enemy.move_index = index;
     }
     assert_eq!(
-        game.incoming_damage_amount(&content, Actor::Enemy(1), 9, DamageKind::Attack),
+        game.modify_damage(
+            &content,
+            Some(Actor::Player),
+            9,
+            DamageKind::Attack,
+            Context {
+                source: Actor::Enemy(1),
+                ..Context::player()
+            },
+            None
+        ),
         3
     );
     game.step(&content, Action::EndTurn).unwrap();
@@ -850,35 +860,51 @@ fn cinder_attacks_then_uses_one_card_selection_draw() {
 }
 
 #[test]
-fn leaving_play_clears_temporary_cost_state() {
+fn cost_modifiers_expire_like_the_game() {
     let content = foundation_content();
     let mut game = Game::new_character_ascension(&content, 3, 0, 0).unwrap();
     game.begin_act(&content, 0).unwrap();
     game.start_combat(&content, content.acts[0].encounters[0])
         .unwrap();
-    let card = Card {
-        id: content.card_id("CARD.STRIKE_IRONCLAD").unwrap(),
-        free: true,
-        cost_override: Some(0),
-        until_played: true,
+    let strike = content.card_id("CARD.STRIKE_IRONCLAD").unwrap();
+    let def = content.cards[strike as usize];
+    let cost = |card: Card| card_cost(card, def, 0);
+    let mut card = Card {
+        id: strike,
         ..Card::default()
     };
-    // A combat-long cost (Confused) stays once played.
-    let combat_long = Card {
-        cost_override: Some(2),
-        until_played: false,
-        ..card
+    // Confused's combat cost, Kingly Kick's relative, Enlightenment's reduce-only cap, then
+    // Snecko Oil's cost this turn or until played on top.
+    card.add_cost(3, ABSOLUTE);
+    card.add_cost(-1, 0);
+    card.add_cost(1, ABSOLUTE | REDUCE_ONLY | THIS_TURN | UNTIL_PLAYED);
+    assert_eq!(cost(card), 1);
+    card.add_cost(2, ABSOLUTE | THIS_TURN | UNTIL_PLAYED);
+    assert_eq!(cost(card), 2);
+    // Snecko Oil overrides the cap for good (both expire together), not the combat-long ones.
+    assert_eq!(card.cost_mods().count(), 3);
+    // A this-turn discount (Stomp) survives the play; Bookmark's until-played one doesn't.
+    card.add_cost(-1, THIS_TURN);
+    card.add_cost(-1, UNTIL_PLAYED);
+    assert_eq!(cost(card), 0);
+    game.place_card(&content, card, false, false);
+    let placed = *game.combat().unwrap().discard.last().unwrap();
+    assert_eq!(cost(placed), 1);
+    let mut next_turn = placed;
+    next_turn.expire_costs(THIS_TURN);
+    assert_eq!(cost(next_turn), 2);
+    // Free this turn: no energy or star cost until the turn ends; free this combat lasts.
+    let mut free = Card {
+        id: strike,
+        ..Card::default()
     };
-    game.place_card(&content, combat_long, false, false);
-    let discard = &game.combat().unwrap().discard;
-    assert_eq!(discard.last().unwrap().cost_override, Some(2));
-
-    let exhausted = game.place_card(&content, card, false, false);
-
-    assert!(!exhausted);
-    let card = game.combat().unwrap().discard.last().unwrap();
-    assert!(!card.free);
-    assert_eq!(card.cost_override, None);
+    free.free_this_turn();
+    assert_eq!((cost(free), free.star_override()), (0, Some(0)));
+    free.expire_costs(THIS_TURN);
+    assert_eq!((cost(free), free.star_override()), (1, None));
+    free.free_this_combat();
+    free.expire_costs(THIS_TURN | UNTIL_PLAYED);
+    assert_eq!((cost(free), free.star_override()), (0, Some(0)));
 }
 
 #[test]
@@ -3402,12 +3428,27 @@ fn bread_raises_max_energy_from_turn_two() {
     game.begin_act(&content, 0).unwrap();
     game.start_combat(&content, content.acts[0].encounters[0])
         .unwrap();
-    let combat = game.combat().unwrap();
-    assert_eq!((combat.max_energy, combat.energy), (3, 1));
+    let energy = |game: &Game| (game.max_energy(&content), game.combat().unwrap().energy);
+    assert_eq!(energy(&game), (3, 1));
     game.combat_mut().unwrap().player.hp = 999;
     game.step(&content, Action::EndTurn).unwrap();
-    let combat = game.combat().unwrap();
-    assert_eq!((combat.max_energy, combat.energy), (4, 4));
+    assert_eq!(energy(&game), (4, 4));
+}
+
+#[test]
+fn max_energy_is_the_run_energy_through_its_listeners() {
+    let content = foundation_content();
+    let mut game = turn_start_test(&content, 1, &[], &["RELIC.PAELS_FLESH"]);
+    let base = game.combat().unwrap().max_energy;
+    assert_eq!(game.max_energy(&content), base);
+    game.combat_mut().unwrap().turn = 3;
+    assert_eq!(game.max_energy(&content), base + 1);
+    let player = &mut game.combat_mut().unwrap().player;
+    player.add_power(power_id::FRIENDSHIP, 2);
+    player.add_power(power_id::WASTE_AWAY, 1);
+    game.pumpkin_candle = 5;
+    assert_eq!(game.max_energy(&content), base + 3);
+    assert_eq!(game.combat().unwrap().max_energy, base);
 }
 
 #[test]
@@ -3430,7 +3471,9 @@ fn metamorphosis_cards_are_free_all_combat() {
     assert_eq!(draw.len(), 3);
     assert!(
         draw.iter()
-            .all(|card| card.flags & FREE_COMBAT != 0 && !card.free)
+            .all(|card| card.cost_mods().all(|cost| cost.amount == 0
+                && cost.kind & ABSOLUTE != 0
+                && cost.kind & (THIS_TURN | UNTIL_PLAYED) == 0))
     );
 }
 
@@ -3829,8 +3872,9 @@ fn crossbow_and_big_hat_generate_in_relic_order() {
         game.start_turn();
         game.resolve(&content);
         let hand = &game.combat().unwrap().hand;
-        assert_eq!(hand[0].free, order[0].1);
-        assert_eq!(hand.last().unwrap().free, order[1].1);
+        let free = |card: &Card| card.cost_mods().any(|cost| cost.kind & THIS_TURN != 0);
+        assert_eq!(free(&hand[0]), order[0].1);
+        assert_eq!(free(hand.last().unwrap()), order[1].1);
         order.reverse();
     }
 }
@@ -3846,8 +3890,7 @@ fn seal_of_gold_and_happy_flower_give_energy_in_relic_order() {
         game.happy_flower = 2;
         game.start_turn();
         game.resolve(&content);
-        let combat = game.combat().unwrap();
-        assert_eq!(combat.energy, combat.max_energy + 2);
+        assert_eq!(game.combat().unwrap().energy, game.max_energy(&content) + 2);
         assert_eq!(game.run.gold, 2);
         order.reverse();
     }
@@ -4303,4 +4346,74 @@ fn storm_hears_only_the_plays_it_recorded() {
             .unwrap();
         assert_eq!(game.combat().unwrap().orbs.len(), orbs);
     }
+}
+
+#[test]
+fn hp_loss_is_unblockable_damage_through_the_hp_loss_hooks() {
+    // Block doesn't stop it, and Tungsten Rod lowers it before Buffer (Late) sees what is left.
+    let content = foundation_content();
+    for (amount, buffer_left) in [(1, 1), (3, 0)] {
+        let powers = &["POWER.BUFFER_POWER"];
+        let mut game = turn_start_test(&content, 1, powers, &["RELIC.TUNGSTEN_ROD"]);
+        let combat = game.combat_mut().unwrap();
+        combat.queue.clear();
+        combat.player.block = 10;
+        let hp = combat.player.hp;
+        combat.queue.push(Pending {
+            effect: Effect::LoseHp(Target::Player, Amount::fixed(amount, amount)),
+            context: Context::player(),
+        });
+        game.resolve(&content);
+        let player = &game.combat().unwrap().player;
+        assert_eq!((player.hp, player.block), (hp, 10));
+        assert_eq!(player.kind(&content, PowerKind::Buffer), buffer_left);
+    }
+}
+
+#[test]
+fn shroud_block_goes_through_modify_block() {
+    // Shroud gains unpowered block (CreatureCmd.GainBlock), which Shadowmeld doubles.
+    let content = foundation_content();
+    let powers = &["POWER.SHROUD_POWER", "POWER.SHADOWMELD_POWER"];
+    let mut game = turn_start_test(&content, 1, powers, &[]);
+    let combat = game.combat_mut().unwrap();
+    combat.queue.clear();
+    combat.player.block = 0;
+    game.apply_power(&content, Actor::Enemy(0), power_id::DOOM, 3);
+    assert_eq!(game.combat().unwrap().player.block, 2);
+}
+
+#[test]
+fn thrash_gains_the_fully_modified_damage() {
+    // Thrash modifies the exhausted attack's damage with no target (Hook.ModifyDamage, Move):
+    // Miniature Cannon adds to the upgraded Strike.
+    let content = foundation_content();
+    let mut game = turn_start_test(&content, 1, &[], &["RELIC.MINIATURE_CANNON"]);
+    let thrash = content.card_id("CARD.THRASH").unwrap();
+    let strike = Card {
+        id: content.card_id("CARD.STRIKE_IRONCLAD").unwrap(),
+        upgrades: 1,
+        ..Card::default()
+    };
+    let combat = game.combat_mut().unwrap();
+    combat.queue.clear();
+    combat.energy = 9;
+    combat.hand = vec![
+        Card {
+            id: thrash,
+            ..Card::default()
+        },
+        strike,
+    ];
+    game.step(
+        &content,
+        Action::Play {
+            hand: 0,
+            target: Some(0),
+        },
+    )
+    .unwrap();
+    let combat = game.combat().unwrap();
+    let played = combat.discard.iter().find(|card| card.id == thrash);
+    assert_eq!(played.map(|card| card.value), Some(12));
 }

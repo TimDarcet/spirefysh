@@ -765,7 +765,7 @@ impl Game {
             exhaust: vec![],
             offer: vec![],
             energy: self.run.energy as i16 + (self.pumpkin_candle > 0) as i16,
-            max_energy: self.run.energy as i16 + (self.pumpkin_candle > 0) as i16,
+            max_energy: self.run.energy as i16,
             draw_per_turn: self.run.draw,
             stars: 0,
             turn: 0,

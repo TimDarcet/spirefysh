@@ -47,27 +47,23 @@ impl Combat {
             .sum()
     }
 
-    /// Stomp costs 1 less this turn for each attack played (its BeforeCardPlayed hook).
-    fn discount_stomps(&mut self, content: &Content) {
-        for pile in [
-            &mut self.draw,
-            &mut self.hand,
-            &mut self.discard,
-            &mut self.exhaust,
-        ] {
-            for card in pile.iter_mut() {
-                if content.cards[card.id as usize].id == "CARD.STOMP" {
-                    card.value += 1;
-                }
-            }
-        }
-        // Cards picked in advance (Cascade's) are still in their pile in the game.
-        for pending in &mut self.queue {
-            if let Effect::AutoPlay(card) = &mut pending.effect
-                && content.cards[card.id as usize].id == "CARD.STOMP"
-            {
-                card.value += 1;
-            }
+    /// Adds a cost modifier to every combat card `matches` picks, as its own hook would: in the
+    /// piles, being played, or picked to auto-play (still in its pile in the game, Cascade's).
+    fn add_costs(&mut self, matches: impl Fn(&Card) -> bool, amount: i8, kind: u8) {
+        let piles = (self.draw.iter_mut())
+            .chain(&mut self.hand)
+            .chain(&mut self.discard)
+            .chain(&mut self.exhaust)
+            .chain(self.plays.iter_mut().map(|play| &mut play.card));
+        let picked = self
+            .queue
+            .iter_mut()
+            .filter_map(|pending| match &mut pending.effect {
+                Effect::AutoPlay(card) => Some(card),
+                _ => None,
+            });
+        for card in piles.chain(picked).filter(|card| matches(card)) {
+            card.add_cost(amount, kind);
         }
     }
 
@@ -279,25 +275,13 @@ pub(crate) fn card_cost(card: Card, def: CardDef, energy: i16) -> i16 {
     if def.cost[card.upgrades.min(1) as usize] < 0 {
         return energy;
     }
-    if card.free || card.flags & FREE_COMBAT != 0 {
-        return 0;
-    }
-    // Stomp's discounts are relative modifiers added after any absolute one (Snecko Eye).
-    let stomp = if def.id == "CARD.STOMP" {
-        card.value
-    } else {
-        0
-    };
-    local_cost(card, def, stomp).max(0)
+    local_cost(card, def).max(0)
 }
 
 /// The cost after the card's own modifiers, before the final clamp at 0: global modifiers
 /// (Borrowed Time) add to it first (CardEnergyCost.GetWithModifiers).
-fn local_cost(card: Card, def: CardDef, stomp: i16) -> i16 {
-    match card.cost_override {
-        Some(cost) => cost as i16 - stomp,
-        None => base_cost(card, def) + card.cost_delta as i16 - stomp,
-    }
+fn local_cost(card: Card, def: CardDef) -> i16 {
+    card.local_energy(base_cost(card, def))
 }
 
 /// Tezcatara's Ember lowers the base cost to 0; later cost modifiers still apply on top.
@@ -331,25 +315,8 @@ pub(crate) fn energy_cost(
     {
         return 0;
     }
-    // Flatten's free turn is an absolute local modifier set once Osty attacks: relative ones
-    // added before it (its value holds their sum, plus 1) are overridden, later ones still add.
-    // A captured shown cost already includes it. Global modifiers (Borrowed Time) still apply.
-    let flatten_free = card.id == card_id::FLATTEN
-        && combat.history.osty_attacks > 0
-        && card.cost_override.is_none()
-        && (card.cost_delta == 0 || card.value > 0);
-    let cost = if flatten_free {
-        (card.cost_delta as i16 - (card.value - 1).max(0)).max(0)
-    } else if card.free || card.flags & FREE_COMBAT != 0 {
-        0
-    } else {
-        let stomp = if def.id == "CARD.STOMP" {
-            card.value
-        } else {
-            0
-        };
-        local_cost(card, def, stomp)
-    } + combat.player.power(power_id::BORROWED_TIME)
+    let cost = local_cost(card, def)
+        + combat.player.power(power_id::BORROWED_TIME)
         + (card.affliction == Affliction::Entangled) as i16
             * combat.player.power(power_id::TANGLED)
         + (card_type == CardType::Power && spiked_gauntlets) as i16;
@@ -361,8 +328,6 @@ pub(crate) fn energy_cost(
             || card_type == CardType::Attack && combat.player.power(power_id::FREE_ATTACK) > 0)
     {
         0
-    } else if card.id == card_id::PINPOINT {
-        (cost - combat.history.skills).max(0)
     } else {
         cost.max(0)
     }
@@ -373,16 +338,13 @@ pub(crate) fn star_cost(combat: &Combat, card: Card, def: CardDef) -> i16 {
     if def.star_cost[card.upgrades.min(1) as usize] == -2 {
         return combat.stars;
     }
-    if card.free
-        || card.free_stars
-        || card.free_stars_combat
-        || card.flags & FREE_COMBAT != 0
-        || card.enchantment == Some(Enchantment::TezcatarasEmber)
+    if card.enchantment == Some(Enchantment::TezcatarasEmber)
         || combat.history.manual_cards < combat.player.power(power_id::VOID_FORM)
     {
         return 0;
     }
-    def.star_cost[card.upgrades.min(1) as usize].max(0) as i16
+    let base = def.star_cost[card.upgrades.min(1) as usize] as i16;
+    card.star_override().unwrap_or(base).max(0)
 }
 
 pub(crate) fn trigger_orbit(combat: &mut Combat, cost: i16) {

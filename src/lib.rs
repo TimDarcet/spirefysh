@@ -492,7 +492,6 @@ const RETURN_TO_HAND: u16 = 1024;
 const RETURN_TO_DRAW: u16 = 2048;
 const NO_GENERATE: u16 = 4096;
 const FETCHED: u16 = 8192;
-const FREE_COMBAT: u16 = 16384;
 const FILTERED_DRAW: u16 = 32768;
 pub const STRIKE_TAG: u16 = 1;
 pub const DEFEND_TAG: u16 = 2;
@@ -1502,22 +1501,12 @@ pub struct Card {
     pub id: Id,
     pub instance: u32,
     pub upgrades: u8,
-    pub cost_delta: i8,
     pub flags: u16,
     pub turn_flags: u16,
     pub value: i16,
     pub replays: u8,
-    pub free: bool,
-    pub cost_override: Option<i8>,
-    /// `cost_override` lasts only this turn or until played (Snecko Oil), not the combat.
-    pub until_played: bool,
-    /// `cost_override` lasts until played, across turns (Rocket Punch, Bookmark).
-    pub when_played: bool,
-    /// Star cost is 0 this turn (SetToFreeThisTurn on a card whose energy cost a global hook raises).
-    pub free_stars: bool,
-    /// Star cost is 0 for the rest of combat (SetToFreeThisCombat) after a later absolute energy
-    /// cost (Confused) replaced its energy part.
-    pub free_stars_combat: bool,
+    /// Local cost modifiers in the order applied, then empty slots.
+    pub costs: [CostMod; 6],
     pub enchantment: Option<Enchantment>,
     pub enchantment_amount: i16,
     pub enchantment_value: i16,
@@ -1525,6 +1514,22 @@ pub struct Card {
     /// The card's affliction (one at most; a card already afflicted can't take another).
     pub affliction: Affliction,
 }
+
+/// A local cost modifier (CardEnergyCost's LocalCostModifier; with STAR_COST, a
+/// TemporaryCardCost of the star cost).
+#[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq)]
+pub struct CostMod {
+    pub amount: i8,
+    pub kind: u8,
+}
+
+/// Cost modifier kinds: absolute (else relative), expiring at turn end and/or once played (else at
+/// combat end), reduce only, and the star cost instead of the energy cost.
+pub const ABSOLUTE: u8 = 1;
+pub const THIS_TURN: u8 = 2;
+pub const UNTIL_PLAYED: u8 = 4;
+pub const REDUCE_ONLY: u8 = 8;
+pub const STAR_COST: u8 = 16;
 
 /// Card afflictions, each applied by a power: Bound (Chains of Binding), Galvanized (Galvanic),
 /// Entangled (Tangled), Ringing, Smog (Smoggy), Tainted (Vital Spark), Hexed (Hex).
@@ -1556,17 +1561,17 @@ impl Affliction {
     }
 }
 
-fn card_key(card: &Card) -> [i64; 13] {
+fn card_key(card: &Card) -> [i64; 11] {
     [
         card.id as i64,
         card.upgrades as i64,
-        card.cost_delta as i64,
         card.flags as i64,
         card.turn_flags as i64,
         card.value as i64,
         card.replays as i64,
-        card.free as i64,
-        card.cost_override.unwrap_or(-1) as i64,
+        (card.costs.iter()).fold(0, |key, cost| {
+            key << 10 ^ (cost.amount as i64) << 5 ^ cost.kind as i64
+        }),
         card.enchantment.map_or(0, |x| x as i64 + 1),
         card.enchantment_amount as i64,
         card.enchantment_value as i64,
@@ -1575,6 +1580,90 @@ fn card_key(card: &Card) -> [i64; 13] {
 }
 
 impl Card {
+    /// Adds a local cost modifier. An absolute one drops the earlier ones it outlasts (overridden
+    /// for good) and relatives that expire together merge, which keeps the cost exact.
+    pub fn add_cost(&mut self, amount: i8, kind: u8) {
+        let expiry = |kind: u8| kind & (THIS_TURN | UNTIL_PLAYED);
+        if kind & (ABSOLUTE | REDUCE_ONLY) == ABSOLUTE {
+            self.retain_costs(|cost| {
+                (cost.kind ^ kind) & STAR_COST != 0
+                    || expiry(cost.kind) & expiry(kind) != expiry(kind)
+            });
+        }
+        let len = self.cost_mods().count();
+        let new = CostMod { amount, kind };
+        // A repeated reduce-only cap changes nothing (Enlightenment twice).
+        if len > 0 && self.costs[len - 1] == new && kind & REDUCE_ONLY != 0 {
+            return;
+        }
+        if kind & (ABSOLUTE | REDUCE_ONLY) == 0 && len > 0 && self.costs[len - 1].kind == kind {
+            self.costs[len - 1].amount = self.costs[len - 1].amount.saturating_add(amount);
+            self.retain_costs(|cost| cost.kind & ABSOLUTE != 0 || cost.amount != 0);
+        } else if kind & ABSOLUTE != 0 || amount != 0 {
+            debug_assert!(
+                len < self.costs.len(),
+                "cost modifiers overflow: {:?}",
+                self.costs
+            );
+            if len == self.costs.len() {
+                self.costs.copy_within(1.., 0);
+            }
+            self.costs[len.min(self.costs.len() - 1)] = new;
+        }
+    }
+
+    /// Clears the cost modifiers that expire with `expiry` (EndOfTurnCleanup,
+    /// AfterCardPlayedCleanup).
+    pub fn expire_costs(&mut self, expiry: u8) {
+        self.retain_costs(|cost| cost.kind & expiry == 0);
+    }
+
+    fn retain_costs(&mut self, keep: impl Fn(CostMod) -> bool) {
+        let mut kept = self
+            .costs
+            .into_iter()
+            .filter(|&x| x != CostMod::default() && keep(x));
+        self.costs = std::array::from_fn(|_| kept.next().unwrap_or_default());
+    }
+
+    pub fn cost_mods(&self) -> impl Iterator<Item = CostMod> + '_ {
+        self.costs
+            .iter()
+            .copied()
+            .take_while(|&cost| cost != CostMod::default())
+    }
+
+    /// SetToFreeThisTurn: no energy or star cost this turn or until played.
+    pub fn free_this_turn(&mut self) {
+        self.add_cost(0, ABSOLUTE | THIS_TURN | UNTIL_PLAYED);
+        self.add_cost(0, ABSOLUTE | THIS_TURN | UNTIL_PLAYED | STAR_COST);
+    }
+
+    /// SetToFreeThisCombat.
+    pub fn free_this_combat(&mut self) {
+        self.add_cost(0, ABSOLUTE);
+        self.add_cost(0, ABSOLUTE | STAR_COST);
+    }
+
+    /// The energy cost through the local modifiers (GetWithModifiers(Local), before the clamp).
+    fn local_energy(&self, base: i16) -> i16 {
+        (self.cost_mods().filter(|cost| cost.kind & STAR_COST == 0)).fold(base, |current, cost| {
+            let set = cost.amount as i16 + (cost.kind & ABSOLUTE == 0) as i16 * current;
+            if cost.kind & REDUCE_ONLY != 0 {
+                current.min(set)
+            } else {
+                set
+            }
+        })
+    }
+
+    /// The last temporary star cost (CurrentStarCost).
+    fn star_override(&self) -> Option<i16> {
+        (self.cost_mods().filter(|cost| cost.kind & STAR_COST != 0))
+            .last()
+            .map(|cost| cost.amount as i16)
+    }
+
     fn flags(self, def: CardDef) -> u16 {
         let mut flags = def.flags[self.upgrades.min(1) as usize];
         // Soul's Power removes the card's own Exhaust, not a forced one (Havoc).

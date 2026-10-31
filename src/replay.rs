@@ -1168,7 +1168,7 @@ fn replay_decision(
         && !combat.choice.is_some_and(|choice| inferred(choice.op))
     {
         let player = &after["players"][0];
-        let hand = hand_cards(content, player).map_err(|error| vec![error])?;
+        let hand = cards(content, &player["hand"]).map_err(|error| vec![error])?;
         resync_pile("resync.potion_hand", &mut combat.hand, hand);
         let discard = cards(content, &player["discard_pile"]).map_err(|error| vec![error])?;
         resync_pile("resync.potion_discard", &mut combat.discard, discard);
@@ -1520,16 +1520,21 @@ fn replay_decision(
                         // By instance when the ids agree, else by model, preferring the same
                         // cost (Jeweled Mask's free Royalties).
                         let shown = card(content, value).ok();
+                        let last_set = |card: Card| {
+                            (card.cost_mods())
+                                .filter(|cost| {
+                                    cost.kind & (ABSOLUTE | REDUCE_ONLY | STAR_COST) == ABSOLUTE
+                                })
+                                .last()
+                        };
                         source
                             .iter()
                             .position(|card| card.instance == instance && same(card, value))
                             .or_else(|| {
                                 source.iter().position(|card| {
                                     same(card, value)
-                                        && shown.is_some_and(|shown| {
-                                            (shown.free, shown.cost_override)
-                                                == (card.free, card.cost_override)
-                                        })
+                                        && shown
+                                            .is_some_and(|shown| last_set(shown) == last_set(*card))
                                 })
                             })
                             .or_else(|| source.iter().position(|card| same(card, value)))
@@ -2076,7 +2081,7 @@ fn replay_decision(
     }
     if inferred_choice && let Phase::Combat(combat) = &mut game.phase {
         let player = &after["players"][0];
-        let hand = hand_cards(content, player).map_err(|error| vec![error])?;
+        let hand = cards(content, &player["hand"]).map_err(|error| vec![error])?;
         resync_pile("resync.choice_hand", &mut combat.hand, hand);
         let discard = cards(content, &player["discard_pile"]).map_err(|error| vec![error])?;
         resync_pile("resync.choice_discard", &mut combat.discard, discard);
@@ -2174,7 +2179,7 @@ fn replay_decision(
             .iter()
             .any(|power| power["model_id"] == "POWER.ENTROPY_POWER")
         {
-            let hand = hand_cards(content, &after["players"][0]).map_err(|error| vec![error])?;
+            let hand = cards(content, &after["players"][0]["hand"]).map_err(|error| vec![error])?;
             resync_pile("resync.entropy_hand", &mut combat.hand, hand);
         }
     }
@@ -2927,26 +2932,52 @@ fn game_from_snapshot(
         .relics
         .iter()
         .any(|&id| content.relics[id as usize].id == "RELIC.SPIKED_GAUNTLETS");
-    let set_values = |mut cards: Vec<Card>| {
-        for card in &mut cards {
-            let card_type = card.card_type(content.cards[card.id as usize]);
+    let has = |id| player_creature.power(id) > 0;
+    // Void Form, or Brilliant Scarf's fifth card this turn.
+    let all_free = history.manual_cards < player_creature.power(power_id::VOID_FORM)
+        || array(&player["relics"])
+            .iter()
+            .any(|relic| relic["model_id"] == "RELIC.BRILLIANT_SCARF" && relic["amount"] == 4);
+    let played_ids: Vec<u32> = array(&player["cards_played_this_turn_ids"])
+        .iter()
+        .map(|id| instance_id(id.as_str().unwrap_or_default()))
+        .collect();
+    let set_values = |values: &Value| -> Result<Vec<Card>, String> {
+        let mut cards = cards(content, values)?;
+        for (card, value) in cards.iter_mut().zip(array(values)) {
+            let def = content.cards[card.id as usize];
+            let card_type = card.card_type(def);
             let global_cost = borrowed_time + (card_type == CardType::Attack) as i16 * tangled
                 - (card_type == CardType::Power) as i16 * curious
                 + (card_type == CardType::Power && spiked_gauntlets) as i16;
-            // The captured cost already includes Pinpoint's per-skill discount (auto-plays too).
-            let dynamic_discount = match card.id {
-                card_id::PINPOINT => player["skills_played_this_turn"]
-                    .as_i64()
-                    .map_or(history.skills, |skills| skills as i16),
-                _ => 0,
-            };
-            let local = |cost: i8| {
-                (cost as i16 - global_cost + dynamic_discount).clamp(i8::MIN as i16, i8::MAX as i16)
-                    as i8
-            };
-            card.cost_delta = local(card.cost_delta);
-            if card.until_played || card.when_played {
-                card.cost_override = card.cost_override.map(local);
+            // Older captures list no modifiers: Pinpoint's discount this turn is in its cost.
+            if card.id == card_id::PINPOINT && !card.cost_mods().any(|cost| cost.kind == THIS_TURN)
+            {
+                let skills = (player["skills_played_this_turn"].as_i64())
+                    .map_or(history.skills, |skills| skills as i16);
+                card.add_cost(-skills.clamp(0, 127) as i8, THIS_TURN);
+            }
+            // A shown cost the local and global modifiers leave unexplained is a combat-long
+            // residual, unless the simulator's own hooks make it free (Free Skill, Veilpiercer).
+            let free = all_free
+                || match card_type {
+                    CardType::Skill => has(power_id::FREE_SKILL) || has(power_id::CORRUPTION),
+                    CardType::Attack => has(power_id::FREE_ATTACK),
+                    CardType::Power => has(power_id::FREE_POWER),
+                    _ => false,
+                }
+                || has(power_id::VEILPIERCER)
+                    && (card.flags(def) & ETHEREAL != 0 || has(power_id::HEX));
+            let base = base_cost(*card, def);
+            if let Some(shown) = value["energy_cost"]
+                .as_i64()
+                .filter(|&shown| shown > 0 || !free)
+                && base >= 0
+                && let local = (card.local_energy(base) + global_cost) as i64
+                && local.max(0) != shown
+            {
+                tally("resync.card_cost");
+                card.add_cost((shown - local).clamp(-127, 127) as i8, 0);
             }
             if let Some(&variant) = variants.get(&card.instance) {
                 card.variant = variant;
@@ -2969,33 +3000,24 @@ fn game_from_snapshot(
             if matches!(
                 content.cards[card.id as usize].id,
                 "CARD.BOLAS" | "CARD.THRUMMING_HATCHET"
-            ) && (history.bolas.contains(&card.instance)
-                || array(&player["cards_played_this_turn_ids"])
-                    .iter()
-                    .any(|id| instance_id(id.as_str().unwrap_or_default()) == card.instance))
+            ) && (history.bolas.contains(&card.instance) || played_ids.contains(&card.instance))
             {
                 card.value = 1;
             }
             // Fetch draws only on its first finished play this turn.
-            if card.id == card_id::FETCH
-                && array(&player["cards_played_this_turn_ids"])
-                    .iter()
-                    .any(|id| instance_id(id.as_str().unwrap_or_default()) == card.instance)
-            {
+            if card.id == card_id::FETCH && played_ids.contains(&card.instance) {
                 card.turn_flags |= FETCHED;
             }
         }
-        cards
+        Ok(cards)
     };
-    let draw = set_values(
-        cards(content, &oracle["hidden_draw_order"])?
-            .into_iter()
-            .rev()
-            .collect(),
-    );
-    let hand = set_values(hand_cards(content, player)?);
-    let discard = set_values(cards(content, &player["discard_pile"])?);
-    let exhaust = set_values(cards(content, &player["exhaust_pile"])?);
+    let draw: Vec<_> = set_values(&oracle["hidden_draw_order"])?
+        .into_iter()
+        .rev()
+        .collect();
+    let hand = set_values(&player["hand"])?;
+    let discard = set_values(&player["discard_pile"])?;
+    let exhaust = set_values(&player["exhaust_pile"])?;
     let dampened = draw
         .iter()
         .chain(&hand)
@@ -3460,11 +3482,6 @@ fn game_from_snapshot(
                 |id| id as u32,
             ),
     };
-    let rng = |key: String| {
-        let mut rng = Rng::from_seed(oracle["rng_seeds"][&key].as_u64().unwrap_or_default());
-        rng.forward(oracle["rng_counters"][&key].as_u64().unwrap_or_default());
-        rng
-    };
     let seed = (oracle["rng_seeds"]["run.UpFront"]
         .as_u64()
         .unwrap_or_default() as u32)
@@ -3489,16 +3506,70 @@ fn game_from_snapshot(
     let act = replay_state
         .encounter_act
         .unwrap_or(number(state, "act")? as Id);
+    let room = match state["room_type"].as_str().unwrap_or("Monster") {
+        "Elite" => Room::Elite,
+        "Boss" => Room::Boss,
+        _ => Room::Combat,
+    };
+    let mut game = Game {
+        event_rng,
+        event_combat,
+        pen_nib: if relic_active(player, "RELIC.PEN_NIB") {
+            9
+        } else {
+            relic_amount(player, "RELIC.PEN_NIB") % 10
+        },
+        ..snapshot_game(
+            content,
+            state,
+            oracle,
+            after,
+            run,
+            trace_map(state, action, after),
+            Phase::Combat(Box::new(combat)),
+            room,
+            oracle["next_combat_card_id"].as_u64().unwrap_or_default() as u32 + 1,
+            act,
+            seed,
+            replay_state,
+            happy_flower,
+        )
+    };
+    // The captured max energy is ModifyMaxEnergy's result; the combat stores its base.
+    let modifiers = game.max_energy(content) - game.combat().unwrap().max_energy;
+    if let Phase::Combat(combat) = &mut game.phase {
+        combat.max_energy -= modifiers;
+    }
+    Ok(game)
+}
+
+fn snapshot_game(
+    content: &Content,
+    state: &Value,
+    oracle: &Value,
+    after: &Value,
+    run: Run,
+    map: Map,
+    phase: Phase,
+    room: Room,
+    next_card: u32,
+    act: Id,
+    seed: u32,
+    replay_state: &ReplayState,
+    happy_flower: u8,
+) -> Game {
+    let player = &state["players"][0];
+    let rng = |key: String| {
+        let mut rng = Rng::from_seed(oracle["rng_seeds"][&key].as_u64().unwrap_or_default());
+        rng.forward(oracle["rng_counters"][&key].as_u64().unwrap_or_default());
+        rng
+    };
     let mut game = Game {
         run,
-        map: trace_map(state, action, after),
-        phase: Phase::Combat(Box::new(combat)),
+        map,
+        phase,
         act,
-        room: match state["room_type"].as_str().unwrap_or("Monster") {
-            "Elite" => Room::Elite,
-            "Boss" => Room::Boss,
-            _ => Room::Combat,
-        },
+        room,
         // Newer captures show the relic's combat count modulo 3.
         fishing_rod: relic_amount_opt(player, "RELIC.FISHING_ROD")
             .filter(|_| player.get("cards_played_this_turn").is_some())
@@ -3522,7 +3593,7 @@ fn game_from_snapshot(
             shops: rng(format!("player.{}.Shops", player["net_id"])),
             transformations: rng(format!("player.{}.Transformations", player["net_id"])),
         },
-        next_card: oracle["next_combat_card_id"].as_u64().unwrap_or_default() as u32 + 1,
+        next_card,
         rarity_offset: replay_state.rarity_offset,
         potion_odds: replay_state.potion_odds,
         bosses: [None; 2],
@@ -3563,7 +3634,7 @@ fn game_from_snapshot(
         replacing_potion: false,
         pending_potion: None,
         removal_price: 0,
-        event_rng,
+        event_rng: None,
         event_relic: None,
         event_data: [0; 4],
         event_cards: vec![],
@@ -3574,7 +3645,7 @@ fn game_from_snapshot(
         prefetched_card_rewards: vec![],
         wongo_combats: wongo_combats(player),
         spoils: None,
-        event_combat,
+        event_combat: 0,
         damage_taken: false,
         lasting_candy: replay_state.lasting_candy,
         paels_wing: replay_state.paels_wing,
@@ -3625,11 +3696,7 @@ fn game_from_snapshot(
             },
             |turns| turns as u8 % 3,
         ),
-        pen_nib: if relic_active(player, "RELIC.PEN_NIB") {
-            9
-        } else {
-            relic_amount(player, "RELIC.PEN_NIB") % 10
-        },
+        pen_nib: relic_amount(player, "RELIC.PEN_NIB") % 10,
         iron_club: relic_amount(player, "RELIC.IRON_CLUB") % 4,
         joss_paper: relic_amount(player, "RELIC.JOSS_PAPER") % 5,
         joss_paper_ethereal: 0,
@@ -3646,7 +3713,7 @@ fn game_from_snapshot(
     };
     // The captured grab bags still hold relics the game only drops when it next pulls.
     game.purge_disallowed_relics(content);
-    Ok(game)
+    game
 }
 
 fn run_game_from_snapshot(
@@ -3684,11 +3751,6 @@ fn run_game_from_snapshot(
         }
         "rest_site" => Phase::Rest,
         _ => Phase::Map,
-    };
-    let rng = |key: String| {
-        let mut rng = Rng::from_seed(oracle["rng_seeds"][&key].as_u64().unwrap_or_default());
-        rng.forward(oracle["rng_counters"][&key].as_u64().unwrap_or_default());
-        rng
     };
     let seed = (oracle["rng_seeds"]["run.UpFront"]
         .as_u64()
@@ -3989,44 +4051,12 @@ fn run_game_from_snapshot(
         },
         |turns| turns as u8 % 3,
     );
-    let mut game = Game {
-        run,
-        map,
-        phase,
-        act,
-        room,
-        // Newer captures show the relic's combat count modulo 3.
-        fishing_rod: relic_amount_opt(player, "RELIC.FISHING_ROD")
-            .filter(|_| player.get("cards_played_this_turn").is_some())
-            .map_or(replay_state.fishing_rod, |amount| amount % 3),
-        run_queue: vec![],
-        resume: None,
-        rngs: Rngs {
-            combat_card_generation: rng("run.CombatCardGeneration".into()),
-            combat_card_selection: rng("run.CombatCardSelection".into()),
-            combat_energy_costs: rng("run.CombatEnergyCosts".into()),
-            combat_orb_generation: rng("run.CombatOrbGeneration".into()),
-            combat_potion_generation: rng("run.CombatPotionGeneration".into()),
-            combat_targets: rng("run.CombatTargets".into()),
-            monster_ai: rng("run.MonsterAi".into()),
-            niche: rng("run.Niche".into()),
-            shuffle: rng("run.Shuffle".into()),
-            treasure_room_relics: rng("run.TreasureRoomRelics".into()),
-            unknown_map_point: rng("run.UnknownMapPoint".into()),
-            up_front: rng("run.UpFront".into()),
-            rewards: rng(format!("player.{}.Rewards", player["net_id"])),
-            shops: rng(format!("player.{}.Shops", player["net_id"])),
-            transformations: rng(format!("player.{}.Transformations", player["net_id"])),
-        },
-        next_card,
-        rarity_offset: replay_state.rarity_offset,
-        potion_odds: replay_state.potion_odds,
+    Ok(Game {
         bosses: if next_room == Room::Boss {
             [next_encounter, None]
         } else {
             [None; 2]
         },
-        bosses_visited: 0,
         encounters: replay_state.encounter_bag(
             content,
             act,
@@ -4043,114 +4073,38 @@ fn run_game_from_snapshot(
                 .then_some(next_encounter)
                 .flatten(),
         ),
-        weak_encounters_left: replay_state.weak_encounters_left,
-        regular_encounters_left: replay_state.regular_encounters_left,
-        elite_encounters_left: replay_state.elite_encounters_left,
-        last_encounter: replay_state.last_encounter,
-        last_elite: replay_state.last_elite,
-        // The act's opening ancient is only known once its node is entered.
-        ancient: after["room_model_id"]
-            .as_str()
-            .and_then(|id| trace_event(content, id).ok()),
         events: (next_room == Room::Event)
             .then_some(next_event)
             .flatten()
             .into_iter()
             .collect(),
-        visited_events: replay_state.visited_events.clone(),
         enemy_starts,
-        seed,
-        unknown_odds: replay_state.unknown_odds,
-        happy_flower,
-        tea_set: array(&player["relics"])
-            .iter()
-            .find(|relic| {
-                relic["state"] == "Active"
-                    && matches!(
-                        relic["model_id"].as_str(),
-                        Some("RELIC.VENERABLE_TEA_SET" | "RELIC.FAKE_VENERABLE_TEA_SET")
-                    )
-            })
-            .map_or(0, |relic| {
-                if relic["model_id"] == "RELIC.VENERABLE_TEA_SET" {
-                    2
-                } else {
-                    1
-                }
-            }),
         replacing_potion: action["kind"] == "discard_potion",
-        pending_potion: None,
-        removal_price: 0,
         event_rng,
-        event_relic: None,
         event_data,
         event_cards,
         relic_queue,
-        relic_deques: replay_state.relic_deques.clone(),
-        shared_relic_deques: replay_state.shared_relic_deques.clone(),
         reward_continuation: pending_curse.then_some(RewardContinuation::AddRandomCurse),
-        prefetched_card_rewards: vec![],
-        wongo_combats: wongo_combats(player),
         spoils,
-        event_combat: 0,
-        damage_taken: false,
-        lasting_candy: replay_state.lasting_candy,
-        paels_wing: replay_state.paels_wing,
-        silver_crucible: replay_state.silver_crucible,
-        silken_tress: replay_state.silken_tress,
-        rerolled_cards: false,
-        maw_bank: spent_maw_banks(player).unwrap_or(replay_state.maw_bank),
-        silver_treasures: replay_state.silver_treasures,
-        golden_compass: replay_state.golden_compass,
-        winged_boots: replay_state.winged_boots,
-        rest_used: replay_state.rest_used,
-        girya: replay_state.girya,
-        pumpkin_candle: replay_state.pumpkin_candle,
-        astrolabe: false,
-        transform_niche: false,
-        paels_tooth: false,
-        paels_cards: paels_cards(content, player, &replay_state.paels_cards),
-        pollinous_core: replay_state.pollinous_core,
-        fur_coat_act: replay_state.fur_coat_act,
-        fur_coat: replay_state.fur_coat.clone(),
-        toy_box_offers: replay_state.toy_box_offers.clone(),
-        wax_relics: replay_state.wax_relics.clone(),
-        melted_relics: melted_relics(player, &replay_state.melted_relics),
-        toy_box_combats: replay_state.toy_box_combats,
-        parasol: replay_state.parasol.clone(),
-        parasol_removal: replay_state.parasol_removal,
-        conveyor: replay_state.conveyor,
-        // A sphere left unfinished (AutoSlay walked away) doesn't follow into the next room.
-        crystal: replay_state
-            .crystal
-            .clone()
-            .filter(|_| state["room_model_id"] == "EVENT.CRYSTAL_SPHERE"),
-        reward_gold_parts: replay_state.reward_gold_parts.clone(),
         fake_merchant,
         fake_shop: state["room_model_id"] == "EVENT.FAKE_MERCHANT",
-        courier_restock: replay_state.courier_restock.clone(),
-        corpse_hp: None,
-        fake_happy_flower: replay_state.fake_happy_flower,
-        lizard_tail: relic_disabled(player, "RELIC.LIZARD_TAIL"),
-        nunchaku: relic_amount(player, "RELIC.NUNCHAKU") % 10,
         pendulum,
-        pen_nib: relic_amount(player, "RELIC.PEN_NIB") % 10,
-        iron_club: relic_amount(player, "RELIC.IRON_CLUB") % 4,
-        joss_paper: relic_amount(player, "RELIC.JOSS_PAPER") % 5,
-        joss_paper_ethereal: 0,
-        tuning_fork: relic_amount(player, "RELIC.TUNING_FORK") % 10,
-        bone_tea: relic_disabled(player, "RELIC.BONE_TEA"),
-        tea_of_discourtesy: relic_disabled(player, "RELIC.TEA_OF_DISCOURTESY"),
-        galactic_dust: relic_amount(player, "RELIC.GALACTIC_DUST") % 10,
-        book_of_five_rings: relic_amount(player, "RELIC.BOOK_OF_FIVE_RINGS") % 5,
-        ember_tea: relic_amount_opt(player, "RELIC.EMBER_TEA")
-            .map_or(0, |amount| 5u8.saturating_sub(amount.min(5))),
-        sword_of_stone: relic_amount(player, "RELIC.SWORD_OF_STONE"),
-        replaying: true,
-        expectation: None,
-    };
-    game.purge_disallowed_relics(content);
-    Ok(game)
+        ..snapshot_game(
+            content,
+            state,
+            oracle,
+            after,
+            run,
+            map,
+            phase,
+            room,
+            next_card,
+            act,
+            seed,
+            replay_state,
+            happy_flower,
+        )
+    })
 }
 
 fn trace_map(state: &Value, action: &Value, after: &Value) -> Map {
@@ -5172,83 +5126,15 @@ fn model_card(content: &Content, value: &str) -> Option<Card> {
     })
 }
 
-/// Hand cards whose shown cost is 0 only through a global hook the simulator applies itself
-/// (Free Skill, Free Attack, Free Power, Corruption) keep their own cost.
-fn hand_cards(content: &Content, player: &Value) -> Result<Vec<Card>, String> {
-    let values = array(&player["hand"]);
-    let mut hand = cards(content, &player["hand"])?;
-    let has = |power: &str| {
-        array(&player["powers"])
-            .iter()
-            .any(|value| value["model_id"] == power && value["amount"].as_i64() > Some(0))
-    };
-    for (card, value) in hand.iter_mut().zip(values) {
-        let def = content.cards[card.id as usize];
-        let free = match card.card_type(def) {
-            CardType::Skill => has("POWER.FREE_SKILL_POWER") || has("POWER.CORRUPTION_POWER"),
-            CardType::Attack => has("POWER.FREE_ATTACK_POWER"),
-            CardType::Power => has("POWER.FREE_POWER_POWER"),
-            _ => false,
-        };
-        if free
-            && value["energy_cost"] == 0
-            && array(&value["cost_modifiers"]).is_empty()
-            && card.cost_override.is_none()
-            && !card.free
-        {
-            card.cost_delta = 0;
-        }
-    }
-    Ok(hand)
-}
-
 fn card(content: &Content, value: &Value) -> Result<Card, String> {
     let id = content
         .card_id(text(value, "model_id")?)
         .ok_or_else(|| format!("simulator has no card {}", value["model_id"]))?;
     let upgrades = value["upgrade"].as_u64().unwrap_or_default() as u8;
-    let base = if value["enchantment_model_id"] == "ENCHANTMENT.TEZCATARAS_EMBER" {
-        0
-    } else {
-        content.cards[id as usize].cost[upgrades.min(1) as usize]
-    };
-    let shown = value["energy_cost"].as_i64().unwrap_or(base as i64) as i8;
-    let modifiers = array(&value["cost_modifiers"]);
-    // Stomp's this-turn discounts are its value, reset at turn start, not a lasting cost delta.
-    let stomp = if content.cards[id as usize].id == "CARD.STOMP" {
-        -modifiers
-            .iter()
-            .filter(|modifier| modifier["expiration"] == 2 && modifier["type"] == "Relative")
-            .filter_map(|modifier| modifier["amount"].as_i64())
-            .sum::<i64>() as i8
-    } else {
-        0
-    };
-    // A cost of 0 for this turn only (Flatten's free turn, Mummified Hand, ...) is `free`, which
-    // resets at turn start; the lasting cost is then the base plus combat-long modifiers.
-    let turn_free = shown == 0
-        && match modifiers
-            .iter()
-            .rev()
-            .find(|modifier| modifier["type"] == "Absolute")
-        {
-            Some(modifier) => modifier["expiration"] == 2 && modifier["amount"] == 0,
-            None => modifiers.is_empty() && value["cost_for_turn"].as_i64() == Some(0),
-        };
-    let lasting = modifiers
-        .iter()
-        .filter(|modifier| modifier["expiration"] == 0 && modifier["type"] == "Relative")
-        .filter_map(|modifier| modifier["amount"].as_i64())
-        .sum::<i64>() as i8;
-    let mut card = Card {
+    Ok(Card {
         id,
         instance: instance_id(value["instance_id"].as_str().unwrap_or_default()),
         upgrades,
-        cost_delta: if turn_free {
-            lasting
-        } else {
-            shown.saturating_sub(base).saturating_add(stomp)
-        },
         // Only keywords the card doesn't have by itself, so an upgrade can still remove its own
         // (Apparition's Ethereal).
         flags: (ETHEREAL * value["ethereal"].as_bool().unwrap_or_default() as u16
@@ -5270,53 +5156,7 @@ fn card(content: &Content, value: &Value) -> Result<Card, String> {
         .filter_map(|key| value[*key].as_i64())
         .max()
         .unwrap_or_default() as i16,
-        // The last absolute cost modifier wins; one that lasts only until played is already in
-        // the shown cost.
-        cost_override: match value["cost_modifiers"].as_array() {
-            Some(modifiers) => modifiers
-                .iter()
-                .rev()
-                .find(|modifier| modifier["type"] == "Absolute")
-                .filter(|modifier| {
-                    matches!(modifier["expiration"].as_i64(), Some(0 | 2))
-                        && modifier["is_reduce_only"] == false
-                })
-                .and_then(|modifier| modifier["amount"].as_i64())
-                // Confused's combat cost isn't a listed modifier.
-                .or_else(|| {
-                    modifiers
-                        .is_empty()
-                        .then(|| value["combat_cost_override"].as_i64())
-                        .flatten()
-                }),
-            None => value["cost_for_turn"]
-                .as_i64()
-                .or_else(|| value["combat_cost_override"].as_i64()),
-        }
-        .filter(|_| !turn_free)
-        .map(|x| x as i8),
         replays: value["base_replay_count"].as_u64().unwrap_or_default() as u8,
-        free: turn_free
-            || shown == 0
-                && value["star_cost"] == 0
-                && content.cards[id as usize].star_cost[upgrades.min(1) as usize] > 0,
-        // SetToFreeThisTurn zeroes the star cost even when a global hook raises the energy cost.
-        free_stars: value["star_cost"] == 0
-            && content.cards[id as usize].star_cost[upgrades.min(1) as usize] > 0
-            && modifiers.iter().any(|modifier| {
-                modifier["type"] == "Absolute"
-                    && modifier["amount"] == 0
-                    && modifier["expiration"].as_i64().is_some_and(|e| e & 2 != 0)
-            }),
-        // A star cost freed for the combat whose energy cost something else set (Confused).
-        free_stars_combat: value["star_cost"] == 0
-            && shown > 0
-            && content.cards[id as usize].star_cost[upgrades.min(1) as usize] > 0
-            && !modifiers.iter().any(|modifier| {
-                modifier["type"] == "Absolute"
-                    && modifier["amount"] == 0
-                    && modifier["expiration"].as_i64().is_some_and(|e| e & 2 != 0)
-            }),
         enchantment: match value["enchantment_model_id"].as_str() {
             Some("ENCHANTMENT.ADROIT") => Some(Enchantment::Adroit),
             Some("ENCHANTMENT.CLONE") => Some(Enchantment::Clone),
@@ -5363,47 +5203,9 @@ fn card(content: &Content, value: &Value) -> Result<Card, String> {
         } else {
             0
         },
+        costs: captured_costs(content, value).costs,
         ..Card::default()
-    };
-    if stomp > 0 {
-        card.value = stomp as i16;
-    }
-    // An absolute cost set this turn or until played (Snecko Oil) is the override, worn off once
-    // played; the cost underneath then comes from the modifiers that stay. The shown cost holds
-    // the global modifiers (Borrowed Time), which set_values takes back out of `cost_delta`.
-    let relative = |modifier: &&Value| modifier["type"] == "Relative";
-    let amount = |modifier: &Value| modifier["amount"].as_i64().unwrap_or_default();
-    if let Some(index) = modifiers
-        .iter()
-        .rposition(|modifier| modifier["type"] == "Absolute")
-        .filter(|&index| {
-            modifiers[index]["expiration"].as_i64().unwrap_or_default() & 4 != 0
-                && modifiers[index]["is_reduce_only"] == false
-                && !turn_free
-        })
-    {
-        let set = amount(&modifiers[index])
-            + modifiers[index + 1..]
-                .iter()
-                .filter(relative)
-                .map(amount)
-                .sum::<i64>();
-        let kept = modifiers
-            .iter()
-            .filter(relative)
-            .filter(|modifier| modifier["expiration"].as_i64().unwrap_or_default() & 4 == 0)
-            .map(amount)
-            .sum::<i64>();
-        // Both hold the shown cost's global part until set_values takes the simulated one out;
-        // Stomp's discounts stay in its value.
-        card.cost_override = Some(shown.saturating_add(stomp));
-        // EndOfTurn | WhenPlayed (Snecko Oil) also wears off at turn start; WhenPlayed alone
-        // (Rocket Punch) lasts until played.
-        card.until_played = modifiers[index]["expiration"].as_i64().unwrap_or_default() & 2 != 0;
-        card.when_played = !card.until_played;
-        card.cost_delta = (shown as i64 - set + kept + stomp as i64) as i8;
-    }
-    Ok(card)
+    })
 }
 
 fn powers(content: &Content, values: &Value) -> Result<Vec<Power>, String> {
@@ -6182,69 +5984,87 @@ fn last_played(
                 card["instance_id"] == *id
                     && matches!(card["type"].as_str(), Some("Attack" | "Skill"))
             })
-            .and_then(|value| next_turn_card(content, player, value))
+            // History Course clones it at the next turn start, without turn and when-played costs.
+            .and_then(|value| {
+                let mut card = card(content, value).ok()?;
+                card.expire_costs(THIS_TURN | UNTIL_PLAYED);
+                Some(card)
+            })
     }))
 }
 
-/// History Course clones the card at the next turn start, once its turn and when-played cost
-/// modifiers are gone.
-fn next_turn_card(content: &Content, player: &Value, value: &Value) -> Option<Card> {
-    let mut card = card(content, value).ok()?;
-    // Only when the captured modifiers explain the shown cost (hook costs aren't listed),
-    // besides this turn's global modifiers, which are gone by then (Borrowed Time, Tangled).
-    let base = base_cost(card, content.cards[card.id as usize]) as i64;
-    let power = |id: &str| {
-        array(&player["powers"])
-            .iter()
-            .filter(|power| power["model_id"] == id)
-            .filter_map(|power| power["amount"].as_i64())
-            .sum::<i64>()
+/// The captured local cost modifiers in order (CardEnergyCost's), and the star cost. The plain
+/// absolute ones for this turn or the combat are captured apart, without their place: they go
+/// where the modifiers explain the shown cost, else first.
+fn captured_costs(content: &Content, value: &Value) -> Card {
+    let modifiers = array(&value["cost_modifiers"]);
+    let amount = |value: &Value| value.as_i64().unwrap_or_default().clamp(-127, 127) as i8;
+    let listed: Vec<_> = (modifiers.iter())
+        .map(|modifier| CostMod {
+            amount: amount(&modifier["amount"]),
+            kind: (modifier["type"] == "Absolute") as u8 * ABSOLUTE
+                | modifier["expiration"].as_i64().unwrap_or_default() as u8
+                    & (THIS_TURN | UNTIL_PLAYED)
+                | (modifier["is_reduce_only"] == true) as u8 * REDUCE_ONLY,
+        })
+        .collect();
+    // An until-played absolute is also captured as the combat cost.
+    let until_played = (listed.iter()).rfind(|cost| cost.kind == ABSOLUTE | UNTIL_PLAYED);
+    let combat = (value["combat_cost_override"].is_i64()
+        && until_played.is_none_or(|cost| cost.amount != amount(&value["combat_cost_override"])))
+    .then(|| CostMod {
+        amount: amount(&value["combat_cost_override"]),
+        kind: ABSOLUTE,
+    });
+    let turn = (value["cost_for_turn"].is_i64()).then(|| CostMod {
+        amount: amount(&value["cost_for_turn"]),
+        kind: ABSOLUTE | THIS_TURN,
+    });
+    let place = |combat_at: usize, turn_at: usize| {
+        let mut card = Card::default();
+        for index in 0..=listed.len() {
+            for (cost, at) in [(combat, combat_at), (turn, turn_at)] {
+                if let Some(cost) = cost.filter(|_| at == index) {
+                    card.add_cost(cost.amount, cost.kind);
+                }
+            }
+            if let Some(cost) = listed.get(index) {
+                card.add_cost(cost.amount, cost.kind);
+            }
+        }
+        card
     };
-    let global = power("POWER.BORROWED_TIME_POWER")
-        + (value["type"] == "Attack") as i64 * power("POWER.TANGLED_POWER");
-    let cost = |modifiers: &[Value], keep: &dyn Fn(&Value) -> bool| {
-        let kept = || modifiers.iter().filter(|modifier| keep(modifier));
-        let start = kept()
-            .filter(|modifier| modifier["type"] == "Absolute")
-            .filter_map(|modifier| modifier["amount"].as_i64())
-            .last()
-            .unwrap_or(base);
-        start
-            + kept()
-                .filter(|modifier| modifier["type"] == "Relative")
-                .filter_map(|modifier| modifier["amount"].as_i64())
-                .sum::<i64>()
+    let id = content.card_id(value["model_id"].as_str().unwrap_or_default());
+    let upgrades = value["upgrade"].as_u64().unwrap_or_default().min(1) as usize;
+    let def = id.map(|id| content.cards[id as usize]);
+    let base = match def {
+        _ if value["enchantment_model_id"] == "ENCHANTMENT.TEZCATARAS_EMBER" => 0,
+        Some(def) => def.cost[upgrades] as i16,
+        None => -1,
     };
-    let shown = value["energy_cost"].as_i64().unwrap_or(base);
-    if let Some(modifiers) = value["cost_modifiers"].as_array()
-        && base >= 0
-        && (cost(modifiers, &|_| true).max(0) + global == shown
-            || modifiers.is_empty() && value["cost_for_turn"].as_i64() == Some(shown - global))
+    let places = |cost: Option<CostMod>| if cost.is_some() { listed.len() } else { 0 };
+    let mut card = (0..=places(combat))
+        .flat_map(|combat_at| (0..=places(turn)).map(move |turn_at| (combat_at, turn_at)))
+        .map(|(combat_at, turn_at)| place(combat_at, turn_at))
+        .find(|card| {
+            base >= 0
+                && value["energy_cost"].as_i64() == Some(card.local_energy(base).max(0) as i64)
+        })
+        .unwrap_or_else(|| place(0, 0));
+    // A star cost freed this turn along with the energy (SetToFreeThisTurn), else for the combat.
+    let stars = def.map(|def| def.star_cost[upgrades]);
+    if let Some(stars) = stars.filter(|&stars| stars >= 0)
+        && value["star_cost"]
+            .as_i64()
+            .is_some_and(|shown| shown != stars as i64)
     {
-        let combat = |modifier: &&Value| modifier["expiration"] == 0;
-        card.cost_delta = modifiers
-            .iter()
-            .filter(combat)
-            .filter(|modifier| modifier["type"] == "Relative")
-            .filter_map(|modifier| modifier["amount"].as_i64())
-            .sum::<i64>() as i8;
-        card.cost_override = modifiers
-            .iter()
-            .filter(combat)
-            .rev()
-            .find(|modifier| modifier["type"] == "Absolute")
-            .filter(|modifier| modifier["is_reduce_only"] == false)
-            .and_then(|modifier| modifier["amount"].as_i64())
-            .or_else(|| {
-                modifiers
-                    .is_empty()
-                    .then(|| value["combat_cost_override"].as_i64())
-                    .flatten()
-            })
-            .map(|x| x as i8);
+        let freed = |cost: &CostMod| {
+            cost.amount == 0 && cost.kind & (ABSOLUTE | THIS_TURN) == ABSOLUTE | THIS_TURN
+        };
+        let turn = listed.iter().any(freed) as u8 * (THIS_TURN | UNTIL_PLAYED);
+        card.add_cost(amount(&value["star_cost"]), ABSOLUTE | STAR_COST | turn);
     }
-    card.free = false;
-    Some(card)
+    card
 }
 
 // Shivs whose play finished this turn, auto-plays included; newer captures list played cards.

@@ -483,6 +483,11 @@ impl Game {
         recorded: Vec<(Actor, Power)>,
     ) -> Context {
         let card_type = card.card_type(content.cards[card.id as usize]);
+        // Pinpoint costs 1 less this turn for each skill played (its AfterCardPlayed).
+        if card_type == CardType::Skill {
+            let pinpoint = |card: &Card| card.id == card_id::PINPOINT;
+            (self.combat_mut().unwrap()).add_costs(pinpoint, -1, THIS_TURN);
+        }
         let trigger = match card_type {
             CardType::Attack => Trigger::AttackPlayed,
             CardType::Skill => Trigger::SkillPlayed,
@@ -1020,7 +1025,7 @@ impl Game {
                     .chain(&mut combat.discard)
                     .chain(&mut combat.exhaust);
                 for card in piles.filter(|other| other.instance == card.instance && !prevented) {
-                    card.cost_delta = card.cost_delta.saturating_sub(1);
+                    card.add_cost(-1, 0);
                 }
                 return;
             }
@@ -1080,10 +1085,7 @@ impl Game {
                         pending.context.upgraded = true;
                     }
                 }
-                combat
-                    .player
-                    .powers
-                    .retain(|power| power.id != power_id::DAMPEN);
+                (combat.player.powers).retain(|power| power.id != power_id::DAMPEN);
             }
             "POWER.CONSTRICT_POWER" => (self.creature_mut(Actor::Player).powers)
                 .retain(|power| power.id != power_id::CONSTRICT || power.value != index as i16 + 1),
@@ -1094,20 +1096,15 @@ impl Game {
                 self.combat_mut().unwrap().enemies[owner].stunned = true;
             }
             "POWER.CRAB_RAGE_POWER" if other => {
-                let creature = self.creature_mut(owner);
-                creature.add_power(power_id::STRENGTH, 6);
-                creature.block = creature.block.saturating_add(99);
-                creature
-                    .powers
-                    .retain(|power| power.id != power_id::CRAB_RAGE);
+                self.creature_mut(owner).add_power(power_id::STRENGTH, 6);
+                self.gain_block(content, owner, 99, None, false);
+                (self.creature_mut(owner).powers).retain(|power| power.id != power_id::CRAB_RAGE);
             }
             // Death strips its other powers; Steam Eruption stays until the About to Blow move
             // stores it as the blast.
             "POWER.STEAM_ERUPTION_POWER" if mine && prevented => {
                 let creature = self.creature_mut(dead);
-                creature
-                    .powers
-                    .retain(|power| power.id == power_id::STEAM_ERUPTION);
+                (creature.powers).retain(|power| power.id == power_id::STEAM_ERUPTION);
                 creature.hp = i16::MAX;
                 creature.max_hp = i16::MAX;
                 let enemy = self.set_move(index, 7, 7, 1);
@@ -1239,8 +1236,7 @@ impl Game {
                                 .chain(&mut combat.exhaust)
                                 .find(|other| other.instance == card.instance);
                             if let Some(card) = pile {
-                                card.cost_override = Some(0);
-                                card.when_played = true;
+                                card.add_cost(0, ABSOLUTE | UNTIL_PLAYED);
                             }
                         }
                     }
@@ -1643,7 +1639,7 @@ impl Game {
                             card.instance = 0;
                             // It clones the card as it is when played: last turn's discounts are
                             // gone (a Stomp gets this turn's in begin_auto_play).
-                            card.free = false;
+                            card.expire_costs(THIS_TURN);
                             card.flags |= REPLAY | DUPE;
                             effects.push(Effect::AutoPlay(card));
                         }
@@ -1912,7 +1908,6 @@ impl Game {
                     for _ in 0..count {
                         let card = Card {
                             instance: 0,
-                            free: false,
                             turn_flags: 0,
                             ..card
                         };
@@ -2016,11 +2011,12 @@ impl Game {
                     && !self.combat().unwrap().extra_turn
                     && self.creature(owner).hp > 0 =>
             {
-                for enemy in &mut self.combat_mut().unwrap().enemies {
-                    if content.enemies[enemy.creature.id as usize].id == "MONSTER.TURRET_OPERATOR"
-                        && enemy.creature.hp > 0
+                for index in 0..self.combat().unwrap().enemies.len() {
+                    let enemy = &self.combat().unwrap().enemies[index].creature;
+                    if content.enemies[enemy.id as usize].id == "MONSTER.TURRET_OPERATOR"
+                        && enemy.hp > 0
                     {
-                        enemy.creature.block += power.amount.max(0);
+                        self.gain_block(content, Actor::Enemy(index), power.amount, None, false);
                     }
                 }
             }
@@ -2079,11 +2075,17 @@ impl Game {
             (Trigger::BeforeCardPlayed, "POWER.DANSE_MACABRE_POWER") => {
                 let spiked = self.has_relic(content, "RELIC.SPIKED_GAUNTLETS");
                 let chemical_x = 2 * self.has_relic(content, "RELIC.CHEMICAL_X") as i16;
+                let scarf = self.has_relic(content, "RELIC.BRILLIANT_SCARF");
                 let combat = self.combat().unwrap();
                 let play = combat.plays.last().unwrap();
                 let def = content.cards[play.card.id as usize];
+                // Brilliant Scarf's fifth card costs 0 (GetResolved has its hook).
+                let scarf =
+                    scarf && play.manual && combat.history.manual_plays - play.plays as i16 == 4;
                 let cost = if def.cost[play.card.upgrades.min(1) as usize] < 0 {
                     play.context.x - chemical_x
+                } else if scarf {
+                    0
                 } else {
                     energy_cost(combat, play.card, def, spiked, true)
                 };
@@ -2489,8 +2491,6 @@ impl Game {
         }
         match step {
             Step::TurnStart => {
-                let paels_flesh = self.relic_count(content, "RELIC.PAELS_FLESH");
-                let bread = self.has_relic(content, "RELIC.BREAD") as i16;
                 let history_course = self.has_relic(content, "RELIC.HISTORY_COURSE");
                 let combat = self.combat_mut().unwrap();
                 combat.setup = true;
@@ -2502,13 +2502,6 @@ impl Game {
                 combat.rainbow_ring = false;
                 combat.attacks_mod3 = 0;
                 combat.bound_this_turn = 0;
-                if combat.turn == 3 {
-                    combat.max_energy += paels_flesh;
-                }
-                // Bread's +1 max energy skips turn 1; its turn-1 loss comes in AfterSideTurnStart.
-                if combat.turn == 2 {
-                    combat.max_energy += bread;
-                }
                 for pile in [
                     &mut combat.draw,
                     &mut combat.hand,
@@ -2516,18 +2509,8 @@ impl Game {
                     &mut combat.exhaust,
                 ] {
                     for card in pile {
-                        card.free = false;
-                        card.free_stars = false;
+                        card.expire_costs(THIS_TURN);
                         card.turn_flags = 0;
-                        if card.until_played {
-                            card.cost_override = None;
-                            card.until_played = false;
-                        }
-                        if card.id == card_id::FLATTEN
-                            || content.cards[card.id as usize].id == "CARD.STOMP"
-                        {
-                            card.value = 0;
-                        }
                     }
                 }
                 combat.last_turn = combat.history;
@@ -2559,13 +2542,14 @@ impl Game {
             Step::ClearBlock => self.clear_block(content, Actor::Player),
             Step::ResetEnergy => {
                 let ice_cream = self.has_relic(content, "RELIC.ICE_CREAM");
+                let max_energy = self.max_energy(content);
                 let combat = self.combat_mut().unwrap();
                 let kept = if ice_cream && combat.turn > 1 {
                     combat.energy
                 } else {
                     0
                 };
-                combat.energy = kept + combat.max_energy;
+                combat.energy = kept + max_energy;
             }
             // Cards' BeforeHandDraw hooks (Bolas, Thrumming Hatchet) come after powers' and relics'.
             Step::HandDraw => {
@@ -2824,13 +2808,7 @@ impl Game {
                 if !choices.is_empty() {
                     let choice = choices
                         [self.rngs.combat_card_selection.below(choices.len() as u32) as usize];
-                    let card = self.combat().unwrap().hand[choice];
-                    let def = content.cards[card.id as usize];
-                    let cost = energy_cost(self.combat().unwrap(), card, def, spiked, true) - 1;
-                    // Bookmark's discount lasts until played (AddUntilPlayed).
-                    let card = &mut self.combat_mut().unwrap().hand[choice];
-                    card.cost_override = Some(cost as i8);
-                    card.when_played = true;
+                    self.combat_mut().unwrap().hand[choice].add_cost(-1, UNTIL_PLAYED);
                 }
             }
             Step::Bookmark => {}

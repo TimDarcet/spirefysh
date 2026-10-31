@@ -1452,14 +1452,14 @@ fn card_flags_are_dense_numeric_features() {
     let layout = Layout::new(&content);
     let mut game = Game::new_character_ascension(&content, 549, 0, 10).unwrap();
     game.begin_act(&content, 0).unwrap();
-    let card = Card {
+    let mut card = Card {
         id: content.card_id("CARD.STRIKE_IRONCLAD").unwrap(),
         flags: u16::MAX,
         turn_flags: u16::MAX,
-        free: true,
-        cost_override: Some(0),
         ..Card::default()
     };
+    card.add_cost(0, ABSOLUTE);
+    card.free_this_turn();
     game.run.deck.push(card);
     let observation = build_observation(&game, &content, layout, (0, 0));
     let actual = observation.domains[CARD_DOMAIN]
@@ -2766,5 +2766,5 @@ fn traced_state_observations_are_stable() {
         }
     }
     assert_eq!(states, 200);
-    assert_eq!(digest, 15134369266544018612);
+    assert_eq!(digest, 5169903605075966011);
 }
