@@ -1645,7 +1645,8 @@ impl Card {
         self.add_cost(0, ABSOLUTE | STAR_COST);
     }
 
-    /// The energy cost through the local modifiers (GetWithModifiers(Local), before the clamp).
+    /// The energy cost through the local modifiers (GetWithModifiers(Local)), before the final
+    /// clamp at 0: global modifiers (Borrowed Time) add to it first.
     fn local_energy(&self, base: i16) -> i16 {
         (self.cost_mods().filter(|cost| cost.kind & STAR_COST == 0)).fold(base, |current, cost| {
             let set = cost.amount as i16 + (cost.kind & ABSOLUTE == 0) as i16 * current;
@@ -1948,6 +1949,9 @@ pub enum Step {
     FabricatorBot(u8),
     /// The enemies' turn end: the player's turn follows.
     EnemyTurnEnd,
+    /// An exhausted played card's until-played costs wear off once its exhaust hooks resolved
+    /// (AfterCardPlayedCleanup), so Burning Sticks' clone keeps them.
+    PlayedCleanup(u32),
 }
 
 #[derive(Clone, Debug)]

@@ -490,6 +490,7 @@ fn push_semantic(row: &mut DomainRow, layout: Layout, namespace: Semantic, value
 /// The turn is ending: the next turn step is the hand flush (Well-Laid Plans' pick).
 fn ending(combat: &Combat) -> bool {
     (combat.queue.iter().rev()).find_map(|pending| match pending.effect {
+        Effect::Step(Step::PlayedCleanup(_)) => None,
         Effect::Step(step) => Some(step),
         _ => None,
     }) == Some(Step::Flush)
@@ -3107,7 +3108,8 @@ fn played_card_preview(
         context: Context::card(card),
         recorded: vec![],
     });
-    let void_free = combat.history.manual_cards < combat.player.power(power_id::VOID_FORM);
+    combat.history.manual_cards += 1;
+    let void_free = combat.void_free();
     let free = match card_type {
         _ if void_free => None,
         CardType::Power if combat.player.power(power_id::FREE_POWER) > 0 => {
@@ -3185,7 +3187,6 @@ fn played_card_preview(
     (play.energy, play.stars, play.plays) = (cost, stars, plays);
     combat.history.energy += cost;
     combat.history.cards += plays as i16;
-    combat.history.manual_cards += 1;
     combat.history.manual_plays += plays as i16;
     match card_type {
         CardType::Attack => combat.history.attacks += plays as i16,

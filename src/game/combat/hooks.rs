@@ -442,6 +442,7 @@ impl Game {
 
     /// CardCmd.Exhaust's AfterCardExhausted pass (causedByEthereal for a turn-end Ethereal).
     pub(super) fn exhausted(&mut self, content: &Content, card: Card, ethereal: bool) {
+        self.combat_mut().unwrap().history.exhausted += 1;
         let context = Context {
             event: 1,
             ethereal,
@@ -1649,10 +1650,7 @@ impl Game {
                     }
                     (Trigger::BeforeSideTurnEndEarly, "RELIC.PAELS_EYE") => {
                         if self.takes_extra_turn(content) {
-                            let combat = self.combat_mut().unwrap();
-                            let cards = std::mem::take(&mut combat.hand);
-                            combat.history.exhausted += cards.len() as i16;
-                            for card in cards {
+                            for card in std::mem::take(&mut self.combat_mut().unwrap().hand) {
                                 self.combat_mut().unwrap().exhaust.push(card);
                                 self.exhausted(content, card, false);
                             }
@@ -2697,7 +2695,6 @@ impl Game {
                 };
                 combat.hand.remove(index);
                 combat.exhaust.push(card);
-                combat.history.exhausted += 1;
                 self.exhausted(content, card, true);
             }
             Step::TurnEndCard(card, hand_size) => {
@@ -2724,7 +2721,6 @@ impl Game {
                 let combat = self.combat_mut().unwrap();
                 if ethereal(content, &card, hexed) {
                     combat.exhaust.push(card);
-                    combat.history.exhausted += 1;
                     self.exhausted(content, card, true);
                 } else {
                     combat.discard.push(card);
@@ -2832,6 +2828,16 @@ impl Game {
                 self.enemy_move_done(content, index as usize, move_index as usize, stunned)
             }
             Step::FabricatorBot(index) => self.spawn_bot(content, index as usize, 2),
+            Step::PlayedCleanup(instance) => {
+                let combat = self.combat_mut().unwrap();
+                let piles = [&mut combat.exhaust, &mut combat.hand, &mut combat.discard];
+                if let Some(card) = (piles.into_iter().flat_map(|pile| pile.iter_mut().rev()))
+                    .chain(combat.draw.iter_mut())
+                    .find(|card| card.instance == instance)
+                {
+                    card.expire_costs(UNTIL_PLAYED);
+                }
+            }
             Step::EnemyTurnEnd => {
                 self.combat_mut().unwrap().enemy_turn = false;
                 self.start_turn();

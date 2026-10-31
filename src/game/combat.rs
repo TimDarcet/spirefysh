@@ -499,7 +499,6 @@ impl Game {
 
     /// Vambrace and Pael's Legion double one card play's block; the game spends them in
     /// AfterCardPlayed, so a replayed card (Spiral) is doubled only once.
-    /// Vambrace and Pael's Legion are spent once the play of the card they doubled finishes.
     fn spend_block_doublers(&mut self, content: &Content, instance: u32) {
         if self.combat().unwrap().block_doubler != Some(instance) {
             return;
@@ -722,7 +721,6 @@ impl Game {
         if let Some(index) = index {
             let card = self.combat_mut().unwrap().remove_draw(index);
             self.combat_mut().unwrap().exhaust.push(card);
-            self.combat_mut().unwrap().history.exhausted += 1;
             self.exhausted(content, card, false);
         }
     }
@@ -3345,6 +3343,10 @@ impl Game {
             Effect::AfterPlay => self.after_play(content),
             Effect::PlacePlayed(card, replay, feral) => {
                 if self.place_card(content, card, replay, feral) {
+                    self.combat_mut().unwrap().queue.push(Pending {
+                        effect: Effect::Step(Step::PlayedCleanup(card.instance)),
+                        context: Context::card(card),
+                    });
                     self.exhausted(content, card, false);
                 }
             }
@@ -3381,7 +3383,6 @@ impl Game {
                         combat.hand.remove(hand);
                         if card.flags(def) & EXHAUST != 0 {
                             combat.exhaust.push(card);
-                            combat.history.exhausted += 1;
                             self.exhausted(content, card, false);
                         } else {
                             combat.discard.push(card);
@@ -6125,7 +6126,6 @@ impl Game {
                 }
                 if to == Pile::Exhaust {
                     self.thrash_gain(content, card);
-                    self.combat_mut().unwrap().history.exhausted += 1;
                     self.exhausted(content, card, false);
                 }
                 return true;
@@ -6166,6 +6166,7 @@ impl Game {
                 // The repeats play the same card: a cost set until played (Snecko Oil) is gone
                 // after the first play, a Confused cost lasts the combat, and Razor Tooth's
                 // upgrade from the first play stays. The queue is a stack: repeats go under the first play.
+                // They find the card in its result pile, outside the hand (Void Form, Free Skill).
                 let razor_tooth = self.razor_tooth(content, card);
                 for _ in 1..count {
                     let mut replay = card;
@@ -6176,7 +6177,10 @@ impl Game {
                     replay.expire_costs(UNTIL_PLAYED);
                     self.combat_mut().unwrap().queue.push(Pending {
                         effect: Effect::AutoPlay(replay),
-                        context,
+                        context: Context {
+                            off_pile: true,
+                            ..context
+                        },
                     });
                 }
                 self.combat_mut().unwrap().queue.push(Pending {
@@ -6512,7 +6516,6 @@ impl Game {
             } else if flags & EXHAUST != 0 {
                 let combat = self.combat_mut().unwrap();
                 combat.exhaust.push(card);
-                combat.history.exhausted += 1;
                 self.exhausted(content, card, false);
             } else {
                 self.combat_mut().unwrap().discard.push(card);
@@ -6557,9 +6560,7 @@ impl Game {
                 .map_or(0, |play| (play.plays - play.done) as i16);
         let energy = if brilliant_scarf && finished_manual == 4 && !context.off_pile && !x {
             0
-        } else if context.off_pile
-            && combat.history.manual_cards < combat.player.power(power_id::VOID_FORM)
-        {
+        } else if context.off_pile && combat.void_free() {
             card_cost(card, def, combat.energy) + combat.player.power(power_id::BORROWED_TIME)
         } else {
             energy_cost(combat, card, def, spiked_gauntlets, !context.off_pile)
@@ -6612,10 +6613,6 @@ impl Game {
         let def = content.cards[card.id as usize];
         let card_type = card.card_type(def);
         let flags = card.flags(def);
-        // Only "until played" costs wear off once the card is placed (AfterCardPlayedCleanup),
-        // so the AfterCardPlayed clones (Juggling, Music Box) keep them; combat-long ones
-        // (Confused, Slither, Touch of Insanity) stay.
-        card.expire_costs(UNTIL_PLAYED);
         // Played this turn, it returns next turn (not its AfterCardPlayed clones).
         if matches!(def.id, "CARD.BOLAS" | "CARD.THRUMMING_HATCHET") {
             card.value = 1;
@@ -6637,6 +6634,11 @@ impl Game {
                 other.add_cost(-2, 0);
             }
         }
+        // Only "until played" costs wear off once the card is placed (AfterCardPlayedCleanup), so
+        // the AfterCardPlayed clones (Juggling, Music Box) keep them, and an exhausted card keeps
+        // them through its exhaust hooks (Step::PlayedCleanup); combat-long ones (Confused) stay.
+        let unexpired = card;
+        card.expire_costs(UNTIL_PLAYED);
         // History Course replays the card as its play left it (Razor Tooth's upgrade).
         if matches!(card_type, CardType::Attack | CardType::Skill) && card.flags & DUPE == 0 {
             combat.history_course = Some(card);
@@ -6645,7 +6647,7 @@ impl Game {
         // and Corruption still exhausts a skill.
         let dupe = card.flags & DUPE != 0
             && !(card_type == CardType::Skill && combat.player.power(power_id::CORRUPTION) > 0);
-        let exhausted = if replay && card.flags & DUPE == 0 {
+        if replay && card.flags & DUPE == 0 {
             false
         } else if feral {
             // Feral returns it to the top of the hand, which a full hand redirects to the top
@@ -6660,7 +6662,7 @@ impl Game {
             false
         } else if card.flags & DUPE != 0 {
             // Corruption's skill dupe (DUPE shares RETURN_TO_HAND's bit).
-            combat.exhaust.push(card);
+            combat.exhaust.push(unexpired);
             true
         } else if flags & RETURN_TO_HAND != 0 {
             if combat.hand.len() < 10 {
@@ -6670,8 +6672,10 @@ impl Game {
             }
             false
         } else if card_type != CardType::Power && flags & EXHAUST != 0 {
-            card.flags &= !RETURN_TO_DRAW;
-            combat.exhaust.push(card);
+            combat.exhaust.push(Card {
+                flags: unexpired.flags & !RETURN_TO_DRAW,
+                ..unexpired
+            });
             true
         } else if flags & RETURN_TO_DRAW != 0 {
             // Nostalgia only redirects cards headed for the discard pile.
@@ -6687,11 +6691,7 @@ impl Game {
                 combat.discard.push(card);
             }
             false
-        };
-        if exhausted {
-            combat.history.exhausted += 1;
         }
-        exhausted
     }
 
     fn release_rupture(&mut self, content: &Content) {

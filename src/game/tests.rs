@@ -4101,6 +4101,42 @@ fn exhaust_listeners_resolve_in_listener_order() {
 }
 
 #[test]
+fn burning_sticks_clones_an_exhausted_card_before_its_until_played_costs_wear_off() {
+    // OnPlayWrapper exhausts the card (AfterCardExhausted: Burning Sticks' CreateClone) before
+    // AfterCardPlayedCleanup, so Bullet Time's "free this turn or until played" carries over.
+    let content = foundation_content();
+    let blade_dance = content.card_id("CARD.BLADE_DANCE").unwrap();
+    let def = content.cards[blade_dance as usize];
+    let mut game = turn_start_test(&content, 0, &[], &["RELIC.BURNING_STICKS"]);
+    let mut card = Card {
+        id: blade_dance,
+        instance: 900,
+        ..Card::default()
+    };
+    card.free_this_turn();
+    let combat = game.combat_mut().unwrap();
+    combat.queue.clear();
+    combat.energy = 3;
+    combat.hand = vec![card];
+    game.play(&content, 0, None, true);
+    game.resolve(&content);
+    let combat = game.combat().unwrap();
+    let clone = combat
+        .hand
+        .iter()
+        .find(|card| card.id == blade_dance)
+        .unwrap();
+    let original = combat
+        .exhaust
+        .iter()
+        .find(|card| card.instance == 900)
+        .unwrap();
+    assert_eq!(combat.energy, 3);
+    assert_eq!(card_cost(*clone, def, 0), 0);
+    assert_eq!(card_cost(*original, def, 0), 1);
+}
+
+#[test]
 fn potion_relics_resolve_in_relic_order() {
     // AfterPotionUsed: Belt Buckle and Reptile Trinket in relic order, once the potion is done.
     let content = foundation_content();
@@ -4416,4 +4452,45 @@ fn thrash_gains_the_fully_modified_damage() {
     let combat = game.combat().unwrap();
     let played = combat.discard.iter().find(|card| card.id == thrash);
     assert_eq!(played.map(|card| card.value), Some(12));
+}
+
+#[test]
+fn void_form_frees_an_auto_play_from_hand_until_hand_plays_finish() {
+    // Decisions, Decisions auto-plays Glitterstream three times. Void Form counts finished hand
+    // plays, so the first play from the hand is free; the repeats find the card in its result pile
+    // and are not. Intimidating Helmet blocks for each play worth 2+ energy.
+    let content = foundation_content();
+    let card = |id| Card {
+        id: content.card_id(id).unwrap(),
+        instance: 90,
+        ..Card::default()
+    };
+    let mut game = turn_start_test(
+        &content,
+        3,
+        &["POWER.VOID_FORM_POWER"],
+        &["RELIC.INTIMIDATING_HELMET"],
+    );
+    let combat = game.combat_mut().unwrap();
+    combat.queue.clear();
+    combat.player.block = 0;
+    combat.player.powers[0].amount = 2;
+    combat.history.manual_cards = 1;
+    combat.stars = 6;
+    combat.hand = vec![
+        card("CARD.DECISIONS_DECISIONS"),
+        Card {
+            instance: 91,
+            ..card("CARD.GLITTERSTREAM")
+        },
+    ];
+    game.step(
+        &content,
+        Action::Play {
+            hand: 0,
+            target: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(game.combat().unwrap().player.block, 3 * 11 + 2 * 4);
 }

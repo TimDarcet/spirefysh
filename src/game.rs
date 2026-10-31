@@ -40,6 +40,12 @@ impl Combat {
         plays
     }
 
+    /// Void Form frees cards until that many hand plays have finished this turn.
+    pub(crate) fn void_free(&self) -> bool {
+        let unfinished = self.plays.iter().filter(|play| play.manual).count() as i16;
+        self.history.manual_cards - unfinished < self.player.power(power_id::VOID_FORM)
+    }
+
     /// Plays started but not finished, the current one included.
     fn unfinished(&self) -> i16 {
         (self.plays.iter())
@@ -251,9 +257,12 @@ pub(crate) fn eligible(content: &Content, card: &&Card, filter: CardFilter, op: 
                 && card.flags(def) & UNPLAYABLE == 0
         }
         CardFilter::PlayableOrAny => card.flags(def) & UNPLAYABLE == 0,
+        // CostsEnergyOrStars: a positive, non-X energy or star cost.
         CardFilter::CostsResource => {
-            def.cost[card.upgrades.min(1) as usize] != 0
-                || def.star_cost[card.upgrades.min(1) as usize] > 0
+            let stars = def.star_cost[card.upgrades.min(1) as usize];
+            def.cost[card.upgrades.min(1) as usize] >= 0
+                && card.local_energy(base_cost(**card, def)) > 0
+                || stars >= 0 && card.star_override().unwrap_or(stars as i16) > 0
         }
     };
     matches
@@ -275,13 +284,7 @@ pub(crate) fn card_cost(card: Card, def: CardDef, energy: i16) -> i16 {
     if def.cost[card.upgrades.min(1) as usize] < 0 {
         return energy;
     }
-    local_cost(card, def).max(0)
-}
-
-/// The cost after the card's own modifiers, before the final clamp at 0: global modifiers
-/// (Borrowed Time) add to it first (CardEnergyCost.GetWithModifiers).
-fn local_cost(card: Card, def: CardDef) -> i16 {
-    card.local_energy(base_cost(card, def))
+    card.local_energy(base_cost(card, def)).max(0)
 }
 
 /// Tezcatara's Ember lowers the base cost to 0; later cost modifiers still apply on top.
@@ -307,15 +310,14 @@ pub(crate) fn energy_cost(
         return combat.energy;
     }
     let card_type = card.card_type(def);
-    let void_free = combat.history.manual_cards < combat.player.power(power_id::VOID_FORM);
-    if void_free
+    if combat.void_free()
         || in_play && card_type == CardType::Power && combat.player.power(power_id::FREE_POWER) > 0
         || in_play && card_type == CardType::Skill && combat.player.power(power_id::FREE_SKILL) > 0
         || card_type == CardType::Skill && combat.player.power(power_id::CORRUPTION) > 0
     {
         return 0;
     }
-    let cost = local_cost(card, def)
+    let cost = card.local_energy(base_cost(card, def))
         + combat.player.power(power_id::BORROWED_TIME)
         + (card.affliction == Affliction::Entangled) as i16
             * combat.player.power(power_id::TANGLED)
@@ -338,9 +340,7 @@ pub(crate) fn star_cost(combat: &Combat, card: Card, def: CardDef) -> i16 {
     if def.star_cost[card.upgrades.min(1) as usize] == -2 {
         return combat.stars;
     }
-    if card.enchantment == Some(Enchantment::TezcatarasEmber)
-        || combat.history.manual_cards < combat.player.power(power_id::VOID_FORM)
-    {
+    if card.enchantment == Some(Enchantment::TezcatarasEmber) || combat.void_free() {
         return 0;
     }
     let base = def.star_cost[card.upgrades.min(1) as usize] as i16;

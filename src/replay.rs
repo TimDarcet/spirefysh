@@ -1113,7 +1113,7 @@ fn replay_decision(
             .combat()
             .is_some_and(|combat| !combat.choice.is_some_and(|choice| inferred(choice.op)))
     {
-        // Effects queued behind skipped picks (Reptile Trinket) still resolve; piles are resynced next.
+        // Effects queued behind the picks (Reptile Trinket) still resolve; piles are resynced next.
         while let Phase::Combat(combat) = &mut game.phase {
             // AutoSlay's selector takes as many cards as allowed (Dredge under Distilled Chaos),
             // which later picks from that pile can see (Drain Power).
@@ -1147,11 +1147,21 @@ fn replay_decision(
                 tally("guess.potion_nightmare");
                 game.step(content, Action::Choose(0))
                     .map_err(|error| vec![format!("potion Nightmare pick rejected: {error:?}")])?;
+            } else if let Some(index) = (combat.choice)
+                .and_then(|choice| potion_pick(content, &game, choice, after, oracle_after))
+            {
+                // AutoSlay's selector picks at random (untraced), but the pick's own hooks
+                // (Regalite on a copy, ...) still fire: take the candidate the after state shows,
+                // else skip the pick.
+                tally("infer.potion_choice");
+                game.step(content, Action::Choose(index))
+                    .map_err(|error| vec![format!("potion pick rejected: {error:?}")])?;
             } else {
-                if combat.choice.is_some() {
+                if let Phase::Combat(combat) = &mut game.phase
+                    && combat.choice.take().is_some()
+                {
                     tally("skip.potion_choice");
                 }
-                combat.choice = None;
                 game.resolve(content);
             }
             if !game
@@ -1440,20 +1450,8 @@ fn replay_decision(
             CardOp::Flag(flag) | CardOp::TurnFlag(flag) => Some(flag),
             _ => None,
         };
-        let expected = match destination {
-            Pile::Draw => array(&oracle_after["hidden_draw_order"]),
-            Pile::Hand => array(&after["players"][0]["hand"]),
-            Pile::Discard => array(&after["players"][0]["discard_pile"]),
-            Pile::Exhaust => array(&after["players"][0]["exhaust_pile"]),
-            Pile::Offer => &[],
-        };
-        let source_expected = match choice.pile {
-            Pile::Draw => array(&oracle_after["hidden_draw_order"]),
-            Pile::Hand => array(&after["players"][0]["hand"]),
-            Pile::Discard => array(&after["players"][0]["discard_pile"]),
-            Pile::Exhaust => array(&after["players"][0]["exhaust_pile"]),
-            Pile::Offer => &[],
-        };
+        let expected = traced_pile(after, oracle_after, destination);
+        let source_expected = traced_pile(after, oracle_after, choice.pile);
         let mut index = game.combat().and_then(|combat| {
             let source = replay_pile(combat, choice.pile);
             // The Knowledge Demon's curse becomes a power whose amount grows.
@@ -1837,23 +1835,38 @@ fn replay_decision(
             });
             index = index.inspect(|_| tally("infer.offer_newest"));
         }
-        // A taken power card that was already played leaves no copy, only its power.
+        // A taken power card that was already played leaves no copy, only its power. A power a
+        // held copy of the card can also explain (Whispering Earring plays it) is weaker evidence:
+        // only an unambiguous candidate counts.
         if index.is_none() && choice.pile == Pile::Offer && choice.op == CardOp::TakeOffer {
             let powers = array(&after["players"][0]["powers"]);
             index = game.combat().and_then(|combat| {
-                combat.offer.iter().position(|offered| {
-                    let def = content.cards[offered.id as usize];
-                    let power = format!("POWER.{}_POWER", def.id.trim_start_matches("CARD."));
-                    def.card_type == CardType::Power
-                        && powers
-                            .iter()
-                            .any(|value| value["model_id"] == power.as_str())
-                        && !combat
-                            .player
-                            .powers
-                            .iter()
-                            .any(|x| content.powers[x.id as usize].id == power)
-                })
+                let (unheld, held): (Vec<usize>, Vec<usize>) = (combat.offer.iter().enumerate())
+                    .filter(|(_, offered)| {
+                        let def = content.cards[offered.id as usize];
+                        let power = format!("POWER.{}_POWER", def.id.trim_start_matches("CARD."));
+                        def.card_type == CardType::Power
+                            && powers
+                                .iter()
+                                .any(|value| value["model_id"] == power.as_str())
+                            && !combat
+                                .player
+                                .powers
+                                .iter()
+                                .any(|x| content.powers[x.id as usize].id == power)
+                    })
+                    .map(|(i, _)| i)
+                    .partition(|&i| {
+                        let id = combat.offer[i].id;
+                        ![&combat.hand, &combat.draw, &combat.discard]
+                            .into_iter()
+                            .flatten()
+                            .any(|card| card.id == id)
+                    });
+                match (&unheld[..], &held[..]) {
+                    ([i], _) | ([], [i]) => Some(*i),
+                    _ => None,
+                }
             });
             index = index.inspect(|_| tally("infer.offer_power"));
         }
@@ -2583,6 +2596,70 @@ fn resync_pile(kind: &'static str, pile: &mut Vec<Card>, cards: Vec<Card>) {
         tally(kind);
     }
     *pile = cards;
+}
+
+/// The candidate of an untraced pick: the only one, else the one whose result the after state
+/// shows (a moved card in its new pile, a copy as a new card of its model, an upgrade, cost or
+/// keyword change on the card itself).
+fn potion_pick(
+    content: &Content,
+    game: &Game,
+    choice: Choice,
+    after: &Value,
+    oracle_after: &Value,
+) -> Option<usize> {
+    let combat = game.combat()?;
+    let traced = |pile| traced_pile(after, oracle_after, pile);
+    let all = || {
+        [Pile::Hand, Pile::Discard, Pile::Exhaust, Pile::Draw]
+            .into_iter()
+            .flat_map(traced)
+    };
+    let instance = |value: &Value| instance_id(value["instance_id"].as_str().unwrap_or_default());
+    let known = |id| {
+        [&combat.hand, &combat.discard, &combat.exhaust, &combat.draw]
+            .iter()
+            .any(|pile| pile.iter().any(|card| card.instance == id))
+    };
+    let after_card = |card: &Card| all().find(|value| instance(value) == card.instance);
+    let in_pile = |pile, card: &Card| (traced(pile).iter()).any(|v| instance(v) == card.instance);
+    let shows = |card: &Card| match choice.op {
+        CardOp::Move(to) | CardOp::MoveFree(to) => in_pile(to, card),
+        CardOp::CopySelected(_) => all().any(|value| {
+            value["model_id"] == content.cards[card.id as usize].id && !known(instance(value))
+        }),
+        CardOp::Upgrade => after_card(card).is_some_and(|value| {
+            value["upgrade"].as_u64().unwrap_or_default() > card.upgrades as u64
+        }),
+        CardOp::Cost(_) | CardOp::SetCost(_) | CardOp::FreeCombat => {
+            after_card(card).is_some_and(|value| captured_costs(content, value).costs != card.costs)
+        }
+        CardOp::Flag(flag @ (ETHEREAL | RETAIN)) => after_card(card).is_some_and(|value| {
+            let key = if flag == ETHEREAL {
+                "ethereal"
+            } else {
+                "retain"
+            };
+            value[key] == true && card.flags(content.cards[card.id as usize]) & flag == 0
+        }),
+        _ => false,
+    };
+    let pile = replay_pile(combat, choice.pile);
+    let picks: Vec<_> = (game.actions(content).into_iter())
+        .filter_map(|action| match action {
+            Action::Choose(index) => Some(index),
+            _ => None,
+        })
+        .collect();
+    // A moved card may have left its new pile too (played, discarded): it is gone from its old one.
+    let left = |card: &Card| {
+        matches!(choice.op, CardOp::Move(_) | CardOp::MoveFree(_)) && !in_pile(choice.pile, card)
+    };
+    match picks[..] {
+        [only] => Some(only),
+        _ => (picks.iter().copied().find(|&index| shows(&pile[index])))
+            .or_else(|| picks.iter().copied().find(|&index| left(&pile[index]))),
+    }
 }
 
 fn traced_rng(oracle: &Value, name: &str) -> Rng {
@@ -5838,6 +5915,16 @@ fn compare_powers(
     }));
     if actual != expected {
         diff.push(format!("{path}: simulator {actual:?} != game {expected:?}"));
+    }
+}
+
+fn traced_pile<'a>(after: &'a Value, oracle_after: &'a Value, pile: Pile) -> &'a [Value] {
+    match pile {
+        Pile::Hand => array(&after["players"][0]["hand"]),
+        Pile::Discard => array(&after["players"][0]["discard_pile"]),
+        Pile::Exhaust => array(&after["players"][0]["exhaust_pile"]),
+        Pile::Draw => array(&oracle_after["hidden_draw_order"]),
+        Pile::Offer => &[],
     }
 }
 
