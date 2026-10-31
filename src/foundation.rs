@@ -31,7 +31,7 @@ const JUGGERNAUT_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const DEMON_FORM_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
+    trigger: Trigger::AfterSideTurnStart,
     effects: effects![Effect::ApplyPower(
         Target::Source,
         0,
@@ -47,7 +47,7 @@ const BECKON_HOOKS: &[Hook] = &[Hook {
     effects: effects![Effect::LoseHp(Target::Player, Amount::fixed(6, 6))],
 }];
 const FEEDING_FRENZY_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnEnd,
+    trigger: Trigger::AfterSideTurnEnd,
     effects: effects![Effect::ApplyPower(
         Target::Source,
         power_id::STRENGTH,
@@ -55,7 +55,7 @@ const FEEDING_FRENZY_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const HIGH_VOLTAGE_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnEnd,
+    trigger: Trigger::AfterSideTurnEnd,
     effects: effects![Effect::ApplyPower(
         Target::Source,
         0,
@@ -63,7 +63,7 @@ const HIGH_VOLTAGE_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const TERRITORIAL_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnEnd,
+    trigger: Trigger::AfterSideTurnEnd,
     effects: effects![Effect::ApplyPower(
         Target::Source,
         0,
@@ -79,40 +79,40 @@ const SLOW_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const CONSTRICT_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnEnd,
+    trigger: Trigger::AfterSideTurnEnd,
     effects: effects![Effect::Damage(
         Target::Source,
         Amount::scaled(Scale::Power(power_id::CONSTRICT), 1),
     )],
 }];
 const INFINITE_BLADES_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
+    trigger: Trigger::BeforeHandDraw,
     effects: effects![Effect::Repeat(
         Amount::scaled(Scale::Power(20), 1),
         effects![Effect::AddCard(Pile::Hand, 137, 1)],
     )],
 }];
 const ENERGY_NEXT_TURN_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
+    trigger: Trigger::AfterEnergyReset,
     effects: effects![Effect::Repeat(
         Amount::scaled(Scale::Power(22), 1),
         effects![Effect::Energy(1)],
     )],
 }];
 const STAR_NEXT_TURN_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
+    trigger: Trigger::AfterEnergyReset,
     effects: effects![Effect::Stars(Amount::scaled(Scale::Power(72), 1))],
 }];
 const FOREGONE_CONCLUSION_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
+    trigger: Trigger::BeforeHandDraw,
     effects: effects![Effect::ChooseDraw(Amount::scaled(Scale::Power(73), 1))],
 }];
 const FURNACE_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
+    trigger: Trigger::AfterSideTurnStart,
     effects: effects![Effect::Forge(Amount::scaled(Scale::Power(74), 1))],
 }];
 const GENESIS_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::EnergyReset,
+    trigger: Trigger::AfterEnergyReset,
     effects: effects![Effect::Stars(Amount::scaled(Scale::Power(75), 1))],
 }];
 const KINGLY_PUNCH_HOOKS: &[Hook] = &[Hook {
@@ -127,7 +127,7 @@ const MONOLOGUE_HOOKS: &[Hook] = &[Hook {
     ],
 }];
 const MONOLOGUE_RESTORE_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnEnd,
+    trigger: Trigger::AfterSideTurnEnd,
     effects: effects![Effect::ApplyPower(
         Target::Source,
         0,
@@ -136,14 +136,14 @@ const MONOLOGUE_RESTORE_HOOKS: &[Hook] = &[Hook {
 }];
 const PLATING_HOOKS: &[Hook] = &[
     Hook {
-        trigger: Trigger::TurnEnd,
+        trigger: Trigger::BeforeSideTurnEndEarly,
         effects: effects![Effect::RawBlock(
             Target::Source,
             Amount::scaled(Scale::Power(79), 1),
         )],
     },
     Hook {
-        trigger: Trigger::TurnStart,
+        trigger: Trigger::AfterSideTurnStart,
         effects: effects![Effect::ApplyPower(
             Target::Source,
             79,
@@ -159,7 +159,7 @@ const PILLAR_OF_CREATION_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const REFLECT_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
+    trigger: Trigger::AfterSideTurnStart,
     effects: effects![Effect::ApplyPower(
         Target::Source,
         85,
@@ -167,7 +167,7 @@ const REFLECT_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const SPECTRUM_SHIFT_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
+    trigger: Trigger::BeforeHandDraw,
     effects: effects![Effect::RandomColorless(
         Pile::Hand,
         Amount::scaled(Scale::Power(93), 1),
@@ -175,7 +175,7 @@ const SPECTRUM_SHIFT_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const CALL_OF_THE_VOID_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
+    trigger: Trigger::BeforeHandDraw,
     effects: effects![Effect::RandomCharacter(
         Pile::Hand,
         Amount::scaled(Scale::Power(97), 1),
@@ -191,7 +191,7 @@ const DEVOUR_LIFE_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const ENFEEBLING_TOUCH_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnEnd,
+    trigger: Trigger::AfterSideTurnEnd,
     effects: effects![Effect::ApplyPower(
         Target::Source,
         0,
@@ -210,11 +210,11 @@ const HAUNT_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const SUMMON_NEXT_TURN_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
+    trigger: Trigger::AfterPlayerTurnStart,
     effects: effects![Effect::Summon(Amount::scaled(Scale::Power(108), 1))],
 }];
 const NEUROSURGE_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
+    trigger: Trigger::AfterSideTurnStart,
     effects: effects![Effect::ApplyPower(
         Target::Source,
         94,
@@ -230,28 +230,28 @@ const OBLIVION_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const SENTRY_MODE_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
+    trigger: Trigger::BeforeHandDraw,
     effects: effects![Effect::Repeat(
         Amount::scaled(Scale::Power(115), 1),
         &[Effect::AddCard(Pile::Hand, 429, 1)],
     )],
 }];
 const CRIMSON_MANTLE_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
+    trigger: Trigger::AfterPlayerTurnStart,
     effects: effects![
         Effect::LoseHp(Target::Source, Amount::scaled(Scale::Power(124), 1)),
         Effect::RawBlock(Target::Source, Amount::scaled(Scale::Power(123), 1)),
     ],
 }];
 const INFERNO_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
+    trigger: Trigger::AfterPlayerTurnStart,
     effects: effects![Effect::LoseHp(
         Target::Source,
         Amount::scaled(Scale::Power(130), 1),
     )],
 }];
 const MANGLE_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnEnd,
+    trigger: Trigger::AfterSideTurnEnd,
     effects: effects![Effect::ApplyPower(
         Target::Source,
         0,
@@ -266,7 +266,7 @@ const RAGE_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const SETUP_STRIKE_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnEnd,
+    trigger: Trigger::AfterSideTurnEnd,
     effects: effects![Effect::ApplyPower(
         Target::Source,
         0,
@@ -274,7 +274,7 @@ const SETUP_STRIKE_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const FLEX_POTION_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnEnd,
+    trigger: Trigger::AfterSideTurnEnd,
     effects: effects![Effect::ApplyPower(
         Target::Source,
         power_id::STRENGTH,
@@ -282,7 +282,7 @@ const FLEX_POTION_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const SPEED_POTION_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnEnd,
+    trigger: Trigger::AfterSideTurnEnd,
     effects: effects![Effect::ApplyPower(
         Target::Source,
         power_id::DEXTERITY,
@@ -290,7 +290,7 @@ const SPEED_POTION_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const TEMPORARY_FOCUS_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnEnd,
+    trigger: Trigger::AfterSideTurnEnd,
     effects: effects![Effect::ApplyPower(
         Target::Source,
         17,
@@ -298,14 +298,14 @@ const TEMPORARY_FOCUS_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const BLOCK_NEXT_TURN_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
+    trigger: Trigger::AfterBlockCleared,
     effects: effects![Effect::RawBlock(
         Target::Source,
         Amount::scaled(Scale::Power(41), 1),
     )],
 }];
 const RESTORE_STRENGTH_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnEnd,
+    trigger: Trigger::AfterSideTurnEnd,
     effects: effects![Effect::ApplyPower(
         Target::Source,
         0,
@@ -313,7 +313,7 @@ const RESTORE_STRENGTH_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const CRUSH_UNDER_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnEnd,
+    trigger: Trigger::AfterSideTurnEnd,
     effects: effects![Effect::ApplyPower(
         Target::Source,
         0,
@@ -321,7 +321,7 @@ const CRUSH_UNDER_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const DARK_SHACKLES_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnEnd,
+    trigger: Trigger::AfterSideTurnEnd,
     effects: effects![Effect::ApplyPower(
         Target::Source,
         0,
@@ -329,7 +329,7 @@ const DARK_SHACKLES_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const DYING_STAR_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnEnd,
+    trigger: Trigger::AfterSideTurnEnd,
     effects: effects![Effect::ApplyPower(
         Target::Source,
         0,
@@ -337,7 +337,7 @@ const DYING_STAR_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const PIERCING_WAIL_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnEnd,
+    trigger: Trigger::AfterSideTurnEnd,
     effects: effects![Effect::ApplyPower(
         Target::Source,
         0,
@@ -345,16 +345,12 @@ const PIERCING_WAIL_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const SHACKLING_POTION_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnEnd,
+    trigger: Trigger::AfterSideTurnEnd,
     effects: effects![Effect::ApplyPower(
         Target::Source,
         0,
         Amount::scaled(Scale::Event, 1),
     )],
-}];
-const DRAW_NEXT_TURN_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
-    effects: effects![Effect::DrawAmount(Amount::scaled(Scale::Power(43), 1))],
 }];
 const AFTERIMAGE_HOOKS: &[Hook] = &[Hook {
     trigger: Trigger::CardPlayed,
@@ -379,7 +375,7 @@ const SERPENT_FORM_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const RESTORE_DEXTERITY_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnEnd,
+    trigger: Trigger::AfterSideTurnEnd,
     effects: effects![Effect::ApplyPower(
         Target::Source,
         1,
@@ -387,7 +383,7 @@ const RESTORE_DEXTERITY_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const ANTICIPATE_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnEnd,
+    trigger: Trigger::AfterSideTurnEnd,
     effects: effects![Effect::ApplyPower(
         Target::Source,
         power_id::DEXTERITY,
@@ -395,7 +391,7 @@ const ANTICIPATE_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const HELICAL_DART_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnEnd,
+    trigger: Trigger::AfterSideTurnEnd,
     effects: effects![Effect::ApplyPower(
         Target::Source,
         power_id::DEXTERITY,
@@ -403,7 +399,7 @@ const HELICAL_DART_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const REPTILE_TRINKET_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnEnd,
+    trigger: Trigger::AfterSideTurnEnd,
     effects: effects![Effect::ApplyPower(
         Target::Source,
         power_id::STRENGTH,
@@ -425,18 +421,18 @@ const SPEEDSTER_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const COOLANT_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
+    trigger: Trigger::AfterSideTurnStart,
     effects: effects![Effect::RawBlock(
         Target::Source,
         Amount::scaled(Scale::OrbTypesPower(25), 1),
     )],
 }];
 const CONSUMING_SHADOW_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnEnd,
+    trigger: Trigger::AfterSideTurnEnd,
     effects: effects![Effect::EvokeLast(Amount::scaled(Scale::Power(142), 1))],
 }];
 const LIGHTNING_ROD_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::EnergyReset,
+    trigger: Trigger::AfterEnergyReset,
     effects: effects![
         Effect::Channel(0, 1),
         Effect::ApplyPower(Target::Player, 143, Amount::fixed(-1, -1)),
@@ -455,7 +451,7 @@ const CALAMITY_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const PREP_TIME_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
+    trigger: Trigger::AfterSideTurnStart,
     effects: effects![Effect::ApplyPower(
         Target::Player,
         83,
@@ -473,7 +469,7 @@ const STRATAGEM_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const RITUAL_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnEnd,
+    trigger: Trigger::AfterSideTurnEnd,
     effects: effects![Effect::ApplyPower(
         Target::Source,
         0,
@@ -481,14 +477,14 @@ const RITUAL_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const DEMISE_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnEnd,
+    trigger: Trigger::AfterSideTurnEnd,
     effects: effects![Effect::LoseHp(
         Target::Source,
         Amount::scaled(Scale::Power(161), 1),
     )],
 }];
 const RADIANCE_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
+    trigger: Trigger::AfterEnergyReset,
     effects: effects![
         Effect::Energy(1),
         Effect::ApplyPower(Target::Source, 162, Amount::fixed(-1, -1)),
@@ -528,7 +524,7 @@ const SMOKESTACK_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const CREATIVE_AI_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
+    trigger: Trigger::BeforeHandDraw,
     effects: effects![Effect::Repeat(
         Amount::scaled(Scale::Power(36), 1),
         &[Effect::RandomCard(Pile::Hand, CardType::Power, 1, false)],
@@ -554,11 +550,11 @@ const ARSENAL_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const ANCHOR_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::CombatStart,
+    trigger: Trigger::BeforeCombatStart,
     effects: effects![Effect::RawBlock(Target::Player, Amount::fixed(10, 10))],
 }];
 const FAKE_ANCHOR_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::CombatStart,
+    trigger: Trigger::BeforeCombatStart,
     effects: effects![Effect::RawBlock(Target::Player, Amount::fixed(4, 4))],
 }];
 const NEOW_OPTIONS: &[EventOption] = &[
@@ -576,19 +572,19 @@ const NEOW_OPTIONS: &[EventOption] = &[
     },
 ];
 const VAJRA_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::RoomEntered,
+    trigger: Trigger::AfterRoomEntered,
     effects: effects![Effect::ApplyPower(Target::Player, 0, Amount::fixed(1, 1))],
 }];
 const STONE_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::RoomEntered,
+    trigger: Trigger::AfterRoomEntered,
     effects: effects![Effect::ApplyPower(Target::Player, 1, Amount::fixed(1, 1))],
 }];
 const DIVINE_RIGHT_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::CombatStart,
+    trigger: Trigger::AfterRoomEntered,
     effects: effects![Effect::Stars(Amount::fixed(3, 3))],
 }];
 const DIVINE_DESTINY_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
+    trigger: Trigger::AfterSideTurnStart,
     effects: effects![Effect::If(
         Condition::FirstTurn,
         effects![Effect::Stars(Amount::fixed(6, 6))],
@@ -597,11 +593,11 @@ const DIVINE_DESTINY_HOOKS: &[Hook] = &[Hook {
 }];
 const BOUND_PHYLACTERY_HOOKS: &[Hook] = &[
     Hook {
-        trigger: Trigger::RoomEntered,
+        trigger: Trigger::BeforeCombatStart,
         effects: effects![Effect::Summon(Amount::fixed(1, 1))],
     },
     Hook {
-        trigger: Trigger::TurnStart,
+        trigger: Trigger::AfterEnergyResetLate,
         effects: effects![Effect::If(
             Condition::FirstTurn,
             &[],
@@ -611,17 +607,17 @@ const BOUND_PHYLACTERY_HOOKS: &[Hook] = &[
 ];
 const PHYLACTERY_UNBOUND_HOOKS: &[Hook] = &[
     Hook {
-        trigger: Trigger::RoomEntered,
+        trigger: Trigger::BeforeCombatStart,
         effects: effects![Effect::Summon(Amount::fixed(5, 5))],
     },
     Hook {
-        trigger: Trigger::TurnStart,
+        trigger: Trigger::AfterSideTurnStart,
         effects: effects![Effect::Summon(Amount::fixed(2, 2))],
     },
 ];
 // BeforeSideTurnStart on turn 1, so its Lightning precedes Symbiotic Virus's Dark.
 const CRACKED_CORE_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
+    trigger: Trigger::BeforeSideTurnStart,
     effects: effects![Effect::If(
         Condition::FirstTurn,
         &[Effect::Channel(0, 1)],
@@ -629,7 +625,7 @@ const CRACKED_CORE_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const INFUSED_CORE_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
+    trigger: Trigger::AfterSideTurnStart,
     effects: effects![Effect::If(
         Condition::FirstTurn,
         &[Effect::Channel(0, 3)],
@@ -637,11 +633,11 @@ const INFUSED_CORE_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const DATA_DISK_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::RoomEntered,
+    trigger: Trigger::AfterRoomEntered,
     effects: effects![Effect::ApplyPower(Target::Player, 17, Amount::fixed(1, 1))],
 }];
 const RUNIC_CAPACITOR_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
+    trigger: Trigger::AfterSideTurnStart,
     effects: effects![Effect::If(
         Condition::FirstTurn,
         &[Effect::OrbSlots(3)],
@@ -649,7 +645,7 @@ const RUNIC_CAPACITOR_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const SYMBIOTIC_VIRUS_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
+    trigger: Trigger::AfterSideTurnStart,
     effects: effects![Effect::If(
         Condition::FirstTurn,
         &[Effect::Channel(2, 1)],
@@ -657,7 +653,7 @@ const SYMBIOTIC_VIRUS_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const BAG_OF_MARBLES_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
+    trigger: Trigger::BeforeSideTurnStart,
     effects: effects![Effect::If(
         Condition::FirstTurn,
         &[Effect::ApplyPower(
@@ -669,11 +665,11 @@ const BAG_OF_MARBLES_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const BRONZE_SCALES_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::RoomEntered,
+    trigger: Trigger::AfterRoomEntered,
     effects: effects![Effect::ApplyPower(Target::Player, 8, Amount::fixed(3, 3))],
 }];
 const RED_MASK_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
+    trigger: Trigger::BeforeSideTurnStart,
     effects: effects![Effect::If(
         Condition::FirstTurn,
         &[Effect::ApplyPower(
@@ -689,7 +685,7 @@ const BLACK_BLOOD_HOOKS: &[Hook] = &[Hook {
     effects: &[Effect::Heal(Target::Player, Amount::fixed(12, 12))],
 }];
 const CLOAK_CLASP_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnEnd,
+    trigger: Trigger::BeforeSideTurnEnd,
     effects: &[Effect::RawBlock(
         Target::Player,
         Amount::scaled(Scale::HandSize, 1),
@@ -770,7 +766,7 @@ const ABACUS_HOOKS: &[Hook] = &[Hook {
     effects: effects![Effect::RawBlock(Target::Player, Amount::fixed(6, 6))],
 }];
 const TWISTED_FUNNEL_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
+    trigger: Trigger::BeforeSideTurnStart,
     effects: effects![Effect::If(
         Condition::FirstTurn,
         &[Effect::ApplyPower(
@@ -790,7 +786,7 @@ const REGALITE_HOOKS: &[Hook] = &[Hook {
     effects: effects![Effect::RawBlock(Target::Player, Amount::fixed(2, 2))],
 }];
 const SANDPIT_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::TurnStart,
+    trigger: Trigger::AfterSideTurnStartLate,
     effects: effects![Effect::ApplyPower(
         Target::Source,
         power_id::SANDPIT,
@@ -12018,13 +12014,13 @@ pub fn foundation_content() -> Content {
             },
             PowerDef {
                 id: "POWER.ENERGY_NEXT_TURN_POWER",
-                kind: PowerKind::OneShot(Trigger::TurnStart),
+                kind: PowerKind::OneShot(Trigger::AfterEnergyReset),
                 debuff: false,
                 hooks: ENERGY_NEXT_TURN_HOOKS,
             },
             PowerDef {
                 id: "POWER.TEMPORARY_FOCUS_POWER",
-                kind: PowerKind::OneShot(Trigger::TurnEnd),
+                kind: PowerKind::OneShot(Trigger::AfterSideTurnEnd),
                 debuff: false,
                 hooks: TEMPORARY_FOCUS_HOOKS,
             },
@@ -12132,21 +12128,21 @@ pub fn foundation_content() -> Content {
             },
             PowerDef {
                 id: "POWER.BLOCK_NEXT_TURN_POWER",
-                kind: PowerKind::OneShot(Trigger::TurnStart),
+                kind: PowerKind::OneShot(Trigger::AfterBlockCleared),
                 debuff: false,
                 hooks: BLOCK_NEXT_TURN_HOOKS,
             },
             PowerDef {
                 id: "POWER.RESTORE_STRENGTH_POWER",
-                kind: PowerKind::OneShot(Trigger::TurnEnd),
+                kind: PowerKind::OneShot(Trigger::AfterSideTurnEnd),
                 debuff: false,
                 hooks: RESTORE_STRENGTH_HOOKS,
             },
             PowerDef {
                 id: "POWER.DRAW_NEXT_TURN_POWER",
-                kind: PowerKind::OneShot(Trigger::TurnStart),
+                kind: PowerKind::OneShot(Trigger::BeforeHandDraw),
                 debuff: false,
-                hooks: DRAW_NEXT_TURN_HOOKS,
+                hooks: EMPTY_HOOKS,
             },
             PowerDef {
                 id: "POWER.FREE_SKILL_POWER",
@@ -12168,19 +12164,19 @@ pub fn foundation_content() -> Content {
             },
             PowerDef {
                 id: "POWER.BURST_POWER",
-                kind: PowerKind::OneShot(Trigger::TurnEnd),
+                kind: PowerKind::OneShot(Trigger::AfterSideTurnEnd),
                 debuff: false,
                 hooks: EMPTY_HOOKS,
             },
             PowerDef {
                 id: "POWER.CORROSIVE_WAVE_POWER",
-                kind: PowerKind::OneShot(Trigger::TurnEnd),
+                kind: PowerKind::OneShot(Trigger::AfterSideTurnEnd),
                 debuff: false,
                 hooks: CORROSIVE_WAVE_HOOKS,
             },
             PowerDef {
                 id: "POWER.SHADOWMELD_POWER",
-                kind: PowerKind::OneShot(Trigger::TurnEnd),
+                kind: PowerKind::OneShot(Trigger::AfterSideTurnEnd),
                 debuff: false,
                 hooks: EMPTY_HOOKS,
             },
@@ -12210,7 +12206,7 @@ pub fn foundation_content() -> Content {
             },
             PowerDef {
                 id: "POWER.TEMPORARY_DEXTERITY_POWER",
-                kind: PowerKind::OneShot(Trigger::TurnEnd),
+                kind: PowerKind::OneShot(Trigger::AfterSideTurnEnd),
                 debuff: false,
                 hooks: RESTORE_DEXTERITY_HOOKS,
             },
@@ -12318,13 +12314,13 @@ pub fn foundation_content() -> Content {
             },
             PowerDef {
                 id: "POWER.STAR_NEXT_TURN_POWER",
-                kind: PowerKind::OneShot(Trigger::TurnStart),
+                kind: PowerKind::OneShot(Trigger::AfterEnergyReset),
                 debuff: false,
                 hooks: STAR_NEXT_TURN_HOOKS,
             },
             PowerDef {
                 id: "POWER.FOREGONE_CONCLUSION_POWER",
-                kind: PowerKind::OneShot(Trigger::TurnStart),
+                kind: PowerKind::OneShot(Trigger::BeforeHandDraw),
                 debuff: false,
                 hooks: FOREGONE_CONCLUSION_HOOKS,
             },
@@ -12348,13 +12344,13 @@ pub fn foundation_content() -> Content {
             },
             PowerDef {
                 id: "POWER.MONOLOGUE_POWER",
-                kind: PowerKind::OneShot(Trigger::TurnEnd),
+                kind: PowerKind::OneShot(Trigger::AfterSideTurnEnd),
                 debuff: false,
                 hooks: MONOLOGUE_HOOKS,
             },
             PowerDef {
                 id: "POWER.MONOLOGUE_RESTORE_POWER",
-                kind: PowerKind::OneShot(Trigger::TurnEnd),
+                kind: PowerKind::OneShot(Trigger::AfterSideTurnEnd),
                 debuff: false,
                 hooks: MONOLOGUE_RESTORE_HOOKS,
             },
@@ -12456,7 +12452,7 @@ pub fn foundation_content() -> Content {
             },
             PowerDef {
                 id: "POWER.BORROWED_TIME_POWER",
-                kind: PowerKind::OneShot(Trigger::TurnEnd),
+                kind: PowerKind::OneShot(Trigger::AfterSideTurnEnd),
                 debuff: true,
                 hooks: EMPTY_HOOKS,
             },
@@ -12504,7 +12500,7 @@ pub fn foundation_content() -> Content {
             },
             PowerDef {
                 id: "POWER.ENFEEBLING_TOUCH_POWER",
-                kind: PowerKind::OneShot(Trigger::TurnEnd),
+                kind: PowerKind::OneShot(Trigger::AfterSideTurnEnd),
                 debuff: true,
                 hooks: ENFEEBLING_TOUCH_HOOKS,
             },
@@ -12534,7 +12530,7 @@ pub fn foundation_content() -> Content {
             },
             PowerDef {
                 id: "POWER.SUMMON_NEXT_TURN_POWER",
-                kind: PowerKind::OneShot(Trigger::TurnStart),
+                kind: PowerKind::OneShot(Trigger::AfterPlayerTurnStart),
                 debuff: false,
                 hooks: SUMMON_NEXT_TURN_HOOKS,
             },
@@ -12678,13 +12674,13 @@ pub fn foundation_content() -> Content {
             },
             PowerDef {
                 id: "POWER.MANGLE_POWER",
-                kind: PowerKind::OneShot(Trigger::TurnEnd),
+                kind: PowerKind::OneShot(Trigger::AfterSideTurnEnd),
                 debuff: true,
                 hooks: MANGLE_HOOKS,
             },
             PowerDef {
                 id: "POWER.ONE_TWO_PUNCH_POWER",
-                kind: PowerKind::OneShot(Trigger::TurnEnd),
+                kind: PowerKind::OneShot(Trigger::AfterSideTurnEnd),
                 debuff: false,
                 hooks: EMPTY_HOOKS,
             },
@@ -12696,13 +12692,13 @@ pub fn foundation_content() -> Content {
             },
             PowerDef {
                 id: "POWER.RAGE_POWER",
-                kind: PowerKind::OneShot(Trigger::TurnEnd),
+                kind: PowerKind::OneShot(Trigger::AfterSideTurnEnd),
                 debuff: false,
                 hooks: RAGE_HOOKS,
             },
             PowerDef {
                 id: "POWER.SETUP_STRIKE_POWER",
-                kind: PowerKind::OneShot(Trigger::TurnEnd),
+                kind: PowerKind::OneShot(Trigger::AfterSideTurnEnd),
                 debuff: false,
                 hooks: SETUP_STRIKE_HOOKS,
             },
@@ -12834,7 +12830,7 @@ pub fn foundation_content() -> Content {
             },
             PowerDef {
                 id: "POWER.DUPLICATION_POWER",
-                kind: PowerKind::Other,
+                kind: PowerKind::OneShot(Trigger::AfterSideTurnEnd),
                 debuff: false,
                 hooks: EMPTY_HOOKS,
             },
@@ -12876,7 +12872,7 @@ pub fn foundation_content() -> Content {
             },
             PowerDef {
                 id: "POWER.ANTICIPATE_POWER",
-                kind: PowerKind::OneShot(Trigger::TurnEnd),
+                kind: PowerKind::OneShot(Trigger::AfterSideTurnEnd),
                 debuff: false,
                 hooks: ANTICIPATE_HOOKS,
             },
@@ -12954,7 +12950,7 @@ pub fn foundation_content() -> Content {
             },
             PowerDef {
                 id: "POWER.CRUSH_UNDER_POWER",
-                kind: PowerKind::OneShot(Trigger::TurnEnd),
+                kind: PowerKind::OneShot(Trigger::AfterSideTurnEnd),
                 debuff: false,
                 hooks: CRUSH_UNDER_HOOKS,
             },
@@ -12978,7 +12974,7 @@ pub fn foundation_content() -> Content {
             },
             PowerDef {
                 id: "POWER.DARK_SHACKLES_POWER",
-                kind: PowerKind::OneShot(Trigger::TurnEnd),
+                kind: PowerKind::OneShot(Trigger::AfterSideTurnEnd),
                 debuff: false,
                 hooks: DARK_SHACKLES_HOOKS,
             },
@@ -13020,7 +13016,7 @@ pub fn foundation_content() -> Content {
             },
             PowerDef {
                 id: "POWER.DYING_STAR_POWER",
-                kind: PowerKind::OneShot(Trigger::TurnEnd),
+                kind: PowerKind::OneShot(Trigger::AfterSideTurnEnd),
                 debuff: false,
                 hooks: DYING_STAR_HOOKS,
             },
@@ -13038,7 +13034,7 @@ pub fn foundation_content() -> Content {
             },
             PowerDef {
                 id: "POWER.FEEDING_FRENZY_POWER",
-                kind: PowerKind::OneShot(Trigger::TurnEnd),
+                kind: PowerKind::OneShot(Trigger::AfterSideTurnEnd),
                 debuff: false,
                 hooks: FEEDING_FRENZY_HOOKS,
             },
@@ -13050,7 +13046,7 @@ pub fn foundation_content() -> Content {
             },
             PowerDef {
                 id: "POWER.FLEX_POTION_POWER",
-                kind: PowerKind::OneShot(Trigger::TurnEnd),
+                kind: PowerKind::OneShot(Trigger::AfterSideTurnEnd),
                 debuff: false,
                 hooks: FLEX_POTION_HOOKS,
             },
@@ -13062,7 +13058,7 @@ pub fn foundation_content() -> Content {
             },
             PowerDef {
                 id: "POWER.FOCUSED_STRIKE_POWER",
-                kind: PowerKind::OneShot(Trigger::TurnEnd),
+                kind: PowerKind::OneShot(Trigger::AfterSideTurnEnd),
                 debuff: false,
                 hooks: EMPTY_HOOKS,
             },
@@ -13122,7 +13118,7 @@ pub fn foundation_content() -> Content {
             },
             PowerDef {
                 id: "POWER.HELICAL_DART_POWER",
-                kind: PowerKind::OneShot(Trigger::TurnEnd),
+                kind: PowerKind::OneShot(Trigger::AfterSideTurnEnd),
                 debuff: false,
                 hooks: HELICAL_DART_HOOKS,
             },
@@ -13146,7 +13142,7 @@ pub fn foundation_content() -> Content {
             },
             PowerDef {
                 id: "POWER.HOTFIX_POWER",
-                kind: PowerKind::OneShot(Trigger::TurnEnd),
+                kind: PowerKind::OneShot(Trigger::AfterSideTurnEnd),
                 debuff: false,
                 hooks: EMPTY_HOOKS,
             },
@@ -13242,7 +13238,7 @@ pub fn foundation_content() -> Content {
             },
             PowerDef {
                 id: "POWER.PIERCING_WAIL_POWER",
-                kind: PowerKind::OneShot(Trigger::TurnEnd),
+                kind: PowerKind::OneShot(Trigger::AfterSideTurnEnd),
                 debuff: false,
                 hooks: PIERCING_WAIL_HOOKS,
             },
@@ -13284,13 +13280,13 @@ pub fn foundation_content() -> Content {
             },
             PowerDef {
                 id: "POWER.REBOUND_POWER",
-                kind: PowerKind::Other,
+                kind: PowerKind::OneShot(Trigger::AfterSideTurnEnd),
                 debuff: false,
                 hooks: EMPTY_HOOKS,
             },
             PowerDef {
                 id: "POWER.REPTILE_TRINKET_POWER",
-                kind: PowerKind::OneShot(Trigger::TurnEnd),
+                kind: PowerKind::OneShot(Trigger::AfterSideTurnEnd),
                 debuff: false,
                 hooks: REPTILE_TRINKET_HOOKS,
             },
@@ -13314,7 +13310,7 @@ pub fn foundation_content() -> Content {
             },
             PowerDef {
                 id: "POWER.SHACKLING_POTION_POWER",
-                kind: PowerKind::OneShot(Trigger::TurnEnd),
+                kind: PowerKind::OneShot(Trigger::AfterSideTurnEnd),
                 debuff: false,
                 hooks: SHACKLING_POTION_HOOKS,
             },
@@ -13374,7 +13370,7 @@ pub fn foundation_content() -> Content {
             },
             PowerDef {
                 id: "POWER.SPEED_POTION_POWER",
-                kind: PowerKind::OneShot(Trigger::TurnEnd),
+                kind: PowerKind::OneShot(Trigger::AfterSideTurnEnd),
                 debuff: false,
                 hooks: SPEED_POTION_HOOKS,
             },
@@ -13416,7 +13412,7 @@ pub fn foundation_content() -> Content {
             },
             PowerDef {
                 id: "POWER.SYNCHRONIZE_POWER",
-                kind: PowerKind::OneShot(Trigger::TurnEnd),
+                kind: PowerKind::OneShot(Trigger::AfterSideTurnEnd),
                 debuff: false,
                 hooks: EMPTY_HOOKS,
             },
@@ -13428,7 +13424,7 @@ pub fn foundation_content() -> Content {
             },
             PowerDef {
                 id: "POWER.TANGLED_POWER",
-                kind: PowerKind::OneShot(Trigger::TurnEnd),
+                kind: PowerKind::OneShot(Trigger::AfterSideTurnEnd),
                 debuff: true,
                 hooks: EMPTY_HOOKS,
             },

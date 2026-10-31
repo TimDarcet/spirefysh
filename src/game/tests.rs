@@ -132,7 +132,9 @@ fn inferno_tracks_self_damage() {
     );
     let hp = game.combat().unwrap().player.hp;
 
-    game.start_player_turn(&content);
+    game.start_turn();
+
+    game.resolve(&content);
     assert_eq!(game.combat().unwrap().player.hp, hp - 1);
     assert_eq!(game.combat().unwrap().enemies[0].creature.hp, 94);
 }
@@ -1191,7 +1193,7 @@ fn stampede_autoplay_choice_pauses_end_turn() {
         combat
             .queue
             .iter()
-            .any(|pending| matches!(pending.effect, Effect::ContinueEndTurn))
+            .any(|pending| pending.effect == Effect::Step(Step::Flush))
     );
     assert_eq!(
         game.actions(&content),
@@ -1462,7 +1464,9 @@ fn hp_loss_events_persist_across_turns() {
         .unwrap();
     game.combat_mut().unwrap().history.hp_loss_events = 3;
 
-    game.start_turn(&content);
+    game.start_turn();
+
+    game.resolve(&content);
 
     assert_eq!(game.combat().unwrap().history.hp_loss_events, 3);
 }
@@ -2058,7 +2062,9 @@ fn enemy_rolls_before_turn_start_orb_damage() {
     }];
     let rolls = game.rngs.monster_ai.1;
 
-    game.start_turn(&content);
+    game.start_turn();
+
+    game.resolve(&content);
 
     assert_eq!(game.rngs.monster_ai.1, rolls + 1);
     assert_eq!(game.combat().unwrap().enemies[0].creature.hp, 0);
@@ -2172,7 +2178,9 @@ fn infinite_blades_creates_one_shiv_per_stack() {
     combat.draw.clear();
     combat.player.add_power(20, 2);
 
-    game.start_turn(&content);
+    game.start_turn();
+
+    game.resolve(&content);
 
     let shiv = content.card_id("CARD.SHIV").unwrap();
     assert_eq!(
@@ -2367,7 +2375,8 @@ fn divine_destiny_replaces_divine_right_and_grants_six_stars() {
         .unwrap();
 
     assert_eq!(game.combat().unwrap().stars, 6);
-    game.start_turn(&content);
+    game.start_turn();
+    game.resolve(&content);
     assert_eq!(game.combat().unwrap().stars, 6);
 }
 
@@ -2382,15 +2391,22 @@ fn furnace_forges_after_hand_draw() {
         id: content.card_id("CARD.STRIKE_REGENT").unwrap(),
         ..Card::default()
     };
+    let furnace = content
+        .powers
+        .iter()
+        .position(|power| power.id == "POWER.FURNACE_POWER")
+        .unwrap() as Id;
     let combat = game.combat_mut().unwrap();
     combat.hand.clear();
     combat.draw = vec![strike];
     combat.discard.clear();
     combat.draw_per_turn = 1;
     combat.player.powers.clear();
-    combat.player.add_power(power_id::FURNACE, 5);
+    combat.player.add_power(furnace, 5);
 
-    game.start_turn(&content);
+    game.start_turn();
+
+    game.resolve(&content);
 
     assert_eq!(
         game.combat()
@@ -2634,7 +2650,8 @@ fn mini_regent_triggers_once_each_turn() {
             expected
         );
         if expected == 1 {
-            game.start_turn(&content);
+            game.start_turn();
+            game.resolve(&content);
         }
     }
 }
@@ -2681,6 +2698,11 @@ fn mayhem_plays_the_top_card_after_the_turn_draw() {
     game.begin_act(&content, 0).unwrap();
     game.start_combat(&content, content.acts[0].encounters[0])
         .unwrap();
+    let mayhem = content
+        .powers
+        .iter()
+        .position(|power| power.id == "POWER.MAYHEM_POWER")
+        .unwrap() as Id;
     let combat = game.combat_mut().unwrap();
     let card = |id| Card {
         id: content.card_id(id).unwrap(),
@@ -2690,9 +2712,11 @@ fn mayhem_plays_the_top_card_after_the_turn_draw() {
     combat.draw = vec![card("CARD.DEFEND_IRONCLAD")];
     combat.draw.extend([card("CARD.STRIKE_IRONCLAD"); 5]);
     combat.player.block = 0;
-    combat.player.add_power(power_id::MAYHEM, 1);
+    combat.player.add_power(mayhem, 1);
 
-    game.start_turn(&content);
+    game.start_turn();
+
+    game.resolve(&content);
 
     let combat = game.combat().unwrap();
     assert_eq!(combat.hand.len(), 5);
@@ -2735,7 +2759,9 @@ fn speedster_ignores_the_turn_draw() {
     combat.enemies[0].creature.block = 0;
     combat.player.add_power(power_id::SPEEDSTER, 2);
 
-    game.start_turn(&content);
+    game.start_turn();
+
+    game.resolve(&content);
     assert_eq!(game.combat().unwrap().enemies[0].creature.hp, 100);
 
     let combat = game.combat_mut().unwrap();
@@ -3318,13 +3344,8 @@ fn bread_raises_max_energy_from_turn_two() {
 #[test]
 fn metamorphosis_cards_are_free_all_combat() {
     let content = foundation_content();
-    let mut game = Game::new_character_ascension(&content, 1, 1, 0).unwrap();
-    game.begin_act(&content, 0).unwrap();
-    game.start_combat(&content, content.acts[0].encounters[0])
-        .unwrap();
-    let combat = game.combat_mut().unwrap();
-    combat.draw.clear();
-    combat.hand = vec![Card {
+    let mut game = turn_start_test(&content, 1, &[], &[]);
+    game.combat_mut().unwrap().hand = vec![Card {
         id: content.card_id("CARD.METAMORPHOSIS").unwrap(),
         ..Card::default()
     }];
@@ -3342,4 +3363,522 @@ fn metamorphosis_cards_are_free_all_combat() {
         draw.iter()
             .all(|card| card.flags & FREE_COMBAT != 0 && !card.free)
     );
+}
+
+fn exhaust_with_feel_no_pain_and_forgotten_soul(relic_at_start: bool) -> Game {
+    let content = foundation_content();
+    let mut game = Game::new_character_ascension(&content, 1, 0, 0).unwrap();
+    game.begin_act(&content, 0).unwrap();
+    let soul = content.relic_id("RELIC.FORGOTTEN_SOUL").unwrap();
+    if relic_at_start {
+        game.run.relics.push(soul);
+    }
+    game.start_combat(&content, content.acts[0].encounters[0])
+        .unwrap();
+    if !relic_at_start {
+        game.run.relics.push(soul);
+    }
+    let feel_no_pain = content
+        .powers
+        .iter()
+        .position(|power| power.id == "POWER.FEEL_NO_PAIN_POWER")
+        .unwrap() as Id;
+    let combat = game.combat_mut().unwrap();
+    combat.queue.clear();
+    combat.player.add_power(feel_no_pain, 3);
+    game.trigger(&content, Trigger::CardExhausted, Actor::Player, 1);
+    game
+}
+
+#[test]
+fn powers_hear_a_pass_before_relics() {
+    // CombatState.IterateHookListeners: a creature's powers, then the player's relics, however
+    // long each was held. The queue is a stack, so the power listens first.
+    for relic_at_start in [false, true] {
+        let game = exhaust_with_feel_no_pain_and_forgotten_soul(relic_at_start);
+        let effects: Vec<_> = game
+            .combat()
+            .unwrap()
+            .queue
+            .iter()
+            .map(|x| x.effect)
+            .collect();
+        assert!(matches!(
+            effects[..],
+            [
+                Effect::Listen(_, Listener::Relic(_)),
+                Effect::Listen(_, Listener::Power(..))
+            ]
+        ));
+    }
+}
+
+#[test]
+fn guarded_passes_do_not_start_once_the_combat_is_over() {
+    // Hook.IterateCombatHookListeners yields nothing once the combat is over or ending.
+    let content = foundation_content();
+    let mut game = exhaust_with_feel_no_pain_and_forgotten_soul(false);
+    let combat = game.combat_mut().unwrap();
+    combat.queue.clear();
+    for enemy in &mut combat.enemies {
+        enemy.creature.hp = 0;
+    }
+    game.trigger(&content, Trigger::CardExhausted, Actor::Player, 1);
+    assert!(game.combat().unwrap().queue.is_empty());
+}
+
+fn combat_with_relics(relics: &[&str]) -> Game {
+    let content = foundation_content();
+    let mut game = Game::new_character_ascension(&content, 1, 0, 0).unwrap();
+    game.begin_act(&content, 0).unwrap();
+    for relic in relics {
+        game.run.relics.push(content.relic_id(relic).unwrap());
+    }
+    game.start_combat(&content, content.acts[0].encounters[0])
+        .unwrap();
+    game
+}
+
+#[test]
+fn room_entered_strength_follows_relic_order() {
+    // Girya and Vajra both apply Strength in AfterRoomEntered, in relic order, so the first one
+    // held gets Ruined Helmet's doubling (Girya.cs:50, Vajra's data hook).
+    for (relics, strength) in [
+        (["RELIC.VAJRA", "RELIC.GIRYA"], 2 * 1 + 2),
+        (["RELIC.GIRYA", "RELIC.VAJRA"], 2 * 2 + 1),
+    ] {
+        let content = foundation_content();
+        let mut game = Game::new_character_ascension(&content, 1, 0, 0).unwrap();
+        game.begin_act(&content, 0).unwrap();
+        game.girya = 2;
+        for relic in ["RELIC.RUINED_HELMET"].iter().chain(&relics) {
+            game.run.relics.push(content.relic_id(relic).unwrap());
+        }
+        game.start_combat(&content, content.acts[0].encounters[0])
+            .unwrap();
+        assert_eq!(
+            game.creature(Actor::Player).power(power_id::STRENGTH),
+            strength
+        );
+    }
+}
+
+#[test]
+fn combat_start_block_and_stars_count_for_turn_one() {
+    // The player's block isn't cleared on turn 1 (Creature.AfterTurnStart), and the combat start
+    // is round 1 (CombatState.RoundNumber), so Anchor's block and Divine Right's stars count.
+    let content = foundation_content();
+    let mut game = combat_with_relics(&["RELIC.ANCHOR", "RELIC.DIVINE_RIGHT"]);
+    let combat = game.combat().unwrap();
+    assert_eq!(combat.player.block, 10);
+    assert_eq!((combat.stars, combat.history.stars_gained), (3, 3));
+    game.step(&content, Action::EndTurn).unwrap();
+    assert_eq!(game.combat().unwrap().history.stars_gained, 0);
+}
+
+#[test]
+fn bone_tea_upgrades_the_hand_gambling_chip_redrew() {
+    // Gambling Chip redraws in AfterPlayerTurnStart; Bone Tea upgrades in the later
+    // AfterSideTurnStart, whichever relic is held first.
+    let content = foundation_content();
+    for relics in [
+        ["RELIC.GAMBLING_CHIP", "RELIC.BONE_TEA"],
+        ["RELIC.BONE_TEA", "RELIC.GAMBLING_CHIP"],
+    ] {
+        let mut game = combat_with_relics(&relics);
+        assert!(
+            game.combat()
+                .unwrap()
+                .hand
+                .iter()
+                .all(|card| card.upgrades == 0)
+        );
+        game.step(&content, Action::Choose(0)).unwrap();
+        game.step(&content, Action::Done).unwrap();
+        let combat = game.combat().unwrap();
+        assert!(combat.choice.is_none());
+        assert_eq!(combat.hand.len(), 5);
+        assert!(combat.hand.iter().all(|card| card.upgrades == 1));
+    }
+}
+
+#[test]
+fn turn_listeners_match_the_game() {
+    // Every sim listener of a combat-start or turn pass overrides that hook in the game.
+    let Ok(game) = std::fs::read_to_string("target/hunt/hook-listeners.txt") else {
+        return;
+    };
+    let content = foundation_content();
+    let title = |word: &str| word[..1].to_owned() + &word[1..].to_lowercase();
+    let class = |id: &str| {
+        let (kind, name) = id.split_once('.').unwrap();
+        let name: String = name.split('_').map(title).collect();
+        format!("{}s.{name}", title(kind))
+    };
+    let passes = (combat::hooks::PLAYER_TURN.iter())
+        .chain(combat::hooks::END_PLAYER_TURN)
+        .chain(combat::hooks::END_ENEMY_TURN)
+        .filter_map(|effect| match effect {
+            Effect::Fire(trigger) => Some(*trigger),
+            _ => None,
+        });
+    let combat_start = [
+        Trigger::AfterRoomEntered,
+        Trigger::BeforeCombatStart,
+        Trigger::BeforeCombatStartLate,
+    ];
+    for trigger in combat_start.into_iter().chain(passes) {
+        let hook = match trigger {
+            Trigger::AutoPrePlay => "\tAfterAutoPrePlayPhaseEntered:".to_owned(),
+            Trigger::AutoPrePlayLate => "\tAfterAutoPrePlayPhaseEnteredLate:".to_owned(),
+            _ => format!("\t{trigger:?}:"),
+        };
+        let line = game.lines().find(|line| line.contains(&hook)).unwrap();
+        let listeners: Vec<_> = line.split(' ').skip(1).collect();
+        let defs = (content.relics.iter().map(|x| (x.id, x.hooks)))
+            .chain(content.powers.iter().map(|x| (x.id, x.hooks)));
+        for (id, hooks) in defs {
+            // A power the game keeps inside another model has no class; a subclass inherits.
+            let class = class(id);
+            let (kind, name) = class.split_once('.').unwrap();
+            let path = format!("target/hunt/sts2_src/MegaCrit.Sts2.Core.Models.{kind}/{name}.cs");
+            let Ok(source) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            let base = source.split(&format!("class {name} : ")).nth(1);
+            let base =
+                base.map(|rest| format!("{kind}.{}", rest.split_whitespace().next().unwrap()));
+            if combat::hooks::listens(trigger, id, hooks) {
+                assert!(
+                    listeners.contains(&class.as_str())
+                        || base.is_some_and(|base| listeners.contains(&base.as_str())),
+                    "{id} in {trigger:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn well_laid_plans_pick_holds_the_turn_end() {
+    let content = foundation_content();
+    let mut game = turn_start_test(&content, 1, &["POWER.WELL_LAID_PLANS_POWER"], &[]);
+    let defend = content.card_id("CARD.DEFEND_SILENT").unwrap();
+    let combat = game.combat_mut().unwrap();
+    combat.hand = (1..=2)
+        .map(|instance| Card {
+            id: defend,
+            instance,
+            ..Card::default()
+        })
+        .collect();
+    combat.enemies[0].creature.hp = 200;
+
+    game.step(&content, Action::EndTurn).unwrap();
+    let combat = game.combat().unwrap();
+    assert!(combat.choice.is_some());
+    assert_eq!((combat.turn, combat.hand.len()), (1, 2));
+
+    game.step(&content, Action::Choose(1)).unwrap();
+    let combat = game.combat().unwrap();
+    assert_eq!(combat.turn, 2);
+    assert!(combat.choice.is_none());
+    assert!(combat.hand.iter().any(|card| card.instance == 2));
+}
+
+#[test]
+fn paels_eye_takes_an_extra_turn_before_the_enemies_act() {
+    let content = foundation_content();
+    let mut game = turn_start_test(&content, 1, &[], &["RELIC.PAELS_EYE"]);
+    let defend = content.card_id("CARD.DEFEND_SILENT").unwrap();
+    let combat = game.combat_mut().unwrap();
+    combat.hand = vec![Card {
+        id: defend,
+        instance: 1,
+        ..Card::default()
+    }];
+    let hp = combat.player.hp;
+    let moves = combat.enemies[0].move_history.len();
+
+    game.step(&content, Action::EndTurn).unwrap();
+    let combat = game.combat().unwrap();
+    assert_eq!(combat.turn, 2);
+    assert!(combat.paels_eye && !combat.extra_turn && !combat.enemy_turn);
+    assert_eq!(combat.player.hp, hp);
+    assert_eq!(combat.enemies[0].move_history.len(), moves);
+    assert!(combat.exhaust.iter().any(|card| card.instance == 1));
+}
+
+fn turn_start_test(content: &Content, character: Id, powers: &[&str], relics: &[&str]) -> Game {
+    let mut game = Game::new_character_ascension(content, 1, character, 0).unwrap();
+    game.begin_act(content, 0).unwrap();
+    game.start_combat(content, content.acts[0].encounters[0])
+        .unwrap();
+    game.run.relics = (relics.iter())
+        .map(|relic| content.relic_id(relic).unwrap())
+        .collect();
+    let combat = game.combat_mut().unwrap();
+    combat.hand.clear();
+    combat.draw.clear();
+    combat.discard.clear();
+    combat.orbs.clear();
+    combat.orb_slots = 3;
+    combat.player.powers.clear();
+    for &id in powers {
+        let power = content.powers.iter().position(|power| power.id == id);
+        combat.player.add_power(power.unwrap() as Id, 1);
+    }
+    game
+}
+
+#[test]
+fn before_hand_draw_powers_add_cards_in_power_order() {
+    // Nightmare, Hello World and Call of the Void are BeforeHandDraw listeners.
+    let content = foundation_content();
+    let strike = content.card_id("CARD.STRIKE_DEFECT").unwrap();
+    let mut order = [
+        ("POWER.NIGHTMARE_POWER", 'N'),
+        ("POWER.HELLO_WORLD_POWER", 'H'),
+        ("POWER.CALL_OF_THE_VOID_POWER", 'V'),
+    ];
+    for _ in 0..2 {
+        let powers = order.map(|(power, _)| power);
+        let mut game = turn_start_test(&content, 1, &powers, &[]);
+        let card = Card {
+            id: strike,
+            ..Card::default()
+        };
+        game.combat_mut().unwrap().nightmares = vec![(card, 1)];
+        game.start_turn();
+        game.resolve(&content);
+        let kinds: String = (game.combat().unwrap().hand.iter())
+            .map(|card| match card {
+                card if card.id == strike => 'N',
+                card if card.flags & ETHEREAL != 0 => 'V',
+                _ => 'H',
+            })
+            .collect();
+        assert_eq!(kinds, String::from_iter(order.map(|(_, kind)| kind)));
+        order.reverse();
+    }
+}
+
+#[test]
+fn spinner_and_lightning_rod_channel_in_power_order() {
+    let content = foundation_content();
+    let mut order = [("POWER.SPINNER_POWER", 4), ("POWER.LIGHTNING_ROD_POWER", 0)];
+    for _ in 0..2 {
+        let mut game = turn_start_test(&content, 1, &order.map(|(power, _)| power), &[]);
+        game.start_turn();
+        game.resolve(&content);
+        let orbs: Vec<_> = game
+            .combat()
+            .unwrap()
+            .orbs
+            .iter()
+            .map(|orb| orb.id)
+            .collect();
+        assert_eq!(orbs, order.map(|(_, orb)| orb));
+        order.reverse();
+    }
+}
+
+#[test]
+fn crossbow_and_big_hat_generate_in_relic_order() {
+    // Both are AfterSideTurnStart relics sharing the card-generation RNG; Crossbow's attack is
+    // free this turn.
+    let content = foundation_content();
+    let mut order = [("RELIC.CROSSBOW", true), ("RELIC.BIG_HAT", false)];
+    for _ in 0..2 {
+        let mut game = turn_start_test(&content, 1, &[], &order.map(|(relic, _)| relic));
+        game.combat_mut().unwrap().turn = 0;
+        game.start_turn();
+        game.resolve(&content);
+        let hand = &game.combat().unwrap().hand;
+        assert_eq!(hand[0].free, order[0].1);
+        assert_eq!(hand.last().unwrap().free, order[1].1);
+        order.reverse();
+    }
+}
+
+#[test]
+fn seal_of_gold_and_happy_flower_give_energy_in_relic_order() {
+    // Both are AfterSideTurnStart relics; Seal of Gold isn't forced ahead of the others.
+    let content = foundation_content();
+    let mut order = ["RELIC.SEAL_OF_GOLD", "RELIC.HAPPY_FLOWER"];
+    for _ in 0..2 {
+        let mut game = turn_start_test(&content, 1, &[], &order);
+        game.run.gold = 7;
+        game.happy_flower = 2;
+        game.start_turn();
+        game.resolve(&content);
+        let combat = game.combat().unwrap();
+        assert_eq!(combat.energy, combat.max_energy + 2);
+        assert_eq!(game.run.gold, 2);
+        order.reverse();
+    }
+}
+
+#[test]
+fn paels_legion_and_letter_opener_each_count_their_turn() {
+    // One AfterSideTurnStart arm each: Pael's Legion counts down once, Letter Opener resets.
+    let content = foundation_content();
+    let mut order = ["RELIC.PAELS_LEGION", "RELIC.LETTER_OPENER"];
+    for _ in 0..2 {
+        let mut game = turn_start_test(&content, 1, &[], &order);
+        let combat = game.combat_mut().unwrap();
+        combat.paels_legion = 2;
+        combat.letter_opener = 2;
+        game.start_turn();
+        game.resolve(&content);
+        assert_eq!(game.combat().unwrap().paels_legion, 1);
+        assert_eq!(game.combat().unwrap().letter_opener, 0);
+        order.reverse();
+    }
+}
+
+#[test]
+fn side_turn_powers_tick_on_their_owners_side() {
+    // Poison and Slow hear AfterSideTurnStart only when their owner's side starts its turn.
+    let content = foundation_content();
+    let mut game = turn_start_test(&content, 1, &[], &[]);
+    let enemy = &mut game.combat_mut().unwrap().enemies[0].creature;
+    enemy.add_power(power_id::SLOW, 2);
+    enemy.add_power(power_id::POISON, 3);
+    let hp = enemy.hp;
+    game.start_turn();
+    game.resolve(&content);
+    let enemy = &game.combat().unwrap().enemies[0].creature;
+    assert_eq!((enemy.hp, enemy.power(power_id::POISON)), (hp, 3));
+    assert_eq!(enemy.power(power_id::SLOW), 2);
+    game.combat_mut().unwrap().enemy_turn = true;
+    let queue = &mut game.combat_mut().unwrap().queue;
+    push_effects(queue, super::combat::hooks::ENEMY_TURN, Context::player());
+    game.resolve(&content);
+    let enemy = &game.combat().unwrap().enemies[0].creature;
+    assert_eq!((enemy.hp, enemy.power(power_id::POISON)), (hp - 3, 2));
+    assert_eq!(enemy.power(power_id::SLOW), 0);
+}
+
+#[test]
+fn slumber_and_demise_tick_in_power_order() {
+    // Slumber ticking first lets Demise's HP loss end it with a stun; ticking last, the beetle
+    // wakes up on its own (WakeUpMove drops Plating) and rolls Roll Out as usual.
+    let content = foundation_content();
+    let beetle = (content.enemies.iter()).position(|enemy| enemy.id == "MONSTER.SLUMBERING_BEETLE");
+    let demise = (content.powers.iter()).position(|power| power.id == "POWER.DEMISE_POWER");
+    for slumber_leads in [true, false] {
+        let mut game = turn_start_test(&content, 1, &[], &[]);
+        let combat = game.combat_mut().unwrap();
+        combat.enemy_turn = true;
+        let enemy = &mut combat.enemies[0];
+        enemy.creature.id = beetle.unwrap() as Id;
+        enemy.creature.hp = 50;
+        enemy.creature.powers.clear();
+        enemy.move_index = 0;
+        enemy.last_move = 0;
+        let powers = [(power_id::SLUMBER, 2), (demise.unwrap() as Id, 5)];
+        let powers = if slumber_leads {
+            powers
+        } else {
+            [powers[1], powers[0]]
+        };
+        for (id, amount) in powers.into_iter().chain([(power_id::PLATING, 8)]) {
+            enemy.creature.add_power(id, amount);
+        }
+        push_effects(
+            &mut combat.queue,
+            super::combat::hooks::END_ENEMY_TURN,
+            Context::player(),
+        );
+        game.resolve(&content);
+        let enemy = &game.combat().unwrap().enemies[0];
+        assert_eq!(enemy.creature.power(power_id::SLUMBER), 0);
+        assert_eq!(enemy.creature.hp, 45);
+        // Stunned, or Roll Out once the player's turn rolls the moves.
+        assert_eq!(enemy.move_index, if slumber_leads { 2 } else { 1 });
+        assert_eq!(enemy.creature.power(power_id::PLATING) > 0, slumber_leads);
+    }
+}
+
+#[test]
+fn a_power_pick_blocks_later_turn_start_listeners() {
+    // AutoSlay's selector answers picks without pausing, so the pass waits for Foregone
+    // Conclusion's pick before Toasty Mittens (a later BeforeHandDraw listener) exhausts.
+    let content = foundation_content();
+    let powers = ["POWER.FOREGONE_CONCLUSION_POWER"];
+    let mut game = turn_start_test(&content, 1, &powers, &["RELIC.TOASTY_MITTENS"]);
+    let strike = Card {
+        id: content.card_id("CARD.STRIKE_DEFECT").unwrap(),
+        ..Card::default()
+    };
+    game.combat_mut().unwrap().draw = vec![strike; 8];
+    game.start_turn();
+    game.resolve(&content);
+    assert!(game.combat().unwrap().choice.is_some());
+    assert!(game.combat().unwrap().exhaust.is_empty());
+    assert!(game.combat().unwrap().hand.is_empty());
+    game.step(&content, Action::Choose(0)).unwrap();
+    let combat = game.combat().unwrap();
+    assert_eq!(combat.exhaust.len(), 1);
+    assert_eq!(combat.player.power(power_id::STRENGTH), 1);
+    assert_eq!(combat.hand.len(), 1 + combat.draw_per_turn as usize);
+}
+
+#[test]
+fn dark_embrace_draws_for_ethereal_exhausts_in_power_order() {
+    // Ethereal exhausts at turn end defer Dark Embrace's draws to its AfterSideTurnEnd, where a
+    // No Draw listed before it is already gone and one listed after it still blocks them.
+    let content = foundation_content();
+    let defend = content.card_id("CARD.DEFEND_SILENT").unwrap();
+    let mut order = [("POWER.DARK_EMBRACE_POWER", 5), ("POWER.NO_DRAW_POWER", 6)];
+    for _ in 0..2 {
+        let mut game = turn_start_test(&content, 1, &order.map(|(power, _)| power), &[]);
+        let combat = game.combat_mut().unwrap();
+        combat.hand = vec![Card {
+            id: defend,
+            instance: 1,
+            flags: ETHEREAL,
+            ..Card::default()
+        }];
+        combat.draw = (2..12)
+            .map(|instance| Card {
+                id: defend,
+                instance,
+                ..Card::default()
+            })
+            .collect();
+        combat.enemies[0].creature.hp = 200;
+        game.step(&content, Action::EndTurn).unwrap();
+        let combat = game.combat().unwrap();
+        assert!(combat.exhaust.iter().any(|card| card.instance == 1));
+        assert_eq!((combat.turn, combat.hand.len()), (2, order[0].1));
+        order.reverse();
+    }
+}
+
+#[test]
+fn joss_paper_counts_ethereal_exhausts_after_the_flush() {
+    let content = foundation_content();
+    let defend = content.card_id("CARD.DEFEND_SILENT").unwrap();
+    let mut game = turn_start_test(&content, 1, &[], &["RELIC.JOSS_PAPER"]);
+    game.joss_paper = 4;
+    let combat = game.combat_mut().unwrap();
+    combat.hand = vec![Card {
+        id: defend,
+        instance: 1,
+        flags: ETHEREAL,
+        ..Card::default()
+    }];
+    combat.draw = (2..12)
+        .map(|instance| Card {
+            id: defend,
+            instance,
+            ..Card::default()
+        })
+        .collect();
+    combat.enemies[0].creature.hp = 200;
+    game.step(&content, Action::EndTurn).unwrap();
+    assert_eq!((game.joss_paper, game.joss_paper_ethereal), (0, 0));
+    assert_eq!(game.combat().unwrap().hand.len(), 6);
 }

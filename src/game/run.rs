@@ -259,8 +259,7 @@ impl Game {
             pen_nib: 0,
             iron_club: 0,
             joss_paper: 0,
-            joss_ethereal: None,
-            turn_end_exhaust: false,
+            joss_paper_ethereal: 0,
             tuning_fork: 0,
             bone_tea: false,
             tea_of_discourtesy: false,
@@ -775,7 +774,8 @@ impl Game {
             orb_slots: self.run.orb_slots,
             history: History::default(),
             total_cards: 0,
-            last_cards: 0,
+            last_turn: History::default(),
+            last_turn_card: None,
             orbit_spent: 0,
             hits: vec![0; enemy_count],
             last_damage: 0,
@@ -792,11 +792,10 @@ impl Game {
             boulders: vec![],
             dampened: vec![],
             paels_tears: false,
-            ending: false,
+            orichalcum: false,
             playing: None,
             auto_plays: vec![],
             queue: vec![],
-            control: vec![],
             choice: None,
             power_snapshot: vec![],
             enemy_power_snapshot: vec![],
@@ -819,7 +818,6 @@ impl Game {
             swift_after_return: 0,
             juggled: vec![],
             music_box_copy: None,
-            ethereal_ending: None,
             mini_regent: false,
             rainbow_ring: false,
             attacks_mod3: 0,
@@ -827,7 +825,6 @@ impl Game {
             letter_opener: 0,
             bound_played: false,
             bound_this_turn: 0,
-            auto_pre_play: false,
             setup: false,
             potions: 0,
             unsettling_lamp: None,
@@ -871,175 +868,17 @@ impl Game {
                     .add_power(power_id::CRAB_RAGE, 1);
             }
         }
-        for (index, relic) in self.run.relics.clone().into_iter().enumerate() {
-            if self.melted_relics.contains(&index) {
-                continue;
-            }
-            match content.relics[relic as usize].id {
-                "RELIC.DELICATE_FROND" => {
-                    while self.run.potions.iter().any(Option::is_none) {
-                        let pool = self.potion_pool(content);
-                        let potion = self.random_potions(&pool, 1, false, false).pop();
-                        if self.has_relic(content, "RELIC.SOZU") {
-                            break;
-                        }
-                        let Some(potion) = potion else { break };
-                        *self
-                            .run
-                            .potions
-                            .iter_mut()
-                            .find(|slot| slot.is_none())
-                            .unwrap() = Some(potion);
-                    }
-                }
-                "RELIC.PETRIFIED_TOAD" if !self.has_relic(content, "RELIC.SOZU") => {
-                    if let Some(id) = content.potion_id("POTION.POTION_SHAPED_ROCK")
-                        && let Some(slot) = self.run.potions.iter_mut().find(|slot| slot.is_none())
-                    {
-                        *slot = Some(id);
-                    }
-                }
-                "RELIC.PHILOSOPHERS_STONE" => {
-                    for enemy in &mut self.combat_mut().unwrap().enemies {
-                        enemy.creature.add_power(power_id::STRENGTH, 1);
-                    }
-                }
-                "RELIC.GORGET" => self.apply_power(content, Actor::Player, power_id::PLATING, 4),
-                "RELIC.BELT_BUCKLE" if self.run.potions.iter().all(Option::is_none) => {
-                    self.combat_mut().unwrap().belt_buckle = true;
-                    self.apply_power(content, Actor::Player, power_id::DEXTERITY, 2);
-                }
-                "RELIC.EMBER_TEA" if self.ember_tea < 5 => {
-                    self.ember_tea += 1;
-                    self.apply_power(content, Actor::Player, power_id::STRENGTH, 2);
-                }
-                "RELIC.SLING_OF_COURAGE" if self.room == Room::Elite => {
-                    self.apply_power(content, Actor::Player, power_id::STRENGTH, 2)
-                }
-                "RELIC.SWORD_OF_JADE" => {
-                    self.apply_power(content, Actor::Player, power_id::STRENGTH, 3)
-                }
-                "RELIC.TEA_OF_DISCOURTESY" if !self.tea_of_discourtesy => {
-                    self.tea_of_discourtesy = true;
-                    for _ in 0..2 {
-                        self.add_random(
-                            content,
-                            Pile::Draw,
-                            Card {
-                                id: card_id::DAZED,
-                                ..Card::default()
-                            },
-                        );
-                    }
-                }
-                "RELIC.STONE_CRACKER" => {
-                    let mut cards: Vec<_> = self
-                        .combat()
-                        .unwrap()
-                        .draw
-                        .iter()
-                        .rev()
-                        .copied()
-                        .filter(|card| {
-                            card.upgrades == 0
-                                && !matches!(
-                                    card.card_type(content.cards[card.id as usize]),
-                                    CardType::Status | CardType::Curse | CardType::Quest
-                                )
-                        })
-                        .collect();
-                    sort_for_shuffle(&mut cards, content);
-                    self.rngs.combat_card_selection.shuffle(&mut cards);
-                    for card in cards.into_iter().take(2) {
-                        self.combat_mut()
-                            .unwrap()
-                            .draw
-                            .iter_mut()
-                            .find(|candidate| candidate.instance == card.instance)
-                            .unwrap()
-                            .upgrades = 1;
-                    }
-                }
-                _ => {}
-            }
+        self.start_turn();
+        for trigger in [
+            Trigger::BeforeCombatStartLate,
+            Trigger::BeforeCombatStart,
+            Trigger::AfterRoomEntered,
+        ] {
+            self.combat_mut().unwrap().queue.push(Pending {
+                effect: Effect::Fire(trigger),
+                context: Context::player(),
+            });
         }
-        if self.has_relic(content, "RELIC.RED_SKULL")
-            && self.creature(Actor::Player).hp * 2 <= self.creature(Actor::Player).max_hp
-        {
-            self.combat_mut().unwrap().red_skull = true;
-            self.apply_power(content, Actor::Player, power_id::STRENGTH, 3);
-        }
-        // Snecko Eye's Confused (BeforeCombatStart) shows as a power; draws still check the relic.
-        let confused = self.relic_count(content, "RELIC.SNECKO_EYE")
-            + self.relic_count(content, "RELIC.FAKE_SNECKO_EYE");
-        if confused > 0 {
-            self.apply_power(content, Actor::Player, power_id::CONFUSED, confused);
-        }
-        // Girya's lifts are Strength applied AfterRoomEntered, in relic order with Vajra, so
-        // the first of them gets Ruined Helmet's doubling.
-        let position = |id: &str| {
-            content
-                .relic_id(id)
-                .and_then(|id| self.run.relics.iter().position(|&relic| relic == id))
-        };
-        let girya = (self.girya > 0 && self.has_relic(content, "RELIC.GIRYA"))
-            .then(|| position("RELIC.GIRYA"))
-            .flatten()
-            .map(|girya| (girya, self.girya as i16));
-        let vajra_first = girya
-            .is_some_and(|(girya, _)| position("RELIC.VAJRA").is_some_and(|vajra| vajra < girya));
-        if let Some((_, lifts)) = girya.filter(|_| !vajra_first) {
-            self.apply_power(content, Actor::Player, power_id::STRENGTH, lifts);
-        }
-        // BeforeCombatStart: Galvanic afflicts power cards, Vital Spark skills.
-        let enemy_power = |game: &Self, id| {
-            game.combat()
-                .unwrap()
-                .enemies
-                .iter()
-                .any(|enemy| enemy.creature.power(id) > 0)
-        };
-        if enemy_power(self, power_id::GALVANIC) {
-            self.afflict_all(content, Affliction::Galvanized, &[CardType::Power]);
-        }
-        if enemy_power(self, power_id::VITAL_SPARK) {
-            self.afflict_all(content, Affliction::Tainted, &[CardType::Skill]);
-        }
-        self.trigger(content, Trigger::RoomEntered, Actor::Player, 0);
-        self.resolve(content);
-        if let Some((_, lifts)) = girya.filter(|_| vajra_first) {
-            self.apply_power(content, Actor::Player, power_id::STRENGTH, lifts);
-        }
-        self.start_turn(content);
-        self.trigger(content, Trigger::CombatStart, Actor::Player, 0);
-        // With Gambling Chip (AfterPlayerTurnStart), Akabeko and Bone Tea act after its
-        // discard-and-redraw and before the AutoPrePlay phase (Imbued, Whispering Earring).
-        if self.has_relic(content, "RELIC.GAMBLING_CHIP") {
-            for _ in 0..self.relic_count(content, "RELIC.AKABEKO") {
-                self.combat_mut().unwrap().queue.insert(
-                    0,
-                    Pending {
-                        effect: Effect::ApplyPower(
-                            Target::Player,
-                            power_id::VIGOR,
-                            Amount::fixed(8, 8),
-                        ),
-                        context: Context::player(),
-                    },
-                );
-            }
-            if self.has_relic(content, "RELIC.BONE_TEA") && !self.bone_tea {
-                self.bone_tea = true;
-                self.combat_mut().unwrap().queue.insert(
-                    0,
-                    Pending {
-                        effect: Effect::Upgrade(Pile::Hand, u8::MAX, false),
-                        context: Context::player(),
-                    },
-                );
-            }
-        }
-        self.combat_mut().unwrap().auto_pre_play = true;
         self.resolve(content);
         Ok(())
     }
@@ -1237,12 +1076,6 @@ impl Game {
             action => self.run_step(content, action),
         }
         self.finish_empty_run_choices(content);
-        if self
-            .combat()
-            .is_some_and(|combat| combat.ending && combat.choice.is_none())
-        {
-            self.finish_end_turn(content);
-        }
         if self.combat().is_some() {
             self.resolve(content);
             self.finish_play(content);

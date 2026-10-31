@@ -487,6 +487,14 @@ fn push_semantic(row: &mut DomainRow, layout: Layout, namespace: Semantic, value
     row.c[slot] = layout.semantic(namespace, value);
 }
 
+/// The turn is ending: the next turn step is the hand flush (Well-Laid Plans' pick).
+fn ending(combat: &Combat) -> bool {
+    (combat.queue.iter().rev()).find_map(|pending| match pending.effect {
+        Effect::Step(step) => Some(step),
+        _ => None,
+    }) == Some(Step::Flush)
+}
+
 fn push_boolean(row: &mut DomainRow, layout: Layout, field: u32, value: bool) {
     push_semantic(row, layout, Semantic::Boolean, field * 2 + value as u32);
 }
@@ -855,7 +863,7 @@ fn populate_domain_features(
                 Phase::Combat(combat) => {
                     push_boolean(row, layout, 0, combat.choice.is_some());
                     push_boolean(row, layout, 1, combat.enemy_turn);
-                    push_boolean(row, layout, 2, combat.ending);
+                    push_boolean(row, layout, 2, ending(combat));
                     push_boolean(row, layout, 3, combat.force_end);
                     if let Some(choice) = combat.choice {
                         push_boolean(row, layout, 4, choice.optional);
@@ -3997,7 +4005,7 @@ fn effect_index(effect: &Effect) -> usize {
         Effect::OstyAttack(..) => 2,
         Effect::OstyAttackMany(..) => 3,
         Effect::MoveDamage(..) => 4,
-        Effect::Damage(..) | Effect::BoulderTick => 5,
+        Effect::Damage(..) => 5,
         Effect::Kill(..) => 6,
         Effect::Stun(..) => 7,
         Effect::DoomKill => 8,
@@ -4064,7 +4072,6 @@ fn effect_index(effect: &Effect) -> usize {
         Effect::AutoPlayDraw(..) => 69,
         Effect::Stoke => 70,
         Effect::Stampede => 71,
-        Effect::ContinueEndTurn => 72,
         Effect::FlakCannon(..) => 73,
         Effect::CopyCard(..) => 74,
         Effect::Discard(..) => 75,
@@ -4073,9 +4080,9 @@ fn effect_index(effect: &Effect) -> usize {
         Effect::PlayExhaustedShivs => 78,
         Effect::AutoPlay(..)
         | Effect::Uproar
-        | Effect::Bombardments
-        | Effect::TurnStartOrbs
-        | Effect::ToastyMittens
+        | Effect::Fire(_)
+        | Effect::Listen(..)
+        | Effect::Step(_)
         | Effect::BurningSticks(..)
         | Effect::Juggle
         | Effect::ConfusedRoll(..) => 79,
@@ -4083,10 +4090,7 @@ fn effect_index(effect: &Effect) -> usize {
         | Effect::AutoPlayStep
         | Effect::PlacePlayed(..)
         | Effect::CheckEmptyHand
-        | Effect::SideTurnStart
-        | Effect::TickPoison
         | Effect::MummifiedHand
-        | Effect::Rampart
         | Effect::ReturnLate(..) => 80,
         Effect::WhisperingEarring(..) => 81,
         Effect::MoveAll(..) => 82,
@@ -4676,7 +4680,7 @@ fn phase_domain_row(game: &Game, content: &Content, phase: &Phase, suspended: bo
         Phase::Combat(combat) => {
             row.u[4] = combat.choice.is_some() as u32;
             row.u[13] = combat.enemy_turn as u32;
-            row.u[14] = combat.ending as u32;
+            row.u[14] = ending(combat) as u32;
             row.u[15] = combat.force_end as u32;
             if let Some(choice) = combat.choice {
                 let (filter, filter_value, filter_signed) = filter_payload(choice.filter);
@@ -5023,7 +5027,7 @@ fn push_actor_domains(game: &Game, content: &Content, domains: &mut [Vec<DomainR
         history.hp_lost as i32,
         history.hp_loss_events as i32,
         history.feral_returns as i32,
-        combat.last_cards as i32,
+        combat.last_turn.cards as i32,
         combat.orbit_spent as i32,
         combat.lightning_channeled as i32,
         combat.orbs_channeled as i32,
@@ -5694,24 +5698,19 @@ impl ContinuationBuilder {
             | Effect::FranticEscape
             | Effect::Stoke
             | Effect::Stampede
-            | Effect::ContinueEndTurn
             | Effect::DiscardHandDraw
             | Effect::PlayExhaustedShivs
             | Effect::FinishAutoPlay
             | Effect::AutoPlayStep
             | Effect::Uproar
-            | Effect::Rampart
-            | Effect::Bombardments
-            | Effect::TurnStartOrbs
-            | Effect::ToastyMittens
+            | Effect::Fire(_)
+            | Effect::Listen(..)
+            | Effect::Step(_)
             | Effect::BurningSticks(..)
             | Effect::Juggle
             | Effect::ConfusedRoll(..)
-            | Effect::BoulderTick
             | Effect::PlacePlayed(..)
             | Effect::CheckEmptyHand
-            | Effect::SideTurnStart
-            | Effect::TickPoison
             | Effect::MummifiedHand
             | Effect::ReturnLate(..)
             | Effect::PassiveAll
@@ -6384,10 +6383,7 @@ fn continuation_domains(
             group_continuation_item(&mut out.rows[before..], frame, order);
             order += 1;
         }
-        if combat
-            .control
-            .contains(&ControlContinuation::StartExtraPlayerTurnAfterResolution)
-        {
+        if combat.extra_turn && !combat.setup {
             let row = out.row(9, 3, NO_NODE, 0, 0, 0, order, 0);
             let frame = out.rows[row].u[2];
             group_continuation_item(&mut out.rows[row..], frame, order);

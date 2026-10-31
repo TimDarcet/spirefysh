@@ -1119,7 +1119,10 @@ fn v53_combat_choice_keeps_typed_filter_and_operation_fields() {
         optional: true,
     });
     combat.enemy_turn = true;
-    combat.ending = true;
+    combat.queue.push(Pending {
+        effect: Effect::Step(Step::Flush),
+        context: Context::player(),
+    });
     combat.force_end = true;
     let row = phase_domain_row(&game, &content, &game.phase, false);
     assert_eq!(
@@ -1603,9 +1606,7 @@ fn v57_control_and_resolving_play_state_are_continuations() {
     combat.card_stars = 2;
     combat.card_plays = 4;
     combat.unsettling_lamp = Some(card.id);
-    combat
-        .control
-        .push(ControlContinuation::StartExtraPlayerTurnAfterResolution);
+    combat.extra_turn = true;
     game.run_queue.push(RunEffect::FinishCooking);
     game.reward_continuation = Some(RewardContinuation::AddRandomCurse);
     let domains = continuation_rows(&game, &content);
@@ -2721,4 +2722,51 @@ fn v56_continuation_amounts_use_declared_scales_and_current_values() {
         .find(|row| row.scope == STATE_SCOPE && row.u[0] == 2)
         .unwrap();
     assert_eq!(context.f[..2], [0.8, 0.0]);
+}
+
+#[test]
+fn traced_state_observations_are_stable() {
+    // 200 captured states, 40 per character; skipped without the traces.
+    let content = foundation_content();
+    let layout = Layout::new(&content);
+    let mut digest = 0u64;
+    let mut states = 0;
+    for name in [
+        "0001-SILENT",
+        "0002-IRONCLAD",
+        "0003-REGENT",
+        "0004-DEFECT",
+        "0005-NECROBINDER",
+    ] {
+        let path = format!("target/oracle-policy-samples/hunt-r062/{name}.ndjson.zst");
+        let Ok(output) = std::process::Command::new("zstd")
+            .args(["-dcq", &path])
+            .output()
+        else {
+            return;
+        };
+        if !output.status.success() {
+            return;
+        }
+        let records = String::from_utf8(output.stdout).unwrap();
+        for record in records
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|record| record["kind"] == "decision")
+            .step_by(15)
+            .take(40)
+        {
+            let game = crate::replay::game_from_live_snapshot(
+                &content,
+                &record["before"],
+                &record["oracle_before"],
+            )
+            .unwrap();
+            let observation = build_observation(&game, &content, layout, (0, 0));
+            digest = digest.rotate_left(5) ^ observation_digest(&observation);
+            states += 1;
+        }
+    }
+    assert_eq!(states, 200);
+    assert_eq!(digest, 15134369266544018612);
 }

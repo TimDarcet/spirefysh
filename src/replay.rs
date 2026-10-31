@@ -6,7 +6,7 @@ use crate::game::{
 };
 use crate::*;
 use serde_json::Value;
-#[cfg(feature = "python")]
+#[cfg(any(test, feature = "python"))]
 use serde_json::json;
 use std::{
     cell::RefCell,
@@ -453,7 +453,7 @@ impl ReplayState {
     }
 }
 
-#[cfg(feature = "python")]
+#[cfg(any(test, feature = "python"))]
 pub(crate) fn game_from_live_snapshot(
     content: &Content,
     state: &Value,
@@ -3388,7 +3388,11 @@ fn game_from_snapshot(
         total_cards: player["cards_played_this_combat"]
             .as_i64()
             .map_or(history.total_cards, |cards| cards as i16),
-        last_cards: history.last_cards,
+        last_turn: History {
+            cards: history.last_cards,
+            ..History::default()
+        },
+        last_turn_card: None,
         orbit_spent,
         hits: vec![0; array(&combat_state["enemies"]).len()],
         last_damage: 0,
@@ -3417,11 +3421,10 @@ fn game_from_snapshot(
         boulders,
         dampened,
         paels_tears: false,
-        ending: false,
+        orichalcum: false,
         playing: None,
         auto_plays: vec![],
         queue: vec![],
-        control: vec![],
         choice: None,
         power_snapshot: vec![],
         enemy_power_snapshot: vec![],
@@ -3455,7 +3458,6 @@ fn game_from_snapshot(
         swift_after_return: 0,
         juggled: vec![],
         music_box_copy: None,
-        ethereal_ending: None,
         mini_regent: used_relic(player, "RELIC.MINI_REGENT").unwrap_or(false),
         rainbow_ring: relic_active(player, "RELIC.RAINBOW_RING"),
         attacks_mod3: (played("attacks", history.attacks) % 3).max(0) as u8,
@@ -3493,7 +3495,6 @@ fn game_from_snapshot(
                 + bound(&oracle["hidden_draw_order"])
                 + (bound_played && played == 0) as usize) as u8
         },
-        auto_pre_play: false,
         setup: false,
         potions: 0,
         unsettling_lamp: None,
@@ -3714,8 +3715,7 @@ fn game_from_snapshot(
         },
         iron_club: relic_amount(player, "RELIC.IRON_CLUB") % 4,
         joss_paper: relic_amount(player, "RELIC.JOSS_PAPER") % 5,
-        joss_ethereal: None,
-        turn_end_exhaust: false,
+        joss_paper_ethereal: 0,
         tuning_fork: relic_amount(player, "RELIC.TUNING_FORK") % 10,
         bone_tea: relic_disabled(player, "RELIC.BONE_TEA"),
         tea_of_discourtesy: relic_disabled(player, "RELIC.TEA_OF_DISCOURTESY"),
@@ -4220,8 +4220,7 @@ fn run_game_from_snapshot(
         pen_nib: relic_amount(player, "RELIC.PEN_NIB") % 10,
         iron_club: relic_amount(player, "RELIC.IRON_CLUB") % 4,
         joss_paper: relic_amount(player, "RELIC.JOSS_PAPER") % 5,
-        joss_ethereal: None,
-        turn_end_exhaust: false,
+        joss_paper_ethereal: 0,
         tuning_fork: relic_amount(player, "RELIC.TUNING_FORK") % 10,
         bone_tea: relic_disabled(player, "RELIC.BONE_TEA"),
         tea_of_discourtesy: relic_disabled(player, "RELIC.TEA_OF_DISCOURTESY"),

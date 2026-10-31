@@ -117,12 +117,6 @@ impl Combat {
 }
 
 /// TemporaryStrengthPower subclasses that lower Strength, debuffs in the game.
-/// Player buffs that grant Strength until the turn ends (TemporaryStrengthPower).
-pub(crate) const TEMPORARY_STRENGTH: [Id; 3] = [
-    power_id::FLEX_POTION,
-    power_id::FEEDING_FRENZY,
-    power_id::REPTILE_TRINKET,
-];
 pub(crate) const TEMPORARY_STRENGTH_DOWN: [Id; 8] = [
     power_id::CRUSH_UNDER,
     power_id::DARK_SHACKLES,

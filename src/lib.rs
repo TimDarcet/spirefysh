@@ -110,12 +110,26 @@ pub enum PowerKind {
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum Trigger {
-    /// AfterRoomEntered and BeforeCombatStart, before the first turn starts.
-    RoomEntered,
-    CombatStart,
-    /// AfterEnergyReset, before the turn-start hooks (AfterPlayerTurnStart).
-    EnergyReset,
-    TurnStart,
+    AfterRoomEntered,
+    BeforeCombatStart,
+    BeforeCombatStartLate,
+    BeforeSideTurnStart,
+    AfterBlockCleared,
+    AfterEnergyReset,
+    AfterEnergyResetLate,
+    BeforeHandDraw,
+    AfterPlayerTurnStart,
+    AfterPlayerTurnStartLate,
+    AfterSideTurnStart,
+    AfterSideTurnStartLate,
+    AutoPrePlay,
+    AutoPrePlayLate,
+    BeforeSideTurnEndVeryEarly,
+    BeforeSideTurnEndEarly,
+    BeforeSideTurnEnd,
+    AfterSideTurnEnd,
+    AfterSideTurnEndLate,
+    /// A card's turn-end-in-hand effect (Regret, Burn, Doubt).
     TurnEnd,
     CardPlayed,
     AttackPlayed,
@@ -312,6 +326,12 @@ pub enum CardOp {
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum Effect {
+    /// A hook pass starts: its listeners are snapshotted and queued.
+    Fire(Trigger),
+    /// One listener of a hook pass, run when popped so it sees the earlier listeners' results.
+    Listen(Trigger, Listener),
+    /// A step of the turn flow that isn't a hook pass.
+    Step(Step),
     Attack(Target, Amount, u8),
     AttackMany(Target, Amount, Amount),
     OstyAttack(Target, Amount, u8),
@@ -384,7 +404,6 @@ pub enum Effect {
     AutoPlayDraw(Amount, bool),
     Stoke,
     Stampede,
-    ContinueEndTurn,
     FlakCannon(Amount),
     CopyCard(Pile, u8),
     Discard(u8, bool),
@@ -394,29 +413,16 @@ pub enum Effect {
     AutoPlay(Card),
     /// Uproar auto-plays a random draw-pile attack at the end of its OnPlay.
     Uproar,
-    /// Rampart shields the Turret Operators (AfterSideTurnStart).
-    Rampart,
-    /// Every Bombardment in the exhaust pile plays itself (AfterAutoPrePlayPhaseEnteredEarly).
-    Bombardments,
-    /// Turn-start orb passives (Plasma) run after AfterSideTurnStart (OrbQueue.AfterTurnStart).
-    TurnStartOrbs,
-    ToastyMittens,
     BurningSticks(Card),
     Juggle,
     /// Confused rolls a Strike's cost after Hellraiser auto-played it (AfterCardDrawnEarly first).
     ConfusedRoll(Card),
-    /// Each Rolling Boulder hits every enemy, then grows by 5 (AfterPlayerTurnStart).
-    BoulderTick,
     FinishAutoPlay,
     /// An auto-play's earlier play finished: its AfterCardPlayed hooks run before the next play.
     AutoPlayStep,
     /// A played card reaches its result pile once its AfterCardPlayed hooks resolved.
     PlacePlayed(Card, bool, bool),
     CheckEmptyHand,
-    /// AfterSideTurnStart bookkeeping: Pael's Legion cools down, Letter Opener's count resets.
-    SideTurnStart,
-    /// The player's Poison ticks (AfterSideTurnStart, in power order).
-    TickPoison,
     /// Mummified Hand frees a random hand card (AfterCardPlayed, in relic order).
     MummifiedHand,
     ReturnLate(bool, i16),
@@ -534,7 +540,6 @@ mod foundation_id {
         pub const SERPENT_FORM: Id = 53;
         pub const AFTERIMAGE: Id = 46;
         pub const FRAIL: Id = 4;
-        pub const DEMON_FORM: Id = 14;
         pub const MINION: Id = 16;
         pub const INTANGIBLE: Id = 5;
         pub const ASLEEP: Id = 166;
@@ -556,7 +561,6 @@ mod foundation_id {
         pub const RAVENOUS: Id = 231;
         pub const ANTICIPATE: Id = 165;
         pub const SLUMBER: Id = 244;
-        pub const DEMISE: Id = 161;
         pub const SKITTISH: Id = 240;
         pub const SLOTH: Id = 242;
         pub const SURROUNDED: Id = 253;
@@ -565,7 +569,6 @@ mod foundation_id {
         pub const SHRIEK: Id = 239;
         pub const WASTE_AWAY: Id = 266;
         pub const POISON: Id = 7;
-        pub const NOXIOUS_FUMES: Id = 19;
         pub const ACCURACY: Id = 21;
         pub const FERAL: Id = 33;
         pub const FREE_POWER: Id = 35;
@@ -594,17 +597,10 @@ mod foundation_id {
         pub const CHILD_OF_THE_STARS: Id = 69;
         pub const CONQUEROR: Id = 70;
         pub const RETAIN_HAND: Id = 71;
-        pub const FURNACE: Id = 74;
-        pub const PREP_TIME: Id = 153;
-        pub const COUNTDOWN: Id = 98;
         pub const MONARCHS_GAZE: Id = 76;
         pub const ORBIT: Id = 80;
-        pub const MAYHEM: Id = 150;
         pub const ACCELERANT: Id = 57;
-        pub const HAILSTORM: Id = 26;
-        pub const SPINNER: Id = 28;
         pub const DARK_EMBRACE: Id = 11;
-        pub const CORROSIVE_WAVE: Id = 48;
         pub const RUPTURE: Id = 12;
         pub const REBOUND: Id = 233;
         pub const NIGHTMARE: Id = 222;
@@ -665,7 +661,6 @@ mod foundation_id {
         pub const UNMOVABLE: Id = 138;
         pub const FREE_ATTACK: Id = 139;
         pub const VICIOUS: Id = 140;
-        pub const CONSUMING_SHADOW: Id = 142;
         pub const NO_BLOCK: Id = 144;
         pub const THE_GAMBIT: Id = 145;
         pub const AUTOMATION: Id = 146;
@@ -1457,7 +1452,6 @@ impl Content {
             | Effect::FranticEscape
             | Effect::Stoke
             | Effect::Stampede
-            | Effect::ContinueEndTurn
             | Effect::CopyCard(..)
             | Effect::Discard(..)
             | Effect::DiscardHandDraw
@@ -1465,17 +1459,13 @@ impl Content {
             | Effect::FinishAutoPlay
             | Effect::AutoPlayStep
             | Effect::Uproar
-            | Effect::Rampart
-            | Effect::Bombardments
-            | Effect::TurnStartOrbs
-            | Effect::ToastyMittens
+            | Effect::Fire(_)
+            | Effect::Listen(..)
+            | Effect::Step(_)
             | Effect::BurningSticks(..)
             | Effect::Juggle
             | Effect::ConfusedRoll(..)
-            | Effect::BoulderTick
             | Effect::CheckEmptyHand
-            | Effect::SideTurnStart
-            | Effect::TickPoison
             | Effect::MummifiedHand
             | Effect::ReturnLate(..)
             | Effect::WhisperingEarring(_)
@@ -1743,7 +1733,7 @@ pub struct History {
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-enum Actor {
+pub enum Actor {
     Player,
     Osty,
     Enemy(usize),
@@ -1770,6 +1760,8 @@ struct Context {
     /// The targeted enemy's instance, so a later play of the series skips a creature that
     /// respawned into its slot (Axebot's Stock).
     target_instance: Option<u32>,
+    /// An exhaust by Ethereal at turn end (causedByEthereal): Dark Embrace defers its draws.
+    ethereal: bool,
 }
 
 impl Context {
@@ -1788,6 +1780,7 @@ impl Context {
             hook: false,
             off_pile: false,
             target_instance: None,
+            ethereal: false,
         }
     }
 
@@ -1806,9 +1799,48 @@ struct Pending {
     context: Context,
 }
 
+/// A hook listener snapshotted when its pass starts: a removed power still fires as it was.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-enum ControlContinuation {
-    StartExtraPlayerTurnAfterResolution,
+pub enum Listener {
+    Power(Actor, Power),
+    Relic(u8),
+}
+
+/// The turn's non-hook steps (CombatManager.StartTurn, SetupPlayerTurn, EndPlayerTurnPhaseOne).
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum Step {
+    TurnStart,
+    RollMoves,
+    ClearBlock,
+    ResetEnergy,
+    CardsBeforeHandDraw,
+    HandDraw,
+    TurnStartOrbs,
+    Bombardments,
+    Imbued,
+    IAmInvincible,
+    Stampede,
+    HowlFromBeyond,
+    TurnEndOrbs,
+    DoTurnEnd,
+    /// An Ethereal card in hand exhausts (causedByEthereal).
+    EtherealExhaust(Card),
+    /// A turn-end-in-hand card's effect, with the hand size at BeforeSideTurnEnd (Regret).
+    TurnEndCard(Card, i16),
+    TurnEndCardDone(Card),
+    Retain,
+    Flush,
+    Bookmark,
+    SwitchSide,
+    EnemyMoves,
+    /// An enemy's move, with its instance when the moves started.
+    EnemyMove(u8, u32),
+    /// After an enemy's move resolved, with the move and whether it was stunned.
+    EnemyMoveDone(u8, u8, bool),
+    /// The Fabricator's second bot, once its move's effects resolved.
+    FabricatorBot(u8),
+    /// The enemies' turn end: the player's turn follows.
+    EnemyTurnEnd,
 }
 
 #[derive(Clone, Debug)]
@@ -1849,7 +1881,9 @@ pub struct Combat {
     pub orb_slots: u8,
     pub history: History,
     total_cards: i16,
-    last_cards: i16,
+    last_turn: History,
+    /// History Course's card: last turn's last finished attack or skill.
+    last_turn_card: Option<Card>,
     orbit_spent: i16,
     hits: Vec<i16>,
     last_damage: i16,
@@ -1868,11 +1902,10 @@ pub struct Combat {
     boulders: Vec<i16>,
     dampened: Vec<(u32, u8)>,
     paels_tears: bool,
-    ending: bool,
+    orichalcum: bool,
     playing: Option<Card>,
     auto_plays: Vec<AutoPlay>,
     queue: Vec<Pending>,
-    control: Vec<ControlContinuation>,
     choice: Option<Choice>,
     power_snapshot: Vec<Power>,
     enemy_power_snapshot: Vec<Vec<Power>>,
@@ -1903,8 +1936,6 @@ pub struct Combat {
     juggled: Vec<Card>,
     /// Music Box's copy, queued with the relic card-played hooks.
     music_box_copy: Option<Card>,
-    /// Ethereal cards taken out of the hand before the turn-end card effects, awaiting their exhaust.
-    ethereal_ending: Option<Vec<Card>>,
     mini_regent: bool,
     rainbow_ring: bool,
     attacks_mod3: u8,
@@ -1912,7 +1943,6 @@ pub struct Combat {
     letter_opener: u8,
     bound_played: bool,
     bound_this_turn: u8,
-    auto_pre_play: bool,
     /// The player's turn setup (PlayerTurnPhase.Start), when an emptied hand doesn't count.
     setup: bool,
     /// Potions whose effects are still resolving (IsExecutingCardOrPotionEffect).
@@ -1931,7 +1961,7 @@ pub struct Combat {
     /// Enemies whose Curl Up a card hit; they curl once that card's play finishes.
     curled: Vec<usize>,
     paels_eye: bool,
-    /// Pael's Eye's extra turn is being set up (Rampart skips it).
+    /// Pael's Eye earned an extra turn, until its setup ends (Rampart skips it).
     extra_turn: bool,
     paels_legion: u8,
     /// The game's next creature combat id; pets (Osty, Pael's Legion) take ids too.
@@ -2355,10 +2385,8 @@ pub struct Game {
     pen_nib: u8,
     iron_club: u8,
     joss_paper: u8,
-    /// Ethereal exhausts Joss Paper only counts at AfterSideTurnEnd.
-    joss_ethereal: Option<u8>,
-    /// Exhausts during turn end, whose Burning Sticks copies the hand discard then sweeps away.
-    turn_end_exhaust: bool,
+    /// Ethereal exhausts Joss Paper only counts at AfterSideTurnEnd (its EtherealCount).
+    joss_paper_ethereal: u8,
     tuning_fork: u8,
     bone_tea: bool,
     tea_of_discourtesy: bool,
