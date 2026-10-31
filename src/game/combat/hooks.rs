@@ -1295,7 +1295,7 @@ impl Game {
                         for card in cards.into_iter().take(2) {
                             let draw = &mut self.combat_mut().unwrap().draw;
                             let card = draw.iter_mut().find(|x| x.instance == card.instance);
-                            card.unwrap().upgrades = 1;
+                            card.unwrap().upgrade(content);
                         }
                     }
                     (Trigger::AfterRoomEntered, "RELIC.SWORD_OF_JADE") => {
@@ -1775,7 +1775,7 @@ impl Game {
                                 CardType::Attack | CardType::Skill
                             )
                         {
-                            card.upgrades = 1;
+                            card.upgrade(content);
                         }
                     }
                     (_, "RELIC.HELICAL_DART")
@@ -2398,8 +2398,8 @@ impl Game {
             }
             power_id::REGEN if participant && player => {
                 effects = vec![
-                    Effect::ApplyPower(Target::Player, power_id::REGEN, Amount::fixed(-1, -1)),
                     Effect::Heal(Target::Player, amount),
+                    Effect::ApplyPower(Target::Player, power_id::REGEN, Amount::fixed(-1, -1)),
                 ]
             }
             // Hellraiser resets at its side's turn end, Skittish at the other side's.
@@ -2416,10 +2416,7 @@ impl Game {
             _ => {}
         }
         let queue = &mut self.combat_mut().unwrap().queue;
-        queue.extend(effects.into_iter().map(|effect| Pending {
-            effect,
-            context: Context::player(),
-        }));
+        push_effects(queue, &effects, Context::player());
     }
 
     /// Creature.AfterTurnStart: the block clears unless a power keeps it (ShouldClearBlock). The
@@ -2674,19 +2671,14 @@ impl Game {
                 let ethereal_cards = others
                     .into_iter()
                     .filter(|card| ethereal(content, card, hexed));
-                let steps = (ethereal_cards.map(Step::EtherealExhaust))
-                    .chain(
-                        turn_end_cards
-                            .into_iter()
-                            .map(|card| Step::TurnEndCard(card, hand_size)),
-                    )
-                    .collect::<Vec<_>>();
-                combat
-                    .queue
-                    .extend(steps.into_iter().rev().map(|step| Pending {
-                        effect: Effect::Step(step),
-                        context: Context::player(),
-                    }));
+                let ends = turn_end_cards
+                    .into_iter()
+                    .map(|card| Step::TurnEndCard(card, hand_size));
+                let steps = ethereal_cards.map(Step::EtherealExhaust).chain(ends);
+                combat.queue.extend(steps.rev().map(|step| Pending {
+                    effect: Effect::Step(step),
+                    context: Context::player(),
+                }));
             }
             Step::EtherealExhaust(card) => {
                 let combat = self.combat_mut().unwrap();

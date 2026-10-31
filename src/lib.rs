@@ -755,6 +755,30 @@ pub struct CardDef {
     pub tags: u16,
 }
 
+impl CardDef {
+    /// The card's own damage (its DamageVar).
+    pub fn damage(&self) -> Option<Amount> {
+        self.effects.iter().find_map(|effect| match effect {
+            Effect::Attack(_, amount, _)
+            | Effect::AttackMany(_, amount, _)
+            | Effect::ExhaustForAttack(_, amount)
+            | Effect::MoveDamage(_, amount)
+            | Effect::OstyAttack(_, amount, _)
+            | Effect::OstyAttackMany(_, amount, _) => Some(*amount),
+            _ => None,
+        })
+    }
+
+    /// The card's DamageVar.BaseValue, a decimal (Thrash's grows by fractions), in hundredths.
+    pub fn damage_cents(&self, card: Card) -> Option<i64> {
+        self.damage().map(|amount| {
+            let base = [amount.base, amount.upgraded][card.upgrades.min(1) as usize];
+            let value = (amount.scale == Scale::CardValue) as i64 * card.value as i64;
+            (base as i64 + value) * 100 / amount.divisor.max(1) as i64
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Hash)]
 pub struct PowerDef {
     pub id: &'static str,
@@ -1610,6 +1634,24 @@ impl Card {
             }
             self.costs[len.min(self.costs.len() - 1)] = new;
         }
+    }
+
+    /// CardCmd.Upgrade: a lower upgraded cost caps the absolute energy cost modifiers above it
+    /// (CardEnergyCost.UpgradeBy), so a Snecko Eye roll can't outlast the cheaper upgrade.
+    pub fn upgrade(&mut self, content: &Content) {
+        let def = content.cards[self.id as usize];
+        let new = def.cost[1];
+        if self.upgrades == 0
+            && (0..def.cost[0]).contains(&new)
+            && self.enchantment != Some(Enchantment::TezcatarasEmber)
+        {
+            for cost in &mut self.costs {
+                if cost.kind & (ABSOLUTE | STAR_COST) == ABSOLUTE && cost.amount > new {
+                    cost.amount = new;
+                }
+            }
+        }
+        self.upgrades = self.upgrades.max(1);
     }
 
     /// Clears the cost modifiers that expire with `expiry` (EndOfTurnCleanup,

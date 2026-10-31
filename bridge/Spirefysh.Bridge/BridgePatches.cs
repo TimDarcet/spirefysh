@@ -28,6 +28,8 @@ internal static class BridgePatches
 {
     private static TraceCapture? _capture;
     private static RewardsSet? _rewardsSet;
+    // The game's stack of open reward sets: a reward that offers rewards (Neow's Bones) nests one.
+    private static readonly List<RewardsSet> _rewardsSets = new();
     private static CardReward? _cardReward;
 
     internal static void Install(Harmony harmony, TraceCapture capture)
@@ -45,6 +47,8 @@ internal static class BridgePatches
             nameof(RewardsSetSynchronizer.SelectLocalReward), nameof(BeforeRewardSelected));
         PatchPrefix(harmony, typeof(RewardsSetSynchronizer),
             nameof(RewardsSetSynchronizer.SkipLocalRewardsSet), nameof(BeforeRewardsSkipped));
+        PatchPrefix(harmony, typeof(RewardsSetSynchronizer),
+            "CompleteRewardsSet", nameof(BeforeRewardsSetCompleted));
         PatchPrefix(harmony, typeof(RestSiteSynchronizer),
             nameof(RestSiteSynchronizer.ChooseLocalOption), nameof(BeforeRestSiteOption));
         PatchPrefix(harmony, typeof(EventSynchronizer),
@@ -187,9 +191,24 @@ internal static class BridgePatches
 
     private static void BeforeRewardsSet(object[] __args) => Observe("rewards offered", () =>
     {
-        _rewardsSet = __args.OfType<RewardsSet>().Single();
-        _capture?.OnRewardsSetBegun(_rewardsSet);
+        _rewardsSets.Add(__args.OfType<RewardsSet>().Single());
+        ShowRewardsSet();
     });
+
+    private static void BeforeRewardsSetCompleted(object[] __args) => Observe("rewards completed", () =>
+    {
+        var state = __args[0];
+        var set = (RewardsSet)(AccessTools.Field(state.GetType(), "set")?.GetValue(state)
+            ?? throw new MissingFieldException(state.GetType().FullName, "set"));
+        _rewardsSets.Remove(set);
+        if (_rewardsSets.Count > 0) ShowRewardsSet();
+    });
+
+    private static void ShowRewardsSet()
+    {
+        _rewardsSet = _rewardsSets[^1];
+        _capture?.OnRewardsSetBegun(_rewardsSet);
+    }
 
     private static void BeforeRewardSelected(object[] __args) => Observe("reward selected", () =>
     {

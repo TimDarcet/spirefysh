@@ -1025,13 +1025,11 @@ impl Game {
                 _ => unreachable!(),
             },
             Action::Done => {
-                if self
-                    .combat()
-                    .unwrap()
-                    .choice
-                    .is_some_and(|choice| choice.op == CardOp::DiscardDraw)
+                if let Some(choice) = self.combat().unwrap().choice
+                    && (choice.op == CardOp::DiscardDraw
+                        || choice.pile == Pile::Hand && choice.op == CardOp::Move(Pile::Discard))
                 {
-                    self.finish_discard_draw(content);
+                    self.finish_discard_draw(content, choice.op == CardOp::DiscardDraw);
                 }
                 let combat = self.combat_mut().unwrap();
                 if combat

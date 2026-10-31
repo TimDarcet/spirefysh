@@ -5480,13 +5480,14 @@ pub fn foundation_content() -> Content {
             effects![
                 Effect::Attack(
                     Target::ChosenEnemy,
+                    // In hundredths: the exhausted attacks' modified damage adds fractions.
                     Amount {
-                        base: 4,
-                        upgraded: 6,
+                        base: 400,
+                        upgraded: 600,
                         ascension: 0,
                         scale: Scale::CardValue,
                         multiplier: 1,
-                        divisor: 1,
+                        divisor: 100,
                     },
                     2,
                 ),

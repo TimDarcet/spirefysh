@@ -1348,7 +1348,8 @@ internal static class Snapshotter
         return result.ToArray();
     }
 
-    private static int CaptureExtraDamage(CardModel card)
+    // Decimal: Thrash's extra damage adds the exhausted attack's modified (fractional) damage.
+    private static decimal CaptureExtraDamage(CardModel card)
     {
         var name = card.Id.ToString() switch
         {
@@ -1360,8 +1361,8 @@ internal static class Snapshotter
         if (name is null) return 0;
         var property = card.GetType().GetProperty(name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
             ?? throw new MissingMemberException(card.GetType().FullName, name);
-        return decimal.ToInt32(Convert.ToDecimal(property.GetValue(card)
-            ?? throw new InvalidOperationException($"{card.Id} extra damage is unavailable.")));
+        return Convert.ToDecimal(property.GetValue(card)
+            ?? throw new InvalidOperationException($"{card.Id} extra damage is unavailable."));
     }
 
     private static int CaptureRampageExtraDamage(CardModel card)
@@ -1661,7 +1662,7 @@ internal sealed record CardSnapshot(
     int ClawExtraDamage,
     int GeneticAlgorithmBonusBlock,
     int SovereignBladeBonusDamage,
-    int ExtraDamage,
+    decimal ExtraDamage,
     int CombatsSeen,
     int BaseReplayCount,
     bool CostsX,

@@ -4321,7 +4321,8 @@ fn card_domain_row(
     ]);
     row.s[..6].copy_from_slice(&[
         cost_delta,
-        card.value as i32,
+        // In whole points (Thrash keeps hundredths).
+        card.value as i32 / def.damage().map_or(1, |amount| amount.divisor.max(1)) as i32,
         cost_override.unwrap_or_default() as i32,
         card.enchantment_amount as i32,
         card.enchantment_value as i32,

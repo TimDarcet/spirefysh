@@ -90,6 +90,7 @@ struct TurnHistory {
     wither_upgrades: i16,
     bolas: Vec<u32>,
     panache_start: Option<i16>,
+    enemy_round: u16,
     enemy_moves: HashMap<u32, Vec<String>>,
 }
 
@@ -918,6 +919,9 @@ fn replay_decision(
         if selected.is_empty() {
             Action::Cancel
         } else {
+            // The deck's new card carries its enchantment, but only if it is the chosen model:
+            // a quarantined gap's after state can hold other gains too (deck ids are positions).
+            let chosen = model_card(content, selected[0].as_str().unwrap_or_default());
             let selected = added_value(
                 &before["players"][0]["deck"],
                 &after["players"][0]["deck"],
@@ -926,7 +930,8 @@ fn replay_decision(
             .map(|value| card(content, value))
             .transpose()
             .map_err(|error| vec![error])?
-            .or_else(|| model_card(content, selected[0].as_str().unwrap_or_default()))
+            .filter(|card| chosen.is_none_or(|chosen| chosen.id == card.id))
+            .or(chosen)
             .ok_or_else(|| vec!["invalid card reward choice".into()])?;
             let Phase::Rewards(rewards) = &mut game.phase else {
                 return Err(vec!["card reward did not reconstruct rewards".into()]);
@@ -1078,7 +1083,7 @@ fn replay_decision(
             card.variant = (rider / 3 + 1) as u8 * 10 + rider as u8 + 1;
         }
     }
-    while step_traced_pick(content, &mut game, &mut replay_state.picks)? {}
+    while step_traced_pick(content, &mut game, &mut replay_state.picks, after)? {}
     // An untraced pick from a potion's offer still generates a card (Regalite, ...): the one new
     // in the traced hand, else any (the hand is resynced below).
     if traced_action["kind"] == "use_potion"
@@ -1124,7 +1129,7 @@ fn replay_decision(
     {
         // Effects queued behind the picks (Reptile Trinket) still resolve; piles are resynced next.
         while game.combat().is_some() {
-            let traced = step_traced_pick(content, &mut game, &mut replay_state.picks)?;
+            let traced = step_traced_pick(content, &mut game, &mut replay_state.picks, after)?;
             let Phase::Combat(combat) = &mut game.phase else {
                 break;
             };
@@ -1437,7 +1442,7 @@ fn replay_decision(
             break;
         };
         inferred_choice = true;
-        if step_traced_pick(content, &mut game, &mut replay_state.picks)? {
+        if step_traced_pick(content, &mut game, &mut replay_state.picks, after)? {
             continue;
         }
         // Nightmare's pick only shows next turn, so any eligible card reproduces this step.
@@ -2623,8 +2628,9 @@ fn step_traced_pick(
     content: &Content,
     game: &mut Game,
     picks: &mut Vec<Value>,
+    after: &Value,
 ) -> Result<bool, Vec<String>> {
-    // The pending choice's eligible cards: (pile index, instance, "MODEL:upgrades").
+    // The pending choice's eligible cards: (pile index, instance, "MODEL:upgrades", enchantment).
     let offered = |game: &Game| {
         let combat = game.combat()?;
         let choice = combat.choice?;
@@ -2635,7 +2641,12 @@ fn step_traced_pick(
                 .filter(|(_, card)| eligible(content, card, choice.filter, choice.op))
                 .map(|(index, card)| {
                     let model = format!("{}:{}", content.cards[card.id as usize].id, card.upgrades);
-                    (index, card.instance, model)
+                    (
+                        index,
+                        card.instance,
+                        model,
+                        card.enchantment.map(enchantment_id),
+                    )
                 })
                 .collect::<Vec<_>>(),
         )
@@ -2643,7 +2654,7 @@ fn step_traced_pick(
     let Some(cards) = offered(game) else {
         return Ok(false);
     };
-    let mut models: Vec<_> = cards.iter().map(|(.., model)| model.as_str()).collect();
+    let mut models: Vec<_> = cards.iter().map(|card| card.2.as_str()).collect();
     models.sort_unstable();
     let fits = |pick: &Value| {
         let mut candidates: Vec<_> = array(&pick["candidate_models"])
@@ -2667,6 +2678,18 @@ fn step_traced_pick(
     };
     let pick = picks.drain(..=index).last().unwrap();
     tally("trace.choice");
+    // The game's candidates still to pick from: identical copies keep their pile order (the draw
+    // pile's are sorted stably by rarity and id), so a pick's rank among them names the copy.
+    let mut remaining: Vec<_> = array(&pick["candidate_ids"])
+        .iter()
+        .zip(array(&pick["candidate_models"]))
+        .map(|(id, model)| {
+            (
+                id.as_str().unwrap_or_default(),
+                model.as_str().unwrap_or_default(),
+            )
+        })
+        .collect();
     for (id, model) in array(&pick["selected_ids"])
         .iter()
         .zip(array(&pick["selected_models"]))
@@ -2674,12 +2697,40 @@ fn step_traced_pick(
         let Some(cards) = offered(game) else {
             break;
         };
-        let instance = instance_id(id.as_str().unwrap_or_default());
-        let same = |card: &&(usize, u32, String)| model.as_str() == Some(card.2.as_str());
+        let id = id.as_str().unwrap_or_default();
+        let instance = instance_id(id);
+        // The model key carries no enchantment: the traced card (wherever it ends up) tells
+        // copies apart when the instance numbering drifted.
+        let traced = ["hand", "draw_pile", "discard_pile", "exhaust_pile"]
+            .iter()
+            .flat_map(|pile| array(&after["players"][0][*pile]))
+            .find(|card| card["instance_id"] == id);
+        let enchanted = |card: &&(_, _, _, Option<&str>)| {
+            traced.is_none_or(|traced| traced["enchantment_model_id"].as_str() == card.3)
+        };
+        let model = model.as_str().unwrap_or_default();
+        let same = |card: &&(_, u32, String, _)| card.2 == model;
+        let rank = remaining.iter().position(|x| x.0 == id).map(|position| {
+            let rank = remaining[..position]
+                .iter()
+                .filter(|x| x.1 == model)
+                .count();
+            remaining.remove(position);
+            rank
+        });
+        let copies = remaining.iter().filter(|x| x.1 == model).count() + 1;
+        let mut ranked: Vec<_> = cards.iter().filter(same).collect();
+        // The sim keeps the draw pile bottom first.
+        if game.combat().unwrap().choice.unwrap().pile == Pile::Draw {
+            ranked.reverse();
+        }
         let Some(&(index, ..)) = cards
             .iter()
             .filter(same)
+            .filter(enchanted)
             .find(|card| card.1 == instance)
+            .or_else(|| rank.filter(|_| ranked.len() == copies).map(|x| ranked[x]))
+            .or_else(|| cards.iter().filter(same).find(enchanted))
             .or_else(|| cards.iter().find(same))
         else {
             break;
@@ -3547,7 +3598,7 @@ fn game_from_snapshot(
         )
         .unwrap_or_default()
         .max(0) as u8,
-        nightmares: nightmare_copies(content, player, after),
+        nightmares: nightmare_copies(content, player, oracle, after),
         dampened,
         paels_tears: false,
         orichalcum: false,
@@ -4990,7 +5041,10 @@ fn update_history(history: &mut TurnHistory, state: &Value, oracle: &Value) {
         .as_u64()
         .or_else(|| state["combat"]["round"].as_u64())
         .unwrap_or_default() as u16;
-    let observe_moves = history.encounter != encounter || history.round != round;
+    let new_turn = history.encounter != encounter || history.round != round;
+    // Enemies act once per combat round, so an extra player turn repeats no move.
+    let enemy_round = state["combat"]["round"].as_u64().unwrap_or_default() as u16;
+    let observe_moves = history.encounter != encounter || history.enemy_round != enemy_round;
     if history.encounter != encounter {
         *history = TurnHistory {
             encounter,
@@ -5025,6 +5079,7 @@ fn update_history(history: &mut TurnHistory, state: &Value, oracle: &Value) {
         history.toric.retain(|x| x.0 > 0);
         history.round = round;
     }
+    history.enemy_round = enemy_round;
     if observe_moves {
         for enemy in enemies {
             let instance_id_text = enemy["instance_id"].as_str().unwrap_or_default();
@@ -5047,7 +5102,7 @@ fn update_history(history: &mut TurnHistory, state: &Value, oracle: &Value) {
         .any(|power| power["model_id"] == "POWER.PANACHE_POWER");
     if !has_panache {
         history.panache_start = None;
-    } else if observe_moves {
+    } else if new_turn {
         history.panache_start = Some(0);
     }
     if array(&player["powers"])
@@ -5228,25 +5283,13 @@ fn advance_history(
     else {
         return;
     };
-    let Some(exhausted_id) = exhausted["model_id"]
-        .as_str()
-        .and_then(|id| content.card_id(id))
-    else {
+    let Ok(exhausted) = self::card(content, exhausted) else {
         return;
     };
-    let upgraded = exhausted["upgrade"].as_u64().unwrap_or_default() > 0;
-    let damage = content.cards[exhausted_id as usize]
-        .effects
-        .iter()
-        .find_map(|effect| match effect {
-            Effect::Attack(_, amount, _) | Effect::AttackMany(_, amount, _) => Some(if upgraded {
-                amount.upgraded
-            } else {
-                amount.base
-            }),
-            _ => None,
-        })
-        .unwrap_or_default();
+    // Unmodified, in Thrash's hundredths.
+    let damage = content.cards[exhausted.id as usize]
+        .damage_cents(exhausted)
+        .unwrap_or_default() as i16;
     let instance = instance_id(source);
     *history.values.entry(instance).or_default() += damage;
 }
@@ -5313,7 +5356,8 @@ fn card(content: &Content, value: &Value) -> Result<Card, String> {
             | DUPE * value["is_dupe"].as_bool().unwrap_or_default() as u16,
         turn_flags: SLY * value["sly_this_turn"].as_bool().unwrap_or_default() as u16,
         affliction: Affliction::from_model(value["affliction_model_id"].as_str().unwrap_or("")),
-        value: [
+        // In the card's damage units (Thrash's hundredths).
+        value: ([
             "rampage_extra_damage",
             "claw_extra_damage",
             "genetic_algorithm_bonus_block",
@@ -5322,9 +5366,12 @@ fn card(content: &Content, value: &Value) -> Result<Card, String> {
             "combats_seen",
         ]
         .iter()
-        .filter_map(|key| value[*key].as_i64())
-        .max()
-        .unwrap_or_default() as i16,
+        .filter_map(|key| value[*key].as_f64())
+        .fold(0.0, f64::max)
+            * content.cards[id as usize]
+                .damage()
+                .map_or(1, |amount| amount.divisor.max(1)) as f64)
+            .round() as i16,
         replays: value["base_replay_count"].as_u64().unwrap_or_default() as u8,
         enchantment: match value["enchantment_model_id"].as_str() {
             Some("ENCHANTMENT.ADROIT") => Some(Enchantment::Adroit),
@@ -5394,19 +5441,26 @@ fn powers(content: &Content, values: &Value) -> Result<Vec<Power>, String> {
 // Nightmare copies a hand card next turn; recover it from the copies that appear (the first new
 // cards, made before the hand draw; Entropy may transform one of them afterwards). The game keeps
 // one power per Nightmare played, each with its own card.
-fn nightmare_copies(content: &Content, player: &Value, after: &Value) -> Vec<(Card, u8)> {
+fn nightmare_copies(
+    content: &Content,
+    player: &Value,
+    oracle: &Value,
+    after: &Value,
+) -> Vec<(Card, u8)> {
     let counts: Vec<u64> = array(&player["powers"])
         .iter()
         .filter(|power| power["model_id"] == "POWER.NIGHTMARE_POWER")
         .filter_map(|power| power["amount"].as_u64())
         .collect();
-    let known: Vec<_> = ["hand", "discard_pile", "exhaust_pile"]
-        .iter()
+    let piles = ["hand", "discard_pile", "exhaust_pile"];
+    let known: Vec<_> = (piles.iter())
         .flat_map(|pile| array(&player[*pile]))
+        .chain(array(&oracle["hidden_draw_order"]))
         .map(|card| &card["instance_id"])
         .collect();
-    let mut new: Vec<_> = array(&after["players"][0]["hand"])
-        .iter()
+    // Copies drawn into the hand may already be discarded or exhausted (Tools of the Trade).
+    let mut new: Vec<_> = (piles.iter())
+        .flat_map(|pile| array(&after["players"][0][*pile]))
         .filter(|card| !known.contains(&&card["instance_id"]))
         .collect();
     let same =
@@ -6368,6 +6422,15 @@ mod tests {
             instance,
             ..Card::default()
         };
+        let exhaust_choice = |pile| {
+            Some(Choice {
+                pile,
+                filter: CardFilter::Any,
+                op: CardOp::Move(Pile::Exhaust),
+                remaining: 1,
+                optional: false,
+            })
+        };
         let Phase::Combat(combat) = &mut game.phase else {
             unreachable!()
         };
@@ -6377,13 +6440,7 @@ mod tests {
             card("CARD.STRIKE_IRONCLAD", 7),
         ];
         combat.exhaust.clear();
-        combat.choice = Some(Choice {
-            pile: Pile::Hand,
-            filter: CardFilter::Any,
-            op: CardOp::Move(Pile::Exhaust),
-            remaining: 1,
-            optional: false,
-        });
+        combat.choice = exhaust_choice(Pile::Hand);
         let pick = |candidates: &[&str], id: &str, model: &str| {
             serde_json::json!({
                 "candidate_models": candidates,
@@ -6401,7 +6458,7 @@ mod tests {
             pick(&["CARD.BASH:0"], "combat-card:0", "CARD.BASH:0"),
             pick(&hand, "combat-card:6", "CARD.STRIKE_IRONCLAD:0"),
         ];
-        assert!(step_traced_pick(&content, &mut game, &mut picks).unwrap());
+        assert!(step_traced_pick(&content, &mut game, &mut picks, &Value::Null).unwrap());
         assert!(picks.is_empty());
         let combat = game.combat().unwrap();
         assert!(combat.choice.is_none());
@@ -6413,7 +6470,66 @@ mod tests {
                 .collect::<Vec<_>>(),
             [7]
         );
-        assert!(!step_traced_pick(&content, &mut game, &mut picks).unwrap());
+        assert!(!step_traced_pick(&content, &mut game, &mut picks, &Value::Null).unwrap());
+        // With drifted instance numbering, or against a same-numbered plain copy, the traced
+        // card's enchantment tells copies apart.
+        let sharp = Card {
+            enchantment: Some(Enchantment::Sharp),
+            ..card("CARD.STRIKE_IRONCLAD", 9)
+        };
+        let strikes = ["CARD.STRIKE_IRONCLAD:0", "CARD.STRIKE_IRONCLAD:0"];
+        let after = serde_json::json!({"players": [{"exhaust_pile": [
+            {"instance_id": "combat-card:40", "enchantment_model_id": "ENCHANTMENT.SHARP"}
+        ]}]});
+        for plain in [8, 40] {
+            let Phase::Combat(combat) = &mut game.phase else {
+                unreachable!()
+            };
+            combat.hand = vec![card("CARD.STRIKE_IRONCLAD", plain), sharp];
+            combat.choice = exhaust_choice(Pile::Hand);
+            let mut picks = vec![pick(&strikes, "combat-card:40", "CARD.STRIKE_IRONCLAD:0")];
+            assert!(step_traced_pick(&content, &mut game, &mut picks, &after).unwrap());
+            assert_eq!(game.combat().unwrap().exhaust.last().unwrap().instance, 9);
+        }
+        // Identical copies keep the game's pile order among the candidates (top first for the
+        // draw pile, which the simulator keeps bottom first): the pick's rank names the copy.
+        let Phase::Combat(combat) = &mut game.phase else {
+            unreachable!()
+        };
+        combat.draw = vec![
+            card("CARD.STRIKE_IRONCLAD", 10),
+            card("CARD.STRIKE_IRONCLAD", 11),
+        ];
+        combat.choice = exhaust_choice(Pile::Draw);
+        let mut picks = vec![serde_json::json!({
+            "candidate_ids": ["combat-card:50", "combat-card:60"],
+            "candidate_models": strikes,
+            "selected_ids": ["combat-card:60"],
+            "selected_models": ["CARD.STRIKE_IRONCLAD:0"],
+        })];
+        assert!(step_traced_pick(&content, &mut game, &mut picks, &Value::Null).unwrap());
+        assert_eq!(game.combat().unwrap().exhaust.last().unwrap().instance, 10);
+    }
+
+    #[test]
+    fn nightmare_copies_are_new_cards_in_any_pile() {
+        let content = foundation_content();
+        let card = |instance: u32, model: &str| serde_json::json!({"instance_id": format!("combat-card:{instance}"), "model_id": model, "upgrade": 0});
+        let player = serde_json::json!({
+            "powers": [{"model_id": "POWER.NIGHTMARE_POWER", "amount": 3}],
+            "hand": [card(1, "CARD.SHIV")],
+        });
+        let oracle = serde_json::json!({"hidden_draw_order": [card(2, "CARD.REFLEX")]});
+        // One copy was discarded before the snapshot; the drawn Reflex is no copy.
+        let after = serde_json::json!({"players": [{
+            "hand": [card(1, "CARD.SHIV"), card(5, "CARD.APPARITION"), card(2, "CARD.REFLEX"),
+                     card(7, "CARD.APPARITION")],
+            "discard_pile": [card(6, "CARD.APPARITION")],
+        }]});
+        let copies = nightmare_copies(&content, &player, &oracle, &after);
+        assert_eq!(copies.len(), 1);
+        assert_eq!(content.cards[copies[0].0.id as usize].id, "CARD.APPARITION");
+        assert_eq!(copies[0].1, 3);
     }
 
     #[test]
