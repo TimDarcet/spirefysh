@@ -6450,7 +6450,7 @@ impl Batch {
                     combat.discard.len(),
                     combat.exhaust.len(),
                     combat.queue.len(),
-                    combat.auto_plays.len(),
+                    combat.plays.iter().filter(|play| !play.manual).count(),
                     combat.enemies.len(),
                     combat.player.powers.len(),
                     combat

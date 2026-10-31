@@ -16,38 +16,35 @@ pub(crate) struct ActionOutcome {
 const MAX_EXPECTATION_BRANCHES: usize = 64;
 
 impl Combat {
-    /// Rebound's redirect is chosen when a play starts (ModifyCardPlayResultPileTypeAndPosition):
-    /// a discard-bound card starting under it goes to the top of the draw pile and uses one stack.
-    fn mark_rebound(&mut self, def: CardDef, card: &Card) {
-        let flags = card.flags(def);
-        if self.player.power(power_id::REBOUND) > 0
-            && card.card_type(def) != CardType::Power
-            && flags & (EXHAUST | RETURN_TO_HAND | RETURN_TO_DRAW) == 0
-        {
-            self.player.consume_power(power_id::REBOUND);
-            self.rebounds.push(card.instance);
+    /// GeneratePlayCount: the card's own replays, then ModifyCardPlayCount (Throwing Axe, Echo
+    /// Form, Duplication, Burst, One-Two Punch, Signal Boost), whose powers spend themselves.
+    fn play_count(&mut self, content: &Content, card: Card, throwing_axe: bool) -> u8 {
+        let card_type = card.card_type(content.cards[card.id as usize]);
+        let mut plays = 1
+            + card.replays
+            + (card.enchantment == Some(Enchantment::Spiral)) as u8
+            + (card.enchantment == Some(Enchantment::Glam) && card.enchantment_value > 0) as u8
+            + throwing_axe as u8
+            + (self.history.first_plays < self.player.power(power_id::ECHO_FORM)) as u8;
+        for (kind, id) in [
+            (None, power_id::DUPLICATION),
+            (Some(CardType::Skill), power_id::BURST),
+            (Some(CardType::Attack), power_id::ONE_TWO_PUNCH),
+            (Some(CardType::Power), power_id::SIGNAL_BOOST),
+        ] {
+            if kind.is_none_or(|kind| kind == card_type) && self.player.power(id) > 0 {
+                self.player.consume_power(id);
+                plays += 1;
+            }
         }
+        plays
     }
 
-    /// Feral's return is also chosen when a play starts: the first zero-energy attacks to start
-    /// this turn go back to the hand, even if one auto-played inside them finishes first.
-    fn mark_feral(&mut self, card_type: CardType, energy: i16, card: &Card) {
-        if card_type == CardType::Attack
-            && energy == 0
-            && self.history.feral_returns < self.player.power(power_id::FERAL)
-        {
-            self.history.feral_returns += 1;
-            self.ferals.push(card.instance);
-        }
-    }
-
-    /// Takes a play's Feral mark.
-    fn take_feral(&mut self, card: &Card) -> bool {
-        self.ferals
-            .iter()
-            .position(|&id| id == card.instance)
-            .map(|index| self.ferals.swap_remove(index))
-            .is_some()
+    /// Plays started but not finished, the current one included.
+    fn unfinished(&self) -> i16 {
+        (self.plays.iter())
+            .map(|play| (play.plays - play.done) as i16)
+            .sum()
     }
 
     /// Stomp costs 1 less this turn for each attack played (its BeforeCardPlayed hook).
@@ -643,7 +640,7 @@ fn relic_allowed_in_shop(id: Id) -> bool {
     ![21, 44, 135, 161, 247].contains(&id)
 }
 
-fn push_effects(queue: &mut Vec<Pending>, effects: &'static [Effect], context: Context) {
+fn push_effects(queue: &mut Vec<Pending>, effects: &[Effect], context: Context) {
     queue.extend(
         effects
             .iter()

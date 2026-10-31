@@ -3036,10 +3036,13 @@ fn game_from_snapshot(
             block.max(0)
         })
         .collect();
+    let states = |id: &'static str| {
+        array(&oracle["power_states"]["creature:0"])
+            .iter()
+            .filter(move |state| state["model_id"] == id)
+    };
     // Newer captures record each Toric Toughness instance's stored block.
-    let captured: Vec<i16> = array(&oracle["power_states"]["creature:0"])
-        .iter()
-        .filter(|state| state["model_id"] == "POWER.TORIC_TOUGHNESS_POWER")
+    let captured: Vec<i16> = states("POWER.TORIC_TOUGHNESS_POWER")
         // Older captures hard-coded 0; newer ones (with next_creature_id) store No Block's 0 too.
         .filter_map(|state| {
             state["toric_toughness_block"]
@@ -3058,9 +3061,7 @@ fn game_from_snapshot(
         fallback
     }
     .into_iter();
-    let mut orbit_states = array(&oracle["power_states"]["creature:0"])
-        .iter()
-        .filter(|state| state["model_id"] == "POWER.ORBIT_POWER")
+    let mut orbit_states = states("POWER.ORBIT_POWER")
         .map(|state| 4 - state["display_amount"].as_i64().unwrap_or(4) as i16);
     for power in &mut player_creature.powers {
         let name = content.powers[power.id as usize].id;
@@ -3098,21 +3099,17 @@ fn game_from_snapshot(
         player_creature.powers.push(Power {
             id: power_id::INFERNO_DAMAGE,
             amount,
-            skip_next_decay: false,
-            value: 0,
+            ..Power::default()
         });
     }
-    let monologue = array(&oracle["power_states"]["creature:0"])
-        .iter()
-        .filter(|state| state["model_id"] == "POWER.MONOLOGUE_POWER")
+    let monologue = states("POWER.MONOLOGUE_POWER")
         .filter_map(|state| state["display_amount"].as_i64())
         .sum::<i64>() as i16;
     if monologue > 0 {
         player_creature.powers.push(Power {
             id: power_id::MONOLOGUE_RESTORE,
             amount: monologue,
-            skip_next_decay: false,
-            value: 0,
+            ..Power::default()
         });
     }
     let orbs = if player["orbs"].is_array() {
@@ -3190,70 +3187,35 @@ fn game_from_snapshot(
                         .count() as i64
                 })
         }) as i16;
-    // One counter per Automation played, as the game keeps them instanced.
+    // The game keeps one entry per Automation, Bomb or Panache, each with its own counter.
     let fallback = history
         .automation_drawn
         .map_or(10, |start| 10 - (drawn - start).rem_euclid(10));
-    let automation: Vec<(u8, i16)> = array(&oracle["power_states"]["creature:0"])
-        .iter()
-        .filter(|state| state["model_id"] == "POWER.AUTOMATION_POWER")
-        .map(|state| {
-            let left = state["automation_cards_left"]
-                .as_i64()
-                .filter(|&left| left > 0);
-            (
-                left.map_or(fallback, |left| left as i16) as u8,
-                state["amount"].as_i64().unwrap_or(1) as i16,
-            )
-        })
-        .collect();
-    let automation = if automation.is_empty() {
-        let amount: i16 = player_creature
-            .powers
-            .iter()
-            .filter(|power| power.id == power_id::AUTOMATION)
-            .map(|power| power.amount)
-            .sum();
-        (amount > 0)
-            .then_some((fallback as u8, amount))
-            .into_iter()
-            .collect()
-    } else {
-        automation
-    };
-    let boulders = player_creature
-        .powers
-        .iter()
-        .filter(|power| power.id == power_id::ROLLING_BOULDER && power.amount > 0)
-        .map(|power| power.amount)
-        .collect();
+    let mut lefts = states("POWER.AUTOMATION_POWER").map(|state| {
+        state["automation_cards_left"]
+            .as_i64()
+            .filter(|&left| left > 0)
+    });
+    for power in (player_creature.powers.iter_mut()).filter(|x| x.id == power_id::AUTOMATION) {
+        power.value = lefts.next().flatten().map_or(fallback, |left| left as i16);
+    }
     let bomb_damage =
         40 + 10
             * run.deck.iter().any(|card| {
                 content.cards[card.id as usize].id == "CARD.THE_BOMB" && card.upgrades > 0
             }) as i16;
     // Newer traces record each Bomb's damage; it isn't always the deck's copy (generated Bombs).
-    let mut bomb_damages = array(&oracle["power_states"]["creature:0"])
-        .iter()
-        .filter(|state| state["model_id"] == "POWER.THE_BOMB_POWER")
-        .map(|state| state["bomb_damage"].as_i64().filter(|&damage| damage > 0))
-        .collect::<Vec<_>>()
-        .into_iter();
-    let bombs = player_creature
-        .powers
-        .iter()
-        .filter(|power| power.id == power_id::THE_BOMB && power.amount > 0)
-        .map(|power| {
-            let damage = bomb_damages.next().flatten().map_or_else(
-                || {
-                    tally("fallback.bomb_damage");
-                    bomb_damage
-                },
-                |damage| damage as i16,
-            );
-            (power.amount as u8, damage)
-        })
-        .collect();
+    let mut damages = states("POWER.THE_BOMB_POWER")
+        .map(|state| state["bomb_damage"].as_i64().filter(|&damage| damage > 0));
+    for power in (player_creature.powers.iter_mut()).filter(|x| x.id == power_id::THE_BOMB) {
+        power.value = damages.next().flatten().map_or_else(
+            || {
+                tally("fallback.bomb_damage");
+                bomb_damage
+            },
+            |damage| damage as i16,
+        );
+    }
     // Newer traces count every card play this turn, including automatic ones.
     let played = |kind: &str, fallback: i16| {
         player[format!("{kind}_played_this_turn")]
@@ -3262,32 +3224,25 @@ fn game_from_snapshot(
     };
     let cards = played("cards", history.cards).max(play_pile.len() as i16);
     let panache_played = (history.cards - history.panache_start.unwrap_or(0)).max(0);
-    // Newer traces show Panache's cards left.
-    let panache_left = oracle_power_value(
-        oracle,
-        "creature:0",
-        "POWER.PANACHE_POWER",
-        "display_amount",
-    )
-    .unwrap_or(5 - panache_played.rem_euclid(5));
-    // Each Panache instance counts its own cards left.
-    let panache_states: Vec<_> = array(&oracle["power_states"]["creature:0"])
-        .iter()
-        .filter(|state| state["model_id"] == "POWER.PANACHE_POWER")
-        .collect();
-    let panache = player_creature
-        .powers
-        .iter()
-        .filter(|power| power.id == power_id::PANACHE)
-        .enumerate()
-        .map(|(index, power)| {
-            let left = panache_states
-                .get(index)
-                .and_then(|state| state["display_amount"].as_i64())
-                .map_or(panache_left, |left| left as i16);
-            (left as u8, power.amount, cards)
-        })
-        .collect();
+    // Newer traces show each Panache's cards left.
+    let panache_left = 5 - panache_played.rem_euclid(5);
+    let mut lefts = states("POWER.PANACHE_POWER").map(|state| state["display_amount"].as_i64());
+    for power in (player_creature.powers.iter_mut()).filter(|x| x.id == power_id::PANACHE) {
+        power.value = lefts
+            .next()
+            .flatten()
+            .map_or(panache_left, |left| left as i16);
+    }
+    let bound_played =
+        states("POWER.CHAINS_OF_BINDING_POWER").any(|state| state["bound_card_played"] == true);
+    let hp_lost = player["hp_lost_this_turn"].as_i64().unwrap_or_else(|| {
+        player["player_lost_hp_this_turn"]
+            .as_bool()
+            .unwrap_or(false) as i64
+    }) as i16;
+    let turn = number(player, "turn_number")
+        .or_else(|_| number(combat_state, "round"))
+        .map(|turn| turn as u16);
     let combat = Combat {
         player: player_creature,
         osty: Creature {
@@ -3316,7 +3271,7 @@ fn game_from_snapshot(
         max_energy: number(player, "max_energy")? as i16,
         draw_per_turn: run.draw,
         stars: number(player, "stars")? as i16,
-        turn: number(player, "turn_number").or_else(|_| number(combat_state, "round"))? as u16,
+        turn: turn.clone()?,
         orbs,
         orb_slots: player["orb_slots"].as_u64().unwrap_or(run.orb_slots as u64) as u8,
         history: History {
@@ -3354,16 +3309,8 @@ fn game_from_snapshot(
             energy: number(player, "energy_spent_this_turn")? as i16,
             stars_gained,
             exhausted: number(player, "cards_exhausted_this_turn")? as i16,
-            hp_lost: player["hp_lost_this_turn"].as_i64().unwrap_or_else(|| {
-                player["player_lost_hp_this_turn"]
-                    .as_bool()
-                    .unwrap_or(false) as i64
-            }) as i16,
-            remnant_lost: player["hp_lost_this_turn"].as_i64().unwrap_or_else(|| {
-                player["player_lost_hp_this_turn"]
-                    .as_bool()
-                    .unwrap_or(false) as i64
-            }) as i16,
+            hp_lost,
+            remnant_lost: hp_lost,
             hp_loss_events: number(player, "player_hp_loss_events_this_combat")? as i16,
             osty_attacks: number(player, "osty_attacks_this_turn")? as i16,
             feral_returns: oracle_power_value(
@@ -3373,15 +3320,10 @@ fn game_from_snapshot(
                 "feral_returns_this_turn",
             )
             .unwrap_or_default(),
-            unblocked_hits: {
-                let turn = number(player, "turn_number")
-                    .or_else(|_| number(combat_state, "round"))
-                    .unwrap_or_default() as u16;
-                if replay_state.unblocked_hits.0 == turn {
-                    replay_state.unblocked_hits.1
-                } else {
-                    0
-                }
+            unblocked_hits: if turn == Ok(replay_state.unblocked_hits.0) {
+                replay_state.unblocked_hits.1
+            } else {
+                0
             },
             ..History::default()
         },
@@ -3415,27 +3357,15 @@ fn game_from_snapshot(
         .unwrap_or_default()
         .max(0) as u8,
         nightmares: nightmare_copies(content, player, after),
-        bombs,
-        automation,
-        panache,
-        boulders,
         dampened,
         paels_tears: false,
         orichalcum: false,
-        playing: None,
-        auto_plays: vec![],
+        plays: vec![],
         queue: vec![],
         choice: None,
-        power_snapshot: vec![],
-        enemy_power_snapshot: vec![],
         rebounds: vec![],
         ferals: vec![],
-        card_energy: 0,
-        card_stars: 0,
-        card_plays: 1,
-        pending_plays: vec![],
-        dying: None,
-        envenomed: Vec::new(),
+        pending_hits: None,
         force_end: false,
         enemy_turn: false,
         centennial_puzzle: number(player, "player_hp_loss_events_this_combat")? > 0,
@@ -3456,8 +3386,7 @@ fn game_from_snapshot(
         music_box: played("attacks", history.attacks) > 0,
         music_box_card: None,
         swift_after_return: 0,
-        juggled: vec![],
-        music_box_copy: None,
+
         mini_regent: used_relic(player, "RELIC.MINI_REGENT").unwrap_or(false),
         rainbow_ring: relic_active(player, "RELIC.RAINBOW_RING"),
         attacks_mod3: (played("attacks", history.attacks) % 3).max(0) as u8,
@@ -3468,12 +3397,7 @@ fn game_from_snapshot(
         letter_opener: relic_amount_opt(player, "RELIC.LETTER_OPENER")
             .filter(|_| player.get("used_relics").is_some())
             .unwrap_or((played("skills", history.skills) % 3).max(0) as u8),
-        bound_played: array(&oracle["power_states"]["creature:0"])
-            .iter()
-            .any(|state| {
-                state["model_id"] == "POWER.CHAINS_OF_BINDING_POWER"
-                    && state["bound_card_played"] == true
-            }),
+        bound_played,
         // Played cards keep Bound, but a played Bound power leaves every pile: count it when Bound
         // was played this turn and no played-looking Bound card remains.
         bound_this_turn: {
@@ -3484,12 +3408,6 @@ fn game_from_snapshot(
                     .count()
             };
             let played = bound(&player["discard_pile"]) + bound(&player["exhaust_pile"]);
-            let bound_played = array(&oracle["power_states"]["creature:0"])
-                .iter()
-                .any(|state| {
-                    state["model_id"] == "POWER.CHAINS_OF_BINDING_POWER"
-                        && state["bound_card_played"] == true
-                });
             (bound(&player["hand"])
                 + played
                 + bound(&oracle["hidden_draw_order"])
@@ -3501,7 +3419,6 @@ fn game_from_snapshot(
         unsettling_used: !relic_active(player, "RELIC.UNSETTLING_LAMP"),
         applying_hook: false,
         belt_buckle: relic_active(player, "RELIC.BELT_BUCKLE"),
-        exhaust_queue: None,
         burning_sticks: array(&player["relics"])
             .iter()
             .any(|relic| relic["model_id"] == "RELIC.BURNING_STICKS" && relic["state"] != "Active"),
@@ -5490,17 +5407,17 @@ fn card(content: &Content, value: &Value) -> Result<Card, String> {
 }
 
 fn powers(content: &Content, values: &Value) -> Result<Vec<Power>, String> {
-    array(values)
-        .iter()
-        .map(|value| {
-            Ok(Power {
-                id: find_id(&content.powers, text(value, "model_id")?, |x| x.id)?,
-                amount: number(value, "amount")? as i16,
-                skip_next_decay: false,
-                value: 0,
-            })
-        })
-        .collect()
+    let mut powers: Vec<Power> = vec![];
+    for value in array(values) {
+        let id = find_id(&content.powers, text(value, "model_id")?, |x| x.id)?;
+        powers.push(Power {
+            id,
+            amount: number(value, "amount")? as i16,
+            instance: powers.iter().filter(|x| x.id == id).count() as u8,
+            ..Power::default()
+        });
+    }
+    Ok(powers)
 }
 
 // Nightmare copies a hand card next turn; recover it from the copies that appear (the first new
@@ -6073,8 +5990,7 @@ fn compare_powers(
     actual: &[Power],
     expected: &Value,
 ) {
-    // The game keeps one instance per Automation, Monologue, Nightmare, Panache or Rolling Boulder;
-    // the simulator stacks them.
+    // The game keeps one instance per Monologue or Nightmare; the simulator stacks them.
     fn stack(powers: impl Iterator<Item = (String, i64)>) -> Vec<String> {
         let mut stacked: Vec<(String, i64)> = vec![];
         for (id, amount) in powers {
@@ -6082,11 +5998,7 @@ fn compare_powers(
                 *other == id
                     && matches!(
                         id.as_str(),
-                        "POWER.AUTOMATION_POWER"
-                            | "POWER.MONOLOGUE_POWER"
-                            | "POWER.NIGHTMARE_POWER"
-                            | "POWER.PANACHE_POWER"
-                            | "POWER.ROLLING_BOULDER_POWER"
+                        "POWER.MONOLOGUE_POWER" | "POWER.NIGHTMARE_POWER"
                     )
             }) {
                 Some((_, total)) => *total += amount,

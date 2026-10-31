@@ -120,7 +120,14 @@ fn inferno_tracks_self_damage() {
         .player
         .powers
         .iter()
-        .find(|power| power.id == power_id::INFERNO)
+        .find(|power| {
+            power.id
+                == (content
+                    .powers
+                    .iter()
+                    .position(|power| power.id == "POWER.INFERNO_POWER")
+                    .unwrap() as Id)
+        })
         .unwrap();
     assert_eq!(inferno.amount, 6);
     assert_eq!(
@@ -524,6 +531,49 @@ fn the_bomb_shows_its_countdown() {
 }
 
 #[test]
+fn panache_instances_count_their_own_plays() {
+    let content = foundation_content();
+    let mut game = Game::new_character_ascension(&content, 1, 0, 0).unwrap();
+    game.begin_act(&content, 0).unwrap();
+    game.start_combat(&content, content.acts[0].encounters[0])
+        .unwrap();
+    let combat = game.combat_mut().unwrap();
+    combat.enemies.truncate(1);
+    combat.enemies[0].creature.hp = 100;
+    combat.enemies[0].creature.max_hp = 100;
+    let card = |id| Card {
+        id: content.card_id(id).unwrap(),
+        ..Card::default()
+    };
+    combat.hand = vec![card("CARD.PANACHE"), card("CARD.PANACHE")];
+    combat.hand.extend([card("CARD.DEFEND_IRONCLAD"); 4]);
+    combat.energy = 10;
+    let play = |game: &mut Game| {
+        let action = Action::Play {
+            hand: 0,
+            target: None,
+        };
+        game.step(&content, action).unwrap();
+    };
+    let lefts = |game: &Game| {
+        let powers = game.combat().unwrap().player.powers.iter();
+        powers
+            .filter(|x| x.id == power_id::PANACHE)
+            .map(|x| x.value)
+            .collect::<Vec<_>>()
+    };
+    for _ in 0..5 {
+        play(&mut game);
+    }
+    // Each Panache skips its own play: the first has counted 4 cards, the second 3.
+    assert_eq!(lefts(&game), [1, 2]);
+    assert_eq!(game.combat().unwrap().enemies[0].creature.hp, 100);
+    play(&mut game);
+    assert_eq!(lefts(&game), [5, 1]);
+    assert_eq!(game.combat().unwrap().enemies[0].creature.hp, 90);
+}
+
+#[test]
 fn bolas_returns_before_the_next_draw() {
     let content = foundation_content();
     let mut game = Game::new_character_ascension(&content, 1, 3, 0).unwrap();
@@ -734,10 +784,10 @@ fn rolling_boulder_ticks_damage_and_display() {
     let combat = game.combat_mut().unwrap();
     combat.enemies[0].creature.hp = 100;
     combat.enemies[0].creature.max_hp = 100;
-    combat.boulders = vec![5];
-    combat.player.add_power(power_id::ROLLING_BOULDER, 5);
+    combat.player.add_instance(power_id::ROLLING_BOULDER, 5, 0);
 
-    game.tick_boulders(&content);
+    let boulder = game.combat().unwrap().player.powers[0];
+    game.tick_boulder(&content, boulder);
     game.resolve(&content);
 
     let combat = game.combat().unwrap();
@@ -816,23 +866,16 @@ fn leaving_play_clears_temporary_cost_state() {
     // A combat-long cost (Confused) stays once played.
     let combat_long = Card {
         cost_override: Some(2),
+        until_played: false,
         ..card
     };
-    let combat_long = game.finish_card(
-        &content,
-        Card {
-            until_played: false,
-            ..combat_long
-        },
-    );
-    assert_eq!(combat_long.cost_override, Some(2));
+    game.place_card(&content, combat_long, false, false);
+    let discard = &game.combat().unwrap().discard;
+    assert_eq!(discard.last().unwrap().cost_override, Some(2));
 
-    let card = game.finish_card(&content, card);
     let exhausted = game.place_card(&content, card, false, false);
 
     assert!(!exhausted);
-    assert!(!card.free);
-    assert_eq!(card.cost_override, None);
     let card = game.combat().unwrap().discard.last().unwrap();
     assert!(!card.free);
     assert_eq!(card.cost_override, None);
@@ -999,7 +1042,7 @@ fn forced_full_run_reaches_both_a10_bosses_and_wins() {
         });
         combat.choice = None;
         combat.queue.clear();
-        combat.playing = None;
+        combat.plays.clear();
         game.finish_combat(content);
     }
 
@@ -1205,7 +1248,7 @@ fn stampede_autoplay_choice_pauses_end_turn() {
     let combat = game.combat().unwrap();
     assert!(combat.choice.is_none());
     assert!(combat.queue.is_empty());
-    assert!(combat.auto_plays.is_empty());
+    assert!(combat.plays.is_empty());
     assert_eq!(combat.turn, 2);
     assert!(!game.actions(&content).is_empty());
 }
@@ -1281,13 +1324,29 @@ fn fishing_rod_upgrades_every_third_combat() {
     }
     combat.queue.clear();
     combat.choice = None;
-    combat.playing = None;
+    combat.plays.clear();
 
     game.finish_combat(&content);
 
     assert_eq!(game.fishing_rod, 0);
     assert_eq!(game.run.deck[0].upgrades, 1);
     assert!(matches!(game.phase, Phase::Rewards(_)));
+}
+
+fn snapshot_play(enemy_powers: Vec<Vec<Power>>) -> Play {
+    let recorded = enemy_powers.into_iter().enumerate();
+    let recorded =
+        recorded.flat_map(|(i, powers)| powers.into_iter().map(move |x| (Actor::Enemy(i), x)));
+    Play {
+        card: Card::default(),
+        plays: 1,
+        done: 0,
+        energy: 0,
+        stars: 0,
+        manual: true,
+        context: Context::player(),
+        recorded: recorded.collect(),
+    }
 }
 
 #[test]
@@ -1302,12 +1361,11 @@ fn spawned_enemies_reuse_dead_slots_and_clear_slot_state() {
     combat.hits.truncate(1);
     combat.enemies[0].creature.hp = 0;
     combat.hits[0] = 9;
-    combat.enemy_power_snapshot = vec![vec![Power {
+    combat.plays.push(snapshot_play(vec![vec![Power {
         id: power_id::STRENGTH,
         amount: 2,
-        skip_next_decay: false,
-        value: 0,
-    }]];
+        ..Power::default()
+    }]]));
 
     let slot = game.spawn_enemy(&content, "MONSTER.TOUGH_EGG");
 
@@ -1315,7 +1373,7 @@ fn spawned_enemies_reuse_dead_slots_and_clear_slot_state() {
     assert_eq!(slot, 0);
     assert_eq!(combat.enemies.len(), 1);
     assert_eq!(combat.hits, [0]);
-    assert!(combat.enemy_power_snapshot[0].is_empty());
+    assert!(combat.plays[0].recorded.is_empty());
     assert_eq!(
         content.enemies[combat.enemies[0].creature.id as usize].id,
         "MONSTER.TOUGH_EGG"
@@ -1343,15 +1401,14 @@ fn death_spawns_use_the_slots_they_return() {
     let combat = game.combat_mut().unwrap();
     combat.enemies = vec![template.clone(), template.clone(), template];
     combat.hits = vec![9, 8, 7];
-    combat.enemy_power_snapshot = vec![
+    combat.plays.push(snapshot_play(vec![
         vec![Power {
             id: power_id::STRENGTH,
             amount: 1,
-            skip_next_decay: false,
-            value: 0,
+            ..Power::default()
         }];
         3
-    ];
+    ]));
     combat.enemies[0].creature.hp = 0;
     combat.enemies[1].creature.id = merc;
     combat.enemies[1].creature.hp = 1;
@@ -1359,14 +1416,13 @@ fn death_spawns_use_the_slots_they_return() {
         Power {
             id: power_id::SURPRISE,
             amount: 1,
-            skip_next_decay: false,
-            value: 0,
+            ..Power::default()
         },
         Power {
             id: power_id::THIEVERY,
             amount: 1,
-            skip_next_decay: false,
             value: 17,
+            ..Power::default()
         },
     ];
 
@@ -1375,7 +1431,8 @@ fn death_spawns_use_the_slots_they_return() {
     let combat = game.combat().unwrap();
     assert_eq!(combat.enemies.len(), 3);
     assert_eq!(combat.hits[..2], [0, 0]);
-    assert!(combat.enemy_power_snapshot[..2].iter().all(Vec::is_empty));
+    let recorded = combat.plays[0].recorded.iter().map(|(actor, _)| *actor);
+    assert!(recorded.eq([Actor::Enemy(2)]));
     assert_eq!(
         content.enemies[combat.enemies[0].creature.id as usize].id,
         "MONSTER.SNEAKY_GREMLIN"
@@ -1400,7 +1457,6 @@ fn stock_reuses_dead_slots_and_wrigglers_append() {
     let combat = game.combat_mut().unwrap();
     combat.enemies = vec![template.clone(), template];
     combat.hits = vec![9, 8];
-    combat.enemy_power_snapshot = vec![vec![], vec![]];
     combat.enemies[0].creature.hp = 1;
     combat.enemies[0].creature.powers.clear();
     combat.enemies[0].creature.add_power(power_id::STOCK, 2);
@@ -1907,7 +1963,14 @@ fn monarchs_gaze_restores_strength_after_enemy_turn() {
         ..Card::default()
     }];
     combat.energy = 3;
-    combat.player.add_power(power_id::MONARCHS_GAZE, 1);
+    combat.player.add_power(
+        content
+            .powers
+            .iter()
+            .position(|power| power.id == "POWER.MONARCHS_GAZE_POWER")
+            .unwrap() as Id,
+        1,
+    );
     combat.enemies[0].creature.hp = 100;
     combat.enemies[0].creature.max_hp = 100;
 
@@ -2237,7 +2300,6 @@ fn channel_slots_resolves_each_overflow_before_the_next() {
         let combat = game.combat_mut().unwrap();
         combat.enemies.truncate(1);
         combat.hits.truncate(1);
-        combat.enemy_power_snapshot.truncate(1);
         combat.enemies[0].creature.hp = hp;
         combat.enemies[0].creature.max_hp = 1_000;
         combat.enemies[0].creature.powers.clear();
@@ -2986,7 +3048,14 @@ fn reaper_form_counts_blocked_damage() {
     combat.enemies[0].creature.hp = 100;
     combat.enemies[0].creature.block = 10;
     combat.enemies[0].creature.powers.clear();
-    combat.player.add_power(power_id::REAPER_FORM, 1);
+    combat.player.add_power(
+        content
+            .powers
+            .iter()
+            .position(|power| power.id == "POWER.REAPER_FORM_POWER")
+            .unwrap() as Id,
+        1,
+    );
     combat.hand = vec![Card {
         id: content.card_id("CARD.STRIKE_IRONCLAD").unwrap(),
         ..Card::default()
@@ -3386,7 +3455,7 @@ fn exhaust_with_feel_no_pain_and_forgotten_soul(relic_at_start: bool) -> Game {
     let combat = game.combat_mut().unwrap();
     combat.queue.clear();
     combat.player.add_power(feel_no_pain, 3);
-    game.trigger(&content, Trigger::CardExhausted, Actor::Player, 1);
+    game.trigger(&content, Trigger::AfterCardExhausted, Actor::Player, 1);
     game
 }
 
@@ -3414,6 +3483,51 @@ fn powers_hear_a_pass_before_relics() {
 }
 
 #[test]
+fn a_played_card_has_one_pass_in_listener_order() {
+    // AfterCardPlayed runs a listener's typed hooks (Rage on an attack) with its any-card ones
+    // (Afterimage): the player's powers in power order, the relics, then the enemies.
+    let content = foundation_content();
+    let shiv = content.card_id("CARD.SHIV").unwrap();
+    let slow = content
+        .powers
+        .iter()
+        .position(|x| x.id == "POWER.SLOW_POWER")
+        .unwrap() as Id;
+    let mut powers = ["POWER.RAGE_POWER", "POWER.AFTERIMAGE_POWER"];
+    for _ in 0..2 {
+        let mut game = turn_start_test(&content, 0, &powers, &["RELIC.HELICAL_DART"]);
+        let combat = game.combat_mut().unwrap();
+        combat.queue.clear();
+        let player = combat.player.powers.clone();
+        let enemy = &mut combat.enemies[0].creature;
+        enemy.powers.clear();
+        enemy.add_power(slow, 1);
+        let card = Card {
+            id: shiv,
+            ..Card::default()
+        };
+        let recorded = player.iter().map(|&x| (Actor::Player, x)).collect();
+        game.card_played(&content, card, recorded);
+        let order: Vec<_> = (game.combat().unwrap().queue.iter().rev())
+            .filter_map(|x| match x.effect {
+                Effect::Listen(Trigger::AttackPlayed, listener) => Some(listener),
+                _ => None,
+            })
+            .collect();
+        assert!(matches!(
+            order[..],
+            [
+                Listener::Power(Actor::Player, first),
+                Listener::Power(Actor::Player, second),
+                Listener::Relic(0),
+                Listener::Power(Actor::Enemy(0), _),
+            ] if [first.id, second.id] == [player[0].id, player[1].id]
+        ));
+        powers.reverse();
+    }
+}
+
+#[test]
 fn guarded_passes_do_not_start_once_the_combat_is_over() {
     // Hook.IterateCombatHookListeners yields nothing once the combat is over or ending.
     let content = foundation_content();
@@ -3423,7 +3537,7 @@ fn guarded_passes_do_not_start_once_the_combat_is_over() {
     for enemy in &mut combat.enemies {
         enemy.creature.hp = 0;
     }
-    game.trigger(&content, Trigger::CardExhausted, Actor::Player, 1);
+    game.trigger(&content, Trigger::AfterCardExhausted, Actor::Player, 1);
     assert!(game.combat().unwrap().queue.is_empty());
 }
 
@@ -3504,7 +3618,8 @@ fn bone_tea_upgrades_the_hand_gambling_chip_redrew() {
 
 #[test]
 fn turn_listeners_match_the_game() {
-    // Every sim listener of a combat-start or turn pass overrides that hook in the game.
+    // Every sim listener of a combat-start, turn, card, damage or death pass overrides that hook
+    // in the game.
     let Ok(game) = std::fs::read_to_string("target/hunt/hook-listeners.txt") else {
         return;
     };
@@ -3512,7 +3627,7 @@ fn turn_listeners_match_the_game() {
     let title = |word: &str| word[..1].to_owned() + &word[1..].to_lowercase();
     let class = |id: &str| {
         let (kind, name) = id.split_once('.').unwrap();
-        let name: String = name.split('_').map(title).collect();
+        let name: String = name.replace("_S_", "S_").split('_').map(title).collect();
         format!("{}s.{name}", title(kind))
     };
     let passes = (combat::hooks::PLAYER_TURN.iter())
@@ -3522,13 +3637,31 @@ fn turn_listeners_match_the_game() {
             Effect::Fire(trigger) => Some(*trigger),
             _ => None,
         });
-    let combat_start = [
+    let others = [
         Trigger::AfterRoomEntered,
         Trigger::BeforeCombatStart,
         Trigger::BeforeCombatStartLate,
+        Trigger::AfterCardDrawn,
+        Trigger::AfterCardExhausted,
+        Trigger::AfterCardGeneratedForCombat,
+        Trigger::AfterShuffle,
+        Trigger::AfterPotionUsed,
+        Trigger::BeforeCardPlayed,
+        Trigger::AfterCardPlayed,
+        Trigger::AttackPlayed,
+        Trigger::SkillPlayed,
+        Trigger::PowerPlayed,
+        Trigger::AfterBlockGained,
+        Trigger::AfterDamageGiven,
+        Trigger::AfterDamageReceived,
+        Trigger::AfterDeath,
+        Trigger::AfterCombatVictory,
     ];
-    for trigger in combat_start.into_iter().chain(passes) {
+    for trigger in others.into_iter().chain(passes) {
         let hook = match trigger {
+            Trigger::AttackPlayed | Trigger::SkillPlayed | Trigger::PowerPlayed => {
+                "\tAfterCardPlayed:".to_owned()
+            }
             Trigger::AutoPrePlay => "\tAfterAutoPrePlayPhaseEntered:".to_owned(),
             Trigger::AutoPrePlayLate => "\tAfterAutoPrePlayPhaseEnteredLate:".to_owned(),
             _ => format!("\t{trigger:?}:"),
@@ -3536,7 +3669,8 @@ fn turn_listeners_match_the_game() {
         let line = game.lines().find(|line| line.contains(&hook)).unwrap();
         let listeners: Vec<_> = line.split(' ').skip(1).collect();
         let defs = (content.relics.iter().map(|x| (x.id, x.hooks)))
-            .chain(content.powers.iter().map(|x| (x.id, x.hooks)));
+            .chain(content.powers.iter().map(|x| (x.id, x.hooks)))
+            .chain(content.cards.iter().map(|x| (x.id, x.hooks)));
         for (id, hooks) in defs {
             // A power the game keeps inside another model has no class; a subclass inherits.
             let class = class(id);
@@ -3881,4 +4015,292 @@ fn joss_paper_counts_ethereal_exhausts_after_the_flush() {
     game.step(&content, Action::EndTurn).unwrap();
     assert_eq!((game.joss_paper, game.joss_paper_ethereal), (0, 0));
     assert_eq!(game.combat().unwrap().hand.len(), 6);
+}
+
+#[test]
+fn exhaust_listeners_resolve_in_listener_order() {
+    // AfterCardExhausted: Dark Embrace (a power) draws first, then Joss Paper's draw and Burning
+    // Sticks' copy in relic order.
+    let content = foundation_content();
+    let id = |card| content.card_id(card).unwrap();
+    let card = |card| Card {
+        id: id(card),
+        ..Card::default()
+    };
+    let mut relics = ["RELIC.JOSS_PAPER", "RELIC.BURNING_STICKS"];
+    for _ in 0..2 {
+        let mut game = turn_start_test(&content, 0, &["POWER.DARK_EMBRACE_POWER"], &relics);
+        game.joss_paper = 4;
+        let combat = game.combat_mut().unwrap();
+        combat.draw = vec![card("CARD.BASH"), card("CARD.ANGER")];
+        combat.hand = vec![card("CARD.DEFEND_IRONCLAD")];
+        combat.queue = vec![Pending {
+            effect: Effect::RandomCardOp(
+                Pile::Hand,
+                CardFilter::Any,
+                CardOp::Move(Pile::Exhaust),
+                Amount::fixed(1, 1),
+            ),
+            context: Context::player(),
+        }];
+        game.resolve(&content);
+        let hand: Vec<_> = (game.combat().unwrap().hand.iter())
+            .map(|card| content.cards[card.id as usize].id)
+            .collect();
+        let expected = if relics[0] == "RELIC.JOSS_PAPER" {
+            ["CARD.ANGER", "CARD.BASH", "CARD.DEFEND_IRONCLAD"]
+        } else {
+            ["CARD.ANGER", "CARD.DEFEND_IRONCLAD", "CARD.BASH"]
+        };
+        assert_eq!(hand, expected, "{relics:?}");
+        relics.reverse();
+    }
+}
+
+#[test]
+fn potion_relics_resolve_in_relic_order() {
+    // AfterPotionUsed: Belt Buckle and Reptile Trinket in relic order, once the potion is done.
+    let content = foundation_content();
+    let mut relics = ["RELIC.BELT_BUCKLE", "RELIC.REPTILE_TRINKET"];
+    for _ in 0..2 {
+        let mut game = turn_start_test(&content, 0, &[], &relics);
+        game.run.potions = vec![content.potion_id("POTION.BLOCK_POTION"), None, None];
+        game.combat_mut().unwrap().queue.clear();
+        game.use_potion(&content, 0, None);
+        game.resolve(&content);
+        let combat = game.combat().unwrap();
+        assert!(combat.player.block > 0);
+        let powers: Vec<_> = (combat.player.powers.iter())
+            .map(|power| power.id)
+            .filter(|&id| id == power_id::DEXTERITY || id == power_id::STRENGTH)
+            .collect();
+        let expected = if relics[0] == "RELIC.BELT_BUCKLE" {
+            [power_id::DEXTERITY, power_id::STRENGTH]
+        } else {
+            [power_id::STRENGTH, power_id::DEXTERITY]
+        };
+        assert_eq!(powers, expected, "{relics:?}");
+        relics.reverse();
+    }
+}
+
+#[test]
+fn belt_buckle_checks_the_potions_once_the_potion_is_done() {
+    // BeltBuckle.AfterPotionUsed (BeltBuckle.cs:84): Entropic Brew refilled the slots first.
+    let content = foundation_content();
+    for (potion, dexterity) in [("POTION.BLOCK_POTION", 2), ("POTION.ENTROPIC_BREW", 0)] {
+        let mut game = turn_start_test(&content, 0, &[], &["RELIC.BELT_BUCKLE"]);
+        game.run.potions = vec![content.potion_id(potion), None, None];
+        game.combat_mut().unwrap().queue.clear();
+        game.use_potion(&content, 0, None);
+        game.resolve(&content);
+        let player = &game.combat().unwrap().player;
+        assert_eq!(player.power(power_id::DEXTERITY), dexterity, "{potion}");
+    }
+}
+
+#[test]
+fn gremlin_horn_draws_while_a_dying_enemy_spawns() {
+    // Infested stops the combat from ending (ShouldStopCombatFromEnding), so Gremlin Horn, a relic
+    // and so an earlier AfterDeath listener than the dying enemy's Infested, still draws.
+    let content = foundation_content();
+    let mut game = turn_start_test(&content, 0, &[], &["RELIC.GREMLIN_HORN"]);
+    let infested = content
+        .powers
+        .iter()
+        .position(|power| power.id == "POWER.INFESTED_POWER");
+    let combat = game.combat_mut().unwrap();
+    combat.enemies.truncate(1);
+    combat.enemies[0].creature.powers = vec![];
+    combat.enemies[0]
+        .creature
+        .add_power(infested.unwrap() as Id, 4);
+    combat.draw = vec![Card {
+        id: content.card_id("CARD.BASH").unwrap(),
+        ..Card::default()
+    }];
+    game.kill_actor(&content, Actor::Enemy(0));
+    let combat = game.combat().unwrap();
+    assert_eq!((combat.hand.len(), combat.enemies.len()), (1, 5));
+}
+
+#[test]
+fn a_killing_hit_skips_after_damage_received() {
+    // CreatureCmd.Damage runs AfterDamageReceived only for a target the hit didn't kill, so Demon
+    // Tongue heals a survivor but not a player at 0 HP.
+    let content = foundation_content();
+    for (hp, healed) in [(20, 20), (5, 0)] {
+        let mut game = turn_start_test(&content, 0, &[], &["RELIC.DEMON_TONGUE"]);
+        let combat = game.combat_mut().unwrap();
+        combat.player.hp = hp;
+        combat.queue = vec![Pending {
+            effect: Effect::LoseHp(Target::Player, Amount::fixed(10, 10)),
+            context: Context::player(),
+        }];
+        game.resolve(&content);
+        assert_eq!(game.combat().unwrap().player.hp.max(0), healed);
+    }
+}
+
+#[test]
+fn an_area_hit_lands_on_every_target_before_its_hooks() {
+    // One damage command hits every target, then runs each hit's hooks (AfterDamageGiven):
+    // Envenom poisons every enemy the area attack hit.
+    let content = foundation_content();
+    let envenom = content
+        .powers
+        .iter()
+        .position(|power| power.id == "POWER.ENVENOM_POWER");
+    let mut game = turn_start_test(&content, 1, &[], &[]);
+    let template = game.combat().unwrap().enemies[0].clone();
+    let combat = game.combat_mut().unwrap();
+    combat.enemies = vec![template.clone(), template];
+    combat.hits = vec![0, 0];
+    for enemy in &mut combat.enemies {
+        enemy.creature.powers.clear();
+        enemy.creature.hp = 30;
+        enemy.creature.block = 0;
+    }
+    combat.player.add_power(envenom.unwrap() as Id, 2);
+    combat.queue = vec![Pending {
+        effect: Effect::Attack(Target::AllEnemies, Amount::fixed(5, 5), 1),
+        context: Context::player(),
+    }];
+    game.resolve(&content);
+    for enemy in &game.combat().unwrap().enemies {
+        assert_eq!(
+            (enemy.creature.hp, enemy.creature.power(power_id::POISON)),
+            (25, 2)
+        );
+    }
+}
+
+#[test]
+fn auto_plays_and_manual_plays_share_the_per_play_steps() {
+    // One OnPlayWrapper: Maul grows after each play of a Duplication series either way.
+    let content = foundation_content();
+    let maul = content.card_id("CARD.MAUL").unwrap();
+    let duplication = content
+        .powers
+        .iter()
+        .position(|power| power.id == "POWER.DUPLICATION_POWER");
+    let outcomes = [true, false].map(|manual| {
+        let mut game = turn_start_test(&content, 0, &[], &[]);
+        let combat = game.combat_mut().unwrap();
+        combat.queue.clear();
+        combat.energy = 9;
+        combat.player.add_power(duplication.unwrap() as Id, 1);
+        combat.enemies.truncate(1);
+        combat.enemies[0].creature.hp = 999;
+        combat.enemies[0].creature.powers.clear();
+        let card = Card {
+            id: maul,
+            instance: 99,
+            ..Card::default()
+        };
+        if manual {
+            combat.hand = vec![card];
+            game.step(
+                &content,
+                Action::Play {
+                    hand: 0,
+                    target: Some(0),
+                },
+            )
+            .unwrap();
+        } else {
+            combat.queue.push(Pending {
+                effect: Effect::AutoPlay(card),
+                context: Context {
+                    target: Some(0),
+                    ..Context::card(card)
+                },
+            });
+            game.resolve(&content);
+        }
+        let combat = game.combat().unwrap();
+        (combat.enemies[0].creature.hp, combat.discard[0].value)
+    });
+    assert_eq!(outcomes[0], outcomes[1]);
+    assert_eq!(outcomes[0].1, 2);
+}
+
+#[test]
+fn danse_macabre_reads_the_cost_after_earlier_listeners() {
+    // A Veilpiercer listed before Danse Macabre spends itself first, so the Ethereal Bash costs 2
+    // again when Danse Macabre reads it; listed after, it still costs 0.
+    let content = foundation_content();
+    let mut powers = ["POWER.VEILPIERCER_POWER", "POWER.DANSE_MACABRE_POWER"];
+    for block in [1, 0] {
+        let mut game = turn_start_test(&content, 0, &powers, &[]);
+        let combat = game.combat_mut().unwrap();
+        combat.queue.clear();
+        combat.energy = 3;
+        combat.player.block = 0;
+        combat.hand = vec![Card {
+            id: content.card_id("CARD.BASH").unwrap(),
+            flags: ETHEREAL,
+            ..Card::default()
+        }];
+        let target = Some(0);
+        game.step(&content, Action::Play { hand: 0, target })
+            .unwrap();
+        let combat = game.combat().unwrap();
+        assert_eq!((combat.player.block, combat.energy), (block, 3));
+        powers.reverse();
+    }
+}
+
+#[test]
+fn razor_tooth_music_box_and_juggling_read_the_card_in_listener_order() {
+    // Juggling (a power) clones the third attack before Razor Tooth upgrades it; Music Box's copy
+    // is upgraded only when Razor Tooth comes first in relic order.
+    let content = foundation_content();
+    let mut relics = ["RELIC.RAZOR_TOOTH", "RELIC.MUSIC_BOX"];
+    for upgrades in [1, 0] {
+        let mut game = turn_start_test(&content, 0, &["POWER.JUGGLING_POWER"], &relics);
+        let combat = game.combat_mut().unwrap();
+        combat.queue.clear();
+        combat.energy = 3;
+        combat.history.attacks = 2;
+        combat.hand = vec![Card {
+            id: content.card_id("CARD.STRIKE_IRONCLAD").unwrap(),
+            ..Card::default()
+        }];
+        let target = Some(0);
+        game.step(&content, Action::Play { hand: 0, target })
+            .unwrap();
+        let combat = game.combat().unwrap();
+        let hand: Vec<_> = combat
+            .hand
+            .iter()
+            .map(|x| (x.upgrades, x.flags & ETHEREAL))
+            .collect();
+        assert_eq!(hand, [(0, 0), (upgrades, ETHEREAL)]);
+        assert_eq!(combat.discard[0].upgrades, 1);
+        relics.reverse();
+    }
+}
+
+#[test]
+fn storm_hears_only_the_plays_it_recorded() {
+    // Storm records each power play in BeforeCardPlayed: its own card's play doesn't channel,
+    // the next power card's does.
+    let content = foundation_content();
+    let mut game = turn_start_test(&content, 1, &[], &[]);
+    let combat = game.combat_mut().unwrap();
+    combat.queue.clear();
+    combat.energy = 9;
+    combat.hand = ["CARD.STORM", "CARD.DEFRAGMENT"]
+        .map(|id| Card {
+            id: content.card_id(id).unwrap(),
+            ..Card::default()
+        })
+        .to_vec();
+    for orbs in [0, 1] {
+        let target = None;
+        game.step(&content, Action::Play { hand: 0, target })
+            .unwrap();
+        assert_eq!(game.combat().unwrap().orbs.len(), orbs);
+    }
 }

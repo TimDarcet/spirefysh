@@ -5,26 +5,18 @@ macro_rules! effects {
 }
 
 const FEEL_NO_PAIN_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::CardExhausted,
+    trigger: Trigger::AfterCardExhausted,
     effects: effects![Effect::RawBlock(
         Target::Source,
         Amount::scaled(Scale::Power(10), 1),
     )],
 }];
 const DARK_EMBRACE_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::CardExhausted,
+    trigger: Trigger::AfterCardExhausted,
     effects: effects![Effect::DrawAmount(Amount::scaled(Scale::Power(11), 1))],
 }];
-const RUPTURE_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::HpLost,
-    effects: effects![Effect::ApplyPower(
-        Target::Source,
-        0,
-        Amount::scaled(Scale::Power(12), 1),
-    )],
-}];
 const JUGGERNAUT_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::BlockGained,
+    trigger: Trigger::AfterBlockGained,
     effects: effects![Effect::Damage(
         Target::RandomEnemy,
         Amount::scaled(Scale::Power(13), 1),
@@ -71,7 +63,7 @@ const TERRITORIAL_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const SLOW_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::CardPlayed,
+    trigger: Trigger::AfterCardPlayed,
     effects: effects![Effect::ApplyPower(
         Target::Source,
         power_id::SLOW,
@@ -116,11 +108,11 @@ const GENESIS_HOOKS: &[Hook] = &[Hook {
     effects: effects![Effect::Stars(Amount::scaled(Scale::Power(75), 1))],
 }];
 const KINGLY_PUNCH_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::CardDrawn,
+    trigger: Trigger::AfterCardDrawn,
     effects: effects![Effect::GrowDrawn(Amount::fixed(4, 6))],
 }];
 const MONOLOGUE_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::CardPlayed,
+    trigger: Trigger::AfterCardPlayed,
     effects: effects![
         Effect::ApplyPower(Target::Player, 0, Amount::scaled(Scale::Event, 1)),
         Effect::ApplyPower(Target::Player, 78, Amount::scaled(Scale::Event, 1)),
@@ -152,7 +144,7 @@ const PLATING_HOOKS: &[Hook] = &[
     },
 ];
 const PILLAR_OF_CREATION_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::CardGenerated,
+    trigger: Trigger::AfterCardGeneratedForCombat,
     effects: effects![Effect::RawBlock(
         Target::Source,
         Amount::scaled(Scale::Event, 1),
@@ -183,7 +175,7 @@ const CALL_OF_THE_VOID_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const DEVOUR_LIFE_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::CardPlayed,
+    trigger: Trigger::AfterCardPlayed,
     effects: effects![Effect::If(
         Condition::Card(368),
         &[Effect::Summon(Amount::scaled(Scale::Power(102), 1))],
@@ -199,7 +191,7 @@ const ENFEEBLING_TOUCH_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const HAUNT_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::CardPlayed,
+    trigger: Trigger::AfterCardPlayed,
     effects: effects![Effect::If(
         Condition::Card(368),
         &[Effect::LoseHp(
@@ -222,7 +214,7 @@ const NEUROSURGE_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const OBLIVION_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::CardPlayed,
+    trigger: Trigger::AfterCardPlayed,
     effects: effects![Effect::ApplyPower(
         Target::Source,
         94,
@@ -353,14 +345,14 @@ const SHACKLING_POTION_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const AFTERIMAGE_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::CardPlayed,
+    trigger: Trigger::AfterCardPlayed,
     effects: effects![Effect::RawBlock(
         Target::Source,
         Amount::scaled(Scale::Event, 1)
     )],
 }];
 const CORROSIVE_WAVE_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::CardDrawn,
+    trigger: Trigger::AfterCardDrawn,
     effects: effects![Effect::ApplyPower(
         Target::AllEnemies,
         7,
@@ -368,7 +360,7 @@ const CORROSIVE_WAVE_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const SERPENT_FORM_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::CardPlayed,
+    trigger: Trigger::AfterCardPlayed,
     effects: effects![Effect::Damage(
         Target::RandomEnemy,
         Amount::scaled(Scale::Event, 1),
@@ -407,14 +399,14 @@ const REPTILE_TRINKET_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const STRANGLE_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::CardPlayed,
+    trigger: Trigger::AfterCardPlayed,
     effects: effects![Effect::LoseHp(
         Target::Source,
         Amount::scaled(Scale::Event, 1)
     )],
 }];
 const SPEEDSTER_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::CardDrawn,
+    trigger: Trigger::AfterCardDrawn,
     effects: effects![Effect::Damage(
         Target::AllEnemies,
         Amount::scaled(Scale::Event, 1),
@@ -459,7 +451,7 @@ const PREP_TIME_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const STRATAGEM_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::Shuffle,
+    trigger: Trigger::AfterShuffle,
     effects: effects![Effect::SelectAmount(
         Pile::Draw,
         CardFilter::Any,
@@ -505,7 +497,7 @@ const SUBROUTINE_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const ITERATION_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::CardDrawn,
+    trigger: Trigger::AfterCardDrawn,
     effects: effects![Effect::If(
         Condition::CardType(CardType::Status),
         &[Effect::DrawAmount(Amount::scaled(Scale::Event, 1))],
@@ -513,7 +505,7 @@ const ITERATION_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const SMOKESTACK_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::CardGenerated,
+    trigger: Trigger::AfterCardGeneratedForCombat,
     effects: effects![Effect::If(
         Condition::CardType(CardType::Status),
         &[Effect::Damage(
@@ -531,7 +523,7 @@ const CREATIVE_AI_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const TRASH_TO_TREASURE_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::CardGenerated,
+    trigger: Trigger::AfterCardGeneratedForCombat,
     effects: effects![Effect::If(
         Condition::CardType(CardType::Status),
         &[Effect::Repeat(
@@ -542,7 +534,7 @@ const TRASH_TO_TREASURE_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const ARSENAL_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::CardGenerated,
+    trigger: Trigger::AfterCardGeneratedForCombat,
     effects: effects![Effect::ApplyPower(
         Target::Player,
         0,
@@ -681,7 +673,7 @@ const RED_MASK_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const BLACK_BLOOD_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::Victory,
+    trigger: Trigger::AfterCombatVictory,
     effects: &[Effect::Heal(Target::Player, Amount::fixed(12, 12))],
 }];
 const CLOAK_CLASP_HOOKS: &[Hook] = &[Hook {
@@ -749,20 +741,20 @@ const DECAY_HOOKS: &[Hook] = &[Hook {
     effects: effects![Effect::Damage(Target::Player, Amount::fixed(2, 2))],
 }];
 const VOID_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::CardDrawn,
+    trigger: Trigger::AfterCardDrawn,
     effects: effects![Effect::Energy(-1)],
 }];
 const EMPTY_HOOKS: &[Hook] = &[];
 const BURNING_BLOOD_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::Victory,
+    trigger: Trigger::AfterCombatVictory,
     effects: effects![Effect::Heal(Target::Player, Amount::fixed(6, 6))],
 }];
 const CHARONS_ASHES_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::CardExhausted,
+    trigger: Trigger::AfterCardExhausted,
     effects: effects![Effect::Damage(Target::AllEnemies, Amount::fixed(3, 3),)],
 }];
 const ABACUS_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::Shuffle,
+    trigger: Trigger::AfterShuffle,
     effects: effects![Effect::RawBlock(Target::Player, Amount::fixed(6, 6))],
 }];
 const TWISTED_FUNNEL_HOOKS: &[Hook] = &[Hook {
@@ -778,11 +770,11 @@ const TWISTED_FUNNEL_HOOKS: &[Hook] = &[Hook {
     )],
 }];
 const FORGOTTEN_SOUL_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::CardExhausted,
+    trigger: Trigger::AfterCardExhausted,
     effects: effects![Effect::Damage(Target::RandomEnemy, Amount::fixed(1, 1),)],
 }];
 const REGALITE_HOOKS: &[Hook] = &[Hook {
-    trigger: Trigger::CardGenerated,
+    trigger: Trigger::AfterCardGeneratedForCombat,
     effects: effects![Effect::RawBlock(Target::Player, Amount::fixed(2, 2))],
 }];
 const SANDPIT_HOOKS: &[Hook] = &[Hook {
@@ -11956,7 +11948,7 @@ pub fn foundation_content() -> Content {
                 id: "POWER.RUPTURE_POWER",
                 kind: PowerKind::Other,
                 debuff: false,
-                hooks: RUPTURE_HOOKS,
+                hooks: EMPTY_HOOKS,
             },
             PowerDef {
                 id: "POWER.JUGGERNAUT_POWER",

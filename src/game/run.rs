@@ -619,8 +619,7 @@ impl Game {
                 .map(|(id, amount)| Power {
                     id,
                     amount,
-                    skip_next_decay: false,
-                    value: 0,
+                    ..Power::default()
                 })
                 .collect();
             enemies.push(Enemy {
@@ -786,27 +785,15 @@ impl Game {
             orbs_channeled: 0,
             poisoned: 0,
             nightmares: vec![],
-            bombs: vec![],
-            automation: vec![],
-            panache: vec![],
-            boulders: vec![],
             dampened: vec![],
             paels_tears: false,
             orichalcum: false,
-            playing: None,
-            auto_plays: vec![],
+            plays: vec![],
             queue: vec![],
             choice: None,
-            power_snapshot: vec![],
-            enemy_power_snapshot: vec![],
             rebounds: vec![],
             ferals: vec![],
-            card_energy: 0,
-            card_stars: 0,
-            card_plays: 1,
-            pending_plays: vec![],
-            dying: None,
-            envenomed: Vec::new(),
+            pending_hits: None,
             force_end: false,
             enemy_turn: false,
             centennial_puzzle: false,
@@ -816,8 +803,7 @@ impl Game {
             music_box: false,
             music_box_card: None,
             swift_after_return: 0,
-            juggled: vec![],
-            music_box_copy: None,
+
             mini_regent: false,
             rainbow_ring: false,
             attacks_mod3: 0,
@@ -831,7 +817,6 @@ impl Game {
             unsettling_used: false,
             applying_hook: false,
             belt_buckle: false,
-            exhaust_queue: None,
             burning_sticks: false,
             red_skull: false,
             throwing_axe: false,
@@ -869,16 +854,8 @@ impl Game {
             }
         }
         self.start_turn();
-        for trigger in [
-            Trigger::BeforeCombatStartLate,
-            Trigger::BeforeCombatStart,
-            Trigger::AfterRoomEntered,
-        ] {
-            self.combat_mut().unwrap().queue.push(Pending {
-                effect: Effect::Fire(trigger),
-                context: Context::player(),
-            });
-        }
+        let queue = &mut self.combat_mut().unwrap().queue;
+        push_effects(queue, combat::hooks::COMBAT_START, Context::player());
         self.resolve(content);
         Ok(())
     }
@@ -966,31 +943,8 @@ impl Game {
         }
         let mut actions = Vec::new();
         for hand in self.playable_cards(content) {
-            let card = &combat.hand[hand];
-            let def = &content.cards[card.id as usize];
-            let target_type = if card.id == card_id::SOVEREIGN_BLADE
-                && combat.player.power(power_id::SEEKING_EDGE) > 0
-                || def.id == "CARD.SHIV" && combat.player.power(power_id::FAN_OF_KNIVES) > 0
-            {
-                Target::AllEnemies
-            } else {
-                card.target(*def)
-            };
-            if target_type == Target::ChosenEnemy {
-                actions.extend(
-                    combat
-                        .enemies
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, x)| x.creature.hp > 0)
-                        .map(|(target, _)| Action::Play {
-                            hand,
-                            target: Some(target),
-                        }),
-                );
-            } else {
-                actions.push(Action::Play { hand, target: None });
-            }
+            let targets = self.play_targets(content, hand).into_iter();
+            actions.extend(targets.map(|target| Action::Play { hand, target }));
         }
         for (slot, potion) in self.run.potions.iter().enumerate() {
             let Some(id) = potion else { continue };
@@ -1021,6 +975,22 @@ impl Game {
         actions
     }
 
+    /// The targets a hand card can be played at: each hittable enemy, or none.
+    pub(crate) fn play_targets(&self, content: &Content, hand: usize) -> Vec<Option<usize>> {
+        let combat = self.combat().unwrap();
+        let card = combat.hand[hand];
+        let def = content.cards[card.id as usize];
+        let all = card.id == card_id::SOVEREIGN_BLADE
+            && combat.player.power(power_id::SEEKING_EDGE) > 0
+            || def.id == "CARD.SHIV" && combat.player.power(power_id::FAN_OF_KNIVES) > 0;
+        if all || card.target(def) != Target::ChosenEnemy {
+            return vec![None];
+        }
+        let enemies = combat.enemies.iter().enumerate();
+        let alive = enemies.filter(|(_, enemy)| enemy.creature.hp > 0);
+        alive.map(|(target, _)| Some(target)).collect()
+    }
+
     pub fn step(&mut self, content: &Content, action: Action) -> Result<(), Error> {
         let hidden_event_choice = matches!(self.phase, Phase::Event(..))
             && matches!(action, Action::EventRelic(..) | Action::EventCard(..));
@@ -1028,7 +998,7 @@ impl Game {
             return Err(Error::InvalidAction);
         }
         match action {
-            Action::Play { hand, target } => self.play(content, hand, target),
+            Action::Play { hand, target } => self.play(content, hand, target, true),
             Action::Potion { slot, target } => self.use_potion(content, slot, target),
             Action::DiscardPotion(slot) => {
                 self.run.potions[slot] = self.pending_potion.take();
@@ -1077,8 +1047,6 @@ impl Game {
         }
         self.finish_empty_run_choices(content);
         if self.combat().is_some() {
-            self.resolve(content);
-            self.finish_play(content);
             self.resolve(content);
             if self.combat().is_some_and(|combat| {
                 combat.force_end && combat.choice.is_none() && combat.queue.is_empty()

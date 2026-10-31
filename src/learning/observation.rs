@@ -1587,8 +1587,7 @@ impl CardPreview {
                 .iter()
                 .chain(&combat.hand)
                 .chain(&combat.discard)
-                .chain(combat.playing.iter())
-                .chain(combat.auto_plays.iter().map(|play| &play.card))
+                .chain(combat.plays.iter().map(|play| &play.card))
                 .any(|card| card.id == card_id::SOVEREIGN_BLADE),
             ..Self::default()
         }
@@ -1688,10 +1687,9 @@ fn preview_block(
         .card
         .and_then(|id| {
             combat
-                .auto_plays
+                .plays
                 .last()
                 .map(|play| play.card)
-                .or(combat.playing)
                 .filter(|card| card.id == id)
         })
         .map_or(0, |card| match card.enchantment {
@@ -1737,7 +1735,7 @@ fn preview_gain_block(
             preview_hooks(
                 game,
                 content,
-                Trigger::BlockGained,
+                Trigger::AfterBlockGained,
                 Actor::Player,
                 Context::player(),
                 &powers,
@@ -1803,10 +1801,9 @@ fn push_preview_hit(
     }
     let card = game.combat().and_then(|combat| {
         combat
-            .auto_plays
+            .plays
             .last()
             .map(|play| play.card)
-            .or(combat.playing)
             .filter(|card| Some(card.id) == context.card)
     });
     let player_attack = matches!(damage, PreviewDamage::Attack(Actor::Player));
@@ -1905,7 +1902,7 @@ fn preview_draw_count(
         preview_hooks(
             game,
             content,
-            Trigger::CardDrawn,
+            Trigger::AfterCardDrawn,
             Actor::Player,
             context,
             &powers,
@@ -1915,7 +1912,7 @@ fn preview_draw_count(
             for hook in content.cards[card.id as usize]
                 .hooks
                 .iter()
-                .filter(|hook| hook.trigger == Trigger::CardDrawn)
+                .filter(|hook| hook.trigger == Trigger::AfterCardDrawn)
             {
                 preview_effects(game, content, context, hook.effects, 1, preview);
             }
@@ -1933,7 +1930,7 @@ fn preview_exhaust(game: &Game, content: &Content, count: i16, preview: &mut Car
         preview_hooks(
             game,
             content,
-            Trigger::CardExhausted,
+            Trigger::AfterCardExhausted,
             Actor::Player,
             Context::player(),
             &powers,
@@ -2165,7 +2162,7 @@ fn preview_generated(
         preview_hooks(
             game,
             content,
-            Trigger::CardGenerated,
+            Trigger::AfterCardGeneratedForCombat,
             Actor::Player,
             context,
             &powers,
@@ -3055,7 +3052,7 @@ fn preview_hooks(
     for power in powers {
         if matches!(
             trigger,
-            Trigger::PowerPlayed | Trigger::CardDrawn | Trigger::CardGenerated
+            Trigger::PowerPlayed | Trigger::AfterCardDrawn | Trigger::AfterCardGeneratedForCombat
         ) || matches!(
             power.id,
             power_id::STRANGLE | power_id::SERPENT_FORM | power_id::AFTERIMAGE
@@ -3167,7 +3164,16 @@ fn played_card_preview(
     if let Some(index) = combat.hand.iter().position(|&candidate| candidate == card) {
         combat.hand.remove(index);
     }
-    combat.playing = Some(card);
+    combat.plays.push(Play {
+        card,
+        plays: 1,
+        done: 0,
+        energy: 0,
+        stars: 0,
+        manual: true,
+        context: Context::card(card),
+        recorded: vec![],
+    });
     let void_free = combat.history.manual_cards < combat.player.power(power_id::VOID_FORM);
     let free = match card_type {
         _ if void_free => None,
@@ -3242,9 +3248,8 @@ fn played_card_preview(
     {
         combat.player.consume_power(power);
     }
-    combat.card_energy = cost;
-    combat.card_stars = stars;
-    combat.card_plays = plays;
+    let play = combat.plays.last_mut().unwrap();
+    (play.energy, play.stars, play.plays) = (cost, stars, plays);
     combat.history.energy += cost;
     combat.history.cards += plays as i16;
     combat.history.manual_cards += 1;
@@ -3257,7 +3262,7 @@ fn played_card_preview(
     }
     if card.enchantment == Some(Enchantment::Sown) && card.enchantment_value > 0 {
         combat.energy = combat.energy.saturating_add(card.enchantment_amount);
-        combat.playing.as_mut().unwrap().enchantment_value = 0;
+        combat.plays.last_mut().unwrap().card.enchantment_value = 0;
     }
     let pen_nib = card_type == CardType::Attack && relic("RELIC.PEN_NIB");
     let mut counter = game.pen_nib;
@@ -3421,7 +3426,7 @@ fn played_card_preview(
         CardType::Attack => Trigger::AttackPlayed,
         CardType::Skill => Trigger::SkillPlayed,
         CardType::Power => Trigger::PowerPlayed,
-        _ => Trigger::CardPlayed,
+        _ => Trigger::AfterCardPlayed,
     };
     let context = Context {
         event: 1,
@@ -3432,7 +3437,7 @@ fn played_card_preview(
             preview_hooks(
                 &projected,
                 content,
-                Trigger::CardPlayed,
+                Trigger::AfterCardPlayed,
                 Actor::Enemy(target),
                 Context {
                     source: Actor::Enemy(target),
@@ -3446,13 +3451,13 @@ fn played_card_preview(
         preview_hooks(
             &projected,
             content,
-            Trigger::CardPlayed,
+            Trigger::AfterCardPlayed,
             Actor::Player,
             context,
             &original.player.powers,
             &mut preview,
         );
-        if trigger != Trigger::CardPlayed {
+        if trigger != Trigger::AfterCardPlayed {
             preview_hooks(
                 &projected,
                 content,
@@ -4083,11 +4088,11 @@ fn effect_index(effect: &Effect) -> usize {
         | Effect::Fire(_)
         | Effect::Listen(..)
         | Effect::Step(_)
-        | Effect::BurningSticks(..)
         | Effect::Juggle
         | Effect::ConfusedRoll(..) => 79,
-        Effect::FinishAutoPlay
-        | Effect::AutoPlayStep
+        Effect::BeforePlay
+        | Effect::OnPlay
+        | Effect::AfterPlay
         | Effect::PlacePlayed(..)
         | Effect::CheckEmptyHand
         | Effect::MummifiedHand
@@ -5039,35 +5044,23 @@ fn push_actor_domains(game: &Game, content: &Content, domains: &mut [Vec<DomainR
     if game.damage_taken {
         push_status_domain(&mut domains[STATUS_DOMAIN], 1, 0, 0, &[]);
     }
-    for (order, &(turns, amount)) in combat.bombs.iter().enumerate() {
-        push_status_domain(
-            &mut domains[STATUS_DOMAIN],
-            1,
-            2,
-            order,
-            &[turns as i32, amount as i32],
-        );
+    let instances = |id| (combat.player.powers.iter()).filter(move |power| power.id == id);
+    for (order, bomb) in instances(power_id::THE_BOMB).enumerate() {
+        let values = [bomb.amount as i32, bomb.value as i32];
+        push_status_domain(&mut domains[STATUS_DOMAIN], 1, 2, order, &values);
     }
-    for (order, &(turns, energy)) in combat.automation.iter().enumerate() {
-        push_status_domain(
-            &mut domains[STATUS_DOMAIN],
-            1,
-            3,
-            order,
-            &[turns as i32, energy as i32],
-        );
+    for (order, automation) in instances(power_id::AUTOMATION).enumerate() {
+        let values = [automation.value as i32, automation.amount as i32];
+        push_status_domain(&mut domains[STATUS_DOMAIN], 1, 3, order, &values);
     }
-    for (order, &(cards, damage, start)) in combat.panache.iter().enumerate() {
-        push_status_domain(
-            &mut domains[STATUS_DOMAIN],
-            1,
-            4,
-            order,
-            &[cards as i32, damage as i32, start as i32],
-        );
+    let cards = combat.history.cards as i32;
+    for (order, panache) in instances(power_id::PANACHE).enumerate() {
+        let values = [panache.value as i32, panache.amount as i32, cards];
+        push_status_domain(&mut domains[STATUS_DOMAIN], 1, 4, order, &values);
     }
-    for (order, &amount) in combat.boulders.iter().enumerate() {
-        push_status_domain(&mut domains[STATUS_DOMAIN], 1, 5, order, &[amount as i32]);
+    for (order, boulder) in instances(power_id::ROLLING_BOULDER).enumerate() {
+        let values = [boulder.amount as i32];
+        push_status_domain(&mut domains[STATUS_DOMAIN], 1, 5, order, &values);
     }
 }
 
@@ -5085,7 +5078,7 @@ fn push_power_domains(
             owner,
             power.id as u32,
             snapshot as u32,
-            power.skip_next_decay as u32,
+            (power.skip_next_decay && power.id != power_id::PANACHE) as u32,
             (name == "POWER.SURROUNDED_POWER") as u32 * (power.value > 0) as u32,
             if name == "POWER.CONSTRICT_POWER" {
                 power.value.max(0) as u32 + 1
@@ -5095,7 +5088,12 @@ fn push_power_domains(
             order as u32 + 1,
         ]);
         row.s[0] = power.amount as i32;
-        row.s[1] = power.value as i32;
+        // Instance counters are encoded as status rows.
+        let counter = matches!(
+            power.id,
+            power_id::THE_BOMB | power_id::AUTOMATION | power_id::PANACHE
+        );
+        row.s[1] = if counter { 0 } else { power.value as i32 };
         out.push(row);
     }
 }
@@ -5700,13 +5698,13 @@ impl ContinuationBuilder {
             | Effect::Stampede
             | Effect::DiscardHandDraw
             | Effect::PlayExhaustedShivs
-            | Effect::FinishAutoPlay
-            | Effect::AutoPlayStep
+            | Effect::BeforePlay
+            | Effect::OnPlay
+            | Effect::AfterPlay
             | Effect::Uproar
             | Effect::Fire(_)
             | Effect::Listen(..)
             | Effect::Step(_)
-            | Effect::BurningSticks(..)
             | Effect::Juggle
             | Effect::ConfusedRoll(..)
             | Effect::PlacePlayed(..)
@@ -6355,28 +6353,23 @@ fn continuation_domains(
                 &mut order,
             );
         }
-        for play in combat.auto_plays.iter().rev() {
+        for play in combat.plays.iter().rev() {
             let before = out.rows.len();
-            let item = out.row(3, 0, NO_NODE, 0, 0, 0, order, 1);
-            out.rows[item].u[11] = play.plays as u32;
+            let item = if play.manual {
+                let item = out.row(9, 0, NO_NODE, 0, 0, 0, order, 1);
+                out.rows[item].u[11..14].copy_from_slice(&[
+                    play.energy.max(0) as u32,
+                    play.stars.max(0) as u32,
+                    play.plays as u32,
+                ]);
+                item
+            } else {
+                let item = out.row(3, 0, NO_NODE, 0, 0, 0, order, 1);
+                out.rows[item].u[11] = play.plays as u32;
+                item
+            };
             out.card(play.card, item);
             if combat.unsettling_lamp == Some(play.card.id) {
-                out.rows[item].u[23] = 1;
-            }
-            let frame = out.rows[before].u[2];
-            group_continuation_item(&mut out.rows[before..], frame, order);
-            order += 1;
-        }
-        if let Some(card) = combat.playing {
-            let before = out.rows.len();
-            let item = out.row(9, 0, NO_NODE, 0, 0, 0, order, 1);
-            out.rows[item].u[11..14].copy_from_slice(&[
-                combat.card_energy.max(0) as u32,
-                combat.card_stars.max(0) as u32,
-                combat.card_plays as u32,
-            ]);
-            out.card(card, item);
-            if combat.unsettling_lamp == Some(card.id) {
                 out.rows[item].u[23] = 1;
             }
             let frame = out.rows[before].u[2];

@@ -738,8 +738,7 @@ fn v36_fisticuffs_and_misery_previews_match_play() {
     combat.enemies[0].creature.powers = vec![Power {
         id: power_id::VULNERABLE,
         amount: 1,
-        skip_next_decay: false,
-        value: 0,
+        ..Power::default()
     }];
     combat.hand = vec![fisticuffs];
     combat.energy = 3;
@@ -752,8 +751,7 @@ fn v36_fisticuffs_and_misery_previews_match_play() {
     .map(|(id, amount)| Power {
         id,
         amount,
-        skip_next_decay: false,
-        value: 0,
+        ..Power::default()
     })
     .to_vec();
     let preview = played_card_preview(&game, &content, fisticuffs, Some(0));
@@ -781,8 +779,7 @@ fn v36_fisticuffs_and_misery_previews_match_play() {
     combat.player.powers.push(Power {
         id: power_id::NO_BLOCK,
         amount: 1,
-        skip_next_decay: false,
-        value: 0,
+        ..Power::default()
     });
     assert_eq!(
         played_card_preview(&game, &content, fisticuffs, Some(0)).block,
@@ -932,8 +929,7 @@ fn v36_play_draw_and_exhaust_hooks_match_play() {
         .map(|(id, amount)| Power {
             id,
             amount,
-            skip_next_decay: false,
-            value: 0,
+            ..Power::default()
         })
         .collect();
     let preview = played_card_preview(&game, &content, card, Some(0));
@@ -1601,10 +1597,16 @@ fn v57_control_and_resolving_play_state_are_continuations() {
         unreachable!()
     };
     let card = combat.hand[0];
-    combat.playing = Some(card);
-    combat.card_energy = 3;
-    combat.card_stars = 2;
-    combat.card_plays = 4;
+    combat.plays.push(Play {
+        card,
+        plays: 4,
+        done: 0,
+        energy: 3,
+        stars: 2,
+        manual: true,
+        context: Context::card(card),
+        recorded: vec![],
+    });
     combat.unsettling_lamp = Some(card.id);
     combat.extra_turn = true;
     game.run_queue.push(RunEffect::FinishCooking);
@@ -1817,7 +1819,6 @@ fn v58_unequal_target_previews_remain_distinct_candidates() {
     };
     combat.enemies.truncate(2);
     combat.hits.resize(2, 0);
-    combat.enemy_power_snapshot.resize(2, Vec::new());
     combat.enemies[0].creature.hp = 5;
     combat.enemies[0].creature.block = 0;
     combat.enemies[1].creature.hp = 50;
@@ -1906,14 +1907,12 @@ fn v55_power_trigger_order_is_semantic_and_actor_ratios_are_finite() {
         Power {
             id: 0,
             amount: 1,
-            skip_next_decay: false,
-            value: 0,
+            ..Power::default()
         },
         Power {
             id: 1,
             amount: 1,
-            skip_next_decay: false,
-            value: 0,
+            ..Power::default()
         },
     ];
     let mut ordered = game.clone();
@@ -2073,7 +2072,6 @@ fn v56_enemy_instance_renumbering_preserves_wriggler_transitions() {
     };
     combat.enemies.truncate(1);
     combat.hits.truncate(1);
-    combat.enemy_power_snapshot.truncate(1);
     combat.player.hp = 999;
     combat.player.max_hp = 999;
     combat.enemies[0].creature.id = wriggler;
