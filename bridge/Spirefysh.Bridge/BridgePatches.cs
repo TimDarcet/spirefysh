@@ -109,7 +109,10 @@ internal static class BridgePatches
         Observe("card selection offer", () =>
     {
         if (__originalMethod.Name == nameof(CardSelectCmd.FromChooseABundleScreen))
-            throw new NotSupportedException("Card-bundle choices require a typed bundle descriptor.");
+        {
+            _capture?.OnBundleChoiceOffered(__args.OfType<IReadOnlyList<IReadOnlyList<CardModel>>>().Single());
+            return;
+        }
         var prefs = __args.OfType<CardSelectorPrefs>()
             .Select(value => (CardSelectorPrefs?)value).SingleOrDefault();
         var filter = __args.OfType<Func<CardModel, bool>>().SingleOrDefault();
@@ -122,6 +125,9 @@ internal static class BridgePatches
         var candidates = options.Where(card => filter?.Invoke(card) ?? true).ToArray();
         var canSkip = prefs?.Cancelable == true || prefs?.MinSelect == 0 ||
                       prefs is null && __args.OfType<bool>().SingleOrDefault();
+        // With no more cards than it must take, the game takes them all without a player choice.
+        if (prefs is { RequireManualConfirmation: false } auto && candidates.Length <= auto.MinSelect)
+            candidates = [];
         OfferCards(candidates, prefs?.MinSelect ?? (canSkip ? 0 : 1), prefs?.MaxSelect ?? 1,
             canSkip);
     });

@@ -16,9 +16,11 @@ using MegaCrit.Sts2.Core.GameActions;
 using MegaCrit.Sts2.Core.GameActions.Multiplayer;
 using MegaCrit.Sts2.Core.Map;
 using MegaCrit.Sts2.Core.Models;
+using MegaCrit.Sts2.Core.Models.Powers;
 using MegaCrit.Sts2.Core.MonsterMoves.Intents;
 using MegaCrit.Sts2.Core.Random;
 using MegaCrit.Sts2.Core.Runs;
+using MegaCrit.Sts2.Core.ValueProps;
 
 namespace Spirefysh.Bridge;
 
@@ -334,7 +336,8 @@ internal sealed class TraceCapture : IDisposable
                 return;
             }
             maximum = Math.Min(maximum, candidates.Length);
-            if (minimum < 0 || maximum < minimum)
+            minimum = Math.Min(minimum, maximum);  // a manual screen with too few cards takes them all
+            if (minimum < 0)
                 throw new InvalidOperationException(
                     $"Invalid card-choice range {minimum}..{maximum} for {candidates.Length} candidates.");
             var choice = new SemanticAction(
@@ -376,6 +379,43 @@ internal sealed class TraceCapture : IDisposable
         });
     }
 
+    // Scroll Boxes: each bundle is one option; the chosen bundle's cards become the selected ids.
+    public void OnBundleChoiceOffered(IReadOnlyList<IReadOnlyList<CardModel>> bundles)
+    {
+        Guard("bundle choice offered", () =>
+        {
+            var ids = bundles.Select(bundle => bundle.Select(SemanticAction.CardIdentity).ToArray()).ToArray();
+            if (ids.Length == 0)
+            {
+                _choiceOffer = null;
+                return;
+            }
+            var candidates = ids.SelectMany(bundle => bundle).ToArray();
+            var choice = new SemanticAction(
+                "choose_cards",
+                "choose-cards",
+                null,
+                null,
+                "PlayerChoiceResult",
+                CandidateIds: candidates,
+                Minimum: ids.Min(bundle => bundle.Length),
+                Maximum: ids.Max(bundle => bundle.Length),
+                CanSkip: false);
+            _choiceOffer = new("choose_bundle", [choice], candidates, choice.Minimum ?? 0, choice.Maximum ?? 0,
+                false, [], Bundles: ids);
+            var snapshot = Snapshotter.Capture(_choiceOffer.LegalActions);
+            Resynchronize(snapshot, "bundle_choice");
+            Write(new TraceEvent(0, "choice_offered", null,
+                snapshot.Public, null, null,
+                snapshot.Oracle, null,
+                new Dictionary<string, object?> { ["bundles"] = ids })
+            {
+                BeforePublicHash = snapshot.PublicHash,
+                BeforeOracleHash = snapshot.OracleHash
+            });
+        });
+    }
+
     public void OnPlayerChoice(PlayerChoiceResult result, uint choiceId)
     {
         Guard("player choice", () =>
@@ -395,7 +435,13 @@ internal sealed class TraceCapture : IDisposable
                 ? result.AsIndexes().ToArray()
                 : [];
             SemanticAction action;
-            if (indexes is [var index] && index >= offer.CandidateIds.Length)
+            if (offer.Bundles is { } bundles)
+            {
+                if (indexes is not [var bundle] || bundle < 0 || bundle >= bundles.Length)
+                    throw new InvalidOperationException("Selected bundle is outside the captured offer.");
+                action = offer.LegalActions[0] with { SelectedIds = bundles[bundle] };
+            }
+            else if (indexes is [var index] && index >= offer.CandidateIds.Length)
             {
                 var alternative = index - offer.CandidateIds.Length;
                 if (alternative < 0 || alternative >= offer.AlternativeActions.Length)
@@ -662,7 +708,8 @@ internal sealed class TraceCapture : IDisposable
         int Maximum,
         bool CanSkip,
         SemanticAction?[] AlternativeActions,
-        uint? ChoiceId = null);
+        uint? ChoiceId = null,
+        string[][]? Bundles = null);
 
     private sealed class TraceOutputException(Exception inner) : Exception("Trace output failed.", inner);
 }
@@ -920,12 +967,27 @@ internal static class Snapshotter
             powerStates,
             cardDeckVersionIndices,
             playerGeneratedCards,
-            combat is null ? 0U : CaptureNextCombatCardId());
+            combat is null ? 0U : CaptureNextCombatCardId(),
+            combat is null ? 0U : (uint)(typeof(CombatState).GetField("_nextCreatureId",
+                BindingFlags.Instance | BindingFlags.NonPublic)?.GetValue(combat) ?? 0U),
+            CaptureRelicGrabBags(run));
         return new(
             publicSnapshot,
             oracleSnapshot,
             CanonicalHash(publicSnapshot),
             CanonicalHash(oracleSnapshot));
+    }
+
+    // Relic grab bag order, keyed "player.Common", "shared.Uncommon", ...
+    private static IReadOnlyDictionary<string, string[]> CaptureRelicGrabBags(RunState run)
+    {
+        var field = typeof(RelicGrabBag).GetField("_deques", BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new MissingFieldException(typeof(RelicGrabBag).FullName, "_deques");
+        var bags = new SortedDictionary<string, string[]>(StringComparer.Ordinal);
+        foreach (var (name, bag) in new[] { ("player", run.Players[0].RelicGrabBag), ("shared", run.SharedRelicGrabBag) })
+            foreach (var (rarity, deque) in (Dictionary<MegaCrit.Sts2.Core.Entities.Relics.RelicRarity, List<RelicModel>>)field.GetValue(bag)!)
+                bags[$"{name}.{rarity}"] = deque.Select(relic => relic.Id.ToString()).ToArray();
+        return bags;
     }
 
     private static string CanonicalHash<T>(T value)
@@ -947,6 +1009,10 @@ internal static class Snapshotter
                 candidate.Kind == selectedAction.Kind && candidate.Id == selectedAction.Id &&
                 candidate.SourceId == selectedAction.SourceId && candidate.TargetId == selectedAction.TargetId))
             actions = [.. actions, selectedAction];
+        var entries = combat is null ? [] : CombatManager.Instance.History.Entries;
+        var finished = combat is null ? [] : CombatManager.Instance.History.CardPlaysFinished;
+        var turn = entries.Where(entry => entry.HappenedThisTurn(combat)).ToArray();
+        var turnPlays = turn.OfType<CardPlayFinishedEntry>().ToArray();
         return new(
             player.NetId,
             $"creature:{creature.CombatId}",
@@ -969,20 +1035,45 @@ internal static class Snapshotter
                 combatState.DiscardPile.Cards, requireCombatId: true),
             combatState is null ? [] : CaptureCombatCards(
                 combatState.ExhaustPile.Cards, requireCombatId: true),
-            player.Relics.Select(x => new EntitySnapshot(x.Id.ToString(), x.StackCount, x.Status.ToString())).ToArray(),
+            player.Relics.Select(x => new EntitySnapshot(x.Id.ToString(), x.ShowCounter ? x.DisplayAmount : x.StackCount, x.IsMelted ? "Melted" : x.Status.ToString())).ToArray(),
             player.Potions.Select(x => new EntitySnapshot(x.Id.ToString(), player.GetPotionSlotIndex(x), x.Usage.ToString())).ToArray(),
             creature.Pets.Select(CaptureSummon).ToArray(),
             combatState?.OrbQueue.Orbs.Select(CaptureOrb).ToArray() ?? [],
             combatState?.OrbQueue.Capacity ?? 0,
             CapturePowers(creature.Powers),
-            CaptureCardsExhaustedThisTurn(combat),
-            CaptureCardsDrawnThisCombat(combat),
-            CapturePlayerLostHpThisTurn(combat, creature),
-            CapturePlayerHpLossEventsThisCombat(combat, creature),
-            CaptureEnergySpentThisTurn(combat, player),
-            CaptureStarsGainedThisTurn(combat),
+            turn.OfType<CardExhaustedEntry>().Count(),
+            entries.OfType<CardDrawnEntry>().Count(),
+            turn.OfType<DamageReceivedEntry>().Any(entry => ReferenceEquals(entry.Receiver, creature) && entry.Result.UnblockedDamage > 0),
+            turn.OfType<DamageReceivedEntry>().Where(entry => ReferenceEquals(entry.Receiver, creature)).Sum(entry => entry.Result.UnblockedDamage),
+            entries.OfType<DamageReceivedEntry>().Count(entry =>
+                ReferenceEquals(entry.Receiver, creature) && entry.Result.UnblockedDamage > 0),
+            turn.OfType<EnergySpentEntry>().Where(entry => ReferenceEquals(entry.Actor, creature)).Sum(entry => entry.Amount),
+            turn.OfType<StarsModifiedEntry>().Where(entry => entry.Amount > 0).Sum(entry => entry.Amount),
             CaptureOstyAttacksThisTurn(combat, player),
             CapturePendulumTurnsSeen(player),
+            turnPlays.Length,
+            turnPlays.Count(entry => entry.CardPlay.Card.Type == CardType.Attack),
+            turnPlays.Count(entry => entry.CardPlay.Card.Type == CardType.Skill),
+            turnPlays.Count(entry => entry.CardPlay.Card.Type == CardType.Power),
+            turn.OfType<CardDrawnEntry>().Count(entry => !entry.FromHandDraw),
+            turn.OfType<CardDrawnEntry>().Count(entry => entry.Card.Type == CardType.Status),
+            player.Relics.OfType<MegaCrit.Sts2.Core.Models.Relics.PaelsTooth>()
+                .SelectMany(relic => relic.SerializableCards)
+                .Select(card => $"{card.Id}+{card.CurrentUpgradeLevel}"
+                    + (card.Enchantment is { } enchantment ? $"@{enchantment.Id}:{enchantment.Amount}" : "")).ToArray(),
+            player.MaxPotionCount,
+            entries.OfType<OrbChanneledEntry>().Count(entry => entry.Actor.Player == player),
+            entries.OfType<OrbChanneledEntry>()
+                .Count(entry => entry.Actor.Player == player && entry.Orb is MegaCrit.Sts2.Core.Models.Orbs.LightningOrb),
+            finished.Count(),
+            turnPlays.Select(entry => SemanticAction.CardIdentity(entry.CardPlay.Card)).ToArray(),
+            finished.Count(entry => entry.WasEthereal),
+            turn.OfType<PowerReceivedEntry>().Count(entry => entry.Power is DoomPower && ReferenceEquals(entry.Applier, creature)),
+            turn.OfType<CardDiscardedEntry>().Count(entry => entry.Card.Owner == player),
+            finished.Count(entry => entry.CardPlay.Card.Type == CardType.Power),
+            turn.OfType<BlockGainedEntry>().Count(entry => ReferenceEquals(entry.Receiver, creature) && entry.Props.IsCardOrMonsterMove()),
+            turn.OfType<CardPlayStartedEntry>().Count(entry => entry.CardPlay.IsFirstInSeries && entry.CardPlay.Card.Owner == player),
+            CaptureUsedRelics(player),
             actions);
     }
 
@@ -1059,7 +1150,9 @@ internal static class Snapshotter
             enemy.MaxHp,
             enemy.Block,
             CaptureIntents(combat, enemy),
-            CapturePowers(enemy.Powers))).ToArray());
+            CapturePowers(enemy.Powers),
+            enemy.SlotName,
+            enemy.SlotName is null ? null : combat.Encounter?.Slots.ToList().IndexOf(enemy.SlotName) is int index && index >= 0 ? index : null)).ToArray());
 
     private static IntentSnapshot[] CaptureIntents(CombatState combat, Creature enemy) =>
         enemy.Monster?.NextMove?.Intents.Select(intent => intent is AttackIntent attack
@@ -1092,11 +1185,16 @@ internal static class Snapshotter
             card.CurrentStarCost,
             card.Type.ToString(),
             card.TargetType.ToString(),
-            CaptureLocalEthereal(card),
+            CaptureLocalKeyword(card, "Ethereal"),
+            CaptureLocalKeyword(card, "Retain"),
+            CaptureLocalKeyword(card, "Sly"),
+            card.IsSlyThisTurn,
             CaptureRampageExtraDamage(card),
             CaptureClawExtraDamage(card),
             CaptureGeneticAlgorithmBonusBlock(card),
             CaptureSovereignBladeBonusDamage(card),
+            CaptureExtraDamage(card),
+            card is MegaCrit.Sts2.Core.Models.Cards.Guilty guilty ? guilty.CombatsSeen : 0,
             card.BaseReplayCount,
             card.EnergyCost.CostsX,
             costForTurn,
@@ -1105,7 +1203,8 @@ internal static class Snapshotter
             enchantmentAmount,
             enchantmentCombatAmount,
             card.Affliction?.Id.ToString(),
-            CaptureLocalCostModifiers(card));
+            CaptureLocalCostModifiers(card),
+            card.IsDupe);
     }
 
     private static (string? ModelId, decimal? Amount, decimal CombatAmount) CaptureEnchantment(
@@ -1202,6 +1301,7 @@ internal static class Snapshotter
                 case "EndOfTurn": costForTurn = amount; break;
                 case "EndOfCombat": combatCostOverride = amount; break;
                 case "EndOfTurn, WhenPlayed": break;
+                case "WhenPlayed": combatCostOverride = amount; break;
                 default:
                     throw new InvalidOperationException(
                         $"Unsupported absolute card-cost modifier expiration '{expiration ?? "<missing>"}'.");
@@ -1236,6 +1336,22 @@ internal static class Snapshotter
             result.Add(new(amount, modifierType, Convert.ToInt32(expirationValue), reduceOnly));
         }
         return result.ToArray();
+    }
+
+    private static int CaptureExtraDamage(CardModel card)
+    {
+        var name = card.Id.ToString() switch
+        {
+            "CARD.THRASH" or "CARD.KINGLY_PUNCH" => "ExtraDamage",
+            "CARD.MAUL" => "ExtraDamageFromMaulPlays",
+            "CARD.THE_SCYTHE" => "IncreasedDamage",
+            _ => null,
+        };
+        if (name is null) return 0;
+        var property = card.GetType().GetProperty(name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+            ?? throw new MissingMemberException(card.GetType().FullName, name);
+        return decimal.ToInt32(Convert.ToDecimal(property.GetValue(card)
+            ?? throw new InvalidOperationException($"{card.Id} extra damage is unavailable.")));
     }
 
     private static int CaptureRampageExtraDamage(CardModel card)
@@ -1280,37 +1396,21 @@ internal static class Snapshotter
             ?? throw new InvalidOperationException("Sovereign Blade damage is unavailable."))) - 10);
     }
 
-    private static bool CaptureLocalEthereal(CardModel card)
+    private static bool CaptureLocalKeyword(CardModel card, string name)
     {
         var property = typeof(CardModel).GetProperty(
             "LocalKeywords", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
             ?? throw new MissingMemberException(typeof(CardModel).FullName, "LocalKeywords");
         var keywords = (System.Collections.IEnumerable)(property.GetValue(card)
             ?? throw new InvalidOperationException("Card local keywords are unavailable."));
-        return keywords.Cast<object>().Any(keyword => keyword.ToString() == "Ethereal");
+        return keywords.Cast<object>().Any(keyword => keyword.ToString() == name);
     }
 
-    private static int CaptureCardsExhaustedThisTurn(CombatState? combat) => combat is null ? 0 :
-        CombatManager.Instance.History.Entries.OfType<CardExhaustedEntry>().Count(entry => entry.HappenedThisTurn(combat));
-
-    private static int CaptureCardsDrawnThisCombat(CombatState? combat) => combat is null ? 0 :
-        CombatManager.Instance.History.Entries.OfType<CardDrawnEntry>().Count();
-
-    private static bool CapturePlayerLostHpThisTurn(CombatState? combat, Creature player) => combat is not null &&
-        CombatManager.Instance.History.Entries.OfType<DamageReceivedEntry>().Any(entry =>
-            ReferenceEquals(entry.Receiver, player) && entry.Result.UnblockedDamage > 0 && entry.HappenedThisTurn(combat));
-
-    private static int CapturePlayerHpLossEventsThisCombat(CombatState? combat, Creature player) => combat is null ? 0 :
-        CombatManager.Instance.History.Entries.OfType<DamageReceivedEntry>().Count(entry =>
-            ReferenceEquals(entry.Receiver, player) && entry.Result.UnblockedDamage > 0);
-
-    private static int CaptureEnergySpentThisTurn(CombatState? combat, Player player) => combat is null ? 0 :
-        CombatManager.Instance.History.Entries.OfType<EnergySpentEntry>().Where(entry =>
-            ReferenceEquals(entry.Actor, player.Creature) && entry.HappenedThisTurn(combat)).Sum(entry => entry.Amount);
-
-    private static int CaptureStarsGainedThisTurn(CombatState? combat) => combat is null ? 0 :
-        CombatManager.Instance.History.Entries.OfType<StarsModifiedEntry>().Where(entry =>
-            entry.Amount > 0 && entry.HappenedThisTurn(combat)).Sum(entry => entry.Amount);
+    // Relics with a private used-this-combat/turn flag (Ruined Helmet, Mini Regent, ...).
+    private static string[] CaptureUsedRelics(Player player) => player.Relics
+        .Where(relic => new[] { "_usedThisCombat", "_usedThisTurn" }.Any(name =>
+            relic.GetType().GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)?.GetValue(relic) is true))
+        .Select(relic => relic.Id.ToString()).ToArray();
 
     private static int CaptureOstyAttacksThisTurn(CombatState? combat, Player player)
     {
@@ -1338,23 +1438,39 @@ internal static class Snapshotter
         new EntitySnapshot(x.Id.ToString(), CaptureVisiblePowerAmount(x), x.Type.ToString())).ToArray();
     private static PowerOracleSnapshot[] CaptureOraclePowers(IReadOnlyList<PowerModel> powers) => powers.Select(x =>
         new PowerOracleSnapshot(x.Id.ToString(), x.Amount, x.AmountOnTurnStart, x.SkipNextDurationTick,
-            CaptureDarkEmbraceEtherealCount(x), CaptureSelfDamage(x),
-            CaptureIntProperty(x, "POWER.SLOTH_POWER", "CardsPlayedThisTurn"),
+            x.Id.ToString() == "POWER.DARK_EMBRACE_POWER" ? (int)PowerData(x, "etherealCount") : 0, CaptureSelfDamage(x),
+            CaptureIntProperty(x, "POWER.SLOTH_POWER", "DisplayAmount"),
             CaptureAdvancedCounterDebuffActivityCount(x), CaptureBoundCardPlayed(x),
-            CaptureFeralReturnsThisTurn(x), CaptureAutomationCardsLeft(x), 0,
-            x.Id.ToString() == "POWER.HARDENED_SHELL_POWER" ? x.Amount - x.DisplayAmount : 0,
-            CaptureBoolProperty(x, "POWER.SKITTISH_POWER", "HasGainedBlockThisTurn"))).ToArray();
+            CaptureFeralReturnsThisTurn(x),
+            x.Id.ToString() == "POWER.AUTOMATION_POWER" ? (int)PowerData(x, "cardsLeft") : 0,
+            x is ToricToughnessPower toric ? (int)toric.DynamicVars.Block.BaseValue : 0,
+            // Damage received this turn, unclamped: The Boot can push it past the cap (Amount - DisplayAmount can't).
+            x.Id.ToString() == "POWER.HARDENED_SHELL_POWER" ? (int)(decimal)PowerData(x, "damageReceivedThisTurn") : 0,
+            CaptureBoolProperty(x, "POWER.SKITTISH_POWER", "HasGainedBlockThisTurn"),
+            x.DisplayAmount,
+            x is SurroundedPower surrounded ? (int)surrounded.Facing : 0,
+            CaptureStolen(x),
+            x is TheBombPower bomb ? (int)bomb.DynamicVars.Damage.BaseValue : 0)).ToArray();
 
-    private static int CaptureAutomationCardsLeft(PowerModel power)
+    // Possess Strength/Speed return what they actually took from the player when their owner dies.
+    private static int CaptureStolen(PowerModel power)
     {
-        if (power.Id.ToString() != "POWER.AUTOMATION_POWER") return 0;
-        var data = typeof(PowerModel).GetField("_internalData", BindingFlags.Instance | BindingFlags.NonPublic)!
-            .GetValue(power) ?? throw new InvalidOperationException("Automation internal data is unavailable.");
-        var field = data.GetType().GetField(
-            "cardsLeft", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
-            ?? throw new MissingFieldException(data.GetType().FullName, "cardsLeft");
-        return (int)(field.GetValue(data)
-            ?? throw new InvalidOperationException("Automation cards-left counter is unavailable."));
+        var name = power.Id.ToString() switch
+        {
+            "POWER.POSSESS_STRENGTH_POWER" => "stolenStrength",
+            "POWER.POSSESS_SPEED_POWER" => "stolenDexterity",
+            _ => null,
+        };
+        return name is null ? 0 : (int)-((System.Collections.IDictionary)PowerData(power, name)).Values.Cast<decimal>().Sum();
+    }
+
+    private static object PowerData(PowerModel power, string name)
+    {
+        var data = typeof(PowerModel).GetField("_internalData", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(power)
+            ?? throw new InvalidOperationException($"{power.Id} internal data is unavailable.");
+        return (data.GetType().GetField(name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+            ?? throw new MissingFieldException(data.GetType().FullName, name)).GetValue(data)
+            ?? throw new InvalidOperationException($"{power.Id}.{name} is unavailable.");
     }
 
     private static bool CaptureBoolProperty(PowerModel power, string id, string name)
@@ -1393,19 +1509,6 @@ internal static class Snapshotter
         power.Id.ToString() is "POWER.SLOW_POWER" or "POWER.TENDER_POWER"
             ? CaptureIntProperty(power, power.Id.ToString(), "DisplayAmount")
             : power.Amount;
-
-    private static int CaptureDarkEmbraceEtherealCount(PowerModel power)
-    {
-        if (power.Id.ToString() != "POWER.DARK_EMBRACE_POWER") return 0;
-        var dataField = typeof(PowerModel).GetField("_internalData", BindingFlags.Instance | BindingFlags.NonPublic)
-            ?? throw new MissingFieldException(typeof(PowerModel).FullName, "_internalData");
-        var data = dataField.GetValue(power)
-            ?? throw new InvalidOperationException("Dark Embrace internal data is unavailable.");
-        var countField = data.GetType().GetField("etherealCount", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
-            ?? throw new MissingFieldException(data.GetType().FullName, "etherealCount");
-        return (int)(countField.GetValue(data)
-            ?? throw new InvalidOperationException("Dark Embrace Ethereal count is unavailable."));
-    }
 
     private static int CaptureSelfDamage(PowerModel power) =>
         power.Id.ToString() is "POWER.CRIMSON_MANTLE_POWER" or "POWER.INFERNO_POWER"
@@ -1525,10 +1628,10 @@ internal sealed record PublicSnapshot(
     MapNodeSnapshot[] Map,
     HistorySnapshot[] History,
     SemanticAction[] VisibleOffers);
-internal sealed record OracleSnapshot(IReadOnlyDictionary<string, uint> RngSeeds, IReadOnlyDictionary<string, int> RngCounters, CardSnapshot[] HiddenDrawOrder, IReadOnlyDictionary<string, string?> EnemyMoveIds, IReadOnlyDictionary<string, PowerOracleSnapshot[]> PowerStates, IReadOnlyDictionary<string, int?> CardDeckVersionIndices, int PlayerGeneratedCards, uint NextCombatCardId);
-internal sealed record PlayerSnapshot(ulong NetId, string InstanceId, string CharacterId, int HitPoints, int MaxHitPoints, int Block, int Gold, int Energy, int MaxEnergy, int Stars, int TurnNumber, CardSnapshot[] Deck, CardSnapshot[] Hand, CardSnapshot[] PlayPile, int DrawPileCount, CardSnapshot[] DiscardPile, CardSnapshot[] ExhaustPile, EntitySnapshot[] Relics, EntitySnapshot[] Potions, SummonSnapshot[] Summons, OrbSnapshot[] Orbs, int OrbSlots, EntitySnapshot[] Powers, int CardsExhaustedThisTurn, int CardsDrawnThisCombat, bool PlayerLostHpThisTurn, int PlayerHpLossEventsThisCombat, int EnergySpentThisTurn, int StarsGainedThisTurn, int OstyAttacksThisTurn, int PendulumTurnsSeen, SemanticAction[] LegalActions);
+internal sealed record OracleSnapshot(IReadOnlyDictionary<string, uint> RngSeeds, IReadOnlyDictionary<string, int> RngCounters, CardSnapshot[] HiddenDrawOrder, IReadOnlyDictionary<string, string?> EnemyMoveIds, IReadOnlyDictionary<string, PowerOracleSnapshot[]> PowerStates, IReadOnlyDictionary<string, int?> CardDeckVersionIndices, int PlayerGeneratedCards, uint NextCombatCardId, uint NextCreatureId, IReadOnlyDictionary<string, string[]> RelicGrabBags);
+internal sealed record PlayerSnapshot(ulong NetId, string InstanceId, string CharacterId, int HitPoints, int MaxHitPoints, int Block, int Gold, int Energy, int MaxEnergy, int Stars, int TurnNumber, CardSnapshot[] Deck, CardSnapshot[] Hand, CardSnapshot[] PlayPile, int DrawPileCount, CardSnapshot[] DiscardPile, CardSnapshot[] ExhaustPile, EntitySnapshot[] Relics, EntitySnapshot[] Potions, SummonSnapshot[] Summons, OrbSnapshot[] Orbs, int OrbSlots, EntitySnapshot[] Powers, int CardsExhaustedThisTurn, int CardsDrawnThisCombat, bool PlayerLostHpThisTurn, int HpLostThisTurn, int PlayerHpLossEventsThisCombat, int EnergySpentThisTurn, int StarsGainedThisTurn, int OstyAttacksThisTurn, int PendulumTurnsSeen, int CardsPlayedThisTurn, int AttacksPlayedThisTurn, int SkillsPlayedThisTurn, int PowersPlayedThisTurn, int ExtraCardsDrawnThisTurn, int StatusesDrawnThisTurn, string[] PaelsToothCards, int PotionSlots, int OrbsChanneledThisCombat, int LightningChanneledThisCombat, int CardsPlayedThisCombat, string[] CardsPlayedThisTurnIds, int EtherealCardsPlayedThisCombat, int DoomAppliedThisTurn, int CardsDiscardedThisTurn, int PowersPlayedThisCombat, int CardBlockGainsThisTurn, int FirstCardPlaysThisTurn, string[] UsedRelics, SemanticAction[] LegalActions);
 internal sealed record CombatSnapshot(int Round, string Side, EnemySnapshot[] Enemies);
-internal sealed record EnemySnapshot(string InstanceId, string ModelId, int HitPoints, int MaxHitPoints, int Block, IntentSnapshot[] VisibleIntents, EntitySnapshot[] Powers);
+internal sealed record EnemySnapshot(string InstanceId, string ModelId, int HitPoints, int MaxHitPoints, int Block, IntentSnapshot[] VisibleIntents, EntitySnapshot[] Powers, string? Slot, int? SlotIndex);
 internal sealed record SummonSnapshot(string InstanceId, string ModelId, int HitPoints, int MaxHitPoints, int Block, EntitySnapshot[] Powers);
 internal sealed record OrbSnapshot(string ModelId, int Value);
 internal sealed record IntentSnapshot(string Kind, int Damage, int Hits);
@@ -1541,10 +1644,15 @@ internal sealed record CardSnapshot(
     string Type,
     string TargetType,
     bool Ethereal,
+    bool Retain,
+    bool Sly,
+    bool SlyThisTurn,
     int RampageExtraDamage,
     int ClawExtraDamage,
     int GeneticAlgorithmBonusBlock,
     int SovereignBladeBonusDamage,
+    int ExtraDamage,
+    int CombatsSeen,
     int BaseReplayCount,
     bool CostsX,
     int? CostForTurn,
@@ -1553,14 +1661,15 @@ internal sealed record CardSnapshot(
     decimal? EnchantmentAmount,
     decimal EnchantmentCombatAmount,
     string? AfflictionModelId,
-    CardCostModifierSnapshot[] CostModifiers);
+    CardCostModifierSnapshot[] CostModifiers,
+    bool IsDupe);
 internal sealed record CardCostModifierSnapshot(
     int Amount,
     string Type,
     int Expiration,
     bool IsReduceOnly);
 internal sealed record EntitySnapshot(string ModelId, int Amount, string State);
-internal sealed record PowerOracleSnapshot(string ModelId, int Amount, int AmountOnTurnStart, bool SkipNextDurationTick, int DarkEmbraceEtherealCount, int SelfDamage, int CardsPlayedThisTurn, int AdvancedCounterDebuffActivityCount, bool BoundCardPlayed, int FeralReturnsThisTurn, int AutomationCardsLeft, int ToricToughnessBlock, int HardenedShellDamage, bool SkittishBlock);
+internal sealed record PowerOracleSnapshot(string ModelId, int Amount, int AmountOnTurnStart, bool SkipNextDurationTick, int DarkEmbraceEtherealCount, int SelfDamage, int CardsPlayedThisTurn, int AdvancedCounterDebuffActivityCount, bool BoundCardPlayed, int FeralReturnsThisTurn, int AutomationCardsLeft, int ToricToughnessBlock, int HardenedShellDamage, bool SkittishBlock, int DisplayAmount, int Facing, int Stolen, int BombDamage);
 internal sealed record MapCoordSnapshot(int Column, int Row);
 internal sealed record MapNodeSnapshot(
     int Column,
