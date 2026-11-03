@@ -12,7 +12,7 @@ use std::{
 };
 
 const MAGIC: &[u8; 8] = b"STSVALUE";
-const VERSION: u32 = 61;
+const VERSION: u32 = 62;
 const VALUE_MODEL_VERSION: u32 = 79;
 const TERMINAL_CATEGORIES: usize = 83;
 const CARD_ZONES: usize = 5;
@@ -75,7 +75,7 @@ const DOMAIN_NAMES: [&str; 16] = [
 const DOMAIN_WIDTHS: [(usize, usize, usize, usize); 16] = [
     (23, 16, 1, 22),
     (16, 8, 42, 4),
-    (20, 16, 4, 40),
+    (20, 16, 4, 44),
     (12, 11, 5, 15),
     (8, 4, 5, 2),
     (6, 29, 1, 29),
@@ -180,6 +180,7 @@ enum Semantic {
     Boolean,
     TokenRole,
     Collection,
+    Trigger,
     Count,
 }
 
@@ -247,6 +248,7 @@ const SEMANTIC_NAMES: [&str; Semantic::Count as usize] = [
     "boolean",
     "token_role",
     "collection",
+    "trigger",
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -357,7 +359,7 @@ impl Layout {
             (Semantic::Pile, 5),
             (Semantic::Phase, PHASES),
             (Semantic::Action, ACTION_KINDS),
-            (Semantic::Effect, 120),
+            (Semantic::Effect, 125),
             (Semantic::RunEffect, 37),
             (Semantic::Condition, 23),
             (Semantic::Filter, 16),
@@ -400,6 +402,7 @@ impl Layout {
             (Semantic::Boolean, 184),
             (Semantic::TokenRole, 1),
             (Semantic::Collection, 11),
+            (Semantic::Trigger, Trigger::BeforeCardPlayed as usize + 1),
         ] {
             semantic_sizes[namespace as usize] = size as u32;
         }
@@ -514,18 +517,14 @@ fn put_bits(row: &mut DomainRow, offset: usize, bits: u32) {
     }
 }
 
-fn put_card_flags(
-    row: &mut DomainRow,
-    offset: usize,
-    flags: u32,
-    turn_flags: u32,
-    free: u32,
-    override_: u32,
-) {
-    put_bits(row, offset, flags);
-    put_bits(row, offset + 16, turn_flags);
-    row.f[offset + 32] = (free != 0) as u8 as f32;
-    row.f[offset + 33] = (override_ != 0) as u8 as f32;
+/// The flag bits, then the cost modifiers' expiration kinds and their count.
+fn put_card_flags(row: &mut DomainRow, offset: usize) {
+    put_bits(row, offset, row.u[6]);
+    put_bits(row, offset + 16, row.u[7]);
+    for bit in 0..5 {
+        row.f[offset + 32 + bit] = (row.u[9] >> bit & 1) as f32;
+    }
+    row.f[offset + 37] = row.u[10] as f32 / 6.0;
 }
 
 fn push_filter_semantics(row: &mut DomainRow, layout: Layout, kind: usize, argument: usize) {
@@ -604,6 +603,15 @@ fn push_effect_semantics(row: &mut DomainRow, layout: Layout) {
             push_scale_semantics(row, layout, 12, 13);
         }
         6 | 7 => target(row),
+        72 => push_semantic(row, layout, Semantic::Trigger, row.u[11]),
+        120 => {
+            push_semantic(row, layout, Semantic::Trigger, row.u[11]);
+            match row.u[12] {
+                1 => push_semantic(row, layout, Semantic::Power, row.u[13]),
+                2 => push_semantic(row, layout, Semantic::Relic, row.u[13]),
+                _ => card(row, 13),
+            }
+        }
         11 | 12 | 17 | 18 | 20 | 22 | 23 | 24 | 29 | 34 | 37 | 68 | 73 | 87 | 98 | 99 | 105
         | 106 | 107 | 109 | 110 | 112 => push_scale_semantics(row, layout, 11, 12),
         13 => {
@@ -944,7 +952,7 @@ fn populate_domain_features(
                 sf(row.s[4], 30.0),
                 row.u[8] as f32 / 5.0,
             ]);
-            put_card_flags(row, 6, row.u[6], row.u[7], row.u[9], row.u[10]);
+            put_card_flags(row, 6);
         }
         ACTOR_DOMAIN => {
             push_semantic(row, layout, Semantic::ActorKind, row.u[1]);
@@ -3881,23 +3889,15 @@ fn effect_index(effect: &Effect) -> usize {
         Effect::AutoPlayDraw(..) => 69,
         Effect::Stoke => 70,
         Effect::Stampede => 71,
+        Effect::Fire(_) => 72,
         Effect::FlakCannon(..) => 73,
         Effect::CopyCard(..) => 74,
         Effect::Discard(..) => 75,
         Effect::DiscardHandDraw => 76,
         Effect::DiscardHandAdd(..) => 77,
         Effect::PlayExhaustedShivs => 78,
-        Effect::AutoPlay(..)
-        | Effect::Uproar
-        | Effect::Fire(_)
-        | Effect::Listen(..)
-        | Effect::Step(_)
-        | Effect::Juggle
-        | Effect::ConfusedRoll(..) => 79,
-        Effect::BeforePlay
-        | Effect::OnPlay
-        | Effect::AfterPlay
-        | Effect::PlacePlayed(..)
+        Effect::AutoPlay(..) | Effect::Uproar | Effect::Juggle | Effect::ConfusedRoll(..) => 79,
+        Effect::PlacePlayed(..)
         | Effect::CheckEmptyHand
         | Effect::MummifiedHand
         | Effect::ReturnLate(..) => 80,
@@ -3940,6 +3940,11 @@ fn effect_index(effect: &Effect) -> usize {
         Effect::RecycleHand(..) => 116,
         Effect::EndTurn => 117,
         Effect::Select(..) => 118,
+        Effect::Listen(..) => 120,
+        Effect::Step(_) => 121,
+        Effect::BeforePlay => 122,
+        Effect::OnPlay => 123,
+        Effect::AfterPlay => 124,
     }
 }
 
@@ -4284,18 +4289,7 @@ fn card_domain_row(
         .map_or(&[][..], |combat| combat.dampened.as_slice());
     let (master, dampened) =
         card_relation(card, &game.run.deck, &encoding.masters, combat_dampened);
-    // The energy cost modifiers as free this turn, the last absolute cost and the relative sum.
-    let energy = || card.cost_mods().filter(|cost| cost.kind & STAR_COST == 0);
-    let freed = |cost: &CostMod| cost.amount == 0 && cost.kind & THIS_TURN != 0;
-    let sets = || energy().filter(|cost| cost.kind & (ABSOLUTE | REDUCE_ONLY) == ABSOLUTE);
-    let free = sets().any(|cost| freed(&cost));
-    let cost_override = sets()
-        .filter(|cost| !freed(cost))
-        .last()
-        .map(|cost| cost.amount);
-    let cost_delta: i32 = (energy().filter(|cost| cost.kind & ABSOLUTE == 0))
-        .map(|cost| cost.amount as i32)
-        .sum();
+    let star_cost = def.star_cost[card.upgrades.min(1) as usize] as i16;
     let mut row = DomainRow::new(CARD_DOMAIN, scope);
     row.u.copy_from_slice(&[
         zone,
@@ -4307,8 +4301,9 @@ fn card_domain_row(
         card.flags as u32,
         card.turn_flags as u32,
         card.replays as u32,
-        free as u32,
-        cost_override.is_some() as u32,
+        card.cost_mods()
+            .fold(0, |kinds, cost| kinds | cost.kind as u32),
+        card.cost_mods().count() as u32,
         card.enchantment.map_or(0, |value| value as u32 + 1),
         card.variant as u32,
         dampened as u32,
@@ -4320,10 +4315,11 @@ fn card_domain_row(
         master as u32,
     ]);
     row.s[..6].copy_from_slice(&[
-        cost_delta,
+        // The cost through the card's own modifiers; -1 for X.
+        crate::game::card_cost(card, def, -1) as i32,
         // In whole points (Thrash keeps hundredths).
         card.value as i32 / def.damage().map_or(1, |amount| amount.divisor.max(1)) as i32,
-        cost_override.unwrap_or_default() as i32,
+        card.star_override().unwrap_or(star_cost) as i32,
         card.enchantment_amount as i32,
         card.enchantment_value as i32,
         context,
@@ -5504,6 +5500,18 @@ impl ContinuationBuilder {
             | Effect::HealPercent(target, value)
             | Effect::ExhaustForAttack(target, value) => target_amount!(target, value),
             Effect::Kill(target) | Effect::Stun(target) => row.u[11] = target_index(target),
+            Effect::Fire(trigger) => row.u[11] = trigger as u32,
+            Effect::Listen(trigger, listener) => {
+                row.u[11] = trigger as u32;
+                (row.u[12], row.u[13]) = match listener {
+                    Listener::Power(_, power) => (1, power.id as u32),
+                    Listener::Relic(i) => (
+                        2,
+                        evaluation.map_or(0, |(game, ..)| game.run.relics[i as usize] as u32),
+                    ),
+                    Listener::Card(card) => (3, card.id as u32),
+                };
+            }
             Effect::DoomKill
             | Effect::RandomPotion
             | Effect::FreeHand
@@ -5519,8 +5527,6 @@ impl ContinuationBuilder {
             | Effect::OnPlay
             | Effect::AfterPlay
             | Effect::Uproar
-            | Effect::Fire(_)
-            | Effect::Listen(..)
             | Effect::Step(_)
             | Effect::Juggle
             | Effect::ConfusedRoll(..)
