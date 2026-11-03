@@ -1,5 +1,7 @@
 use super::*;
 
+pub(super) mod hooks;
+
 pub(super) fn sort_for_shuffle(cards: &mut [Card], content: &Content) {
     fn compare(a: Card, b: Card, content: &Content) -> std::cmp::Ordering {
         (content.cards[a.id as usize].id, a.upgrades)
@@ -100,30 +102,94 @@ pub(super) fn sort_for_shuffle(cards: &mut [Card], content: &Content) {
     intro(cards, content, depth);
 }
 
+/// Played cards waiting for their result pile (the game's play pile).
+fn played(queue: &mut [Pending]) -> impl Iterator<Item = &mut Card> {
+    queue
+        .iter_mut()
+        .filter_map(|pending| match &mut pending.effect {
+            Effect::PlacePlayed(card, ..) => Some(card),
+            _ => None,
+        })
+}
+
+/// Cards with the game's Token rarity, which the sim's `CardRarity` doesn't model.
+const TOKEN_CARDS: [&str; 10] = [
+    "CARD.FUEL",
+    "CARD.GIANT_ROCK",
+    "CARD.LUMINESCE",
+    "CARD.MINION_SACRIFICE",
+    "CARD.MINION_DIVE_BOMB",
+    "CARD.MINION_STRIKE",
+    "CARD.SHIV",
+    "CARD.SOUL",
+    "CARD.SOVEREIGN_BLADE",
+    "CARD.SWEEPING_GAZE",
+];
+
 impl Game {
-    pub(super) fn play(&mut self, content: &Content, hand: usize, target: Option<usize>) {
+    pub(super) fn play(
+        &mut self,
+        content: &Content,
+        hand: usize,
+        target: Option<usize>,
+        manual: bool,
+    ) {
         let spiked_gauntlets = self.has_relic(content, "RELIC.SPIKED_GAUNTLETS");
         let chemical_x = self.has_relic(content, "RELIC.CHEMICAL_X");
-        let intimidating_helmet = self.has_relic(content, "RELIC.INTIMIDATING_HELMET");
         let brilliant_scarf = self.has_relic(content, "RELIC.BRILLIANT_SCARF")
             && self.combat().unwrap().history.manual_plays == 4;
-        let throwing_axe =
-            self.has_relic(content, "RELIC.THROWING_AXE") && !self.combat().unwrap().throwing_axe;
-        let pen_nib = self.has_relic(content, "RELIC.PEN_NIB")
-            && self.combat().unwrap().hand[hand]
-                .card_type(content.cards[self.combat().unwrap().hand[hand].id as usize])
-                == CardType::Attack;
-        let mut pen_nib_counter = self.pen_nib;
         self.face_target(target);
         let combat = self.combat_mut().unwrap();
+        let card = combat.hand.remove(hand);
+        combat.bound_played |= card.affliction == Affliction::Bound;
+        let def = content.cards[card.id as usize];
+        // Brilliant Scarf modifies costs, which an X cost ignores (GetAmountToSpend).
+        let cost = if brilliant_scarf && def.cost[card.upgrades.min(1) as usize] >= 0 {
+            0
+        } else {
+            energy_cost(combat, card, def, spiked_gauntlets, true)
+        };
+        let x_cost = def.cost[card.upgrades.min(1) as usize] < 0;
+        // Whispering Earring spends energy before its auto-play, which then sees an X cost as 0.
+        let energy = if manual || !x_cost { cost } else { 0 };
+        let x = if x_cost { combat.energy } else { 0 } + 2 * (x_cost && chemical_x) as i16;
+        combat.energy -= cost;
+        trigger_orbit(combat, cost);
+        let stars = if brilliant_scarf && def.star_cost[card.upgrades.min(1) as usize] != -2 {
+            0
+        } else {
+            star_cost(combat, card, def)
+        };
+        combat.stars -= stars;
+        combat.history.energy += cost;
+        let context = Context {
+            target,
+            x,
+            event: stars
+                + 2 * (chemical_x && def.star_cost[card.upgrades.min(1) as usize] == -2) as i16,
+            target_instance: target.map(|slot| combat.enemies[slot].instance),
+            ..Context::card(card)
+        };
+        let play = Play {
+            card,
+            plays: 0,
+            done: 0,
+            energy,
+            stars,
+            manual,
+            context,
+            recorded: Vec::new(),
+        };
+        self.start_play(content, play);
+    }
+
+    /// CardModel.OnPlayWrapper's start: the result pile, the play count, then the first play.
+    fn start_play(&mut self, content: &Content, mut play: Play) {
+        let throwing_axe =
+            self.has_relic(content, "RELIC.THROWING_AXE") && !self.combat().unwrap().throwing_axe;
+        let combat = self.combat_mut().unwrap();
         combat.throwing_axe |= throwing_axe;
-        combat.power_snapshot = combat.player.powers.clone();
-        combat.enemy_power_snapshot = combat
-            .enemies
-            .iter()
-            .map(|enemy| enemy.creature.powers.clone())
-            .collect();
-        let mut card = combat.hand.remove(hand);
+        let card = &mut play.card;
         let def = content.cards[card.id as usize];
         let card_type = card.card_type(def);
         if matches!(card_type, CardType::Attack | CardType::Skill)
@@ -132,533 +198,342 @@ impl Game {
         {
             card.flags |= RETURN_TO_DRAW;
         }
-        let fetch =
-            card.id == card_id::FETCH && card.turn_flags & FETCHED == 0 && combat.osty.hp > 0;
-        if card.id == card_id::FETCH {
-            card.turn_flags |= FETCHED;
+        // The result pile is chosen when the play starts, so a mid-play upgrade keeps Exhaust and
+        // Corruption only exhausts skills that start after it (not the Havoc that played it).
+        card.turn_flags |= card.flags(def) & EXHAUST;
+        if card_type == CardType::Skill && combat.player.power(power_id::CORRUPTION) > 0 {
+            card.turn_flags |= EXHAUST;
         }
-        combat.playing = Some(card);
-        let void_free = combat.history.manual_cards < combat.player.power(power_id::VOID_FORM);
-        let free = match card_type {
-            _ if void_free => None,
-            CardType::Power if combat.player.power(power_id::FREE_POWER) > 0 => {
-                Some(power_id::FREE_POWER)
-            }
-            CardType::Skill if combat.player.power(power_id::FREE_SKILL) > 0 => {
-                Some(power_id::FREE_SKILL)
-            }
-            _ => None,
-        };
-        let veil =
-            card.flags(def) & ETHEREAL != 0 && combat.player.power(power_id::VEILPIERCER) > 0;
-        let free_attack =
-            card_type == CardType::Attack && combat.player.power(power_id::FREE_ATTACK) > 0;
-        let cost = if brilliant_scarf {
-            0
-        } else {
-            energy_cost(combat, card, def, spiked_gauntlets)
-        };
-        if let Some(power) = free {
-            combat.player.consume_power(power);
+        // Rebound's redirect is chosen when a play starts
+        // (ModifyCardPlayResultPileTypeAndPosition): a discard-bound card starting under it goes to
+        // the top of the draw pile and uses one stack.
+        if combat.player.power(power_id::REBOUND) > 0
+            && card_type != CardType::Power
+            && card.flags(def) & (EXHAUST | RETURN_TO_HAND | RETURN_TO_DRAW) == 0
+        {
+            combat.player.consume_power(power_id::REBOUND);
+            combat.rebounds.push(card.instance);
         }
-        if veil {
-            combat.player.consume_power(power_id::VEILPIERCER);
+        // Feral's return is also chosen when a play starts: the first zero-energy attacks to start
+        // this turn go back to the hand, even if one auto-played inside them finishes first.
+        if card_type == CardType::Attack
+            && play.energy == 0
+            && combat.history.feral_returns < combat.player.power(power_id::FERAL)
+        {
+            combat.history.feral_returns += 1;
+            combat.ferals.push(card.instance);
         }
-        if free_attack {
-            combat.player.consume_power(power_id::FREE_ATTACK);
+        if card_type == CardType::Attack {
+            let stomp = content.card_id("CARD.STOMP");
+            combat.add_costs(|card| Some(card.id) == stomp, -1, THIS_TURN);
         }
-        let danse = if cost >= 2 {
-            combat.player.power(power_id::DANSE_MACABRE)
-        } else {
-            0
-        };
-        let ethereal = card.flags(def);
-        let ash = if ethereal & ETHEREAL != 0 {
-            combat.player.power(power_id::SPIRIT_OF_ASH)
-        } else {
-            0
-        };
-        let x_cost = def.cost[card.upgrades.min(1) as usize] < 0;
-        let x = if !void_free && x_cost {
-            combat.energy
-        } else {
-            0
-        } + 2 * (x_cost && chemical_x) as i16;
-        combat.energy -= cost;
-        trigger_orbit(combat, cost);
-        let throne = combat.player.power(power_id::THE_SEALED_THRONE);
-        if throne > 0 {
-            combat.stars = combat.stars.saturating_add(throne);
-            combat.history.stars_gained = combat.history.stars_gained.saturating_add(throne);
+        play.plays = combat.play_count(content, play.card, throwing_axe);
+        let plays = play.plays as i16;
+        let history = &mut combat.history;
+        history.cards += plays;
+        history.first_plays += 1;
+        combat.total_cards += plays;
+        if play.manual {
+            history.manual_cards += 1;
+            history.manual_plays += plays;
         }
-        let stars = if brilliant_scarf {
-            0
-        } else {
-            star_cost(combat, card, def)
-        };
-        combat.stars -= stars;
-        combat.card_energy = cost;
-        combat.card_stars = stars;
-        let burst = card_type == CardType::Skill && combat.player.power(power_id::BURST) > 0;
-        let punch =
-            card_type == CardType::Attack && combat.player.power(power_id::ONE_TWO_PUNCH) > 0;
-        if burst {
-            combat.player.consume_power(power_id::BURST);
-        }
-        let duplicate = (combat.player.power(power_id::DUPLICATION) > 0) as u8;
-        if duplicate > 0 {
-            combat.player.consume_power(power_id::DUPLICATION);
-        }
-        let plays = 1
-            + throwing_axe as u8
-            + card.replays
-            + matches!(card.enchantment, Some(Enchantment::Spiral)) as u8
-            + (card.enchantment == Some(Enchantment::Glam) && card.enchantment_value > 0) as u8
-            + (combat.history.manual_cards < combat.player.power(power_id::ECHO_FORM)) as u8
-            + (combat.player.power(power_id::SIGNAL_BOOST) > 0) as u8
-            + burst as u8
-            + punch as u8
-            + duplicate
-            + if card.id == card_id::SOVEREIGN_BLADE {
-                combat.player.power(power_id::SWORD_SAGE).max(0) as u8
-            } else {
-                0
-            };
-        if combat.player.power(power_id::SIGNAL_BOOST) > 0 {
-            combat.player.consume_power(power_id::SIGNAL_BOOST);
-        }
-        if punch {
-            combat.player.consume_power(power_id::ONE_TWO_PUNCH);
-        }
-        combat.history.energy += cost;
-        combat.card_plays = plays;
-        combat.history.cards += plays as i16;
-        combat.total_cards += plays as i16;
-        combat.history.manual_cards += 1;
-        combat.history.manual_plays += plays as i16;
+        history.zero_attacks += (card_type == CardType::Attack && play.energy == 0) as i16 * plays;
+        play.context.lethal = card_type == CardType::Attack && history.attacks == 0;
         match card_type {
-            CardType::Attack => combat.history.attacks += plays as i16,
-            CardType::Skill => combat.history.skills += plays as i16,
-            CardType::Power => combat.history.powers += plays as i16,
+            CardType::Attack => history.attacks += plays,
+            CardType::Skill => history.skills += plays,
+            CardType::Power => history.powers += plays,
             _ => {}
         }
+        let (stars, context) = (play.stars, play.context);
         let context = Context {
-            source: Actor::Player,
-            target,
-            card: Some(card.id),
-            upgraded: card.upgrades > 0,
-            x,
-            event: stars,
-            orb: false,
-            orb_id: None,
-            pen_nib: false,
+            lethal: false,
+            ..context
         };
-        let fan_shiv = def.id == "CARD.SHIV" && combat.player.power(power_id::FAN_OF_KNIVES) > 0;
-        if card.enchantment == Some(Enchantment::Sown) && card.enchantment_value > 0 {
-            combat.energy = combat.energy.saturating_add(card.enchantment_amount);
-            combat.playing.as_mut().unwrap().enchantment_value = 0;
+        if !play.manual {
+            // An auto-play's CardPlay records no spent stars (Black Hole).
+            play.stars = 0;
         }
-        if fetch {
-            combat.queue.push(Pending {
-                effect: Effect::Draw(1),
-                context,
-            });
-        }
-        let mut pen_nibs = vec![false; plays as usize];
-        for doubled in &mut pen_nibs {
-            if pen_nib {
-                pen_nib_counter = (pen_nib_counter + 1) % 10;
-                *doubled = pen_nib_counter == 0;
-            }
-        }
-        for play in (0..plays).rev() {
-            let context = Context {
-                pen_nib: pen_nibs[play as usize],
-                ..context
-            };
-            if card.flags(def) & INKY != 0 {
-                combat.queue.push(Pending {
-                    effect: Effect::ApplyPower(
-                        Target::ChosenEnemy,
-                        power_id::WEAK,
-                        Amount::fixed(1, 1),
-                    ),
-                    context,
-                });
-            }
-            if fan_shiv {
-                combat.queue.push(Pending {
-                    effect: Effect::Attack(Target::AllEnemies, Amount::fixed(4, 6), 1),
-                    context,
-                });
-            } else {
-                if def.id == "CARD.COSMIC_INDIFFERENCE" {
-                    combat.queue.push(Pending {
-                        effect: Effect::Select(
-                            Pile::Discard,
-                            CardFilter::Any,
-                            [1, 1],
-                            false,
-                            false,
-                            CardOp::Move(Pile::Draw),
-                        ),
-                        context,
-                    });
-                }
-                push_card_effects(&mut combat.queue, card, def, context);
-                if def.id == "CARD.HOLOGRAM" {
-                    combat.queue.push(Pending {
-                        effect: Effect::Block(Target::Player, Amount::fixed(3, 5)),
-                        context,
-                    });
-                }
-            }
-        }
-        if cost >= 2 && intimidating_helmet {
-            for _ in 0..plays {
-                combat.queue.push(Pending {
-                    effect: Effect::RawBlock(Target::Player, Amount::fixed(4, 4)),
-                    context,
-                });
-            }
-        }
-        match card.enchantment {
-            Some(Enchantment::Adroit) => combat.queue.push(Pending {
-                effect: Effect::Block(
-                    Target::Player,
-                    Amount::fixed(card.enchantment_amount, card.enchantment_amount),
-                ),
-                context,
-            }),
-            Some(Enchantment::Corrupted) => combat.queue.push(Pending {
-                effect: Effect::LoseHp(Target::Player, Amount::fixed(2, 2)),
-                context,
-            }),
-            Some(Enchantment::Swift) if card.enchantment_value > 0 => {
-                combat.playing.as_mut().unwrap().enchantment_value = 0;
-                combat.queue.push(Pending {
-                    effect: Effect::Draw(card.enchantment_amount.max(0) as u8),
-                    context,
-                });
-            }
-            _ => {}
-        }
-        let block = combat
-            .player
-            .power(power_id::CHILD_OF_THE_STARS)
-            .saturating_mul(stars);
+        combat.plays.push(play);
+        combat.queue.push(Pending {
+            effect: Effect::OnPlay,
+            context,
+        });
+        let block = (combat.player.power(power_id::CHILD_OF_THE_STARS)).saturating_mul(stars);
         if block > 0 {
             combat.queue.push(Pending {
                 effect: Effect::RawBlock(Target::Player, Amount::fixed(block, block)),
                 context,
             });
         }
-        let black_hole = combat.player.power(power_id::BLACK_HOLE);
-        if throne > 0 && black_hole > 0 {
-            combat.queue.push(Pending {
-                effect: Effect::Damage(Target::AllEnemies, Amount::fixed(black_hole, black_hole)),
-                context,
-            });
-        }
-        if !self.replaying {
+        if context.card != Some(card_id::BOMBARDMENT) && !self.replaying {
             self.queue_bombardments();
         }
-        if danse > 0 {
-            self.combat_mut().unwrap().queue.push(Pending {
-                effect: Effect::Block(Target::Player, Amount::fixed(danse, danse)),
-                context,
-            });
-        }
-        if ash > 0 {
-            self.combat_mut().unwrap().queue.push(Pending {
-                effect: Effect::RawBlock(Target::Player, Amount::fixed(ash, ash)),
-                context,
-            });
-        }
-        self.pen_nib = pen_nib_counter;
-    }
-
-    pub(super) fn finish_play(&mut self, content: &Content) {
-        let (mut card, card_energy, card_stars) = {
-            let combat = self.combat_mut().unwrap();
-            if combat.choice.is_some() || !combat.queue.is_empty() || combat.playing.is_none() {
-                return;
-            }
-            (
-                combat.playing.take().unwrap(),
-                combat.card_energy,
-                combat.card_stars,
-            )
-        };
-        let def = content.cards[card.id as usize];
-        let card_type = card.card_type(def);
-        match card.enchantment {
-            Some(Enchantment::Glam | Enchantment::Vigorous) => card.enchantment_value = 0,
-            Some(Enchantment::Goopy) => {
-                card.enchantment_amount = card.enchantment_amount.saturating_add(1);
-                card.enchantment_value = card.enchantment_amount;
-                if let Some(deck) = self
-                    .run
-                    .deck
-                    .iter_mut()
-                    .find(|deck| deck.instance == card.instance)
-                {
-                    deck.enchantment_amount = card.enchantment_amount;
-                }
-            }
-            _ => {}
-        }
-        let feral = card_type == CardType::Attack && card_energy == 0;
-        if card.id == card_id::MAUL {
-            let increase = 1 + card.upgrades.min(1) as i16;
-            card.value += increase;
-            let combat = self.combat_mut().unwrap();
-            for other in combat
-                .draw
-                .iter_mut()
-                .chain(&mut combat.hand)
-                .chain(&mut combat.discard)
-                .chain(&mut combat.exhaust)
-            {
-                if other.id == card_id::MAUL {
-                    other.value += increase;
-                }
-            }
-            for other in &mut self.run.deck {
-                if other.id == card_id::MAUL {
-                    other.value += increase;
-                }
-            }
-        }
-        if card.upgrades == 0
-            && matches!(card_type, CardType::Attack | CardType::Skill)
-            && self.has_relic(content, "RELIC.RAZOR_TOOTH")
-        {
-            card.upgrades = 1;
-        }
-        if def.id == "CARD.UPROAR" {
-            let draw = &self.combat().unwrap().draw;
-            let mut attacks: Vec<_> = draw
-                .iter()
-                .rev()
-                .copied()
-                .filter(|card| {
-                    let def = content.cards[card.id as usize];
-                    def.card_type == CardType::Attack && card.flags(def) & UNPLAYABLE == 0
-                })
-                .collect();
-            if attacks.is_empty() {
-                attacks = draw
-                    .iter()
-                    .rev()
-                    .copied()
-                    .filter(|card| content.cards[card.id as usize].card_type == CardType::Attack)
-                    .collect();
-            }
-            sort_for_shuffle(&mut attacks, content);
-            self.rngs.shuffle.shuffle(&mut attacks);
-            if let Some(card) = attacks.first() {
-                let index = self
-                    .combat()
-                    .unwrap()
-                    .draw
-                    .iter()
-                    .position(|candidate| candidate.instance == card.instance)
-                    .unwrap();
-                let card = self.combat_mut().unwrap().remove_draw(index);
-                self.combat_mut().unwrap().queue.push(Pending {
-                    effect: Effect::AutoPlay(card),
-                    context: Context::card(card),
-                });
-                self.resolve(content);
-            }
-        }
-        let (card, exhausted) = self.finish_card_destination(content, card, false, feral);
-        if matches!(card_type, CardType::Attack | CardType::Skill) && card.flags & DUPE == 0 {
-            self.combat_mut().unwrap().history_course = Some(card);
-        }
-        if self.combat().unwrap().unsettling_lamp == Some(card.id) {
-            self.combat_mut().unwrap().unsettling_lamp = None;
-            self.combat_mut().unwrap().unsettling_used = true;
-        }
-        self.unceasing_top(content);
-        if card_type == CardType::Attack
-            && self.has_relic(content, "RELIC.MUSIC_BOX")
-            && !self.combat().unwrap().music_box
-        {
-            let mut copy = card;
-            copy.instance = 0;
-            copy.flags |= ETHEREAL;
-            self.combat_mut().unwrap().music_box = true;
-            self.add_generated(content, Pile::Hand, copy);
-        }
-        if card_type == CardType::Power
-            && self.has_relic(content, "RELIC.PERMAFROST")
-            && !self.combat().unwrap().permafrost
-        {
-            self.combat_mut().unwrap().permafrost = true;
-            self.gain_block(content, Actor::Player, 7, None, false);
-        }
-        if card_type == CardType::Power && self.has_relic(content, "RELIC.MUMMIFIED_HAND") {
-            for _ in 0..self.combat().unwrap().card_plays {
-                self.mummified_hand(content);
-            }
-        }
-        if !self.combat().unwrap().vambrace
-            && self.has_relic(content, "RELIC.VAMBRACE")
-            && self.combat().unwrap().history.block_card == self.combat().unwrap().history.cards
-        {
-            self.combat_mut().unwrap().vambrace = true;
-        }
-        if self.combat().unwrap().paels_legion == 0
-            && self.has_relic(content, "RELIC.PAELS_LEGION")
-            && self.combat().unwrap().history.block_card == self.combat().unwrap().history.cards
-        {
-            self.combat_mut().unwrap().paels_legion = 2;
-        }
-        if exhausted {
-            self.trigger(content, Trigger::CardExhausted, Actor::Player, 1);
-            self.trigger_card(content, card, Trigger::CardExhausted);
-        }
-        let combat = self.combat().unwrap();
-        let old_attacks = combat.history.attacks - combat.card_plays as i16;
-        let old_skills = combat.history.skills - combat.card_plays as i16;
-        if card_type == CardType::Attack
-            && old_attacks < 3
-            && self.combat().unwrap().history.attacks >= 3
-        {
-            let copies = self
-                .creature(Actor::Player)
-                .power(power_id::JUGGLING)
-                .max(0) as u8;
-            for _ in 0..copies {
-                let mut copy = card;
-                copy.instance = 0;
-                self.add_generated(content, Pile::Hand, copy);
-            }
-        }
-        let fan = card_type == CardType::Attack && self.has_relic(content, "RELIC.ORNAMENTAL_FAN");
-        for _ in 0..if fan {
-            self.combat().unwrap().history.attacks / 3 - old_attacks / 3
-        } else {
-            0
-        } {
-            self.combat_mut().unwrap().queue.push(Pending {
-                effect: Effect::RawBlock(Target::Player, Amount::fixed(4, 4)),
-                context: Context::player(),
-            });
-        }
-        if card_type == CardType::Attack {
-            let triggers = self.combat().unwrap().history.attacks / 3 - old_attacks / 3;
-            for _ in 0..triggers {
-                if self.has_relic(content, "RELIC.KUNAI") {
-                    self.apply_power(content, Actor::Player, power_id::DEXTERITY, 1);
-                }
-                if self.has_relic(content, "RELIC.SHURIKEN") {
-                    self.apply_power(content, Actor::Player, power_id::STRENGTH, 1);
-                }
-            }
-            if self.has_relic(content, "RELIC.NUNCHAKU") {
-                let attacks = self.nunchaku as i16 + self.combat().unwrap().card_plays as i16;
-                self.combat_mut().unwrap().energy += attacks / 10;
-                self.nunchaku = (attacks % 10) as u8;
-            }
-            if self.has_relic(content, "RELIC.KUSARIGAMA") {
-                let attacks = self.combat().unwrap().kusarigama as i16
-                    + self.combat().unwrap().card_plays as i16;
-                self.combat_mut().unwrap().kusarigama = (attacks % 3) as u8;
-                for _ in 0..attacks / 3 {
-                    self.combat_mut().unwrap().queue.push(Pending {
-                        effect: Effect::Damage(Target::RandomEnemy, Amount::fixed(6, 6)),
-                        context: Context::player(),
-                    });
-                }
-            }
-        }
-        if card_type == CardType::Skill && self.has_relic(content, "RELIC.LETTER_OPENER") {
-            for _ in 0..self.combat().unwrap().history.skills / 3 - old_skills / 3 {
-                self.combat_mut().unwrap().queue.push(Pending {
-                    effect: Effect::Damage(Target::AllEnemies, Amount::fixed(5, 5)),
-                    context: Context::player(),
-                });
-            }
-        }
-        if self.has_relic(content, "RELIC.IRON_CLUB") {
-            let cards = self.iron_club as i16 + self.combat().unwrap().card_plays as i16;
-            self.iron_club = (cards % 4) as u8;
-            for _ in 0..cards / 4 {
-                self.combat_mut().unwrap().queue.push(Pending {
-                    effect: Effect::Draw(1),
-                    context: Context::player(),
-                });
-            }
-        }
-        if card_type == CardType::Skill && self.has_relic(content, "RELIC.TUNING_FORK") {
-            let skills = self.tuning_fork as i16 + self.combat().unwrap().card_plays as i16;
-            self.tuning_fork = (skills % 10) as u8;
-            for _ in 0..skills / 10 {
-                self.gain_block(content, Actor::Player, 7, None, false);
-            }
-        }
-        if !self.combat().unwrap().rainbow_ring
-            && self.has_relic(content, "RELIC.RAINBOW_RING")
-            && self.combat().unwrap().history.attacks > 0
-            && self.combat().unwrap().history.skills > 0
-            && self.combat().unwrap().history.powers > 0
-        {
-            self.combat_mut().unwrap().rainbow_ring = true;
-            self.apply_power(content, Actor::Player, power_id::STRENGTH, 1);
-            self.apply_power(content, Actor::Player, power_id::DEXTERITY, 1);
-        }
-        if card_stars > 0
+        self.before_card_played(content);
+        // Star-spending relics fire when resources are spent, before the card resolves.
+        if stars > 0
             && self.has_relic(content, "RELIC.MINI_REGENT")
             && !self.combat().unwrap().mini_regent
         {
             self.combat_mut().unwrap().mini_regent = true;
             self.apply_power(content, Actor::Player, power_id::STRENGTH, 1);
         }
-        if card_stars > 0 && self.has_relic(content, "RELIC.GALACTIC_DUST") {
-            let stars = self.galactic_dust as i16 + card_stars;
+        if stars > 0 && self.has_relic(content, "RELIC.GALACTIC_DUST") {
+            let stars = self.galactic_dust as i16 + stars;
             self.galactic_dust = (stars % 10) as u8;
             for _ in 0..stars / 10 {
                 self.gain_block(content, Actor::Player, 10, None, false);
             }
         }
-        if card_energy >= 3 && self.has_relic(content, "RELIC.IVORY_TILE") {
-            self.combat_mut().unwrap().energy += self.combat().unwrap().card_plays as i16;
+    }
+
+    /// One play's OnPlay, enchantment and affliction, then its AfterPlay step.
+    fn queue_play(&mut self, content: &Content) {
+        let pen_nib = self.has_relic(content, "RELIC.PEN_NIB");
+        let play = self.combat().unwrap().plays.last().unwrap();
+        let (card, base, index) = (play.card, play.context, play.done);
+        let def = content.cards[card.id as usize];
+        let attack = card.card_type(def) == CardType::Attack;
+        let context = Context {
+            pen_nib: pen_nib && attack && self.pen_nib == 0,
+            lethal: base.lethal && index == 0,
+            upgraded: card.upgrades > 0,
+            ..base
+        };
+        let combat = self.combat_mut().unwrap();
+        let fan_shiv = def.id == "CARD.SHIV" && combat.player.power(power_id::FAN_OF_KNIVES) > 0;
+        combat.queue.push(Pending {
+            effect: Effect::AfterPlay,
+            context,
+        });
+        // Enchantments act after the card's own effects (queued first, so they resolve last).
+        let amount = card.enchantment_amount;
+        let effect = match card.enchantment {
+            Some(Enchantment::Adroit) => {
+                Some(Effect::Block(Target::Player, Amount::fixed(amount, amount)))
+            }
+            Some(Enchantment::Corrupted) => {
+                Some(Effect::LoseHp(Target::Player, Amount::fixed(2, 2)))
+            }
+            Some(Enchantment::Sown) if card.enchantment_value > 0 => {
+                Some(Effect::Energy(amount as i8))
+            }
+            Some(Enchantment::Swift) if card.enchantment_value > 0 => {
+                let draw = amount.max(0) as u8;
+                if def.flags[card.upgrades.min(1) as usize] & RETURN_TO_DRAW != 0 {
+                    combat.swift_after_return = draw;
+                    None
+                } else {
+                    Some(Effect::Draw(draw))
+                }
+            }
+            _ => None,
+        };
+        if matches!(
+            card.enchantment,
+            Some(Enchantment::Sown | Enchantment::Swift)
+        ) {
+            combat.plays.last_mut().unwrap().card.enchantment_value = 0;
         }
-        let powers = std::mem::take(&mut self.combat_mut().unwrap().power_snapshot);
-        let enemies = std::mem::take(&mut self.combat_mut().unwrap().enemy_power_snapshot);
-        let mut context = Context::card(card);
-        for _ in 0..self.combat().unwrap().card_plays {
-            context = self.queue_card_triggers(content, card, powers.clone(), enemies.clone());
+        if let Some(effect) = effect {
+            combat.queue.push(Pending { effect, context });
         }
+        // Fetch draws after Osty's attack on its first play this turn.
+        if index == 0 && card.id == card_id::FETCH {
+            let play = combat.plays.last_mut().unwrap();
+            if card.turn_flags & FETCHED == 0 && combat.osty.hp > 0 {
+                combat.queue.push(Pending {
+                    effect: Effect::Draw(1),
+                    context,
+                });
+            }
+            play.card.turn_flags |= FETCHED;
+        }
+        if card.flags(def) & INKY != 0 {
+            let target = if fan_shiv || def.target == Target::AllEnemies {
+                Target::AllEnemies
+            } else {
+                Target::ChosenEnemy
+            };
+            combat.queue.push(Pending {
+                effect: Effect::ApplyPower(target, power_id::WEAK, Amount::fixed(1, 1)),
+                context,
+            });
+        }
+        if fan_shiv {
+            combat.queue.push(Pending {
+                effect: Effect::Attack(Target::AllEnemies, Amount::fixed(4, 6), 1),
+                context,
+            });
+            return;
+        }
+        if def.id == "CARD.COSMIC_INDIFFERENCE" {
+            combat.queue.push(Pending {
+                effect: Effect::Select(
+                    Pile::Discard,
+                    CardFilter::Any,
+                    [1, 1],
+                    false,
+                    false,
+                    CardOp::Move(Pile::Draw),
+                ),
+                context,
+            });
+        }
+        push_card_effects(&mut combat.queue, card, def, context);
+    }
+
+    /// A later play of a series starts once the previous one and its AfterCardPlayed hooks
+    /// resolved: its BeforeCardPlayed pass, then its OnPlay.
+    fn before_play(&mut self, content: &Content) {
+        let combat = self.combat_mut().unwrap();
+        let play = combat.plays.last().unwrap();
+        let (card, context) = (play.card, play.context);
+        combat.queue.push(Pending {
+            effect: Effect::OnPlay,
+            context,
+        });
+        if card.card_type(content.cards[card.id as usize]) == CardType::Attack {
+            let stomp = content.card_id("CARD.STOMP");
+            combat.add_costs(|card| Some(card.id) == stomp, -1, THIS_TURN);
+        }
+        self.before_card_played(content);
+    }
+
+    /// A play finished (CardPlayFinished, then AfterCardPlayed): the next play starts, or the
+    /// card goes to its result pile.
+    fn after_play(&mut self, content: &Content) {
+        let combat = self.combat_mut().unwrap();
+        let play = combat.plays.last_mut().unwrap();
+        if play.done + 1 == play.plays {
+            return self.finish_play(content);
+        }
+        let (mut card, energy) = (play.card, play.energy);
+        let finished = play.done as i16 + 1;
+        self.spend_block_doublers(content, card.instance);
+        // Maul grows as each play resolves (OnPlay), so its next play hits harder.
+        self.grow_maul(&mut card);
+        // Vigorous wears off after each play (AfterCardPlayed), so replays don't get it;
+        // Goopy grows with each play.
+        match card.enchantment {
+            Some(Enchantment::Vigorous) => card.enchantment_value = 0,
+            Some(Enchantment::Goopy | Enchantment::Momentum) => self.spend_enchantment(&mut card),
+            _ => {}
+        }
+        self.combat_mut().unwrap().plays.last_mut().unwrap().card = card;
+        // Rupture's Strength from this play's own HP loss lands as it finishes (Glam replays).
+        self.release_rupture(content);
+        let card_type = card.card_type(content.cards[card.id as usize]);
+        self.combat_mut().unwrap().queue.push(Pending {
+            effect: Effect::BeforePlay,
+            context: Context::card(card),
+        });
+        let skills = self.finished_plays(content, CardType::Skill) + finished;
+        self.queue_return_late(card_type, (skills - 1, skills), energy);
+        // Each finished play of a Shiv counts (Phantom Blades), not just the last.
+        let combat = self.combat_mut().unwrap();
+        if content.cards[card.id as usize].tags & SHIV_TAG != 0 {
+            combat.history.shivs += 1;
+        }
+        let play = combat.plays.last_mut().unwrap();
+        play.done += 1;
+        let recorded = play.recorded.clone();
+        // Once the fight is won the combat ends during a card's remaining plays, before
+        // their AfterCardPlayed hooks (Calamity).
+        if !self.enemies_defeated() {
+            self.card_played(content, card, recorded);
+        }
+    }
+
+    /// The last play finished: CardPlayFinished's bookkeeping, AfterCardPlayed, then the result
+    /// pile and the empty-hand check.
+    fn finish_play(&mut self, content: &Content) {
+        let combat = self.combat_mut().unwrap();
+        let play = combat.plays.pop().unwrap();
+        let mut card = play.card;
+        let def = content.cards[card.id as usize];
+        let card_type = card.card_type(def);
+        let replay = card.flags & REPLAY != 0;
+        card.flags &= !REPLAY;
+        self.spend_enchantment(&mut card);
+        let ferals = &mut self.combat_mut().unwrap().ferals;
+        let feral = (ferals.iter().position(|&id| id == card.instance))
+            .map(|index| ferals.swap_remove(index))
+            .is_some();
+        self.grow_maul(&mut card);
+        if card_type == CardType::Skill
+            && self.creature(Actor::Player).power(power_id::MASTER_PLANNER) > 0
+        {
+            card.flags |= SLY;
+        }
+        let combat = self.combat_mut().unwrap();
+        if def.tags & SHIV_TAG != 0 {
+            combat.history.shivs += 1;
+        }
+        // The hand is checked once the card is placed and its exhaust hooks resolved, unless the
+        // play ran inside another card or potion or during the turn's setup (CheckForEmptyHand,
+        // UnceasingTop.IsValidPhase).
+        if combat.plays.is_empty() && combat.potions == 0 && !combat.setup {
+            combat.queue.push(Pending {
+                effect: Effect::CheckEmptyHand,
+                context: Context::player(),
+            });
+        }
+        self.place_played(content, card, replay, feral);
+        let skills = self.finished_plays(content, CardType::Skill);
+        self.queue_return_late(card_type, (skills - 1, skills), play.energy);
+        self.spend_block_doublers(content, card.instance);
+        if play.energy >= 3 && self.has_relic(content, "RELIC.IVORY_TILE") {
+            self.gain_energy(play.plays as i16);
+        }
+        self.release_rupture(content);
+        let context = self.card_played(content, card, play.recorded);
         let damage = self.combat().unwrap().player.power(power_id::BLACK_HOLE);
-        if self.combat().unwrap().card_stars > 0 && damage > 0 {
+        if play.stars > 0 && damage > 0 {
             self.combat_mut().unwrap().queue.push(Pending {
                 effect: Effect::Damage(Target::AllEnemies, Amount::fixed(damage, damage)),
                 context,
             });
         }
-        if card_type == CardType::Skill {
-            self.return_make_it_so(old_skills);
+    }
+
+    /// Vambrace and Pael's Legion double one card play's block; the game spends them in
+    /// AfterCardPlayed, so a replayed card (Spiral) is doubled only once.
+    fn spend_block_doublers(&mut self, content: &Content, instance: u32) {
+        if self.combat().unwrap().block_doubler != Some(instance) {
+            return;
         }
-        if self.combat().unwrap().card_energy >= 2 {
-            while self.combat().unwrap().hand.len() < 10 {
-                let Some(index) = self
-                    .combat()
-                    .unwrap()
-                    .discard
-                    .iter()
-                    .position(|card| card.id == card_id::RIGHT_HAND_HAND)
-                else {
-                    break;
-                };
-                let card = self.combat_mut().unwrap().discard.remove(index);
-                self.combat_mut().unwrap().hand.push(card);
-            }
+        self.combat_mut().unwrap().block_doubler = None;
+        if self.has_relic(content, "RELIC.VAMBRACE") {
+            self.combat_mut().unwrap().vambrace = true;
         }
-        self.tick_panache();
+        if self.combat().unwrap().paels_legion == 0 && self.has_relic(content, "RELIC.PAELS_LEGION")
+        {
+            self.combat_mut().unwrap().paels_legion = 2;
+        }
+    }
+
+    /// Right Hand Hand returns from the discard pile after any play worth 2+ energy, auto-plays too.
+    /// With a full hand it goes back on top of the discard pile.
+    fn return_right_hands(&mut self, energy: i16) {
+        if energy < 2 {
+            return;
+        }
+        let discard = &self.combat().unwrap().discard;
+        let returning: Vec<_> = discard
+            .iter()
+            .filter(|card| card.id == card_id::RIGHT_HAND_HAND)
+            .map(|card| card.instance)
+            .collect();
+        for instance in returning {
+            let discard = &mut self.combat_mut().unwrap().discard;
+            let index = discard
+                .iter()
+                .position(|card| card.instance == instance)
+                .unwrap();
+            let card = discard.remove(index);
+            self.add_to_hand(card);
+        }
     }
 
     pub(super) fn use_potion(&mut self, content: &Content, slot: usize, target: Option<usize>) {
@@ -715,47 +590,43 @@ impl Game {
         }
         self.face_target(target);
         let context = Context {
-            source: Actor::Player,
             target,
-            card: None,
-            upgraded: false,
-            x: 0,
-            event: 0,
-            orb: false,
-            orb_id: None,
-            pen_nib: false,
+            ..Context::player()
         };
+        // The game checks for an empty hand (Unceasing Top) only once the potion is done.
+        let combat = self.combat_mut().unwrap();
+        combat.potions += 1;
+        combat.queue.push(Pending {
+            effect: Effect::CheckEmptyHand,
+            context,
+        });
+        // Its AfterPotionUsed pass starts once the potion is done.
+        combat.queue.push(Pending {
+            effect: Effect::Fire(Trigger::AfterPotionUsed),
+            context,
+        });
         push_effects(
             &mut self.combat_mut().unwrap().queue,
             content.potions[id as usize].effects,
             context,
         );
-        if self.has_relic(content, "RELIC.REPTILE_TRINKET") {
-            self.apply_power(content, Actor::Player, power_id::STRENGTH, 3);
-            self.apply_power(content, Actor::Player, power_id::REPTILE_TRINKET, 3);
-        }
-        self.sync_belt_buckle(content);
     }
 
     pub(super) fn choose(&mut self, content: &Content, index: usize) {
-        let choice = self.combat().unwrap().choice.unwrap();
-        let knowledge = (choice.pile == Pile::Offer && self.combat().unwrap().enemy_turn)
-            .then(|| {
-                let card = self.combat().unwrap().offer[index];
-                self.combat()
-                    .unwrap()
-                    .enemies
-                    .iter()
-                    .enumerate()
-                    .find(|(_, enemy)| {
-                        enemy.move_index == 0
-                            && content.enemies[enemy.creature.id as usize].id
-                                == "MONSTER.KNOWLEDGE_DEMON"
-                    })
-                    .map(|(enemy, _)| (enemy, card))
-            })
-            .flatten();
-        if let Some((enemy, card)) = knowledge {
+        let combat = self.combat().unwrap();
+        let choice = combat.choice.unwrap();
+        let knowledge = (choice.pile == Pile::Offer
+            && combat.enemy_turn
+            && matches!(
+                combat.offer[index].id,
+                card_id::DISINTEGRATION | card_id::MIND_ROT | card_id::SLOTH | card_id::WASTE_AWAY
+            )
+            && combat.enemies.iter().any(|enemy| {
+                enemy.move_index == 0
+                    && content.enemies[enemy.creature.id as usize].id == "MONSTER.KNOWLEDGE_DEMON"
+            }))
+        .then(|| combat.offer[index]);
+        if let Some(card) = knowledge {
             let (power, amount) = match card.id {
                 card_id::DISINTEGRATION => (power_id::DISINTEGRATION, card.value),
                 card_id::MIND_ROT => (power_id::MIND_ROT, 1),
@@ -763,23 +634,17 @@ impl Game {
                 card_id::WASTE_AWAY => (power_id::WASTE_AWAY, 1),
                 _ => unreachable!(),
             };
-            let before = self.creature(Actor::Player).power(power);
             self.apply_power(content, Actor::Player, power, amount);
-            if power == power_id::WASTE_AWAY && self.creature(Actor::Player).power(power) > before {
-                let combat = self.combat_mut().unwrap();
-                combat.max_energy = combat.max_energy.saturating_sub(1);
-                combat.energy = combat.energy.min(combat.max_energy);
-            }
             let combat = self.combat_mut().unwrap();
             combat.offer.clear();
             combat.choice = None;
-            self.trigger(content, Trigger::TurnEnd, Actor::Enemy(enemy), 0);
             self.resolve(content);
-            let count = self.combat().unwrap().enemies.len();
-            self.finish_enemy_turn(content, count);
             return;
         }
-        self.apply_card_op(content, choice.pile, index, choice.op);
+        // The picked cards go through one CardCmd.Discard (DiscardAndDraw without the draw).
+        let discard = choice.pile == Pile::Hand && choice.op == CardOp::Move(Pile::Discard);
+        let op = [choice.op, CardOp::DiscardDraw][discard as usize];
+        self.apply_card_op(content, choice.pile, index, op);
         let combat = self.combat_mut().unwrap();
         let remaining = choice.remaining - 1;
         let candidates = cards(combat, choice.pile)
@@ -790,966 +655,174 @@ impl Game {
             remaining,
             ..choice
         });
+        if op == CardOp::DiscardDraw && self.combat().unwrap().choice.is_none() {
+            self.finish_discard_draw(content, !discard);
+        }
     }
 
-    pub(super) fn start_turn(&mut self, content: &Content) {
-        self.roll_moves(content);
-        self.return_bolas(content);
-        for enemy in &mut self.combat_mut().unwrap().enemies {
-            if let Some(power) = enemy
-                .creature
-                .powers
-                .iter_mut()
-                .find(|power| power.id == power_id::HARDENED_SHELL)
-            {
-                power.value = 0;
-            }
+    /// CardCmd.DiscardAndDraw: each discard's hooks run first, then as many cards are drawn,
+    /// then the Sly ones auto-play from the discard pile; all before anything queued earlier.
+    pub(super) fn finish_discard_draw(&mut self, content: &Content, draw: bool) {
+        let (start, cards) = std::mem::take(&mut self.combat_mut().unwrap().discard_draw);
+        if cards.is_empty() {
+            return;
         }
-        let draw_next = self
-            .creature(Actor::Player)
-            .power(power_id::DRAW_CARDS_NEXT_TURN)
-            .clamp(0, u8::MAX as i16) as u8;
-        let happy_flower = self.has_relic(content, "RELIC.HAPPY_FLOWER");
-        if happy_flower {
-            self.happy_flower = (self.happy_flower + 1) % 3;
-        }
-        let happy_flower = (happy_flower && self.happy_flower == 0) as i16;
-        let fake_happy_flower = self.has_relic(content, "RELIC.FAKE_HAPPY_FLOWER");
-        if fake_happy_flower {
-            self.fake_happy_flower = (self.fake_happy_flower + 1) % 5;
-        }
-        let fake_happy_flower = (fake_happy_flower && self.fake_happy_flower == 0) as i16;
-        let candelabra = self.has_relic(content, "RELIC.CANDELABRA");
-        let sparkling_rouge = self.has_relic(content, "RELIC.SPARKLING_ROUGE");
-        let bread = self.has_relic(content, "RELIC.BREAD");
-        let art_of_war = self.has_relic(content, "RELIC.ART_OF_WAR");
-        let captains_wheel = self.has_relic(content, "RELIC.CAPTAINS_WHEEL");
-        let horn_cleat = self.has_relic(content, "RELIC.HORN_CLEAT");
-        let ninja_scroll = self.has_relic(content, "RELIC.NINJA_SCROLL");
-        let ice_cream = self.has_relic(content, "RELIC.ICE_CREAM");
-        let sturdy_clamp = self.has_relic(content, "RELIC.STURDY_CLAMP");
-        let paels_flesh = self.has_relic(content, "RELIC.PAELS_FLESH");
-        let booming_conch = self.has_relic(content, "RELIC.BOOMING_CONCH");
-        let elite = self.room == Room::Elite;
-        let tea_set = self.tea_set as i16;
-        self.tea_set = 0;
-        let seal_of_gold = self.has_relic(content, "RELIC.SEAL_OF_GOLD") && self.run.gold >= 5;
-        if seal_of_gold {
-            self.run.gold -= 5;
-        }
-        let combat = self.combat_mut().unwrap();
-        let mut generated = Vec::new();
-        combat.turn += 1;
-        combat.paels_legion = combat.paels_legion.saturating_sub(1);
-        combat.demon_tongue = false;
-        combat.mini_regent = false;
-        combat.music_box = false;
-        combat.rainbow_ring = false;
-        combat.kusarigama = 0;
-        combat.diamond_diadem = false;
-        let prior_attacks = combat.history.attacks;
-        let prior_hp_lost = combat.history.hp_lost;
-        if paels_flesh && combat.turn == 3 {
-            combat.max_energy += 1;
-        }
-        let clarity = (combat.player.power(power_id::CLARITY) > 0) as u8;
-        if clarity > 0 {
-            combat.player.consume_power(power_id::CLARITY);
-        }
-        for pile in [
-            &mut combat.draw,
-            &mut combat.hand,
-            &mut combat.discard,
-            &mut combat.exhaust,
-        ] {
-            for card in pile {
-                card.free = false;
-                card.turn_flags = 0;
-            }
-        }
-        let nightmares = std::mem::take(&mut combat.nightmares);
-        for (mut card, count) in nightmares {
-            card.instance = 0;
-            card.free = false;
-            card.turn_flags = 0;
-            for _ in 0..count {
-                if combat.hand.len() < 10 {
-                    combat.hand.push(card);
-                } else {
-                    combat.discard.push(card);
-                }
-                generated.push(card.id);
-            }
-        }
-        combat.energy = if ice_cream && combat.turn > 1 {
-            combat.energy
-        } else {
-            0
-        } + combat.max_energy
-            + 2 * combat.paels_tears as i16
-            + happy_flower
-            + fake_happy_flower
-            + tea_set
-            + 2 * (candelabra && combat.turn == 2) as i16
-            + (booming_conch && elite && combat.turn == 1) as i16
-            + (art_of_war && combat.turn > 1 && prior_attacks == 0) as i16
-            + seal_of_gold as i16
-            - 3 * (bread && combat.turn == 1) as i16;
-        combat.last_cards = combat.history.cards;
-        combat.hits.fill(0);
-        let hp_loss_events = combat.history.hp_loss_events;
-        combat.history = History::default();
-        combat.history.hp_loss_events = hp_loss_events;
-        if let Some(slow) = combat
-            .player
-            .powers
-            .iter_mut()
-            .find(|power| power.id == power_id::SLOW)
-        {
-            slow.amount = 0;
-        }
-        let would_clear_block = combat.player.kind(content, PowerKind::BlockRetain) == 0
-            && combat.player.kind(content, PowerKind::BlockRetainOnce) == 0;
-        let clears_block = would_clear_block && !sturdy_clamp;
-        if clears_block {
-            combat.player.block = 0;
-        } else if would_clear_block {
-            combat.player.block = combat.player.block.min(10);
-        }
-        if combat.turn == 3 && sparkling_rouge {
-            combat.player.add_power(power_id::STRENGTH, 1);
-            combat.player.add_power(power_id::DEXTERITY, 1);
-        }
-        let mut toric_blocks = Vec::new();
-        if clears_block {
-            for power in &mut combat.player.powers {
-                if power.id == power_id::TORIC_TOUGHNESS {
-                    toric_blocks.push(power.value);
-                    power.amount -= 1;
-                }
-            }
-            combat
-                .player
-                .powers
-                .retain(|power| power.id != power_id::TORIC_TOUGHNESS || power.amount != 0);
-            if captains_wheel && combat.turn == 3 {
-                toric_blocks.push(18);
-            }
-            if horn_cleat && combat.turn == 2 {
-                toric_blocks.push(14);
-            }
-        }
-        if let Some(power) = combat
-            .player
-            .powers
+        let sly: Vec<_> = cards
             .iter()
-            .find(|power| content.powers[power.id as usize].kind == PowerKind::BlockRetainOnce)
             .copied()
-        {
-            combat.player.consume_power(power.id);
-        }
-        for id in generated {
-            self.trigger_generated(content, id);
-        }
-        for block in toric_blocks {
-            self.gain_block(content, Actor::Player, block, None, false);
-        }
-        self.poison(content, Actor::Player);
-        self.trigger(content, Trigger::TurnStart, Actor::Player, 0);
-        let rampart: i16 = self
-            .combat()
-            .unwrap()
-            .enemies
-            .iter()
-            .filter(|enemy| enemy.creature.hp > 0)
-            .map(|enemy| enemy.creature.power(power_id::RAMPART).max(0))
-            .sum();
-        if rampart > 0 {
-            let turrets: Vec<_> = self
-                .combat()
-                .unwrap()
-                .enemies
-                .iter()
-                .enumerate()
-                .filter(|(_, enemy)| {
-                    content.enemies[enemy.creature.id as usize].id == "MONSTER.TURRET_OPERATOR"
-                        && enemy.creature.hp > 0
-                })
-                .map(|(index, _)| index)
-                .collect();
-            for index in turrets {
-                self.combat_mut().unwrap().enemies[index].creature.block += rampart;
-            }
-        }
-        self.tick_boulders();
-        self.passive_orbs(content, OrbTiming::TurnStart);
-        self.resolve(content);
-        let tools = self
-            .creature(Actor::Player)
-            .power(power_id::TOOLS_OF_THE_TRADE)
-            .clamp(0, u8::MAX as i16) as u8;
-        let pale_blue_dot = if self.combat().unwrap().last_cards >= 5 {
-            self.creature(Actor::Player)
-                .power(power_id::PALE_BLUE_DOT)
-                .clamp(0, u8::MAX as i16) as u8
-        } else {
-            0
-        };
-        let tyranny = self
-            .creature(Actor::Player)
-            .power(power_id::TYRANNY)
-            .clamp(0, u8::MAX as i16) as u8;
-        let turn = self.combat().unwrap().turn;
-        let history_course = (turn > 1 && self.has_relic(content, "RELIC.HISTORY_COURSE"))
-            .then(|| self.combat_mut().unwrap().history_course.take())
-            .flatten();
-        if self.has_relic(content, "RELIC.POLLINOUS_CORE") {
-            self.pollinous_core += 1;
-        }
-        let mut relic_draw = 0;
-        if turn == 1 {
-            relic_draw -= 2 * self.has_relic(content, "RELIC.BIG_MUSHROOM") as i16;
-            relic_draw += 2
-                * self.has_relic(content, "RELIC.BOOMING_CONCH") as i16
-                * (self.room == Room::Elite) as i16;
-        }
-        if turn <= 3 {
-            relic_draw += 2 * self.has_relic(content, "RELIC.RING_OF_THE_DRAKE") as i16;
-        }
-        relic_draw += 2 * self.has_relic(content, "RELIC.FIDDLE") as i16;
-        relic_draw += 2 * self.has_relic(content, "RELIC.SNECKO_EYE") as i16;
-        if turn > 1 && self.combat().unwrap().last_cards <= 3 {
-            relic_draw += 3 * self.has_relic(content, "RELIC.POCKETWATCH") as i16;
-        }
-        if self.pollinous_core == 4 {
-            relic_draw += 2;
-            self.pollinous_core = 0;
-        }
-        let count = (self
-            .combat()
-            .unwrap()
-            .draw_per_turn
-            .saturating_add(clarity)
-            .saturating_add(tools)
-            .saturating_add(pale_blue_dot)
-            .saturating_add(tyranny)
-            .saturating_add(draw_next)
-            .saturating_add(
-                self.creature(Actor::Player)
-                    .power(power_id::DEMESNE)
-                    .clamp(0, u8::MAX as i16) as u8,
-            ) as i16
-            + relic_draw
-            - self.creature(Actor::Player).power(power_id::MIND_ROT))
-        .clamp(0, u8::MAX as i16) as u8;
-        if tools > 0 {
-            self.combat_mut().unwrap().queue.push(Pending {
-                effect: Effect::Discard(tools, false),
-                context: Context::player(),
-            });
-        }
-        if tyranny > 0 {
-            self.combat_mut().unwrap().queue.push(Pending {
-                effect: Effect::Exhaust(tyranny, false),
-                context: Context::player(),
-            });
-        }
-        self.creature_mut(Actor::Player)
-            .powers
-            .retain(|power| power.id != power_id::DRAW_CARDS_NEXT_TURN);
-        if turn == 1
-            && self.has_relic(content, "RELIC.BLESSED_ANTLER")
-            && let Some(id) = content.card_id("CARD.DAZED")
-        {
-            for _ in 0..3 {
-                let index = self
-                    .rngs
-                    .shuffle
-                    .below((self.combat().unwrap().draw.len() + 1) as u32)
-                    as usize;
-                let card = Card {
-                    id,
-                    instance: self.next_card,
-                    ..Card::default()
-                };
-                self.next_card += 1;
-                self.combat_mut().unwrap().insert_unknown_draw(index, card);
-            }
-        }
-        if turn == 1
-            && ninja_scroll
-            && let Some(id) = content.card_id("CARD.SHIV")
-        {
-            for _ in 0..3 {
-                self.add_generated(
-                    content,
-                    Pile::Hand,
-                    Card {
-                        id,
-                        ..Card::default()
+            .filter(|&card| self.is_sly(content, card))
+            .collect();
+        let queue = &mut self.combat_mut().unwrap().queue;
+        for &card in &sly {
+            queue.insert(
+                start,
+                Pending {
+                    effect: Effect::AutoPlay(card),
+                    context: Context {
+                        off_pile: true,
+                        ..Context::card(card)
                     },
-                );
-            }
+                },
+            );
         }
-        if self.has_relic(content, "RELIC.TOASTY_MITTENS") {
-            if self.combat().unwrap().draw.is_empty() && !self.combat().unwrap().discard.is_empty()
-            {
-                self.shuffle_discard_into_draw(content);
-                self.trigger(content, Trigger::Shuffle, Actor::Player, 0);
-                self.resolve(content);
-            }
-            let index = if turn == 1 {
-                self.combat()
-                    .unwrap()
-                    .draw
-                    .iter()
-                    .rposition(|card| card.flags(content.cards[card.id as usize]) & INNATE == 0)
-            } else {
-                self.combat().unwrap().draw.len().checked_sub(1)
-            };
-            if let Some(index) = index {
-                let card = self.combat_mut().unwrap().remove_draw(index);
-                self.combat_mut().unwrap().exhaust.push(card);
-                self.combat_mut().unwrap().history.exhausted += 1;
-                self.trigger(content, Trigger::CardExhausted, Actor::Player, 1);
-                self.trigger_card(content, card, Trigger::CardExhausted);
-                self.resolve(content);
-            }
-            self.apply_power(content, Actor::Player, power_id::STRENGTH, 1);
+        if draw {
+            queue.insert(
+                start + sly.len(),
+                Pending {
+                    effect: Effect::Draw(cards.len().min(u8::MAX as usize) as u8),
+                    context: Context::player(),
+                },
+            );
         }
-        let mut turn_effects = Vec::new();
-        for id in self.run.relics.clone() {
-            match content.relics[id as usize].id {
-                "RELIC.BIG_HAT" if turn == 1 => {
-                    let mut pool: Vec<_> = content.characters[self.run.character as usize]
-                        .cards
-                        .iter()
-                        .copied()
-                        .filter(|&id| {
-                            let card = content.cards[id as usize];
-                            card.flags[0] & ETHEREAL != 0
-                                && card.flags[0] & NO_GENERATE == 0
-                                && matches!(
-                                    card.rarity,
-                                    CardRarity::Common | CardRarity::Uncommon | CardRarity::Rare
-                                )
-                        })
-                        .collect();
-                    self.rngs.combat_card_generation.shuffle(&mut pool);
-                    for card in pool.into_iter().take(2) {
-                        self.add_generated(
-                            content,
-                            Pile::Hand,
-                            Card {
-                                id: card,
-                                ..Card::default()
-                            },
-                        );
-                    }
-                }
-                "RELIC.BRIMSTONE" => {
-                    turn_effects.push(Effect::ApplyPower(
-                        Target::Player,
-                        power_id::STRENGTH,
-                        Amount::fixed(2, 2),
-                    ));
-                    turn_effects.push(Effect::ApplyPower(
-                        Target::AllEnemies,
-                        power_id::STRENGTH,
-                        Amount::fixed(1, 1),
-                    ));
-                }
-                "RELIC.CHANDELIER" if turn == 3 => turn_effects.push(Effect::Energy(3)),
-                "RELIC.CROSSBOW" => {
-                    let mut pool: Vec<_> = content.characters[self.run.character as usize]
-                        .cards
-                        .iter()
-                        .copied()
-                        .filter(|&id| {
-                            let card = content.cards[id as usize];
-                            card.card_type == CardType::Attack
-                                && card.flags[0] & NO_GENERATE == 0
-                                && matches!(
-                                    card.rarity,
-                                    CardRarity::Common | CardRarity::Uncommon | CardRarity::Rare
-                                )
-                        })
-                        .collect();
-                    self.rngs.combat_card_generation.shuffle(&mut pool);
-                    if let Some(id) = pool.into_iter().next() {
-                        self.add_generated(
-                            content,
-                            Pile::Hand,
-                            Card {
-                                id,
-                                free: true,
-                                ..Card::default()
-                            },
-                        );
-                    }
-                }
-                "RELIC.ORANGE_DOUGH" => {
-                    turn_effects.push(Effect::DistinctColorless(Pile::Hand, 2, false))
-                }
-                "RELIC.POWER_CELL" if turn == 1 => turn_effects.push(Effect::RandomCardOp(
-                    Pile::Draw,
-                    CardFilter::PlayableCost(0),
-                    CardOp::Move(Pile::Hand),
-                    Amount::fixed(2, 2),
-                )),
-                "RELIC.VERY_HOT_COCOA" if turn == 1 => turn_effects.push(Effect::Energy(4)),
-                _ => {}
-            }
-        }
-        for id in self.run.relics.clone() {
-            match content.relics[id as usize].id {
-                "RELIC.FUNERARY_MASK" if turn == 1 => {
-                    if let Some(card) = content.card_id("CARD.SOUL") {
-                        turn_effects.push(Effect::AddRandom(Pile::Draw, card, 3));
-                    }
-                }
-                "RELIC.JEWELED_MASK" if turn == 1 => {
-                    turn_effects.push(Effect::RandomCardOp(
-                        Pile::Draw,
-                        CardFilter::Type(CardType::Power),
-                        CardOp::MoveFree(Pile::Hand),
-                        Amount::fixed(1, 1),
-                    ));
-                }
-                "RELIC.RADIANT_PEARL" if turn == 1 => {
-                    if let Some(card) = content.card_id("CARD.LUMINESCE") {
-                        turn_effects.push(Effect::AddCard(Pile::Hand, card, 1));
-                    }
-                }
-                "RELIC.TOOLBOX" if turn == 1 => {
-                    turn_effects.push(Effect::OfferColorless(3, false, false))
-                }
-                _ => {}
-            }
-        }
-        turn_effects.push(Effect::HandDraw(count));
-        let furnace = self.creature(Actor::Player).power(power_id::FURNACE);
-        if furnace > 0 {
-            turn_effects.push(Effect::Forge(Amount::fixed(furnace, furnace)));
-        }
-        let entropy = self.creature(Actor::Player).power(power_id::ENTROPY);
-        if entropy > 0 {
-            turn_effects.push(Effect::RandomCardOp(
-                Pile::Hand,
-                CardFilter::Any,
-                CardOp::TransformRandom,
-                Amount::fixed(entropy, entropy),
-            ));
-        }
-        for id in self.run.relics.clone() {
-            match content.relics[id as usize].id {
-                "RELIC.BELLOWS" if turn == 1 => {
-                    turn_effects.push(Effect::Upgrade(Pile::Hand, u8::MAX, false))
-                }
-                "RELIC.BONE_TEA" if turn == 1 && !self.bone_tea => {
-                    self.bone_tea = true;
-                    turn_effects.push(Effect::Upgrade(Pile::Hand, u8::MAX, false));
-                }
-                "RELIC.EMOTION_CHIP" if prior_hp_lost > 0 => turn_effects.push(Effect::PassiveAll),
-                "RELIC.PENDULUM" => {
-                    self.pendulum = (self.pendulum + 1) % 3;
-                    if self.pendulum == 0 {
-                        turn_effects.push(Effect::Draw(1));
-                    }
-                }
-                "RELIC.ROYAL_POISON" => {
-                    turn_effects.push(Effect::LoseHp(Target::Player, Amount::fixed(4, 4)))
-                }
-                "RELIC.VEXING_PUZZLEBOX" if turn == 1 => {
-                    turn_effects.push(Effect::DistinctCharacter(Pile::Hand, 1, true))
-                }
-                "RELIC.CHOICES_PARADOX" if turn == 1 => {
-                    turn_effects.push(Effect::OfferCharacterRetain(5))
-                }
-                _ => {}
-            }
-        }
-        if let Some(mut card) = history_course {
-            card.instance = 0;
-            card.flags |= REPLAY | DUPE;
-            turn_effects.push(Effect::AutoPlay(card));
-        }
-        if turn == 1 && self.has_relic(content, "RELIC.WHISPERING_EARRING") {
-            turn_effects.push(Effect::WhisperingEarring(0));
-        }
-        for effect in turn_effects.into_iter().rev() {
-            self.combat_mut().unwrap().queue.push(Pending {
-                effect,
-                context: Context::player(),
-            });
-        }
-        self.resolve(content);
-        self.queue_bombardments();
-        self.resolve(content);
     }
 
-    pub(super) fn tick_boulders(&mut self) {
-        let mut damage = Vec::new();
-        for boulder in &mut self.combat_mut().unwrap().boulders {
-            damage.push(*boulder);
-            *boulder = boulder.saturating_add(5);
+    /// Queues the player's turn (CombatManager.StartTurn).
+    pub(super) fn start_turn(&mut self) {
+        push_effects(
+            &mut self.combat_mut().unwrap().queue,
+            hooks::PLAYER_TURN,
+            Context::player(),
+        );
+    }
+
+    /// Toasty Mittens exhausts the draw pile's top card (turn 1: the top non-Innate one), then
+    /// gives 1 Strength.
+    fn toasty_mittens(&mut self, content: &Content) {
+        self.combat_mut().unwrap().queue.push(Pending {
+            effect: Effect::ApplyPower(Target::Player, power_id::STRENGTH, Amount::fixed(1, 1)),
+            context: Context::player(),
+        });
+        if self.combat().unwrap().draw.is_empty() && !self.combat().unwrap().discard.is_empty() {
+            self.shuffle_discard_into_draw(content);
+            self.after_shuffle(content);
         }
-        self.creature_mut(Actor::Player)
-            .add_power(power_id::ROLLING_BOULDER, 5 * damage.len() as i16);
-        for amount in damage {
+        let combat = self.combat().unwrap();
+        let index = if combat.turn == 1 {
+            (combat.draw.iter())
+                .rposition(|card| card.flags(content.cards[card.id as usize]) & INNATE == 0)
+        } else {
+            combat.draw.len().checked_sub(1)
+        };
+        if let Some(index) = index {
+            let card = self.combat_mut().unwrap().remove_draw(index);
+            self.combat_mut().unwrap().exhaust.push(card);
+            self.exhausted(content, card, false);
+        }
+    }
+
+    /// Its hits land on the enemies one at a time, left to right, so a death in between
+    /// resolves before the next hit (Crab Rage's block); then it grows by 5.
+    pub(super) fn tick_boulder(&mut self, content: &Content, boulder: Power) {
+        let Some(live) = self.creature_mut(Actor::Player).instance_mut(boulder) else {
+            return;
+        };
+        let amount = live.amount;
+        live.amount = amount.saturating_add(5);
+        let enemies = self.targets(content, Target::AllEnemies, Context::player());
+        for enemy in enemies.into_iter().rev() {
+            let Actor::Enemy(index) = enemy else { continue };
             self.combat_mut().unwrap().queue.push(Pending {
-                effect: Effect::Damage(Target::AllEnemies, Amount::fixed(amount, amount)),
-                context: Context::player(),
+                effect: Effect::Damage(Target::ChosenEnemy, Amount::fixed(amount, amount)),
+                context: Context {
+                    target: Some(index),
+                    ..Context::player()
+                },
             });
         }
     }
 
     pub(super) fn end_turn(&mut self, content: &Content) {
-        while self
-            .combat()
-            .unwrap()
-            .draw
-            .last()
-            .is_some_and(|card| card.id == card_id::I_AM_INVINCIBLE)
-        {
-            self.auto_play_top();
-            self.resolve(content);
-        }
-        if self.has_relic(content, "RELIC.PAELS_EYE")
-            && !self.combat().unwrap().paels_eye
-            && self.combat().unwrap().history.manual_cards == 0
-            && !(self.combat().unwrap().turn == 1
-                && self.has_relic(content, "RELIC.WHISPERING_EARRING"))
-        {
-            let cards = std::mem::take(&mut self.combat_mut().unwrap().hand);
-            let combat = self.combat_mut().unwrap();
-            combat.paels_eye = true;
-            combat
-                .control
-                .push(ControlContinuation::StartExtraPlayerTurnAfterResolution);
-            self.combat_mut().unwrap().history.exhausted += cards.len() as i16;
-            for card in cards {
-                self.combat_mut().unwrap().exhaust.push(card);
-                self.trigger(content, Trigger::CardExhausted, Actor::Player, 1);
-                self.trigger_card(content, card, Trigger::CardExhausted);
-            }
-            self.resolve(content);
-        }
-        if self.creature(Actor::Player).block == 0 {
-            let block = 6 * self.has_relic(content, "RELIC.ORICHALCUM") as i16
-                + 3 * self.has_relic(content, "RELIC.FAKE_ORICHALCUM") as i16;
-            if block > 0 {
-                self.gain_block(content, Actor::Player, block, None, false);
-            }
-        }
-        if self.has_relic(content, "RELIC.SCREAMING_FLAGON")
-            && self.combat().unwrap().hand.is_empty()
-        {
-            self.combat_mut().unwrap().queue.push(Pending {
-                effect: Effect::Damage(Target::AllEnemies, Amount::fixed(20, 20)),
-                context: Context::player(),
-            });
-        }
-        if self.has_relic(content, "RELIC.PARRYING_SHIELD")
-            && self.creature(Actor::Player).block >= 10
-        {
-            self.combat_mut().unwrap().queue.push(Pending {
-                effect: Effect::Damage(Target::RandomEnemy, Amount::fixed(6, 6)),
-                context: Context::player(),
-            });
-        }
-        self.combat_mut().unwrap().diamond_diadem = self.has_relic(content, "RELIC.DIAMOND_DIADEM")
-            && self.combat().unwrap().history.cards <= 2;
-        if self.has_relic(content, "RELIC.LUNAR_PASTRY") {
-            self.combat_mut().unwrap().stars += 1;
-        }
+        push_effects(
+            &mut self.combat_mut().unwrap().queue,
+            hooks::END_PLAYER_TURN,
+            Context::player(),
+        );
         self.resolve(content);
-        if self.creature(Actor::Player).power(power_id::STAMPEDE) > 0 {
-            self.combat_mut().unwrap().queue.push(Pending {
-                effect: Effect::ContinueEndTurn,
-                context: Context::player(),
-            });
-            self.combat_mut().unwrap().queue.push(Pending {
-                effect: Effect::Stampede,
-                context: Context::player(),
-            });
-            self.resolve(content);
+    }
+
+    /// It counts down, then explodes as one damage command: every enemy is hit before deaths
+    /// resolve.
+    pub(super) fn tick_bomb(&mut self, content: &Content, bomb: Power) {
+        let Some(live) = self.creature_mut(Actor::Player).instance_mut(bomb) else {
             return;
-        }
-        self.continue_end_turn(content);
-    }
-
-    fn continue_end_turn(&mut self, content: &Content) {
-        self.doom_kill(content, vec![Actor::Player, Actor::Osty]);
-        self.resolve(content);
-        if self.creature(Actor::Player).hp <= 0 {
-            return;
-        }
-        self.tick_bombs(content);
-        let howl = content.card_id("CARD.HOWL_FROM_BEYOND").unwrap();
-        let mut howls = Vec::new();
-        self.combat_mut().unwrap().exhaust.retain(|card| {
-            if card.id == howl {
-                howls.push(*card);
-                false
-            } else {
-                true
-            }
-        });
-        for mut card in howls.into_iter().rev() {
-            card.turn_flags |= RETURN_TO_HAND;
-            self.combat_mut().unwrap().queue.push(Pending {
-                effect: Effect::AutoPlay(card),
-                context: Context::card(card),
-            });
-        }
-        self.resolve(content);
-        if self.combat().unwrap().history.attacks == 0
-            && self.has_relic(content, "RELIC.RIPPLE_BASIN")
-        {
-            self.gain_block(content, Actor::Player, 4, None, false);
-        }
-        self.passive_orbs(content, OrbTiming::TurnEnd);
-        self.resolve(content);
-        self.trigger(content, Trigger::TurnEnd, Actor::Player, 0);
-        self.resolve(content);
-        if self.combat().unwrap().turn == 7 && self.has_relic(content, "RELIC.STONE_CALENDAR") {
-            self.combat_mut().unwrap().queue.push(Pending {
-                effect: Effect::Damage(Target::AllEnemies, Amount::fixed(52, 52)),
-                context: Context::player(),
-            });
-            self.resolve(content);
-        }
-        for panache in &mut self.combat_mut().unwrap().panache {
-            panache.0 = 5;
-        }
-        self.creature_mut(Actor::Player)
-            .powers
-            .retain(|power| power.id != power_id::DUPLICATION);
-        for card in self.combat().unwrap().hand.clone().into_iter().rev() {
-            self.trigger_card(content, card, Trigger::TurnEnd);
-        }
-        self.resolve(content);
-        if self.creature(Actor::Player).power(power_id::RETAIN_HAND) > 0 {
-            for card in &mut self.combat_mut().unwrap().hand {
-                card.turn_flags |= RETAIN;
-            }
-            self.creature_mut(Actor::Player)
-                .consume_power(power_id::RETAIN_HAND);
-        }
-        if self.has_relic(content, "RELIC.RUNIC_PYRAMID") {
-            for card in &mut self.combat_mut().unwrap().hand {
-                card.turn_flags |= RETAIN;
-            }
-        }
-        if self.combat().unwrap().turn == 1 && self.has_relic(content, "RELIC.RINGING_TRIANGLE") {
-            for card in &mut self.combat_mut().unwrap().hand {
-                card.turn_flags |= RETAIN;
-            }
-        }
-        let retain = self
-            .creature(Actor::Player)
-            .power(power_id::WELL_LAID_PLANS)
-            .clamp(0, u8::MAX as i16) as u8;
-        if retain > 0 {
-            self.combat_mut().unwrap().ending = true;
-            self.select(
-                content,
-                Pile::Hand,
-                CardFilter::WithoutFlag(RETAIN),
-                CardOp::TurnFlag(RETAIN),
-                retain,
-                false,
-                true,
-            );
-            if self.combat().unwrap().choice.is_some() {
-                return;
-            }
-        }
-        self.finish_end_turn(content);
-    }
-
-    fn tick_bombs(&mut self, content: &Content) {
-        let mut explosions = Vec::new();
-        for bomb in &mut self.combat_mut().unwrap().bombs {
-            if bomb.0 > 1 {
-                bomb.0 -= 1;
-            } else {
-                explosions.push(bomb.1);
-                bomb.0 = 0;
-            }
-        }
-        self.combat_mut().unwrap().bombs.retain(|bomb| bomb.0 > 0);
-        for power in self
-            .creature_mut(Actor::Player)
-            .powers
-            .iter_mut()
-            .filter(|power| power.id == power_id::THE_BOMB)
-        {
-            power.amount -= 1;
-        }
-        self.creature_mut(Actor::Player)
-            .powers
-            .retain(|power| power.id != power_id::THE_BOMB || power.amount > 0);
-        for amount in explosions {
-            for target in self.targets(Target::AllEnemies, Context::player()) {
-                self.damage(
-                    content,
-                    Actor::Player,
-                    target,
-                    amount,
-                    DamageKind::Unpowered,
-                    None,
-                );
-            }
-        }
-    }
-
-    fn tick_panache(&mut self) {
-        let cards = self.combat().unwrap().history.cards;
-        let mut damage = Vec::new();
-        for panache in &mut self.combat_mut().unwrap().panache {
-            if panache.2 < cards {
-                panache.0 -= 1;
-                if panache.0 == 0 {
-                    panache.0 = 5;
-                    damage.push(panache.1);
-                }
-            }
-        }
-        for amount in damage {
-            self.combat_mut().unwrap().queue.push(Pending {
-                effect: Effect::Damage(Target::AllEnemies, Amount::fixed(amount, amount)),
-                context: Context::player(),
-            });
-        }
-    }
-
-    pub(super) fn finish_end_turn(&mut self, content: &Content) {
-        self.combat_mut().unwrap().ending = false;
-        self.creature_mut(Actor::Player)
-            .powers
-            .retain(|power| power.id != power_id::RINGING);
-        self.combat_mut().unwrap().paels_tears =
-            self.combat().unwrap().energy > 0 && self.has_relic(content, "RELIC.PAELS_TEARS");
-        self.reset_tender();
-        let (count, exhausted) = {
-            let combat = self.combat_mut().unwrap();
-            let mut hand = Vec::new();
-            let mut exhausted = Vec::new();
-            let mut discarded = Vec::new();
-            let hexed = combat.player.power(power_id::HEX) > 0;
-            for card in std::mem::take(&mut combat.hand) {
-                let def = content.cards[card.id as usize];
-                let flags = card.flags(def);
-                if flags & ETHEREAL != 0 || hexed {
-                    combat.exhaust.push(card);
-                    exhausted.push(card);
-                } else if flags & RETAIN != 0 {
-                    hand.push(card);
-                } else {
-                    discarded.push(card);
-                }
-            }
-            discarded.sort_by_key(|card| {
-                !content.cards[card.id as usize]
-                    .hooks
-                    .iter()
-                    .any(|hook| hook.trigger == Trigger::TurnEnd)
-            });
-            combat.discard.extend(discarded);
-            combat.hand = hand;
-            combat.history.exhausted += exhausted.len() as i16;
-            (combat.enemies.len(), exhausted)
         };
-        for card in exhausted {
-            self.trigger(content, Trigger::CardExhausted, Actor::Player, 1);
-            self.trigger_card(content, card, Trigger::CardExhausted);
+        if live.amount > 1 {
+            live.amount -= 1;
+            return;
         }
-        self.resolve(content);
-        if self.has_relic(content, "RELIC.BOOKMARK") {
-            let spiked = self.has_relic(content, "RELIC.SPIKED_GAUNTLETS");
-            let choices: Vec<_> = self
-                .combat()
-                .unwrap()
-                .hand
-                .iter()
-                .enumerate()
-                .filter(|(_, card)| {
-                    let def = content.cards[card.id as usize];
-                    def.cost[card.upgrades.min(1) as usize] >= 0
-                        && energy_cost(self.combat().unwrap(), **card, def, spiked) > 0
-                })
-                .map(|(index, _)| index)
-                .collect();
-            if !choices.is_empty() {
-                let choice =
-                    choices[self.rngs.combat_card_selection.below(choices.len() as u32) as usize];
-                let card = self.combat().unwrap().hand[choice];
-                let def = content.cards[card.id as usize];
-                let cost = energy_cost(self.combat().unwrap(), card, def, spiked) - 1;
-                self.combat_mut().unwrap().hand[choice].cost_override = Some(cost as i8);
-            }
-        }
-        self.creature_mut(Actor::Player).powers.retain(|power| {
-            power.amount <= 0 || content.powers[power.id as usize].kind != PowerKind::NoDraw
-        });
-        self.creature_mut(Actor::Player)
-            .powers
-            .retain(|power| power.id != power_id::NO_ENERGY_GAIN);
-        let disintegration = self.creature(Actor::Player).power(power_id::DISINTEGRATION);
-        if disintegration > 0 {
+        let amount = live.value;
+        let previous = self.combat_mut().unwrap().pending_hits.replace(vec![]);
+        for target in self.targets(content, Target::AllEnemies, Context::player()) {
             self.damage(
                 content,
                 Actor::Player,
-                Actor::Player,
-                disintegration,
+                target,
+                amount,
                 DamageKind::Unpowered,
                 None,
             );
-            if self.creature(Actor::Player).hp <= 0 {
-                return;
-            }
         }
-        for enemy in &mut self.combat_mut().unwrap().enemies {
-            enemy
-                .creature
-                .powers
-                .retain(|power| power.id != power_id::OBLIVION);
-            for power in &mut enemy.creature.powers {
-                if matches!(power.id, power_id::HARDENED_SHELL | power_id::SKITTISH) {
-                    power.value = 0;
-                }
-            }
-            if enemy.creature.power(power_id::NEMESIS) > 0 {
-                enemy
-                    .creature
-                    .powers
-                    .retain(|power| power.id != power_id::INTANGIBLE);
-            }
-        }
-        if self.combat().unwrap().control.last()
-            == Some(&ControlContinuation::StartExtraPlayerTurnAfterResolution)
-        {
-            self.combat_mut().unwrap().control.pop();
-            self.start_turn(content);
+        self.resolve_deaths(content, previous);
+        let powers = &mut self.creature_mut(Actor::Player).powers;
+        powers.retain(|x| x.id != bomb.id || x.instance != bomb.instance);
+    }
+
+    /// ExecuteEnemyTurn and EndEnemyTurn: each enemy's move step in slot order, then the turn end.
+    pub(super) fn enemy_moves(&mut self, content: &Content) {
+        let participants = self.participants(content);
+        let combat = self.combat_mut().unwrap();
+        push_effects(&mut combat.queue, hooks::END_ENEMY_TURN, Context::player());
+        // A creature spawned this turn into a dead participant's slot waits for its next turn.
+        let moves: Vec<_> = (participants.into_iter())
+            .map(|index| Effect::Step(Step::EnemyMove(index as u8, combat.enemies[index].instance)))
+            .collect();
+        push_effects(&mut combat.queue, &moves, Context::player());
+    }
+
+    pub(super) fn enemy_move(&mut self, content: &Content, index: usize, instance: u32) {
+        let enemy = &self.combat().unwrap().enemies[index];
+        let (move_index, id, stunned) = (enemy.move_index, enemy.creature.id, enemy.stunned);
+        if enemy.instance != instance || !self.participants(content).contains(&index) {
             return;
         }
-        self.combat_mut().unwrap().enemy_turn = true;
-        for enemy in &mut self.combat_mut().unwrap().enemies {
-            if let Some(slow) = enemy
-                .creature
-                .powers
-                .iter_mut()
-                .find(|power| power.id == power_id::SLOW)
-            {
-                slow.amount = 0;
-            }
+        self.combat_mut().unwrap().queue.push(Pending {
+            effect: Effect::Step(Step::EnemyMoveDone(index as u8, move_index as u8, stunned)),
+            context: Context::player(),
+        });
+        let effects = content.enemies[id as usize].moves[move_index].effects;
+        let context = Context {
+            source: Actor::Enemy(index),
+            ..Context::player()
+        };
+        if stunned {
+            return;
         }
-        let obscura =
-            self.combat().unwrap().enemies.iter().any(|enemy| {
-                content.enemies[enemy.creature.id as usize].id == "MONSTER.THE_OBSCURA"
-            });
-        let primary_alive = self
-            .combat()
-            .unwrap()
-            .enemies
-            .iter()
-            .any(|enemy| enemy.creature.hp > 0 && enemy.creature.power(power_id::MINION) == 0);
-        let segment_alive = self
-            .combat()
-            .unwrap()
-            .enemies
-            .iter()
-            .any(|enemy| enemy.creature.hp > 0 && enemy.creature.power(power_id::REATTACH) > 0);
-        let mut participants: Vec<_> = (0..count)
-            .filter(|&index| {
-                let enemy = &self.combat().unwrap().enemies[index];
-                enemy.creature.hp > 0
-                    || primary_alive
-                        && enemy.creature.power(power_id::ILLUSION) > 0
-                        && enemy.move_index == 1
-                    || segment_alive
-                        && enemy.creature.power(power_id::REATTACH) > 0
-                        && matches!(enemy.move_index, 3 | 4)
-                    || enemy.creature.power(power_id::ADAPTABLE) > 0 && enemy.move_index == 0
-            })
-            .collect();
-        if obscura {
-            participants.sort_by_key(|&index| {
-                content.enemies[self.combat().unwrap().enemies[index].creature.id as usize].id
-                    != "MONSTER.PARAFRIGHT"
-            });
+        let name = content.enemies[id as usize].id;
+        if name == "MONSTER.THIEVING_HOPPER" && move_index == 0 {
+            self.thieving_hopper(content, index);
         }
-        for &index in &participants {
-            self.poison(content, Actor::Enemy(index));
-            self.trigger(content, Trigger::TurnStart, Actor::Enemy(index), 0);
-            self.resolve(content);
-        }
-        for index in participants {
-            let enemy = &self.combat().unwrap().enemies[index];
-            let reviving = enemy.creature.hp <= 0
-                && (enemy.creature.power(power_id::ILLUSION) > 0
-                    && enemy.move_index == 1
-                    && self.combat().unwrap().enemies.iter().any(|other| {
-                        other.creature.hp > 0 && other.creature.power(power_id::MINION) == 0
-                    })
-                    || enemy.creature.power(power_id::REATTACH) > 0
-                        && matches!(enemy.move_index, 3 | 4)
-                        && self.combat().unwrap().enemies.iter().any(|other| {
-                            other.creature.hp > 0 && other.creature.power(power_id::REATTACH) > 0
-                        })
-                    || enemy.creature.power(power_id::ADAPTABLE) > 0 && enemy.move_index == 0);
-            if enemy.creature.hp <= 0 && !reviving {
-                continue;
-            }
-            if self.combat().unwrap().enemies[index]
-                .creature
-                .kind(content, PowerKind::BlockRetain)
-                == 0
-                && self.combat().unwrap().enemies[index]
-                    .creature
-                    .kind(content, PowerKind::BlockRetainOnce)
-                    == 0
-            {
-                self.combat_mut().unwrap().enemies[index].creature.block = 0;
-            }
-            if let Some(power) = self.combat().unwrap().enemies[index]
-                .creature
-                .powers
-                .iter()
-                .find(|power| content.powers[power.id as usize].kind == PowerKind::BlockRetainOnce)
-                .copied()
-            {
-                self.combat_mut().unwrap().enemies[index]
-                    .creature
-                    .consume_power(power.id);
-            }
-            let move_index = self.combat().unwrap().enemies[index].move_index;
-            let id = self.combat().unwrap().enemies[index].creature.id;
-            let stunned = self.combat().unwrap().enemies[index].stunned;
-            if !stunned
-                && content.enemies[id as usize].id == "MONSTER.THIEVING_HOPPER"
-                && move_index == 0
-            {
-                self.thieving_hopper(content, index);
-            }
-            let effects = content.enemies[id as usize].moves[move_index].effects;
-            let context = Context {
-                source: Actor::Enemy(index),
-                target: None,
-                card: None,
-                upgraded: false,
-                x: 0,
-                event: 0,
-                orb: false,
-                orb_id: None,
-                pen_nib: false,
-            };
-            if stunned {
-            } else if content.enemies[id as usize].id == "MONSTER.WATERFALL_GIANT"
-                && move_index == 4
-            {
+        match (name, move_index) {
+            ("MONSTER.WATERFALL_GIANT", 4) => {
                 let amount = if self.run.ascension >= 9 { 23 } else { 20 }
                     + self.combat().unwrap().enemies[index].value;
                 self.damage(
@@ -1762,9 +835,13 @@ impl Game {
                 );
                 self.combat_mut().unwrap().enemies[index].value += 5;
                 self.apply_power(content, Actor::Enemy(index), power_id::STEAM_ERUPTION, 3);
-            } else if content.enemies[id as usize].id == "MONSTER.WATERFALL_GIANT"
-                && move_index == 6
-            {
+            }
+            ("MONSTER.WATERFALL_GIANT", 7) => {
+                let enemy = &mut self.combat_mut().unwrap().enemies[index];
+                enemy.value = enemy.creature.power(power_id::STEAM_ERUPTION);
+                (enemy.creature.powers).retain(|power| power.id != power_id::STEAM_ERUPTION);
+            }
+            ("MONSTER.WATERFALL_GIANT", 6) => {
                 let amount = self.combat().unwrap().enemies[index].value;
                 self.damage(
                     content,
@@ -1775,9 +852,8 @@ impl Game {
                     None,
                 );
                 self.kill_actor(content, Actor::Enemy(index));
-            } else if content.enemies[id as usize].id == "MONSTER.KNOWLEDGE_DEMON"
-                && move_index == 0
-            {
+            }
+            ("MONSTER.KNOWLEDGE_DEMON", 0) => {
                 let stage = self.combat().unwrap().enemies[index]
                     .move_history
                     .iter()
@@ -1805,8 +881,8 @@ impl Game {
                     false,
                     false,
                 );
-                return;
-            } else if content.enemies[id as usize].id == "MONSTER.TEST_SUBJECT" && move_index == 0 {
+            }
+            ("MONSTER.TEST_SUBJECT", 0) => {
                 let first = self.creature(Actor::Enemy(index)).max_hp < 200;
                 let hp = match (first, self.run.ascension >= 8) {
                     (true, false) => 200,
@@ -1825,14 +901,17 @@ impl Game {
                     });
                     creature.add_power(power_id::NEMESIS, 1);
                 }
-            } else if content.enemies[id as usize].id == "MONSTER.TEST_SUBJECT" && move_index == 3 {
-                let hits = 2 + self.combat().unwrap().enemies[index]
-                    .move_history
-                    .iter()
-                    .filter(|&&prior| prior == 3)
-                    .count();
+            }
+            ("MONSTER.TEST_SUBJECT", 3) => {
+                // Three hits plus one per earlier claw (ExtraMultiClawCount), counted in value.
+                let hits = 3 + self.combat().unwrap().enemies[index].value.max(0);
+                self.combat_mut().unwrap().enemies[index].value += 1;
                 let amount = if self.run.ascension >= 9 { 11 } else { 10 };
+                // The attack stops once the Test Subject dies (Thorns).
                 for _ in 0..hits {
+                    if self.creature(Actor::Enemy(index)).hp <= 0 {
+                        break;
+                    }
                     self.damage(
                         content,
                         Actor::Enemy(index),
@@ -1842,7 +921,8 @@ impl Game {
                         None,
                     );
                 }
-            } else if content.enemies[id as usize].id == "MONSTER.TEST_SUBJECT" && move_index == 6 {
+            }
+            ("MONSTER.TEST_SUBJECT", 6) => {
                 for _ in 0..if self.run.ascension >= 9 { 5 } else { 3 } {
                     self.add_generated(
                         content,
@@ -1859,7 +939,8 @@ impl Game {
                     power_id::STRENGTH,
                     if self.run.ascension >= 9 { 3 } else { 2 },
                 );
-            } else if content.enemies[id as usize].id == "MONSTER.OVICOPTER" && move_index == 0 {
+            }
+            ("MONSTER.OVICOPTER", 0) => {
                 let eggs = self
                     .combat()
                     .unwrap()
@@ -1870,69 +951,57 @@ impl Game {
                             && content.enemies[enemy.creature.id as usize].id == "MONSTER.TOUGH_EGG"
                     })
                     .count();
-                for _ in eggs..3 {
+                // Three eggs, each into the last free of the five egg slots.
+                for _ in 0..3.min(5usize.saturating_sub(eggs)) {
                     let egg = self.spawn_enemy(content, "MONSTER.TOUGH_EGG");
                     self.apply_power(content, Actor::Enemy(egg), power_id::MINION, 1);
                     self.apply_power(content, Actor::Enemy(egg), power_id::HATCH, 1);
                 }
-            } else if content.enemies[id as usize].id == "MONSTER.TOUGH_EGG" && move_index == 0 {
-                let range = if self.run.ascension >= 8 {
-                    20..=22
-                } else {
-                    19..=21
-                };
-                let hp = self.rngs.niche.range(*range.start(), *range.end());
+            }
+            ("MONSTER.TOUGH_EGG", 0) => {
+                let low = if self.run.ascension >= 8 { 20 } else { 19 };
+                let hp = self.rngs.niche.range(low, low + 2);
                 let egg = &mut self.combat_mut().unwrap().enemies[index].creature;
                 egg.hp = hp;
                 egg.max_hp = hp;
                 egg.powers.retain(|power| power.id == power_id::MINION);
-            } else if content.enemies[id as usize].id == "MONSTER.FOGMOG" && move_index == 0 {
+            }
+            ("MONSTER.FOGMOG", 0) => {
                 self.spawn_enemy(content, "MONSTER.EYE_WITH_TEETH");
-            } else if content.enemies[id as usize].id == "MONSTER.LIVING_FOG" && move_index == 1 {
+            }
+            ("MONSTER.LIVING_FOG", 1) => {
                 self.spawn_enemy(content, "MONSTER.GAS_BOMB");
                 push_effects(&mut self.combat_mut().unwrap().queue, effects, context);
-            } else if content.enemies[id as usize].id == "MONSTER.FABRICATOR" && move_index < 2 {
-                if move_index == 1 {
-                    push_effects(&mut self.combat_mut().unwrap().queue, effects, context);
-                    self.resolve(content);
-                } else {
-                    let bot = ["MONSTER.GUARDBOT", "MONSTER.NOISEBOT"]
-                        [self.rngs.monster_ai.below(2) as usize];
-                    let bot = self.spawn_enemy(content, bot);
-                    self.apply_power(content, Actor::Enemy(bot), power_id::MINION, 1);
-                }
-                let bot =
-                    ["MONSTER.ZAPBOT", "MONSTER.STABBOT"][self.rngs.monster_ai.below(2) as usize];
-                let bot = self.spawn_enemy(content, bot);
-                self.apply_power(content, Actor::Enemy(bot), power_id::MINION, 1);
-            } else if content.enemies[id as usize].id == "MONSTER.GUARDBOT" {
+            }
+            ("MONSTER.FABRICATOR", 0) => {
+                self.spawn_bot(content, index, 0);
+                self.spawn_bot(content, index, 2);
+            }
+            ("MONSTER.FABRICATOR", 1) => {
+                self.combat_mut().unwrap().queue.push(Pending {
+                    effect: Effect::Step(Step::FabricatorBot(index as u8)),
+                    context: Context::player(),
+                });
+                push_effects(&mut self.combat_mut().unwrap().queue, effects, context);
+            }
+            ("MONSTER.GUARDBOT", _) => {
                 if let Some(fabricator) = self.combat().unwrap().enemies.iter().position(|enemy| {
                     enemy.creature.hp > 0
                         && content.enemies[enemy.creature.id as usize].id == "MONSTER.FABRICATOR"
                 }) {
-                    let creature = &mut self.combat_mut().unwrap().enemies[fabricator].creature;
-                    creature.block = creature.block.saturating_add(15);
+                    self.gain_block(content, Actor::Enemy(fabricator), 15, None, false);
                 }
-            } else if content.enemies[id as usize].id == "MONSTER.NOISEBOT" {
-                self.add_generated(
-                    content,
-                    Pile::Discard,
-                    Card {
-                        id: card_id::DAZED,
-                        ..Card::default()
-                    },
-                );
-                self.add_random(
-                    content,
-                    Pile::Draw,
-                    Card {
-                        id: card_id::DAZED,
-                        ..Card::default()
-                    },
-                );
-            } else if content.enemies[id as usize].id == "MONSTER.TWO_TAILED_RAT"
-                && move_index == 3
-                && self
+            }
+            ("MONSTER.NOISEBOT", _) => {
+                let dazed = Card {
+                    id: card_id::DAZED,
+                    ..Card::default()
+                };
+                self.add_generated(content, Pile::Discard, dazed);
+                self.add_random(content, Pile::Draw, dazed);
+            }
+            ("MONSTER.TWO_TAILED_RAT", 3)
+                if self
                     .combat()
                     .unwrap()
                     .enemies
@@ -1941,14 +1010,16 @@ impl Game {
                         content.enemies[enemy.creature.id as usize].id == "MONSTER.TWO_TAILED_RAT"
                     })
                     .count()
-                    < 5
+                    < 5 =>
             {
                 let rat = self.spawn_enemy(content, "MONSTER.TWO_TAILED_RAT");
-                self.combat_mut().unwrap().enemies[rat].move_index =
-                    self.rngs.monster_ai.below(3) as usize;
-            } else if content.enemies[id as usize].id == "MONSTER.THE_OBSCURA" && move_index == 0 {
+                // A rat called for backup picks its first move with the next intents.
+                self.combat_mut().unwrap().enemies[rat].value = 1;
+            }
+            ("MONSTER.THE_OBSCURA", 0) => {
                 self.spawn_enemy(content, "MONSTER.PARAFRIGHT");
-            } else if content.enemies[id as usize].id == "MONSTER.ENTOMANCER" && move_index == 2 {
+            }
+            ("MONSTER.ENTOMANCER", 2) => {
                 let hive = self
                     .creature(Actor::Enemy(index))
                     .power(power_id::PERSONAL_HIVE);
@@ -1961,18 +1032,29 @@ impl Game {
                     power_id::STRENGTH,
                     if hive < 3 { 1 } else { 2 },
                 );
-            } else {
-                push_effects(&mut self.combat_mut().unwrap().queue, effects, context);
             }
-            self.resolve(content);
-            if content.enemies[id as usize].id == "MONSTER.AXEBOT" && move_index == 0 {
+            _ => push_effects(&mut self.combat_mut().unwrap().queue, effects, context),
+        }
+    }
+
+    pub(super) fn enemy_move_done(
+        &mut self,
+        content: &Content,
+        index: usize,
+        move_index: usize,
+        stunned: bool,
+    ) {
+        if stunned {
+            return;
+        }
+        let id = self.combat().unwrap().enemies[index].creature.id;
+        match (content.enemies[id as usize].id, move_index) {
+            ("MONSTER.AXEBOT", 0) => {
                 let stock = self.creature(Actor::Enemy(index)).power(power_id::STOCK);
                 let strength = if self.run.ascension >= 9 { 4 } else { 3 } * (2 - stock);
                 self.apply_power(content, Actor::Enemy(index), power_id::STRENGTH, strength);
             }
-            if content.enemies[id as usize].id == "MONSTER.GREMLIN_MERC"
-                && self.creature(Actor::Player).hp > 0
-            {
+            ("MONSTER.GREMLIN_MERC", _) if self.creature(Actor::Player).hp > 0 => {
                 let stolen = self.run.gold.min(
                     self.creature(Actor::Enemy(index))
                         .power(power_id::THIEVERY)
@@ -1988,126 +1070,14 @@ impl Game {
                     power.value = power.value.saturating_add(stolen as i16);
                 }
             }
-            if content.enemies[id as usize].id == "MONSTER.LAGAVULIN_MATRIARCH"
-                && self.creature(Actor::Enemy(index)).power(power_id::ASLEEP) == 1
-            {
-                self.creature_mut(Actor::Enemy(index))
-                    .powers
-                    .retain(|power| power.id != 79);
+            ("MONSTER.GAS_BOMB", _) if self.creature(Actor::Enemy(index)).hp > 0 => {
+                self.kill_actor(content, Actor::Enemy(index))
             }
-            if content.enemies[id as usize].id == "MONSTER.GAS_BOMB"
-                && self.creature(Actor::Enemy(index)).hp > 0
-            {
-                self.kill_actor(content, Actor::Enemy(index));
+            ("MONSTER.THIEVING_HOPPER", 4) | ("MONSTER.FAT_GREMLIN", 1) => {
+                self.creature_mut(Actor::Enemy(index)).hp = 0
             }
-            self.trigger(content, Trigger::TurnEnd, Actor::Enemy(index), 0);
-            self.resolve(content);
-            if content.enemies[id as usize].id == "MONSTER.LAGAVULIN_MATRIARCH" {
-                self.creature_mut(Actor::Enemy(index))
-                    .consume_power(power_id::ASLEEP);
-            }
-            if content.enemies[id as usize].id == "MONSTER.SLUMBERING_BEETLE" {
-                self.creature_mut(Actor::Enemy(index))
-                    .consume_power(power_id::SLUMBER);
-                if self.creature(Actor::Enemy(index)).power(power_id::SLUMBER) == 0 {
-                    self.creature_mut(Actor::Enemy(index))
-                        .powers
-                        .retain(|power| power.id != 79);
-                }
-            }
-            if (1..=3).contains(&self.event_combat) {
-                let timer = self
-                    .creature(Actor::Enemy(index))
-                    .power(power_id::TIME_LIMIT);
-                if timer > 1 {
-                    self.creature_mut(Actor::Enemy(index))
-                        .add_power(power_id::TIME_LIMIT, -1);
-                } else if timer == 1 {
-                    self.creature_mut(Actor::Enemy(index)).hp = 0;
-                    self.event_combat |= 128;
-                }
-            }
-            if self
-                .creature(Actor::Enemy(index))
-                .power(power_id::ESCAPE_ARTIST)
-                > 1
-            {
-                self.creature_mut(Actor::Enemy(index))
-                    .consume_power(power_id::ESCAPE_ARTIST);
-            }
-            if content.enemies[id as usize].id == "MONSTER.THIEVING_HOPPER" && move_index == 4 {
-                self.creature_mut(Actor::Enemy(index)).hp = 0;
-            }
-            if content.enemies[id as usize].id == "MONSTER.FAT_GREMLIN" && move_index == 1 {
-                self.creature_mut(Actor::Enemy(index)).hp = 0;
-            }
+            _ => {}
         }
-        self.finish_enemy_turn(content, count);
-    }
-
-    fn finish_enemy_turn(&mut self, content: &Content, count: usize) {
-        let disintegration = self.creature(Actor::Player).power(power_id::DISINTEGRATION);
-        if disintegration > 0 {
-            self.damage(
-                content,
-                Actor::Player,
-                Actor::Player,
-                disintegration,
-                DamageKind::Unpowered,
-                None,
-            );
-        }
-        self.creature_mut(Actor::Player)
-            .powers
-            .retain(|power| power.id != power_id::TAINTED);
-        self.decay(content, Actor::Player);
-        self.decay(content, Actor::Osty);
-        for index in 0..count {
-            self.decay(content, Actor::Enemy(index));
-        }
-        for enemy in &mut self.combat_mut().unwrap().enemies {
-            enemy
-                .creature
-                .powers
-                .retain(|power| power.id != power_id::STRANGLE);
-            if enemy.creature.hp > 0 && enemy.creature.power(power_id::NEMESIS) > 0 {
-                enemy.creature.add_power(power_id::INTANGIBLE, 1);
-            }
-            enemy.creature.consume_power(power_id::HATCH);
-        }
-        self.combat_mut().unwrap().enemy_turn = false;
-        let enemies = (0..count).map(Actor::Enemy).collect();
-        self.doom_kill(content, enemies);
-        self.resolve(content);
-        self.creature_mut(Actor::Player)
-            .consume_power(power_id::COLOSSUS);
-        self.creature_mut(Actor::Player)
-            .powers
-            .retain(|power| power.id != power_id::FLAME_BARRIER);
-        if self.combat().unwrap().player.hp > 0
-            && self
-                .combat()
-                .unwrap()
-                .enemies
-                .iter()
-                .any(|x| x.creature.hp > 0)
-        {
-            self.start_turn(content);
-        }
-    }
-
-    fn tender(&mut self) {
-        let player = self.creature_mut(Actor::Player);
-        let Some(power) = player
-            .powers
-            .iter_mut()
-            .find(|power| power.id == power_id::TENDER)
-        else {
-            return;
-        };
-        power.amount += 1;
-        player.add_power(power_id::STRENGTH, -1);
-        player.add_power(power_id::DEXTERITY, -1);
     }
 
     fn reset_tender(&mut self) {
@@ -2126,13 +1096,14 @@ impl Game {
     }
 
     fn thieving_hopper(&mut self, content: &Content, enemy: usize) {
+        // Imbued cards are only taken last, alongside Ancients.
         let priorities: &[&[CardRarity]] = &[
             &[CardRarity::Uncommon],
             &[CardRarity::Common, CardRarity::Rare, CardRarity::Event],
-            &[CardRarity::Basic],
+            &[CardRarity::Basic, CardRarity::Quest],
             &[CardRarity::Ancient],
         ];
-        for rarities in priorities {
+        for (priority, rarities) in priorities.iter().enumerate() {
             let deck = &self.run.deck;
             let mut candidates = Vec::new();
             for pile in [Pile::Draw, Pile::Discard] {
@@ -2144,8 +1115,10 @@ impl Game {
                         offset
                     };
                     let card = cards[index];
+                    let imbued = card.enchantment == Some(Enchantment::Imbued);
                     if deck.iter().any(|deck| deck.instance == card.instance)
-                        && rarities.contains(&content.cards[card.id as usize].rarity)
+                        && (rarities.contains(&content.cards[card.id as usize].rarity) && !imbued
+                            || priority == 3 && imbued)
                     {
                         candidates.push((pile, index));
                     }
@@ -2214,8 +1187,15 @@ impl Game {
             }
             let moves = content.enemies[enemy.creature.id as usize].moves;
             if content.enemies[enemy.creature.id as usize].id == "MONSTER.WRIGGLER" {
+                // After the spawn stun, wriggler1/3 bite and wriggler2/4 wriggle (by slot name,
+                // kept in `value`); older states fall back to list parity.
+                let biter = if enemy.value > 0 {
+                    enemy.value % 2 == 1
+                } else {
+                    slot % 2 == 0
+                };
                 let chosen = match enemy.last_move {
-                    0 if slot % 2 == 0 => 1,
+                    0 if biter => 1,
                     0 => 2,
                     1 => 2,
                     _ => 1,
@@ -2249,13 +1229,18 @@ impl Game {
             if content.enemies[enemy.creature.id as usize].id == "MONSTER.OVICOPTER"
                 && enemy.last_move == 3
             {
-                let teammates = living.saturating_sub(1);
-                let chosen = if teammates <= 3 { 0 } else { 1 };
+                let chosen = if living <= 3 { 0 } else { 1 };
                 enemy.last_move = chosen;
                 enemy.move_index = chosen;
                 enemy.repeats = 1;
                 enemy.move_history.push(chosen);
                 continue;
+            }
+            if content.enemies[enemy.creature.id as usize].id == "MONSTER.TWO_TAILED_RAT"
+                && enemy.value == 1
+            {
+                enemy.value = 0;
+                enemy.move_index = self.rngs.monster_ai.below(3) as usize;
             }
             if enemy.last_move == usize::MAX {
                 enemy.last_move = enemy.move_index;
@@ -2265,7 +1250,8 @@ impl Game {
             }
             let id = content.enemies[enemy.creature.id as usize].id;
             if id == "MONSTER.FABRICATOR" {
-                let chosen = if living.saturating_sub(1) < 4 {
+                // CanFabricate counts the Fabricator itself among its living teammates.
+                let chosen = if living < 4 {
                     self.rngs.monster_ai.below(2) as usize
                 } else {
                     2
@@ -2378,7 +1364,7 @@ impl Game {
             }
             choices.retain(|&i| {
                 let cooldown = match (id, i) {
-                    ("MONSTER.FLYCONID", 0) => 2,
+                    ("MONSTER.FLYCONID", 0) => 3,
                     ("MONSTER.FLYCONID", 1) => 2,
                     _ => 0,
                 };
@@ -2426,7 +1412,15 @@ impl Game {
         context: Context,
         hand_draw: bool,
         draw_flags: u16,
+        again: Option<Effect>,
     ) -> Option<Card> {
+        let next = |count| {
+            if hand_draw {
+                Effect::HandDraw(count)
+            } else {
+                Effect::Draw(count)
+            }
+        };
         if !hand_draw
             && !self.combat().unwrap().enemy_turn
             && self.has_relic(content, "RELIC.FIDDLE")
@@ -2442,56 +1436,103 @@ impl Game {
         {
             return None;
         }
-        if count == 0 || self.combat().unwrap().hand.len() >= 10 {
+        // CardPileCmd.Draw stops once the combat is ending (e.g. Speedster killed the last enemy).
+        if count == 0 || self.combat().unwrap().hand.len() >= 10 || self.enemies_defeated() {
             return None;
         }
-        let shuffled = self.combat().unwrap().draw.is_empty();
-        if shuffled {
+        if self.combat().unwrap().draw.is_empty() {
             if self.combat().unwrap().discard.is_empty() {
                 return None;
             }
+            // CardPileCmd.Draw awaits the shuffle's AfterShuffle hooks (Stratagem's pick) before
+            // drawing on, so the draw resumes beneath them.
+            self.combat_mut().unwrap().queue.push(Pending {
+                effect: again.unwrap_or(next(count)),
+                context,
+            });
             self.shuffle_discard_into_draw(content);
-            self.trigger(content, Trigger::Shuffle, Actor::Player, 0);
+            self.after_shuffle(content);
+            return None;
         }
         let mut card = self.take_draw().unwrap();
         self.expectation_draw();
-        if card.enchantment == Some(Enchantment::Slither) {
-            self.expectation_unknown();
-            card.cost_override = Some(if self.expectation.is_some() {
-                0
+        // Hellraiser (AfterCardDrawnEarly) auto-plays a drawn Strike before AfterCardDrawn hooks.
+        let combat = self.combat_mut().unwrap();
+        let early_hellraiser = combat.player.power(power_id::HELLRAISER) > 0
+            && content.cards[card.id as usize].tags & STRIKE_TAG != 0;
+        let mut hellraiser = early_hellraiser;
+        if hellraiser {
+            let infinite = combat
+                .enemies
+                .iter()
+                .filter(|enemy| enemy.creature.hp > 0)
+                .all(|enemy| {
+                    enemy.creature.max_hp == i16::MAX
+                        || enemy.creature.powers.iter().any(|power| {
+                            power.id == power_id::HARDENED_SHELL && power.value >= power.amount
+                        })
+                });
+            let power = combat
+                .player
+                .powers
+                .iter_mut()
+                .find(|power| power.id == power_id::HELLRAISER)
+                .unwrap();
+            if infinite {
+                hellraiser = power.value < 9;
+                power.value = power.value.saturating_add(1);
             } else {
-                self.rngs.combat_energy_costs.below(4) as i8
-            });
+                power.value = 0;
+            }
         }
-        if (self.has_relic(content, "RELIC.SNECKO_EYE")
+        // Slither only rerolls a card still in hand (a Strike Hellraiser played keeps its cost).
+        if card.enchantment == Some(Enchantment::Slither) && !hellraiser {
+            card.add_cost(self.roll_cost(), ABSOLUTE);
+        }
+        // Confused rerolls every drawn card with a canonical cost; X-cost cards (canonical cost
+        // 0) roll too, though their cost stays X.
+        let def = content.cards[card.id as usize];
+        let x_cost =
+            def.cost[card.upgrades.min(1) as usize] < 0 && card.flags(def) & UNPLAYABLE == 0;
+        let confused = (self.has_relic(content, "RELIC.SNECKO_EYE")
             || self.has_relic(content, "RELIC.FAKE_SNECKO_EYE"))
-            && content.cards[card.id as usize].cost[card.upgrades.min(1) as usize] >= 0
-        {
-            self.expectation_unknown();
-            card.cost_override = Some(if self.expectation.is_some() {
-                0
-            } else {
-                self.rngs.combat_energy_costs.below(4) as i8
-            });
+            && (def.cost[card.upgrades.min(1) as usize] >= 0 || x_cost);
+        if confused && !early_hellraiser {
+            let cost = self.roll_cost();
+            if !x_cost {
+                card.add_cost(cost, ABSOLUTE);
+            }
         }
         card.turn_flags |= draw_flags;
         let combat = self.combat_mut().unwrap();
-        let hellraiser = combat.player.power(power_id::HELLRAISER) > 0
-            && content.cards[card.id as usize].tags & STRIKE_TAG != 0;
+        // Chains of Binding afflicts cards drawn on the player's turn, up to its amount per turn,
+        // after Hellraiser has auto-played its Strikes.
+        if !hellraiser
+            && !combat.enemy_turn
+            && card.affliction == Affliction::None
+            && (combat.bound_this_turn as i16) < combat.player.power(power_id::CHAINS_OF_BINDING)
+        {
+            card.affliction = Affliction::Bound;
+            combat.bound_this_turn += 1;
+        }
+        // Kingly Kick costs 1 less for the rest of combat each time it is drawn: a relative
+        // modifier, so it also applies on top of an absolute one (Snecko Eye's roll above).
+        if content.cards[card.id as usize].id == "CARD.KINGLY_KICK" {
+            card.add_cost(-1, 0);
+        }
         if !hellraiser {
             combat.hand.push(card);
         }
         combat.drawn = combat.drawn.saturating_add(1);
+        if content.cards[card.id as usize].card_type == CardType::Status {
+            combat.history.statuses_drawn += 1;
+        }
         if !hand_draw {
             combat.history.extra_drawn = combat.history.extra_drawn.saturating_add(1);
         }
         if count > 1 {
             combat.queue.push(Pending {
-                effect: if hand_draw {
-                    Effect::HandDraw(count - 1)
-                } else {
-                    Effect::Draw(count - 1)
-                },
+                effect: next(count - 1),
                 context,
             });
         }
@@ -2499,33 +1540,31 @@ impl Game {
             .player
             .power(power_id::PAGESTORM)
             .clamp(0, u8::MAX as i16) as u8;
-        let flags = card.flags(content.cards[card.id as usize]);
-        if pagestorm > 0 && flags & ETHEREAL != 0 {
+        if pagestorm > 0 && is_ethereal(combat, card, content.cards[card.id as usize]) {
             combat.queue.push(Pending {
                 effect: Effect::Draw(pagestorm),
                 context,
             });
         }
-        let powers = self.creature(Actor::Player).powers.clone();
-        self.dispatch(
+        let speedster = !hand_draw && !self.combat().unwrap().enemy_turn;
+        let mut powers = self.creature(Actor::Player).powers.clone();
+        powers.retain(|power| speedster || power.id != power_id::SPEEDSTER);
+        self.fire(
             content,
-            Trigger::CardDrawn,
-            Actor::Player,
+            Trigger::AfterCardDrawn,
             Context {
-                source: Actor::Player,
-                target: None,
-                card: Some(card.id),
-                upgraded: card.upgrades > 0,
-                x: 0,
                 event: 1,
-                orb: false,
-                orb_id: None,
-                pen_nib: false,
+                subject: Some(card.instance),
+                ..Context::card(card)
             },
             powers,
         );
-        self.trigger_card(content, card, Trigger::CardDrawn);
-        self.tick_automation();
+        if confused && early_hellraiser {
+            self.combat_mut().unwrap().queue.push(Pending {
+                effect: Effect::ConfusedRoll(card),
+                context: Context::card(card),
+            });
+        }
         if hellraiser {
             self.combat_mut().unwrap().queue.push(Pending {
                 effect: Effect::AutoPlay(card),
@@ -2535,23 +1574,25 @@ impl Game {
         Some(card)
     }
 
-    fn tick_automation(&mut self) {
-        let blocked = self.creature(Actor::Player).power(power_id::NO_ENERGY_GAIN) > 0;
-        let mut energy = 0;
-        for automation in &mut self.combat_mut().unwrap().automation {
-            automation.0 -= 1;
-            if automation.0 == 0 {
-                automation.0 = 10;
-                energy += automation.1;
-            }
-        }
-        if !blocked {
-            self.combat_mut().unwrap().energy =
-                self.combat().unwrap().energy.saturating_add(energy);
+    /// A random 0-3 cost (Confused, Slither); 0 while the expectation search hides it.
+    fn roll_cost(&mut self) -> i8 {
+        self.expectation_unknown();
+        if self.expectation.is_some() {
+            0
+        } else {
+            self.rngs.combat_energy_costs.below(4) as i8
         }
     }
 
-    pub(super) fn resolve(&mut self, content: &Content) {
+    /// PlayerCmd.GainEnergy: No Energy Gain blocks every energy gain.
+    fn gain_energy(&mut self, amount: i16) {
+        if amount > 0 && self.creature(Actor::Player).power(power_id::NO_ENERGY_GAIN) == 0 {
+            let combat = self.combat_mut().unwrap();
+            combat.energy = combat.energy.saturating_add(amount);
+        }
+    }
+
+    pub(crate) fn resolve(&mut self, content: &Content) {
         while self.combat().is_some_and(|x| x.choice.is_none()) {
             let Some(pending) = self.combat_mut().and_then(|x| x.queue.pop()) else {
                 break;
@@ -2560,7 +1601,23 @@ impl Game {
         }
     }
 
+    /// Resolves what was queued above `base`, as the game awaits a command's nested commands.
+    pub(super) fn settle(&mut self, content: &Content, base: usize) {
+        let hook = self.combat().unwrap().applying_hook;
+        while self
+            .combat()
+            .is_some_and(|x| x.choice.is_none() && x.queue.len() > base)
+        {
+            let pending = self.combat_mut().unwrap().queue.pop().unwrap();
+            self.apply(content, pending);
+        }
+        if let Some(combat) = self.combat_mut() {
+            combat.applying_hook = hook;
+        }
+    }
+
     fn apply(&mut self, content: &Content, pending: Pending) {
+        self.combat_mut().unwrap().applying_hook = pending.context.hook;
         let mut amount = self.amount(
             content,
             pending.context,
@@ -2618,34 +1675,93 @@ impl Game {
                 _ => Amount::fixed(0, 0),
             },
         );
+        // ModifyOrbValue runs powers first (Focus clamps at 0), then Infused Core's +1 per copy.
         if pending.context.orb_id == Some(orb_id::LIGHTNING)
             && self.has_relic(content, "RELIC.INFUSED_CORE")
             && matches!(pending.effect, Effect::Damage(..))
         {
-            amount = amount.saturating_add(1);
+            amount = amount
+                .max(0)
+                .saturating_add(self.relic_count(content, "RELIC.INFUSED_CORE") as i16);
         }
         match pending.effect {
-            Effect::Attack(target, _, hits) => {
+            Effect::Attack(target, _, _) | Effect::AttackMany(target, _, _) => {
+                let hits = match pending.effect {
+                    Effect::AttackMany(_, _, hits) => self.amount(content, pending.context, hits),
+                    Effect::Attack(_, _, hits) => hits as i16,
+                    _ => unreachable!(),
+                }
+                .max(0);
+                // Each hit strikes every target before deaths resolve; random attacks retarget per hit.
+                let (rounds, hits) = if matches!(target, Target::RandomEnemy | Target::AllEnemies) {
+                    (hits, 1)
+                } else {
+                    (1, hits)
+                };
+                let source = pending.context.source;
+                // A respawn (Axebot's Stock) refills a killed attacker's slot; the attack still stops.
+                let attacking = self.instance(source);
                 let mut total = 0;
+                // Blight Strike's Doom counts TotalDamage, without the overkill Fisticuffs adds.
+                let overkill = pending.context.card != content.card_id("CARD.BLIGHT_STRIKE");
                 let mut suck_hits = 0;
-                for actor in self.targets(target, pending.context) {
-                    let mut lost = 0;
-                    for _ in 0..hits {
-                        let result = self.damage_with_bonus(
-                            content,
-                            actor,
-                            amount,
-                            DamageKind::Attack,
-                            pending.context,
-                        );
-                        lost += result.lost;
-                        total += result.resolved;
-                        suck_hits += (result.lost > 0) as i16;
-                        if self.creature(pending.context.source).hp <= 0 {
-                            break;
+                let mut killed = false;
+                'rounds: for _ in 0..rounds {
+                    // An area hit strikes every target before deaths resolve (e.g. Shrink, Crab Rage),
+                    // Seeking Edge's Sovereign Blade included.
+                    let area = target == Target::AllEnemies
+                        || target == Target::ChosenEnemy
+                            && pending.context.card == Some(card_id::SOVEREIGN_BLADE)
+                            && self.creature(Actor::Player).power(power_id::SEEKING_EDGE) > 0;
+                    let previous =
+                        area.then(|| self.combat_mut().unwrap().pending_hits.replace(vec![]));
+                    for actor in self.targets(content, target, pending.context) {
+                        let targeted = self.instance(actor);
+                        // A later play of the series still targets the card's original creature, which a
+                        // respawn (Axebot's Stock) has replaced.
+                        if target == Target::ChosenEnemy
+                            && pending
+                                .context
+                                .target_instance
+                                .is_some_and(|played| Some(played) != targeted)
+                        {
+                            continue;
+                        }
+                        for _ in 0..hits {
+                            // A slot refilled mid-attack (Axebot's Stock) holds a creature this attack never targeted.
+                            if self.instance(actor) != targeted {
+                                break;
+                            }
+                            let result = self.damage_with_bonus(
+                                content,
+                                actor,
+                                amount,
+                                DamageKind::Attack,
+                                pending.context,
+                            );
+                            total += if overkill {
+                                result.dealt
+                            } else {
+                                result.blocked + result.lost
+                            };
+                            suck_hits += (result.lost > 0) as i16;
+                            // A respawn (Axebot's Stock) refills the slot, but the target was still killed.
+                            // The Waterfall Giant's death leaves it at i16::MAX HP, still a kill.
+                            killed |= result.lost > 0
+                                && (self.instance(actor) != targeted
+                                    || self.creature(actor).hp <= 0
+                                    || self.creature(actor).hp == i16::MAX);
+                            if self.creature(source).hp <= 0 || self.instance(source) != attacking {
+                                if let Some(previous) = previous {
+                                    self.resolve_deaths(content, previous);
+                                }
+                                break 'rounds;
+                            }
                         }
                     }
-                    self.reaper(content, pending.context.source, actor, lost);
+                    if let Some(previous) = previous {
+                        self.resolve_deaths(content, previous);
+                    }
                 }
                 let suck = self.creature(pending.context.source).power(power_id::SUCK);
                 if suck > 0 {
@@ -2657,6 +1773,7 @@ impl Game {
                     );
                 }
                 self.combat_mut().unwrap().last_damage = total;
+                self.combat_mut().unwrap().last_killed = killed;
                 self.creature_mut(pending.context.source)
                     .powers
                     .retain(|power| power.id != power_id::VIGOR);
@@ -2671,130 +1788,102 @@ impl Game {
                     }
                 }
             }
-            Effect::AttackMany(target, _, hits) => {
-                let hits = self.amount(content, pending.context, hits).max(0);
-                let mut total = 0;
-                let mut suck_hits = 0;
-                for actor in self.targets(target, pending.context) {
-                    let mut lost = 0;
+            Effect::OstyAttack(target, ..) | Effect::OstyAttackMany(target, ..) => {
+                if self.creature(Actor::Osty).hp <= 0 {
+                    return;
+                }
+                let hits = match pending.effect {
+                    Effect::OstyAttackMany(_, _, hits) => {
+                        self.amount(content, pending.context, hits)
+                    }
+                    Effect::OstyAttack(_, _, hits) => hits as i16,
+                    _ => unreachable!(),
+                }
+                .max(0);
+                self.combat_mut().unwrap().history.osty_attacks += 1;
+                // Each of Osty's attacks sets every Flatten's cost to 0 this turn (SetThisTurn).
+                let flatten = |card: &Card| card.id == card_id::FLATTEN;
+                (self.combat_mut().unwrap()).add_costs(flatten, 0, ABSOLUTE | THIS_TURN);
+                // An area hit strikes every target before deaths resolve (e.g. Crab Rage).
+                let previous = (target == Target::AllEnemies)
+                    .then(|| self.combat_mut().unwrap().pending_hits.replace(vec![]));
+                for actor in self.targets(content, target, pending.context) {
                     for _ in 0..hits {
-                        let result = self.damage_with_bonus(
+                        self.damage_with_bonus(
                             content,
                             actor,
                             amount,
                             DamageKind::Attack,
-                            pending.context,
+                            Context {
+                                source: Actor::Osty,
+                                ..pending.context
+                            },
                         );
-                        lost += result.lost;
-                        total += result.resolved;
-                        suck_hits += (result.lost > 0) as i16;
-                        if self.creature(pending.context.source).hp <= 0 {
-                            break;
-                        }
-                    }
-                    self.reaper(content, pending.context.source, actor, lost);
-                }
-                let suck = self.creature(pending.context.source).power(power_id::SUCK);
-                if suck > 0 {
-                    self.apply_power(
-                        content,
-                        pending.context.source,
-                        power_id::STRENGTH,
-                        suck * suck_hits,
-                    );
-                }
-                self.combat_mut().unwrap().last_damage = total;
-                self.creature_mut(pending.context.source)
-                    .powers
-                    .retain(|power| power.id != power_id::VIGOR);
-                if pending.context.source == Actor::Player {
-                    if self
-                        .creature(Actor::Player)
-                        .power(power_id::GIGANTIFICATION)
-                        > 0
-                    {
-                        self.creature_mut(Actor::Player)
-                            .consume_power(power_id::GIGANTIFICATION);
-                    }
-                }
-            }
-            Effect::OstyAttack(target, _, hits) => {
-                if self.creature(Actor::Osty).hp <= 0 {
-                    return;
-                }
-                self.combat_mut().unwrap().history.osty_attacks += 1;
-                for actor in self.targets(target, pending.context) {
-                    let mut dealt = 0;
-                    for _ in 0..hits {
-                        dealt += self
-                            .damage_with_bonus(
-                                content,
-                                actor,
-                                amount,
-                                DamageKind::Attack,
-                                Context {
-                                    source: Actor::Osty,
-                                    ..pending.context
-                                },
-                            )
-                            .lost;
                         if self.creature(Actor::Osty).hp <= 0 {
                             break;
                         }
                     }
-                    self.reaper(content, Actor::Osty, actor, dealt);
-                    self.sic_em(actor);
                 }
-                if self.has_relic(content, "RELIC.BONE_FLUTE") {
-                    self.gain_block(content, Actor::Player, 2, None, false);
+                if let Some(previous) = previous {
+                    self.resolve_deaths(content, previous);
                 }
-            }
-            Effect::OstyAttackMany(target, _, hits) => {
-                if self.creature(Actor::Osty).hp <= 0 {
-                    return;
+                if pending.context.card.is_some() {
+                    self.creature_mut(Actor::Player)
+                        .consume_power(power_id::GIGANTIFICATION);
                 }
-                let hits = self.amount(content, pending.context, hits).max(0);
-                self.combat_mut().unwrap().history.osty_attacks += 1;
-                for actor in self.targets(target, pending.context) {
-                    let mut dealt = 0;
-                    for _ in 0..hits {
-                        dealt += self
-                            .damage_with_bonus(
-                                content,
-                                actor,
-                                amount,
-                                DamageKind::Attack,
-                                Context {
-                                    source: Actor::Osty,
-                                    ..pending.context
-                                },
-                            )
-                            .lost;
-                        if self.creature(Actor::Osty).hp <= 0 {
-                            break;
-                        }
-                    }
-                    self.reaper(content, Actor::Osty, actor, dealt);
-                    self.sic_em(actor);
-                }
-                if self.has_relic(content, "RELIC.BONE_FLUTE") {
+                for _ in 0..self.relic_count(content, "RELIC.BONE_FLUTE") {
                     self.gain_block(content, Actor::Player, 2, None, false);
                 }
             }
             Effect::MoveDamage(target, _) => {
-                for actor in self.targets(target, pending.context) {
-                    self.damage(
+                let card = pending
+                    .context
+                    .card
+                    .map(|card| content.cards[card as usize].id);
+                let mut kills = 0;
+                for actor in self.targets(content, target, pending.context) {
+                    // A death can refill the target's slot (Surprise's gremlins), so the splash
+                    // skips the target by instance.
+                    let hit = self.instance(actor);
+                    let result = self.damage_with_bonus(
                         content,
-                        pending.context.source,
                         actor,
                         amount,
                         DamageKind::Move,
-                        pending.context.card,
+                        pending.context,
                     );
+                    let dealt = result.dealt;
+                    // A refilled slot (Surprise's gremlins) means the hit creature died.
+                    kills += (self.instance(actor) != hit || self.creature(actor).hp <= 0) as i16;
+                    if card == Some("CARD.OMNISLICE") {
+                        for other in self.targets(content, Target::AllEnemies, pending.context) {
+                            if self.instance(other) != hit {
+                                self.damage(
+                                    content,
+                                    pending.context.source,
+                                    other,
+                                    dealt,
+                                    DamageKind::Unpowered,
+                                    pending.context.card,
+                                );
+                            }
+                        }
+                    }
+                }
+                // Echoing Slash strikes again for every enemy it kills.
+                if card == Some("CARD.ECHOING_SLASH") && kills > 0 {
+                    for _ in 0..kills {
+                        self.combat_mut().unwrap().queue.push(pending);
+                    }
+                } else if pending.context.source == Actor::Player {
+                    let player = self.creature_mut(Actor::Player);
+                    player.powers.retain(|power| power.id != power_id::VIGOR);
+                    player.consume_power(power_id::GIGANTIFICATION);
                 }
             }
             Effect::Damage(target, _) => {
-                let targets = self.targets(target, pending.context);
+                let targets = self.targets(content, target, pending.context);
+                let previous = self.combat_mut().unwrap().pending_hits.replace(vec![]);
                 for &actor in &targets {
                     self.damage(
                         content,
@@ -2805,6 +1894,7 @@ impl Game {
                         pending.context.card,
                     );
                 }
+                self.resolve_deaths(content, previous);
                 if pending.context.orb_id == Some(orb_id::LIGHTNING)
                     && pending.context.orb
                     && pending.context.target.is_none()
@@ -2813,64 +1903,65 @@ impl Game {
                 }
             }
             Effect::Kill(target) => {
-                for actor in self.targets(target, pending.context) {
+                for actor in self.targets(content, target, pending.context) {
                     self.kill_actor(content, actor);
                 }
             }
             Effect::Stun(target) => {
-                for actor in self.targets(target, pending.context) {
+                for actor in self.targets(content, target, pending.context) {
                     if let Actor::Enemy(index) = actor {
                         self.combat_mut().unwrap().enemies[index].stunned = true;
                     }
                 }
             }
             Effect::DoomKill => {
-                let enemies = self.targets(Target::AllEnemies, pending.context);
+                let enemies = self.targets(content, Target::AllEnemies, pending.context);
                 self.doom_kill(content, enemies);
             }
+            // HP loss is unblockable, unpowered damage (CreatureCmd.Damage).
             Effect::LoseHp(target, _) => {
-                for actor in self.targets(target, pending.context) {
-                    let before = self.creature(actor).hp.max(0);
-                    let lost = amount.max(0).min(before);
-                    self.creature_mut(actor).hp = before - lost;
-                    if actor == Actor::Player {
-                        self.combat_mut().unwrap().history.hp_lost += lost;
-                        if lost > 0 {
-                            self.combat_mut().unwrap().history.hp_loss_events += 1;
-                        }
-                    }
-                    if lost > 0 {
-                        self.trigger(content, Trigger::HpLost, actor, lost);
-                        if actor == Actor::Player {
-                            self.inferno();
-                        }
-                        if actor == Actor::Osty {
-                            self.necro_mastery(content, lost);
-                        }
-                    }
-                    if self.creature(actor).hp <= 0 {
-                        self.died(content, actor);
-                    }
+                for actor in self.targets(content, target, pending.context) {
+                    let kind = DamageKind::Unblockable;
+                    self.damage_with_bonus(content, actor, amount, kind, pending.context);
                 }
             }
             Effect::Block(target, _) => {
-                let targets = self.targets(target, pending.context);
+                let targets = self.targets(content, target, pending.context);
                 for &actor in &targets {
                     let powered = pending.context.card.is_some()
                         || matches!(pending.context.source, Actor::Enemy(_));
                     self.gain_block(content, actor, amount, pending.context.card, powered);
                 }
             }
-            Effect::BlockNextTurn(_) => {
-                let amount = self.modified_block(content, Actor::Player, amount, false);
-                self.apply_power(content, Actor::Player, power_id::BLOCK_NEXT_TURN, amount);
+            Effect::BlockNextTurn(x) => {
+                // Prolong keeps the current block as is; Glitterstream's next-turn block goes
+                // through ModifyBlock, relic multipliers included.
+                let amount = if x.scale == Scale::Block {
+                    amount
+                } else {
+                    let card = pending.context.card;
+                    let amount = self
+                        .modify_block(content, Actor::Player, amount, card, true)
+                        .0;
+                    self.claim_block_doubler(content, Actor::Player, amount, card);
+                    amount
+                };
+                if amount > 0 {
+                    self.apply_power(content, Actor::Player, power_id::BLOCK_NEXT_TURN, amount);
+                }
             }
             Effect::ToricToughness(_) => {
+                // It stores the block the card gained, so none under No Block.
+                let value = if self.creature(Actor::Player).power(power_id::NO_BLOCK) > 0 {
+                    0
+                } else {
+                    amount
+                };
                 self.creature_mut(Actor::Player).powers.push(Power {
                     id: power_id::TORIC_TOUGHNESS,
                     amount: 2,
-                    skip_next_decay: false,
-                    value: amount,
+                    value,
+                    ..Power::default()
                 });
             }
             Effect::DodgeRoll(_) => {
@@ -2880,31 +1971,48 @@ impl Game {
             }
             Effect::DrawBlockIf(kind, _) => {
                 if self
-                    .draw(content, 1, pending.context, false, 0)
-                    .is_some_and(|card| content.cards[card.id as usize].card_type == kind)
+                    .draw(content, 1, pending.context, false, 0, Some(pending.effect))
+                    .is_some_and(|card| card.card_type(content.cards[card.id as usize]) == kind)
                 {
                     self.gain_block(content, Actor::Player, amount, pending.context.card, true);
                 }
             }
+            // Entrench's own block is unpowered card block (Vambrace, Pael's Legion, Unmovable).
+            Effect::RawBlock(Target::Player, x)
+                if x.scale == Scale::Block && pending.context.card.is_some() =>
+            {
+                self.gain_block(content, Actor::Player, amount, pending.context.card, false);
+            }
             Effect::RawBlock(target, _) => {
-                for actor in self.targets(target, pending.context) {
-                    let amount = amount.max(0);
-                    self.creature_mut(actor).block =
-                        self.creature(actor).block.saturating_add(amount);
+                for actor in self.targets(content, target, pending.context) {
                     if amount > 0 {
-                        self.trigger(content, Trigger::BlockGained, actor, amount);
+                        self.gain_block(content, actor, amount, None, false);
+                        continue;
+                    }
+                    // Negative raw block strips block (Expose); losing all of it breaks it too
+                    // (CreatureCmd.LoseBlock).
+                    let had_block = self.creature(actor).block > 0;
+                    let creature = self.creature_mut(actor);
+                    creature.block = creature.block.saturating_add(amount).max(0);
+                    if had_block && self.creature(actor).block == 0 {
+                        self.break_burrow(content, actor);
                     }
                 }
             }
             Effect::Heal(target, _) => {
-                for actor in self.targets(target, pending.context) {
+                for actor in self.targets(content, target, pending.context) {
+                    // Enemies don't heal once the combat is ending (Knowledge Demon's heal
+                    // after Thorns killed it).
+                    if actor != Actor::Player && self.enemies_defeated() {
+                        continue;
+                    }
                     let x = self.creature_mut(actor);
                     x.hp = (x.hp + amount.max(0)).min(x.max_hp)
                 }
                 self.sync_red_skull(content);
             }
             Effect::HealPercent(target, _) => {
-                for actor in self.targets(target, pending.context) {
+                for actor in self.targets(content, target, pending.context) {
                     let heal = self.creature(actor).max_hp.saturating_mul(amount.max(0)) / 100;
                     let creature = self.creature_mut(actor);
                     creature.hp = creature.hp.saturating_add(heal).min(creature.max_hp);
@@ -2925,11 +2033,14 @@ impl Game {
                             Actor::Player,
                             Actor::Player,
                             excess,
-                            DamageKind::Unpowered,
+                            DamageKind::Unblockable,
                             pending.context.card,
                         );
                     }
-                    self.creature_mut(Actor::Player).max_hp = max_hp;
+                    // Lowering max HP also caps current HP (SetMaxHpInternal).
+                    let player = self.creature_mut(Actor::Player);
+                    player.max_hp = max_hp;
+                    player.hp = player.hp.min(max_hp);
                 } else {
                     let player = self.creature_mut(Actor::Player);
                     player.max_hp = player.max_hp.saturating_add(amount);
@@ -2940,34 +2051,26 @@ impl Game {
                 self.sync_red_skull(content);
             }
             Effect::Gold(_) if amount >= 0 => self.gain_gold(content, amount as i32),
+            // Gold costs (Seal of Gold, Debt) don't apply once the fight is won.
+            Effect::Gold(_) if self.enemies_defeated() => {}
             Effect::Gold(_) => self.run.gold = self.run.gold.saturating_sub(-amount as i32).max(0),
             Effect::Bomb(_) => {
-                self.combat_mut().unwrap().bombs.push((3, amount.max(0)));
-                self.creature_mut(Actor::Player).powers.push(Power {
-                    id: power_id::THE_BOMB,
-                    amount: 3,
-                    skip_next_decay: false,
-                    value: 0,
-                });
+                let player = self.creature_mut(Actor::Player);
+                player.add_instance(power_id::THE_BOMB, 3, amount.max(0));
             }
             Effect::Automation(energy) => {
-                self.combat_mut().unwrap().automation.push((10, energy));
-                self.creature_mut(Actor::Player)
-                    .add_power(power_id::AUTOMATION, energy);
+                let player = self.creature_mut(Actor::Player);
+                player.add_instance(power_id::AUTOMATION, energy, 10);
             }
             Effect::Panache(_) => {
-                let cards = self.combat().unwrap().history.cards;
-                self.combat_mut()
-                    .unwrap()
-                    .panache
-                    .push((5, amount.max(0), cards));
-                self.creature_mut(Actor::Player)
-                    .add_power(power_id::PANACHE, amount);
+                let player = self.creature_mut(Actor::Player);
+                player.add_instance(power_id::PANACHE, amount, 5);
+                // It skips the play that applied it.
+                player.powers.last_mut().unwrap().skip_next_decay = true;
             }
             Effect::RollingBoulder(_) => {
-                self.combat_mut().unwrap().boulders.push(amount.max(0));
-                self.creature_mut(Actor::Player)
-                    .add_power(power_id::ROLLING_BOULDER, amount);
+                let player = self.creature_mut(Actor::Player);
+                player.add_instance(power_id::ROLLING_BOULDER, amount, 0);
             }
             Effect::RandomPotion => {
                 self.expectation_unknown();
@@ -2989,12 +2092,9 @@ impl Game {
                     let card = self.combat().unwrap().hand[index];
                     let def = content.cards[card.id as usize];
                     if def.cost[card.upgrades.min(1) as usize] >= 0 {
-                        let cost = if self.expectation.is_some() {
-                            0
-                        } else {
-                            self.rngs.combat_energy_costs.below(4) as i8
-                        };
-                        self.combat_mut().unwrap().hand[index].cost_override = Some(cost);
+                        let cost = self.roll_cost();
+                        let card = &mut self.combat_mut().unwrap().hand[index];
+                        card.add_cost(cost, ABSOLUTE | THIS_TURN | UNTIL_PLAYED);
                     }
                 }
             }
@@ -3006,6 +2106,7 @@ impl Game {
                     .chain(&mut combat.hand)
                     .chain(&mut combat.discard)
                     .chain(&mut combat.exhaust)
+                    .chain(played(&mut combat.queue))
                 {
                     if content.cards[card.id as usize].tags & tag != 0 {
                         card.replays = card.replays.saturating_add(count);
@@ -3026,7 +2127,6 @@ impl Game {
                         "CARD.ALCHEMIZE" | "CARD.HAND_OF_GREED" | "CARD.HIDDEN_GEM"
                     )
                 });
-                pool.sort_unstable_by_key(|&id| content.cards[id as usize].id);
                 if self.expectation.is_none() {
                     self.rngs.combat_card_generation.shuffle(&mut pool);
                 }
@@ -3042,8 +2142,14 @@ impl Game {
                     );
                 }
             }
+            // Slow only counts card plays (SlowAmount); it isn't a debuff application.
+            Effect::ApplyPower(target, power_id::SLOW, _) => {
+                for actor in self.targets(content, target, pending.context) {
+                    self.creature_mut(actor).add_power(power_id::SLOW, amount);
+                }
+            }
             Effect::ApplyPower(target, id, _) => {
-                for actor in self.targets(target, pending.context) {
+                for actor in self.targets(content, target, pending.context) {
                     let new = self.creature(actor).power(id) == 0;
                     self.apply_power(content, actor, id, amount);
                     if new
@@ -3071,7 +2177,8 @@ impl Game {
                 }
             }
             Effect::ApplyDebuff(target, id, _) => {
-                for actor in self.targets(target, pending.context) {
+                for actor in self.targets(content, target, pending.context) {
+                    let amount = self.modify_power_amount(content, actor, id, amount);
                     if self.apply_debuff(content, actor, id, amount)
                         && let Actor::Enemy(source) = pending.context.source
                         && matches!(actor, Actor::Player)
@@ -3094,14 +2201,16 @@ impl Game {
                     }
                 }
             }
+            // Bubble Bubble applies its poison normally (Artifact, Unsettling Lamp, Snecko Skull).
             Effect::StackPower(target, id, _) => {
-                for actor in self.targets(target, pending.context) {
-                    self.creature_mut(actor).add_power(id, amount);
+                for actor in self.targets(content, target, pending.context) {
+                    self.apply_power(content, actor, id, amount);
                 }
             }
             Effect::DoublePower(target, id, minimum) => {
-                for actor in self.targets(target, pending.context) {
+                for actor in self.targets(content, target, pending.context) {
                     let amount = self.creature(actor).power(id).max(minimum);
+                    let amount = self.modify_power_amount(content, actor, id, amount);
                     self.apply_debuff(content, actor, id, amount);
                 }
             }
@@ -3110,24 +2219,32 @@ impl Game {
                     return;
                 };
                 let target = Actor::Enemy(target);
+                // A dead target (a replay after the first play's kill) lost its powers on death.
+                let alive = self.creature(target).hp > 0;
                 let debuffs: Vec<_> = self
                     .creature(target)
                     .powers
                     .iter()
                     .copied()
                     .filter(|power| {
-                        content.powers[power.id as usize].debuff
+                        alive && content.powers[power.id as usize].debuff
                             || power.id == power_id::STRENGTH && power.amount < 0
+                            || TEMPORARY_STRENGTH_DOWN.contains(&power.id)
                     })
                     .collect();
-                self.damage(
+                self.damage_with_bonus(
                     content,
-                    Actor::Player,
                     target,
                     amount,
                     DamageKind::Attack,
-                    pending.context.card,
+                    Context {
+                        source: Actor::Player,
+                        ..pending.context
+                    },
                 );
+                let player = self.creature_mut(Actor::Player);
+                player.powers.retain(|power| power.id != power_id::VIGOR);
+                player.consume_power(power_id::GIGANTIFICATION);
                 let others: Vec<_> = self
                     .combat()
                     .unwrap()
@@ -3141,7 +2258,8 @@ impl Game {
                     .collect();
                 for actor in others {
                     for power in &debuffs {
-                        if matches!(power.id, power_id::ENFEEBLING_TOUCH | power_id::MANGLE) {
+                        // Copied Strength already carries their loss (IgnoreNextInstance).
+                        if TEMPORARY_STRENGTH_DOWN.contains(&power.id) {
                             if let Some(artifact) = self
                                 .creature(actor)
                                 .powers
@@ -3154,48 +2272,69 @@ impl Game {
                                 self.creature_mut(actor).add_power(power.id, power.amount);
                             }
                         } else {
-                            self.apply_debuff(content, actor, power.id, power.amount);
+                            let amount =
+                                self.modify_power_amount(content, actor, power.id, power.amount);
+                            self.apply_debuff(content, actor, power.id, amount);
                         }
                     }
                 }
             }
             Effect::RemovePower(target, id) => {
-                for actor in self.targets(target, pending.context) {
+                for actor in self.targets(content, target, pending.context) {
                     self.creature_mut(actor).powers.retain(|x| x.id != id)
                 }
             }
             Effect::TemporaryStrength(target, restore, _) => {
-                for actor in self.targets(target, pending.context) {
+                for actor in self.targets(content, target, pending.context) {
+                    let amount =
+                        -self.modify_power_amount(content, actor, power_id::STRENGTH, -amount);
                     if self.apply_debuff(content, actor, power_id::STRENGTH, -amount) {
                         self.creature_mut(actor).add_power(restore, amount);
                     }
                 }
             }
             Effect::Draw(count) => {
-                self.draw(content, count, pending.context, false, 0);
+                self.draw(content, count, pending.context, false, 0, None);
             }
-            Effect::HandDraw(count) => {
-                self.draw(content, count, pending.context, true, 0);
+            Effect::HandDraw(mut count) => {
+                if self.combat().unwrap().turn == 1 && !self.combat().unwrap().innate_ordered {
+                    self.combat_mut().unwrap().innate_ordered = true;
+                    // After BeforeHandDraw (Jeweled Mask, Toolbox), Imbued cards sink to the
+                    // bottom, then innate cards move to the top one by one, reversing their order.
+                    let rank = |card: &Card| {
+                        if card.enchantment == Some(Enchantment::Imbued) {
+                            0
+                        } else {
+                            1 + (card.flags(content.cards[card.id as usize]) & INNATE != 0) as u8
+                        }
+                    };
+                    let draw = &mut self.combat_mut().unwrap().draw;
+                    draw.sort_by_key(rank);
+                    let start = draw
+                        .iter()
+                        .position(|card| rank(card) == 2)
+                        .unwrap_or(draw.len());
+                    draw[start..].reverse();
+                    // The turn-1 hand draw takes every innate card, up to the hand limit.
+                    count = count.max((draw.len() - start) as u8).min(10);
+                }
+                self.draw(content, count, pending.context, true, 0, None);
             }
             Effect::DrawAmount(_) => {
-                self.draw(
-                    content,
-                    amount.clamp(0, u8::MAX as i16) as u8,
-                    pending.context,
-                    false,
-                    0,
-                );
+                let count = amount.clamp(0, u8::MAX as i16) as u8;
+                self.draw(content, count, pending.context, false, 0, None);
             }
             Effect::DrawTo(size) => {
                 let count = size[pending.context.upgraded as usize]
                     .saturating_sub(self.combat().unwrap().hand.len() as u8);
-                self.draw(content, count, pending.context, false, 0);
+                self.draw(content, count, pending.context, false, 0, None);
             }
             Effect::DrawUntilNot(kind) => {
                 let base = self.combat().unwrap().queue.len();
-                if self
-                    .draw(content, 1, pending.context, false, 0)
-                    .is_some_and(|card| content.cards[card.id as usize].card_type == kind)
+                if !self.enemies_defeated()
+                    && self
+                        .draw(content, 1, pending.context, false, 0, Some(pending.effect))
+                        .is_some_and(|card| card.card_type(content.cards[card.id as usize]) == kind)
                 {
                     self.combat_mut().unwrap().queue.insert(
                         base,
@@ -3208,13 +2347,14 @@ impl Game {
             }
             Effect::ChooseDraw(_) => {
                 let count = amount.clamp(0, u8::MAX as i16) as u8;
-                if self.combat().unwrap().draw.len() < count as usize
+                // CardPileCmd.ShuffleIfNecessary: only an empty draw pile is reshuffled.
+                if self.combat().unwrap().draw.is_empty()
                     && !self.combat().unwrap().discard.is_empty()
                 {
-                    let combat = self.combat_mut().unwrap();
-                    combat.draw.append(&mut combat.discard);
-                    self.shuffle_draw();
-                    self.trigger(content, Trigger::Shuffle, Actor::Player, 0);
+                    self.combat_mut().unwrap().queue.push(pending);
+                    self.shuffle_discard_into_draw(content);
+                    self.after_shuffle(content);
+                    return;
                 }
                 self.select(
                     content,
@@ -3228,22 +2368,23 @@ impl Game {
             }
             Effect::FreeHand => {
                 for card in &mut self.combat_mut().unwrap().hand {
-                    card.free = true;
+                    card.free_this_turn();
                 }
             }
-            Effect::Energy(amount) => {
-                if amount > 0 && self.creature(Actor::Player).power(power_id::NO_ENERGY_GAIN) > 0 {
-                    return;
-                }
-                self.combat_mut().unwrap().energy =
-                    self.combat().unwrap().energy.saturating_add(amount as i16);
+            Effect::Energy(amount) if amount < 0 => {
+                let combat = self.combat_mut().unwrap();
+                combat.energy = (combat.energy + amount as i16).max(0);
             }
+            Effect::Energy(amount) => self.gain_energy(amount as i16),
             Effect::DoubleEnergy => {
                 let combat = self.combat_mut().unwrap();
                 combat.energy = combat.energy.saturating_mul(2);
             }
             Effect::AddCard(pile, id, count) => {
+                // Crash Landing fills the hand with Debris; other cards its play adds (Withering
+                // Presence's Wither) still overflow to the discard pile.
                 let count = if pile == Pile::Hand
+                    && content.cards[id as usize].id == "CARD.DEBRIS"
                     && pending
                         .context
                         .card
@@ -3324,20 +2465,32 @@ impl Game {
                             && def.flags[0] & NO_GENERATE == 0
                     })
                     .collect();
-                pool.sort_unstable_by_key(|&id| content.cards[id as usize].id);
-                if self.expectation.is_none() {
+                // Calamity and Metamorphosis pick every card independently.
+                if self.expectation.is_some() {
+                } else if count > 1 || kind == CardType::Attack && !free && pile == Pile::Hand {
+                    pool = (0..count)
+                        .map(|_| {
+                            pool[self.rngs.combat_card_generation.below(pool.len() as u32) as usize]
+                        })
+                        .collect();
+                } else {
                     self.rngs.combat_card_generation.shuffle(&mut pool);
                 }
+                // Free cards shuffled into the draw pile (Metamorphosis) stay free all combat.
+                let mut blank = Card::default();
+                if free && pile == Pile::Draw {
+                    blank.free_this_combat();
+                } else if free {
+                    blank.free_this_turn();
+                }
                 for id in pool.into_iter().take(count as usize) {
-                    self.add_generated(
-                        content,
-                        pile,
-                        Card {
-                            id,
-                            free,
-                            ..Card::default()
-                        },
-                    );
+                    let card = Card { id, ..blank };
+                    // Cards generated into the draw pile land at random positions.
+                    if pile == Pile::Draw {
+                        self.add_random(content, pile, card);
+                    } else {
+                        self.add_generated(content, pile, card);
+                    }
                 }
             }
             Effect::RandomColorless(pile, _, upgrade) => {
@@ -3375,7 +2528,6 @@ impl Game {
                             && content.cards[id as usize].flags[0] & NO_GENERATE == 0
                     })
                     .collect();
-                pool.sort_by_key(|&id| content.cards[id as usize].id);
                 if self.expectation.is_none() {
                     self.rngs.combat_card_generation.shuffle(&mut pool);
                 }
@@ -3405,18 +2557,20 @@ impl Game {
                         ) && card.flags[0] & NO_GENERATE == 0
                     })
                     .collect();
-                pool.sort_by_key(|&id| content.cards[id as usize].id);
                 if self.expectation.is_none() {
                     self.rngs.combat_card_generation.shuffle(&mut pool);
                 }
                 pool.truncate(count as usize);
+                let mut blank = Card::default();
+                if free {
+                    blank.free_this_turn();
+                }
                 self.combat_mut().unwrap().offer = pool
                     .into_iter()
                     .map(|id| Card {
                         id,
                         upgrades: (upgrade && pending.context.upgraded) as u8,
-                        free,
-                        ..Card::default()
+                        ..blank
                     })
                     .collect();
                 self.select(
@@ -3443,19 +2597,16 @@ impl Game {
                         ) && card.flags[0] & NO_GENERATE == 0
                     })
                     .collect();
-                pool.sort_by_key(|&id| content.cards[id as usize].id);
                 if self.expectation.is_none() {
                     self.rngs.combat_card_generation.shuffle(&mut pool);
                 }
                 pool.truncate(count as usize);
-                self.combat_mut().unwrap().offer = pool
-                    .into_iter()
-                    .map(|id| Card {
-                        id,
-                        free,
-                        ..Card::default()
-                    })
-                    .collect();
+                let mut blank = Card::default();
+                if free {
+                    blank.free_this_turn();
+                }
+                self.combat_mut().unwrap().offer =
+                    pool.into_iter().map(|id| Card { id, ..blank }).collect();
                 self.select(
                     content,
                     Pile::Offer,
@@ -3480,7 +2631,6 @@ impl Game {
                         ) && card.flags[0] & NO_GENERATE == 0
                     })
                     .collect();
-                pool.sort_by_key(|&id| content.cards[id as usize].id);
                 if self.expectation.is_none() {
                     self.rngs.combat_card_generation.shuffle(&mut pool);
                 }
@@ -3519,19 +2669,14 @@ impl Game {
                             && def.flags[0] & NO_GENERATE == 0
                     })
                     .collect();
-                pool.sort_by_key(|&id| content.cards[id as usize].id);
                 if self.expectation.is_none() {
                     self.rngs.combat_card_generation.shuffle(&mut pool);
                 }
                 pool.truncate(count as usize);
-                self.combat_mut().unwrap().offer = pool
-                    .into_iter()
-                    .map(|id| Card {
-                        id,
-                        free: true,
-                        ..Card::default()
-                    })
-                    .collect();
+                let mut blank = Card::default();
+                blank.free_this_turn();
+                self.combat_mut().unwrap().offer =
+                    pool.into_iter().map(|id| Card { id, ..blank }).collect();
                 self.select(
                     content,
                     Pile::Offer,
@@ -3547,11 +2692,7 @@ impl Game {
                 let mut pool: Vec<_> = [0, 2, 3, 4, 1]
                     .into_iter()
                     .filter(|&index| index != self.run.character as usize)
-                    .flat_map(|index| {
-                        let mut cards = content.characters[index].cards.to_vec();
-                        cards.sort_by_key(|&id| content.cards[id as usize].id);
-                        cards
-                    })
+                    .flat_map(|index| content.characters[index].cards.iter().copied())
                     .filter(|&id| {
                         let def = content.cards[id as usize];
                         def.card_type == kind
@@ -3566,13 +2707,14 @@ impl Game {
                     self.rngs.combat_card_generation.shuffle(&mut pool);
                 }
                 pool.truncate(count as usize);
+                let mut blank = Card::default();
+                blank.free_this_turn();
                 self.combat_mut().unwrap().offer = pool
                     .into_iter()
                     .map(|id| Card {
                         id,
                         upgrades: (upgrade && pending.context.upgraded) as u8,
-                        free: true,
-                        ..Card::default()
+                        ..blank
                     })
                     .collect();
                 self.select(
@@ -3594,20 +2736,22 @@ impl Game {
                     .filter(|&id| {
                         let card = content.cards[id as usize];
                         card.flags[0] & NO_GENERATE == 0
-                            && !matches!(card.rarity, CardRarity::Basic | CardRarity::Ancient)
+                            && !matches!(
+                                card.rarity,
+                                CardRarity::Basic | CardRarity::Ancient | CardRarity::Event
+                            )
                     })
                     .collect();
-                let mut pool = pool;
-                pool.sort_by_key(|&id| content.cards[id as usize].id);
+                // Each card heads a fresh full shuffle of the pool (GetDistinctForCombat).
                 for _ in 0..amount.max(0) {
                     if pool.is_empty() {
                         break;
                     }
-                    let id = if self.expectation.is_some() {
-                        pool[0]
-                    } else {
-                        pool[self.rngs.combat_card_generation.below(pool.len() as u32) as usize]
-                    };
+                    let mut shuffled = pool.clone();
+                    if self.expectation.is_none() {
+                        self.rngs.combat_card_generation.shuffle(&mut shuffled);
+                    }
+                    let id = shuffled[0];
                     self.add_generated(
                         content,
                         pile,
@@ -3637,16 +2781,19 @@ impl Game {
                 if self.expectation.is_none() {
                     self.rngs.combat_card_generation.shuffle(&mut pool);
                 }
+                // Mad Science's Chaos adds its card without the generation hooks.
+                let chaos = pending.context.card == content.card_id("CARD.MAD_SCIENCE");
+                let mut blank = Card::default();
+                if free {
+                    blank.free_this_turn();
+                }
                 for id in pool.into_iter().take(count as usize) {
-                    self.add_generated(
-                        content,
-                        pile,
-                        Card {
-                            id,
-                            free,
-                            ..Card::default()
-                        },
-                    );
+                    let card = Card { id, ..blank };
+                    if chaos {
+                        self.add_to_pile(content, pile, card);
+                    } else {
+                        self.add_generated(content, pile, card);
+                    }
                 }
             }
             Effect::RandomCharacterCost0(pile, _, upgrade) => {
@@ -3657,7 +2804,12 @@ impl Game {
                     .copied()
                     .filter(|&id| {
                         let def = content.cards[id as usize];
-                        def.cost[0] == 0 && def.flags[0] & NO_GENERATE == 0
+                        def.cost[0] == 0
+                            && def.flags[0] & NO_GENERATE == 0
+                            && matches!(
+                                def.rarity,
+                                CardRarity::Common | CardRarity::Uncommon | CardRarity::Rare
+                            )
                     })
                     .collect();
                 for _ in 0..amount.max(0) {
@@ -3696,11 +2848,44 @@ impl Game {
                     }
                     candidates = selected;
                 } else if count == 1 && !candidates.is_empty() {
+                    // The game lists the draw pile from its top.
+                    if pile == Pile::Draw {
+                        candidates.reverse();
+                    }
                     let selected = self
                         .rngs
                         .combat_card_selection
                         .below(candidates.len() as u32) as usize;
                     candidates = vec![candidates[selected]];
+                } else if pile == Pile::Draw && self.expectation.is_none() {
+                    // The game shuffles the draw pile from its top (Power Cell sorts first, as
+                    // StableShuffle), takes what fits in hand and adds the cards in that order.
+                    let draw = &self.combat().unwrap().draw;
+                    let mut picked: Vec<_> =
+                        candidates.iter().rev().map(|&index| draw[index]).collect();
+                    if filter == CardFilter::PlayableCost(0) {
+                        sort_for_shuffle(&mut picked, content);
+                    }
+                    self.rngs.combat_card_selection.shuffle(&mut picked);
+                    let room =
+                        if matches!(op, CardOp::Move(Pile::Hand) | CardOp::MoveFree(Pile::Hand)) {
+                            10usize.saturating_sub(self.combat().unwrap().hand.len())
+                        } else {
+                            count
+                        };
+                    picked.truncate(count.min(room));
+                    for card in picked {
+                        if let Some(index) = self
+                            .combat()
+                            .unwrap()
+                            .draw
+                            .iter()
+                            .position(|other| other.instance == card.instance)
+                        {
+                            self.apply_card_op(content, pile, index, op);
+                        }
+                    }
+                    return;
                 } else {
                     if self.expectation.is_none() {
                         self.rngs.combat_card_selection.shuffle(&mut candidates);
@@ -3713,20 +2898,22 @@ impl Game {
                 }
             }
             Effect::AutoPlayRandom(pile, filter, _) => {
-                let mut candidates: Vec<_> = cards(self.combat().unwrap(), pile)
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, card)| eligible(content, card, filter, CardOp::AutoPlay(1)))
-                    .map(|(index, card)| (index, *card))
-                    .collect();
-                if candidates.is_empty() && filter == CardFilter::PlayableOrAny {
-                    candidates = cards(self.combat().unwrap(), pile)
-                        .iter()
-                        .copied()
-                        .enumerate()
-                        .collect();
+                // The game lists the draw pile from its top.
+                let mut candidates: Vec<_> = cards(self.combat().unwrap(), pile).to_vec();
+                if pile == Pile::Draw {
+                    candidates.reverse();
                 }
-                let count = amount.max(0) as usize;
+                let all = candidates.clone();
+                candidates.retain(|card| eligible(content, &card, filter, CardOp::AutoPlay(1)));
+                if candidates.is_empty() && filter == CardFilter::PlayableOrAny {
+                    candidates = all;
+                }
+                // Catastrophe reshuffles the draw pile before each card; Beat Down shuffles once.
+                let count = if pile == Pile::Draw {
+                    1
+                } else {
+                    amount.max(0) as usize
+                };
                 if self.expectation.is_some() {
                     let mut selected = Vec::new();
                     for _ in 0..count.min(candidates.len()) {
@@ -3735,28 +2922,55 @@ impl Game {
                     }
                     candidates = selected;
                 } else {
-                    self.rngs.combat_card_selection.shuffle(&mut candidates);
+                    sort_for_shuffle(&mut candidates, content);
+                    self.rngs.shuffle.shuffle(&mut candidates);
                     candidates.truncate(count);
                 }
-                let selected: Vec<_> = candidates.iter().map(|(_, card)| *card).collect();
-                candidates.sort_unstable_by_key(|candidate| std::cmp::Reverse(candidate.0));
-                for (index, _) in candidates {
-                    self.remove_pile(pile, index);
+                // Beat Down's picks stay in the discard pile until each one is played.
+                if pile == Pile::Draw {
+                    for card in &candidates {
+                        let index = cards(self.combat().unwrap(), pile)
+                            .iter()
+                            .position(|other| other == card)
+                            .unwrap();
+                        self.remove_pile(pile, index);
+                    }
                 }
-                for card in selected.into_iter().rev() {
+                if pile == Pile::Draw && amount > 1 && !candidates.is_empty() {
                     self.combat_mut().unwrap().queue.push(Pending {
-                        effect: Effect::AutoPlay(card),
-                        context: Context::card(card),
+                        effect: Effect::AutoPlayRandom(
+                            pile,
+                            filter,
+                            Amount::fixed(amount - 1, amount - 1),
+                        ),
+                        context: pending.context,
                     });
+                }
+                if pile != Pile::Draw {
+                    let combat = self.combat_mut().unwrap();
+                    combat
+                        .beat_down
+                        .extend(candidates.iter().map(|card| card.instance));
+                }
+                for card in candidates.into_iter().rev() {
+                    self.auto_play_off_pile(card);
                 }
             }
             Effect::ChooseRandomDraw(count) => {
                 self.expectation_unknown();
-                let mut candidates: Vec<_> = (0..self.combat().unwrap().draw.len()).collect();
+                // StableShuffle of the draw pile listed from its top: sort, then shuffle.
+                let mut candidates: Vec<_> =
+                    self.combat().unwrap().draw.iter().rev().copied().collect();
+                sort_for_shuffle(&mut candidates, content);
                 self.rngs.combat_card_selection.shuffle(&mut candidates);
                 candidates.truncate(count as usize);
-                for index in candidates {
-                    self.combat_mut().unwrap().draw[index].turn_flags |= FETCHED;
+                for card in &mut self.combat_mut().unwrap().draw {
+                    if candidates
+                        .iter()
+                        .any(|picked| picked.instance == card.instance)
+                    {
+                        card.turn_flags |= FETCHED;
+                    }
                 }
                 self.select(
                     content,
@@ -3813,16 +3027,23 @@ impl Game {
                     .iter()
                     .enumerate()
                     .filter(|(_, card)| {
-                        content.cards[card.id as usize].card_type == CardType::Attack
+                        card.card_type(content.cards[card.id as usize]) == CardType::Attack
                     })
                     .map(|(index, _)| index)
                     .collect();
                 self.rngs.combat_card_selection.shuffle(&mut attacks);
                 attacks.truncate(amount.max(0) as usize);
+                // The picks reach the hand in shuffled order.
+                let picked: Vec<_> = attacks
+                    .iter()
+                    .map(|&index| self.combat().unwrap().discard[index])
+                    .collect();
                 attacks.sort_unstable_by(|a, b| b.cmp(a));
                 for index in attacks {
-                    let mut card = self.combat_mut().unwrap().discard.remove(index);
-                    card.upgrades = 1;
+                    self.combat_mut().unwrap().discard.remove(index);
+                }
+                for mut card in picked {
+                    card.upgrade(content);
                     self.add_to_hand(card);
                 }
             }
@@ -3834,7 +3055,7 @@ impl Game {
                         && !self.combat().unwrap().discard.is_empty()
                     {
                         self.shuffle_discard_into_draw(content);
-                        self.trigger(content, Trigger::Shuffle, Actor::Player, 0);
+                        self.after_shuffle(content);
                     }
                     let Some(mut card) = self.take_draw() else {
                         break;
@@ -3855,10 +3076,14 @@ impl Game {
             Effect::Stoke => {
                 self.expectation_unknown();
                 let count = self.combat().unwrap().hand.len();
+                let base = self.combat().unwrap().queue.len();
                 while !self.combat().unwrap().hand.is_empty() {
                     self.apply_card_op(content, Pile::Hand, 0, CardOp::Move(Pile::Exhaust));
                 }
-                self.resolve(content);
+                // Exhaust triggers resolve first, but not effects queued before this card
+                // (e.g. Whispering Earring's next play).
+                self.settle(content, base);
+                // CardFactory.GetForCombat over the character pool, in the pool's own order.
                 let pool: Vec<_> = content.characters[self.run.character as usize]
                     .cards
                     .iter()
@@ -3866,11 +3091,12 @@ impl Game {
                     .filter(|&id| {
                         let card = content.cards[id as usize];
                         card.flags[0] & NO_GENERATE == 0
-                            && !matches!(card.rarity, CardRarity::Basic | CardRarity::Ancient)
+                            && !matches!(
+                                card.rarity,
+                                CardRarity::Basic | CardRarity::Ancient | CardRarity::Event
+                            )
                     })
                     .collect();
-                let mut pool = pool;
-                pool.sort_by_cached_key(|&id| content.cards[id as usize].id.replace('_', " "));
                 for _ in 0..count {
                     if pool.is_empty() {
                         break;
@@ -3890,48 +3116,68 @@ impl Game {
             }
             Effect::Stampede => {
                 self.expectation_unknown();
-                let count = self
-                    .creature(Actor::Player)
-                    .power(power_id::STAMPEDE)
-                    .max(0);
-                for _ in 0..count {
-                    let attacks: Vec<_> = self
-                        .combat()
-                        .unwrap()
-                        .hand
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, card)| {
-                            let def = content.cards[card.id as usize];
-                            def.card_type == CardType::Attack && card.flags(def) & UNPLAYABLE == 0
-                        })
-                        .map(|(index, _)| index)
-                        .collect();
-                    if attacks.is_empty() {
-                        break;
-                    }
+                // Each pick sees the hand left by the previous auto-play (e.g. Cinder's exhaust);
+                // the remaining picks ride in the event.
+                let remaining = if pending.context.event > 0 {
+                    pending.context.event
+                } else {
+                    self.creature(Actor::Player).power(power_id::STAMPEDE)
+                };
+                let attacks: Vec<_> = self
+                    .combat()
+                    .unwrap()
+                    .hand
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, card)| {
+                        let def = content.cards[card.id as usize];
+                        card.card_type(def) == CardType::Attack && card.flags(def) & UNPLAYABLE == 0
+                    })
+                    .map(|(index, _)| index)
+                    .collect();
+                if remaining > 0 && !attacks.is_empty() {
                     let index = attacks[self.rngs.shuffle.below(attacks.len() as u32) as usize];
                     let card = self.combat_mut().unwrap().hand.remove(index);
+                    if remaining > 1 {
+                        self.combat_mut().unwrap().queue.push(Pending {
+                            effect: Effect::Stampede,
+                            context: Context {
+                                event: remaining - 1,
+                                ..pending.context
+                            },
+                        });
+                    }
                     self.combat_mut().unwrap().queue.push(Pending {
                         effect: Effect::AutoPlay(card),
                         context: Context::card(card),
                     });
                 }
             }
-            Effect::ContinueEndTurn => self.continue_end_turn(content),
             Effect::FlakCannon(_) => {
                 let base = self.combat().unwrap().queue.len();
                 let mut count = 0;
-                for pile in [Pile::Draw, Pile::Hand, Pile::Discard] {
-                    let mut index = 0;
-                    while index < cards(self.combat().unwrap(), pile).len() {
-                        let card = cards(self.combat().unwrap(), pile)[index];
-                        if content.cards[card.id as usize].card_type == CardType::Status {
-                            self.apply_card_op(content, pile, index, CardOp::Move(Pile::Exhaust));
-                            count += 1;
-                        } else {
-                            index += 1;
-                        }
+                // PlayerCombatState.AllCards order: hand, draw pile from its top, discard pile.
+                for pile in [Pile::Hand, Pile::Draw, Pile::Discard] {
+                    let mut statuses: Vec<_> = cards(self.combat().unwrap(), pile)
+                        .iter()
+                        .filter(|card| {
+                            content.cards[card.id as usize].card_type == CardType::Status
+                        })
+                        .map(|card| card.instance)
+                        .collect();
+                    if pile == Pile::Draw {
+                        statuses.reverse();
+                    }
+                    for instance in statuses {
+                        let index = cards(self.combat().unwrap(), pile)
+                            .iter()
+                            .position(|card| {
+                                card.instance == instance
+                                    && content.cards[card.id as usize].card_type == CardType::Status
+                            })
+                            .unwrap();
+                        self.apply_card_op(content, pile, index, CardOp::Move(Pile::Exhaust));
+                        count += 1;
                     }
                 }
                 self.combat_mut().unwrap().queue.insert(
@@ -3948,17 +3194,20 @@ impl Game {
             }
             Effect::CopyCard(pile, count) => {
                 let combat = self.combat().unwrap();
-                let mut card = combat
-                    .auto_plays
-                    .last()
-                    .map(|play| play.card)
-                    .or(combat.playing)
-                    .unwrap_or(Card {
-                        id: pending.context.card.unwrap(),
-                        upgrades: pending.context.upgraded as u8,
-                        ..Card::default()
-                    });
+                let mut card = combat.plays.last().map(|play| play.card).unwrap_or(Card {
+                    id: pending.context.card.unwrap(),
+                    upgrades: pending.context.upgraded as u8,
+                    ..Card::default()
+                });
                 card.instance = 0;
+                // A later play of the series clones the card as Razor Tooth upgraded it (Anger).
+                if pending.context.upgraded {
+                    card.upgrade(content);
+                }
+                // Adaptive Strike's copy costs 0 for the rest of combat.
+                if content.cards[card.id as usize].id == "CARD.ADAPTIVE_STRIKE" {
+                    card.add_cost(0, ABSOLUTE);
+                }
                 for _ in 0..count {
                     self.add_generated(content, pile, card);
                 }
@@ -3974,19 +3223,20 @@ impl Game {
             ),
             Effect::DiscardHandDraw => {
                 let count = self.combat().unwrap().hand.len().min(u8::MAX as usize) as u8;
-                self.discard_hand(content);
-                self.combat_mut().unwrap().queue.push(Pending {
-                    effect: Effect::Draw(count),
-                    context: pending.context,
-                });
+                self.discard_hand(content, count);
             }
             Effect::DiscardHandAdd(id) => {
                 let count = self.combat().unwrap().hand.len().min(u8::MAX as usize) as u8;
+                // An upgraded Storm of Steel upgrades its Shivs.
                 self.combat_mut().unwrap().queue.push(Pending {
-                    effect: Effect::AddCard(Pile::Hand, id, count),
+                    effect: if pending.context.upgraded {
+                        Effect::AddUpgradedCard(Pile::Hand, id, count)
+                    } else {
+                        Effect::AddCard(Pile::Hand, id, count)
+                    },
                     context: pending.context,
                 });
-                self.discard_hand(content);
+                self.discard_hand(content, 0);
             }
             Effect::PlayExhaustedShivs => {
                 let mut shivs = Vec::new();
@@ -4005,39 +3255,137 @@ impl Game {
                 for card in shivs.into_iter().rev() {
                     self.combat_mut().unwrap().queue.push(Pending {
                         effect: Effect::AutoPlay(card),
-                        context: pending.context,
+                        context: Context {
+                            off_pile: true,
+                            ..pending.context
+                        },
                     });
                 }
             }
-            Effect::AutoPlay(card) => self.begin_auto_play(content, card, pending.context),
-            Effect::FinishAutoPlay => self.finish_auto_play(content),
-            Effect::WhisperingEarring(played) => {
-                if self.combat().unwrap().playing.is_some() {
-                    self.finish_play(content);
-                    self.combat_mut().unwrap().queue.insert(
-                        0,
-                        Pending {
-                            effect: Effect::WhisperingEarring(played),
-                            context: pending.context,
-                        },
-                    );
-                } else if played < 13
-                    && let Some(Action::Play { hand, target }) = self
-                        .actions(content)
-                        .into_iter()
-                        .find(|action| matches!(action, Action::Play { .. }))
+            Effect::AutoPlay(mut card) => {
+                let mut context = pending.context;
+                // A card picked in advance is played from wherever it is by then.
+                if card.instance != 0
+                    && card.flags & (DUPE | REPLAY) == 0
+                    && let Some((pile, index)) =
+                        [Pile::Hand, Pile::Draw, Pile::Discard, Pile::Exhaust]
+                            .into_iter()
+                            .find_map(|pile| {
+                                cards(self.combat().unwrap(), pile)
+                                    .iter()
+                                    .position(|other| other.instance == card.instance)
+                                    .map(|index| (pile, index))
+                            })
                 {
-                    let manual_cards = self.combat().unwrap().history.manual_cards;
-                    let void_form = self.creature(Actor::Player).power(power_id::VOID_FORM);
-                    self.combat_mut().unwrap().history.manual_cards = manual_cards.max(void_form);
+                    context.off_pile = pile != Pile::Hand;
+                    card = self.remove_pile(pile, index);
+                }
+                self.begin_auto_play(content, card, context)
+            }
+            Effect::Uproar => self.uproar(content),
+            Effect::Fire(trigger) => {
+                let context = pending.context;
+                self.trigger(content, trigger, context.source, context.event)
+            }
+            Effect::Listen(trigger, listener) => {
+                self.listen(content, trigger, listener, pending.context)
+            }
+            Effect::Step(step) => self.turn_step(content, step),
+            // Juggling clones the turn's third finished attack as its play left it so far.
+            Effect::Juggle => {
+                let card = (pending.context.subject).and_then(|x| self.played_mut(x).copied());
+                if let Some(card) = card.filter(|card| {
+                    card.card_type(content.cards[card.id as usize]) == CardType::Attack
+                        && self.played_this_turn(content, CardType::Attack) == 3
+                }) {
+                    for _ in 0..self
+                        .creature(Actor::Player)
+                        .power(power_id::JUGGLING)
+                        .max(0)
+                    {
+                        // Havoc's forced exhaust belongs to the play, not the card.
+                        let mut copy = card;
+                        copy.instance = 0;
+                        copy.flags &= !EXHAUST;
+                        copy.turn_flags &= !EXHAUST;
+                        self.add_generated(content, Pile::Hand, copy);
+                    }
+                }
+            }
+            // Its hooks don't run once the combat is over (Hellraiser's Strike won the fight).
+            Effect::ConfusedRoll(card) => {
+                if self.enemies_defeated() {
+                    return;
+                }
+                let cost = self.roll_cost();
+                if content.cards[card.id as usize].cost[card.upgrades.min(1) as usize] >= 0 {
+                    let combat = self.combat_mut().unwrap();
+                    for other in combat
+                        .hand
+                        .iter_mut()
+                        .chain(&mut combat.draw)
+                        .chain(&mut combat.discard)
+                        .chain(&mut combat.exhaust)
+                        .filter(|other| other.instance == card.instance)
+                    {
+                        other.add_cost(cost, ABSOLUTE);
+                    }
+                }
+            }
+            Effect::BeforePlay => self.before_play(content),
+            Effect::OnPlay => self.queue_play(content),
+            Effect::AfterPlay => self.after_play(content),
+            Effect::PlacePlayed(card, replay, feral) => {
+                if self.place_card(content, card, replay, feral) {
+                    self.combat_mut().unwrap().queue.push(Pending {
+                        effect: Effect::Step(Step::PlayedCleanup(card.instance)),
+                        context: Context::card(card),
+                    });
+                    self.exhausted(content, card, false);
+                }
+            }
+            Effect::CheckEmptyHand => self.unceasing_top(content),
+            Effect::MummifiedHand => self.mummified_hand(content),
+            Effect::ReturnLate(make_it_so, energy) => {
+                if make_it_so {
+                    self.return_make_it_so();
+                }
+                self.return_right_hands(energy);
+            }
+            // Each copy plays up to 13 cards.
+            Effect::WhisperingEarring(played) => {
+                if played < 13
+                    && !self.combat().unwrap().force_end
+                    && !self.enemies_defeated()
+                    && let Some(&hand) = self.playable_cards(content).first()
+                {
+                    // The first playable hand card, aimed at the leftmost hittable enemy.
+                    let target = self.play_targets(content, hand).first().copied();
                     self.combat_mut().unwrap().queue.push(Pending {
                         effect: Effect::WhisperingEarring(played + 1),
                         context: pending.context,
                     });
-                    self.play(content, hand, target);
-                    let plays = self.combat().unwrap().card_plays as i16;
-                    self.combat_mut().unwrap().history.manual_cards = manual_cards;
-                    self.combat_mut().unwrap().history.manual_plays -= plays;
+                    let Some(target) = target else {
+                        // Its resources are spent, but with every enemy reviving the auto-play
+                        // finds no target and moves the card to its result pile unplayed.
+                        let card = self.combat().unwrap().hand[hand];
+                        let def = content.cards[card.id as usize];
+                        let spiked = self.has_relic(content, "RELIC.SPIKED_GAUNTLETS");
+                        let combat = self.combat_mut().unwrap();
+                        combat.energy -= energy_cost(combat, card, def, spiked, true);
+                        combat.stars -= star_cost(combat, card, def);
+                        combat.hand.remove(hand);
+                        if card.flags(def) & EXHAUST != 0 {
+                            combat.exhaust.push(card);
+                            self.exhausted(content, card, false);
+                        } else {
+                            combat.discard.push(card);
+                        }
+                        return;
+                    };
+                    // Its resources are spent before CardCmd.AutoPlay; Void Form frees these hand
+                    // cards too, but only manual plays use it up.
+                    self.play(content, hand, target, false);
                 }
             }
             Effect::MoveAll(from, filter, to) => {
@@ -4069,7 +3417,14 @@ impl Game {
             Effect::DrawFilteredStep(count, filter) => {
                 let base = self.combat().unwrap().queue.len();
                 if self
-                    .draw(content, 1, pending.context, false, FILTERED_DRAW)
+                    .draw(
+                        content,
+                        1,
+                        pending.context,
+                        false,
+                        FILTERED_DRAW,
+                        Some(pending.effect),
+                    )
                     .is_some()
                     && count > 1
                 {
@@ -4082,22 +3437,19 @@ impl Game {
                     );
                 }
             }
+            // Scrape discards the drawn cards it rejects as one CardCmd.Discard.
             Effect::FinishDrawFiltered(filter) => {
-                let mut index = 0;
-                while index < self.combat().unwrap().hand.len() {
-                    let card = &self.combat().unwrap().hand[index];
-                    let marked = card.turn_flags & FILTERED_DRAW != 0;
-                    let discard =
-                        marked && !eligible(content, &card, filter, CardOp::Move(Pile::Discard));
-                    if marked {
+                let mut rejected = Vec::new();
+                for index in 0..self.combat().unwrap().hand.len() {
+                    let card = self.combat().unwrap().hand[index];
+                    if card.turn_flags & FILTERED_DRAW != 0 {
                         self.combat_mut().unwrap().hand[index].turn_flags &= !FILTERED_DRAW;
-                    }
-                    if discard {
-                        self.apply_card_op(content, Pile::Hand, index, CardOp::Move(Pile::Discard));
-                    } else {
-                        index += 1;
+                        if !eligible(content, &&card, filter, CardOp::Move(Pile::Discard)) {
+                            rejected.push(index);
+                        }
                     }
                 }
+                self.discard_indices(content, &rejected);
                 let combat = self.combat_mut().unwrap();
                 for pile in [&mut combat.draw, &mut combat.discard, &mut combat.exhaust] {
                     for card in pile {
@@ -4114,16 +3466,29 @@ impl Game {
                 random,
                 false,
             ),
+            // Second Wind exhausts the non-attacks it saw in hand, not cards drawn meanwhile
+            // (Joss Paper); the context's event counts the steps left plus one.
             Effect::ExhaustForBlock(value) => {
-                let index =
-                    self.combat().unwrap().hand.iter().position(|card| {
-                        content.cards[card.id as usize].card_type != CardType::Attack
-                    });
-                if let Some(index) = index {
+                let non_attack = |card: &Card| {
+                    card.card_type(content.cards[card.id as usize]) != CardType::Attack
+                };
+                let hand = &self.combat().unwrap().hand;
+                let remaining = if pending.context.event > 0 {
+                    pending.context.event - 1
+                } else {
+                    hand.iter().filter(|card| non_attack(card)).count() as i16
+                };
+                let index = hand.iter().position(non_attack);
+                if remaining > 0
+                    && let Some(index) = index
+                {
                     let combat = self.combat_mut().unwrap();
                     combat.queue.push(Pending {
                         effect: pending.effect,
-                        context: pending.context,
+                        context: Context {
+                            event: remaining,
+                            ..pending.context
+                        },
                     });
                     combat.queue.push(Pending {
                         effect: Effect::Block(Target::Player, value),
@@ -4149,12 +3514,12 @@ impl Game {
                     });
                     self.apply_card_op(content, Pile::Hand, 0, CardOp::Move(Pile::Exhaust));
                 } else {
-                    for _ in 0..pending.context.event {
-                        self.combat_mut().unwrap().queue.push(Pending {
-                            effect: Effect::Attack(target, value, 1),
-                            context: pending.context,
-                        });
-                    }
+                    // One attack command with a hit per exhausted card (Vigor covers every hit).
+                    let hits = pending.context.event.clamp(0, u8::MAX as i16) as u8;
+                    self.combat_mut().unwrap().queue.push(Pending {
+                        effect: Effect::Attack(target, value, hits),
+                        context: pending.context,
+                    });
                 }
             }
             Effect::Upgrade(pile, count, random) => self.select(
@@ -4174,18 +3539,21 @@ impl Game {
                     .iter()
                     .enumerate()
                     .filter(|(_, card)| {
-                        content.cards[card.id as usize].card_type == CardType::Attack
+                        card.card_type(content.cards[card.id as usize]) == CardType::Attack
                     })
                     .map(|(index, _)| index)
                     .collect();
                 for index in attacks {
-                    self.combat_mut().unwrap().hand[index] = Card {
+                    let mut card = Card {
                         id,
                         instance: self.next_card,
                         upgrades: upgrades[pending.context.upgraded as usize],
                         ..Card::default()
                     };
+                    self.afflict_new(content, &mut card);
+                    self.combat_mut().unwrap().hand[index] = card;
                     self.next_card = self.next_card.saturating_add(1);
+                    self.trigger_generated(content, id);
                 }
             }
             Effect::If(condition, yes, no) => {
@@ -4201,11 +3569,13 @@ impl Game {
                 );
             }
             Effect::Repeat(_, effects) => {
-                if pending
-                    .context
-                    .card
-                    .is_some_and(|id| content.cards[id as usize].id == "CARD.BARRAGE")
-                    && let [Effect::Attack(target, damage, 1)] = effects
+                if let [
+                    Effect::Attack(
+                        target @ (Target::ChosenEnemy | Target::RandomEnemy | Target::AllEnemies),
+                        damage,
+                        1,
+                    ),
+                ] = effects
                 {
                     self.combat_mut().unwrap().queue.push(Pending {
                         effect: Effect::Attack(
@@ -4247,16 +3617,9 @@ impl Game {
             }
             Effect::RandomOrb(count) => {
                 self.expectation_unknown();
+                // Orbs are rolled even after the combat ends (channel then does nothing): Chaos's,
+                // and Trash to Treasure's when another generation hook (Smokestack) won the fight.
                 for _ in 0..count[pending.context.upgraded as usize] {
-                    let combat = self.combat().unwrap();
-                    if combat.enemies.iter().all(|enemy| enemy.creature.hp <= 0)
-                        && combat
-                            .enemies
-                            .iter()
-                            .all(|enemy| enemy.creature.power(power_id::ADAPTABLE) == 0)
-                    {
-                        break;
-                    }
                     let id = self
                         .rngs
                         .combat_orb_generation
@@ -4322,7 +3685,7 @@ impl Game {
                 for _ in 0..count {
                     for index in (0..self.combat().unwrap().orbs.len()).rev() {
                         if self.combat().unwrap().orbs[index].id == orb_id::LIGHTNING {
-                            self.passive_orb_target(content, index, pending.context.target);
+                            self.passive_orb_target(content, index, pending.context.target, 1);
                         }
                     }
                 }
@@ -4330,10 +3693,9 @@ impl Game {
             Effect::OrbSlots(amount) => {
                 let combat = self.combat_mut().unwrap();
                 combat.orb_slots = (combat.orb_slots as i16 + amount as i16).clamp(0, 10) as u8;
-                while self.combat().unwrap().orbs.len() > self.combat().unwrap().orb_slots as usize
-                {
-                    self.evoke(content, true);
-                }
+                // Lost slots drop the last orbs without evoking them (OrbQueue.RemoveCapacity).
+                let slots = combat.orb_slots as usize;
+                combat.orbs.truncate(slots);
             }
             Effect::Stars(_) => {
                 let combat = self.combat_mut().unwrap();
@@ -4358,8 +3720,7 @@ impl Game {
                         .iter()
                         .chain(&combat.hand)
                         .chain(&combat.discard)
-                        .chain(combat.playing.iter())
-                        .chain(combat.auto_plays.iter().map(|play| &play.card))
+                        .chain(combat.plays.iter().map(|play| &play.card))
                         .any(|card| card.id == card_id::SOVEREIGN_BLADE)
                 };
                 if !unexhausted {
@@ -4379,15 +3740,20 @@ impl Game {
                     .chain(&mut combat.hand)
                     .chain(&mut combat.discard)
                     .chain(&mut combat.exhaust)
-                    .chain(combat.playing.iter_mut())
-                    .chain(combat.auto_plays.iter_mut().map(|play| &mut play.card))
+                    .chain(combat.plays.iter_mut().map(|play| &mut play.card))
+                    .chain(played(&mut combat.queue))
                     .filter(|card| card.id == card_id::SOVEREIGN_BLADE)
                 {
                     card.value = card.value.saturating_add(amount);
                 }
             }
             Effect::Summon(_) => {
-                let osty = &mut self.combat_mut().unwrap().osty;
+                let combat = self.combat_mut().unwrap();
+                // The first summon of a combat creates Osty as a new creature; later ones revive it.
+                if combat.osty.max_hp == 0 && amount > 0 {
+                    combat.next_creature += 1;
+                }
+                let osty = &mut combat.osty;
                 if osty.hp > 0 {
                     osty.max_hp = osty.max_hp.saturating_add(amount.max(0));
                     osty.hp = osty.hp.saturating_add(amount.max(0));
@@ -4405,10 +3771,9 @@ impl Game {
                 let instance = {
                     let combat = self.combat_mut().unwrap();
                     combat
-                        .auto_plays
+                        .plays
                         .last_mut()
                         .map(|play| &mut play.card)
-                        .or(combat.playing.as_mut())
                         .and_then(|card| {
                             card.value = card.value.saturating_add(amount);
                             (card.id == card_id::THE_SCYTHE && card.instance != 0)
@@ -4447,13 +3812,11 @@ impl Game {
                         card.value = card.value.saturating_add(amount);
                     }
                 }
-                if let Some(card) = combat.playing.as_mut().filter(|card| card.id == id) {
-                    card.value = card.value.saturating_add(amount);
-                }
                 for card in combat
-                    .auto_plays
+                    .plays
                     .iter_mut()
                     .map(|play| &mut play.card)
+                    .chain(played(&mut combat.queue))
                     .filter(|card| card.id == id)
                 {
                     card.value = card.value.saturating_add(amount);
@@ -4463,10 +3826,9 @@ impl Game {
                 let persisted = {
                     let combat = self.combat_mut().unwrap();
                     combat
-                        .auto_plays
+                        .plays
                         .last_mut()
                         .map(|play| &mut play.card)
-                        .or(combat.playing.as_mut())
                         .and_then(|card| {
                             card.value = card.value.saturating_add(amount);
                             (card.instance != 0).then_some((card.instance, card.value))
@@ -4484,59 +3846,41 @@ impl Game {
             }
             Effect::SetCardCost(cost) => {
                 let combat = self.combat_mut().unwrap();
-                if let Some(card) = combat
-                    .auto_plays
-                    .last_mut()
-                    .map(|play| &mut play.card)
-                    .or(combat.playing.as_mut())
-                {
-                    let base = content.cards[card.id as usize].cost[card.upgrades.min(1) as usize];
-                    card.cost_delta = if base < 0 { 0 } else { cost - base };
+                if let Some(card) = combat.plays.last_mut().map(|play| &mut play.card) {
+                    card.add_cost(cost, ABSOLUTE);
                 }
             }
             Effect::ReduceCardCost(amount) => {
                 let combat = self.combat_mut().unwrap();
-                if let Some(card) = combat
-                    .auto_plays
-                    .last_mut()
-                    .map(|play| &mut play.card)
-                    .or(combat.playing.as_mut())
-                {
-                    card.cost_delta = card.cost_delta.saturating_sub(amount);
+                if let Some(card) = combat.plays.last_mut().map(|play| &mut play.card) {
+                    card.add_cost(-amount, 0);
                 }
             }
             Effect::CapHandCosts => {
-                let combat = self.combat_mut().unwrap();
-                for card in &mut combat.hand {
-                    let def = content.cards[card.id as usize];
-                    if card_cost(*card, def, combat.energy) > 1 {
-                        if pending.context.upgraded {
-                            card.cost_delta = 1 - def.cost[card.upgrades.min(1) as usize];
-                        } else {
-                            card.cost_override = Some(1);
-                        }
-                    }
+                let expiry = if pending.context.upgraded {
+                    0
+                } else {
+                    THIS_TURN | UNTIL_PLAYED
+                };
+                for card in &mut self.combat_mut().unwrap().hand {
+                    card.add_cost(1, ABSOLUTE | REDUCE_ONLY | expiry);
                 }
             }
-            Effect::RecycleHand(draw) => {
+            Effect::RecycleHand(_) | Effect::ShuffleHandDraw(_) => {
+                let count = match pending.effect {
+                    Effect::RecycleHand(draw) => draw[pending.context.upgraded as usize],
+                    Effect::ShuffleHandDraw(count) => count,
+                    _ => unreachable!(),
+                };
                 let combat = self.combat_mut().unwrap();
                 let hand = std::mem::take(&mut combat.hand);
-                combat.prepend_draw(hand);
+                combat.draw.splice(0..0, hand.into_iter().rev());
                 combat.queue.push(Pending {
-                    effect: Effect::Draw(draw[pending.context.upgraded as usize]),
-                    context: pending.context,
-                });
-            }
-            Effect::ShuffleHandDraw(count) => {
-                let combat = self.combat_mut().unwrap();
-                let hand = std::mem::take(&mut combat.hand);
-                combat.draw.extend(hand);
-                self.shuffle_draw();
-                self.trigger(content, Trigger::Shuffle, Actor::Player, 0);
-                self.combat_mut().unwrap().queue.push(Pending {
                     effect: Effect::Draw(count),
                     context: pending.context,
                 });
+                self.shuffle_discard_into_draw(content);
+                self.after_shuffle(content);
             }
             Effect::FillPotions => {
                 let pool = self.potion_pool(content);
@@ -4582,60 +3926,224 @@ impl Game {
         }
     }
 
-    pub(crate) fn incoming_damage_amount(
+    /// Hook.ModifyDamage, then the caps. A played card's decimal damage (Thrash) keeps the
+    /// fraction its integer base dropped.
+    pub(crate) fn modify_damage(
         &self,
         content: &Content,
-        source: Actor,
+        target: Option<Actor>,
         base: i16,
         kind: DamageKind,
+        context: Context,
+        played: Option<Card>,
     ) -> i16 {
+        let fraction = played
+            .and_then(|card| content.cards[card.id as usize].damage_cents(card))
+            .map_or(0, |cents| cents.rem_euclid(100));
+        let cents = self.modify_damage_cents(
+            content,
+            target,
+            base as i64 * 100 + fraction,
+            kind,
+            context,
+            played,
+        );
+        let mut amount = cents.div_euclid(100).clamp(0, i16::MAX as i64) as i16;
+        if let Some(target) = target
+            && !matches!(kind, DamageKind::Overflow)
+        {
+            let cap = self.creature(target).power(power_id::HARD_TO_KILL);
+            if cap > 0 {
+                amount = amount.min(cap);
+            }
+            if self.creature(target).kind(content, PowerKind::Intangible) > 0 {
+                amount = amount.min(1);
+            }
+        }
+        amount
+    }
+
+    /// Hook.ModifyDamage in hundredths (the game's decimals): the card's enchantment, the
+    /// additive then the multiplicative modifiers. With no target (Thrash) only the dealer's
+    /// side applies.
+    pub(crate) fn modify_damage_cents(
+        &self,
+        content: &Content,
+        target: Option<Actor>,
+        cents: i64,
+        kind: DamageKind,
+        context: Context,
+        played: Option<Card>,
+    ) -> i64 {
+        let (source, card) = (context.source, context.card);
         let attack = matches!(kind, DamageKind::Attack);
         let powered = matches!(kind, DamageKind::Attack | DamageKind::Move);
-        let target = Actor::Player;
-        let mut amount = base.max(0);
-        if powered {
+        let on = |id| target.map_or(0, |target| self.creature(target).power(id));
+        let on_kind =
+            |power_kind| target.map_or(0, |target| self.creature(target).kind(content, power_kind));
+        // Calculated damage (Precise Cut) may go negative; modifiers apply before the final clamp.
+        // Bonuses add whole points; the fraction waits for the single final floor.
+        let mut amount = cents.div_euclid(100) as i16;
+        let mut fraction = cents.rem_euclid(100);
+        if powered && matches!(source, Actor::Player | Actor::Osty) {
+            match played.and_then(|card| card.enchantment.map(|enchantment| (card, enchantment))) {
+                Some((_, Enchantment::Corrupted)) => {
+                    let corrupted = (amount as i64 * 100 + fraction) * 3 / 2;
+                    fraction = corrupted.rem_euclid(100);
+                    amount = corrupted.div_euclid(100) as i16;
+                }
+                Some((_, Enchantment::Instinct)) => amount = amount.saturating_mul(2),
+                Some((card, Enchantment::Sharp)) => {
+                    amount = amount.saturating_add(card.enchantment_amount)
+                }
+                Some((card, Enchantment::Vigorous)) if card.enchantment_value > 0 => {
+                    amount = amount.saturating_add(card.enchantment_amount)
+                }
+                Some((card, Enchantment::Momentum)) => {
+                    amount = amount.saturating_add(card.enchantment_value)
+                }
+                Some((_, Enchantment::TezcatarasEmber)) => amount = amount.saturating_add(3),
+                _ => {}
+            }
+            if let Some(played) = played {
+                // Razor Tooth upgrades the card between the plays of a series (context.upgraded).
+                if (played.upgrades > 0 || context.upgraded)
+                    && self.has_relic(content, "RELIC.MINIATURE_CANNON")
+                {
+                    amount = amount.saturating_add(3);
+                }
+                if played.enchantment.is_some() && self.has_relic(content, "RELIC.MYSTIC_LIGHTER") {
+                    amount = amount.saturating_add(9);
+                }
+            }
+        }
+        if attack {
+            if source == Actor::Player
+                && card.is_some_and(|id| content.cards[id as usize].tags & SHIV_TAG != 0)
+            {
+                amount = amount.saturating_add(self.creature(source).power(power_id::ACCURACY));
+                if self.combat().unwrap().history.shivs == 0 {
+                    amount = amount
+                        .saturating_add(self.creature(source).power(power_id::PHANTOM_BLADES));
+                }
+            }
+            if source == Actor::Player
+                && played
+                    .is_some_and(|card| card.flags(content.cards[card.id as usize]) & INKY != 0)
+            {
+                amount = amount.saturating_add(1);
+            }
             amount = amount.saturating_add(self.creature(source).power(power_id::VIGOR));
+            if source == Actor::Osty {
+                amount =
+                    amount.saturating_add(self.creature(Actor::Player).power(power_id::CALCIFY));
+            }
+        } else if powered && source == Actor::Player && card.is_some() {
+            // Omnislice and Echoing Slash hit inside their card's attack, so Vigor adds to them.
+            amount = amount.saturating_add(self.creature(source).power(power_id::VIGOR));
+        }
+        let mut ratio = (1i64, 1i64);
+        let mut scale = |num: i16, den: i64| {
+            ratio.0 *= num as i64;
+            ratio.1 *= den;
+        };
+        // Hang multiplies after the additive bonuses (ModifyDamageMultiplicative).
+        if powered && card == Some(card_id::HANG) {
+            scale(on(power_id::HANG).max(1), 1);
+        }
+        if powered {
+            if attack
+                && matches!(source, Actor::Player | Actor::Osty)
+                && card.is_some_and(|id| content.cards[id as usize].tags & STRIKE_TAG != 0)
+            {
+                amount = amount
+                    .saturating_add(3 * self.relic_count(content, "RELIC.STRIKE_DUMMY"))
+                    .saturating_add(self.relic_count(content, "RELIC.FAKE_STRIKE_DUMMY"));
+            }
             amount =
                 amount.saturating_add(self.creature(source).kind(content, PowerKind::Strength));
             if attack {
-                amount = amount.saturating_add(self.creature(target).power(power_id::TAINTED));
+                amount = amount.saturating_add(on(power_id::TAINTED));
             }
-            if self.creature(target).kind(content, PowerKind::Vulnerable) > 0 {
-                let vulnerable = if self.creature(target).power(power_id::DEBILITATE) > 0 {
-                    200
+            // Lethality boosts only the first play of the turn's first attack, Move damage included.
+            if matches!(source, Actor::Player | Actor::Osty) && context.lethal {
+                scale(
+                    100 + self.creature(Actor::Player).power(power_id::LETHALITY),
+                    100,
+                );
+            }
+            if matches!(source, Actor::Player | Actor::Osty)
+                && card.is_some_and(|id| content.cards[id as usize].tags & MINION_TAG != 0)
+                && self.has_relic(content, "RELIC.VITRUVIAN_MINION")
+            {
+                scale(2, 1);
+            }
+            // Pen Nib doubles any powered attack of its card, Move damage (Omnislice) included.
+            if matches!(source, Actor::Player | Actor::Osty) && context.pen_nib {
+                scale(2, 1);
+            }
+            if on_kind(PowerKind::Vulnerable) > 0 {
+                // Cruelty and Paper Phrog read the dealer's own powers and relics, so Osty's
+                // attacks get neither.
+                let cruelty = if source == Actor::Player && matches!(target, Some(Actor::Enemy(_)))
+                {
+                    self.creature(Actor::Player).power(power_id::CRUELTY)
                 } else {
-                    150
+                    0
                 };
-                amount = amount.saturating_mul(vulnerable) / 100;
+                let paper_phrog = 25
+                    * (source == Actor::Player
+                        && matches!(target, Some(Actor::Enemy(_)))
+                        && self.has_relic(content, "RELIC.PAPER_PHROG"))
+                        as i16;
+                // Debilitate doubles the whole bonus, Cruelty's and Paper Phrog's included.
+                let bonus =
+                    (50 + cruelty + paper_phrog) * (1 + (on(power_id::DEBILITATE) > 0) as i16);
+                scale(100 + bonus, 100);
             }
             if self.creature(source).kind(content, PowerKind::Weak) > 0 {
-                let multiplier = if self.creature(source).power(power_id::DEBILITATE) > 0 {
-                    50
-                } else {
-                    75
-                };
                 let paper_krane = 15
-                    * (matches!(source, Actor::Enemy(_))
+                    * (target == Some(Actor::Player)
+                        && matches!(source, Actor::Enemy(_))
                         && self.has_relic(content, "RELIC.PAPER_KRANE"))
                         as i16;
-                amount = amount.saturating_mul(multiplier - paper_krane) / 100;
+                // Paper Krane lowers Weak's multiplier first; Debilitate then doubles the reduction.
+                let weak = 75 - paper_krane;
+                scale(
+                    if self.creature(source).power(power_id::DEBILITATE) > 0 {
+                        2 * weak - 100
+                    } else {
+                        weak
+                    },
+                    100,
+                );
             }
-            if matches!(source, Actor::Enemy(_))
+            if target == Some(Actor::Player)
+                && matches!(source, Actor::Enemy(_))
                 && self.creature(source).hp <= self.creature(source).power(power_id::DOOM)
                 && self.has_relic(content, "RELIC.UNDYING_SIGIL")
             {
-                amount /= 2;
+                scale(1, 2);
             }
-            if self.combat().unwrap().diamond_diadem {
-                amount /= 2;
+            if on(power_id::DIAMOND_DIADEM) > 0 {
+                scale(1, 2);
             }
-            amount = amount.saturating_mul(100 + self.creature(target).power(power_id::SLOW)) / 100;
-            for _ in 0..self.creature(source).power(power_id::DOUBLE_DAMAGE).max(0) {
-                amount = amount.saturating_mul(2);
+            scale(100 + on(power_id::SLOW), 100);
+            // Double Damage also doubles the owner's pet (Osty) attacks from a card.
+            let doubler = if source == Actor::Osty {
+                Actor::Player
+            } else {
+                source
+            };
+            if self.creature(doubler).power(power_id::DOUBLE_DAMAGE) > 0
+                && (source != Actor::Osty || card.is_some())
+            {
+                scale(2, 1);
             }
-            if let Actor::Enemy(index) = source
+            if target == Some(Actor::Player)
+                && let Actor::Enemy(index) = source
                 && let Some(surrounded) = self
-                    .creature(target)
+                    .creature(Actor::Player)
                     .powers
                     .iter()
                     .find(|power| power.id == power_id::SURROUNDED)
@@ -4646,30 +4154,47 @@ impl Game {
                     power_id::BACK_ATTACK_RIGHT
                 };
                 if self.creature(Actor::Enemy(index)).power(back) > 0 {
-                    amount = amount.saturating_mul(3) / 2;
+                    scale(3, 2);
                 }
             }
-            if matches!(source, Actor::Enemy(_))
+            if target == Some(Actor::Player)
+                && matches!(source, Actor::Enemy(_))
                 && self.creature(source).kind(content, PowerKind::Vulnerable) > 0
-                && self.creature(target).power(power_id::COLOSSUS) > 0
+                && on(power_id::COLOSSUS) > 0
             {
-                amount /= 2;
+                scale(1, 2);
             }
             if self.creature(source).power(power_id::SHRINK) != 0 {
-                amount = amount.saturating_mul(70) / 100;
+                scale(70, 100);
             }
         }
-        if attack && self.creature(target).power(power_id::FLUTTER) > 0 {
-            amount /= 2;
+        // Flutter and Soar halve any powered attack, move damage included (IsPoweredAttack).
+        if powered && on(power_id::FLUTTER) > 0 {
+            scale(1, 2);
         }
-        let cap = self.creature(target).power(power_id::HARD_TO_KILL);
-        if cap > 0 {
-            amount = amount.min(cap);
+        if powered && on(power_id::SOAR) > 0 {
+            scale(1, 2);
         }
-        if self.creature(target).kind(content, PowerKind::Intangible) > 0 {
-            amount = amount.min(1);
+        // Tracking (on a Weak enemy) and Gigantification multiply any powered attack from a card,
+        // move damage included.
+        if powered && matches!(source, Actor::Player | Actor::Osty) && card.is_some() {
+            let player = self.creature(Actor::Player);
+            if on_kind(PowerKind::Weak) > 0 {
+                scale(player.power(power_id::TRACKING).max(1), 1);
+            }
+            if player.power(power_id::GIGANTIFICATION) > 0 {
+                scale(3, 1);
+            }
         }
-        amount.max(0)
+        if attack {
+            if source == Actor::Player
+                && card == Some(card_id::SOVEREIGN_BLADE)
+                && on(power_id::CONQUEROR) > 0
+            {
+                scale(2, 1);
+            }
+        }
+        ((amount as i64 * 100 + fraction) * ratio.0).div_euclid(ratio.1)
     }
 
     pub(super) fn damage(
@@ -4715,233 +4240,20 @@ impl Game {
         {
             self.combat_mut().unwrap().hits[index] += 1;
         }
-        let mut amount = base.max(0);
         let played = self
             .combat()
             .unwrap()
-            .auto_plays
+            .plays
             .last()
             .map(|play| play.card)
-            .or(self.combat().unwrap().playing)
             .filter(|played| card == Some(played.id));
-        if powered && source == Actor::Player {
-            match played.and_then(|card| card.enchantment.map(|enchantment| (card, enchantment))) {
-                Some((_, Enchantment::Corrupted)) => amount = amount.saturating_mul(3) / 2,
-                Some((_, Enchantment::Instinct)) => amount = amount.saturating_mul(2),
-                Some((card, Enchantment::Sharp)) => {
-                    amount = amount.saturating_add(card.enchantment_amount)
-                }
-                Some((card, Enchantment::Vigorous)) if card.enchantment_value > 0 => {
-                    amount = amount.saturating_add(card.enchantment_amount)
-                }
-                Some((card, Enchantment::Momentum)) => {
-                    amount = amount.saturating_add(card.enchantment_value)
-                }
-                Some((_, Enchantment::TezcatarasEmber)) => amount = amount.saturating_add(3),
-                _ => {}
+        let amount = self.modify_damage(content, Some(target), base, kind, context, played);
+        // Thorns strikes back in BeforeDamageReceived; the hit still lands.
+        if powered || card.is_some_and(|card| content.cards[card as usize].id == "CARD.OMNISLICE") {
+            let thorns = self.creature(target).kind(content, PowerKind::Thorns);
+            if thorns > 0 {
+                self.damage(content, target, source, thorns, DamageKind::Unpowered, None);
             }
-            if let Some(played) = played {
-                if played.upgrades > 0 && self.has_relic(content, "RELIC.MINIATURE_CANNON") {
-                    amount = amount.saturating_add(3);
-                }
-                if played.enchantment.is_some() && self.has_relic(content, "RELIC.MYSTIC_LIGHTER") {
-                    amount = amount.saturating_add(9);
-                }
-            }
-        }
-        if attack {
-            if source == Actor::Player
-                && card.is_some_and(|id| content.cards[id as usize].tags & SHIV_TAG != 0)
-            {
-                amount = amount.saturating_add(self.creature(source).power(power_id::ACCURACY));
-                if self.combat().unwrap().history.shivs == 0 {
-                    amount = amount
-                        .saturating_add(self.creature(source).power(power_id::PHANTOM_BLADES));
-                }
-            }
-            if source == Actor::Player
-                && played
-                    .is_some_and(|card| card.flags(content.cards[card.id as usize]) & INKY != 0)
-            {
-                amount = amount.saturating_add(1);
-            }
-            amount = amount.saturating_add(self.creature(source).power(power_id::VIGOR));
-            if card == Some(card_id::HANG) {
-                amount = amount.saturating_mul(self.creature(target).power(power_id::HANG).max(1));
-            }
-            if source == Actor::Osty {
-                amount =
-                    amount.saturating_add(self.creature(Actor::Player).power(power_id::CALCIFY));
-            }
-        }
-        if powered {
-            if attack
-                && matches!(source, Actor::Player | Actor::Osty)
-                && card.is_some_and(|id| content.cards[id as usize].tags & STRIKE_TAG != 0)
-            {
-                amount = amount
-                    .saturating_add(3 * self.has_relic(content, "RELIC.STRIKE_DUMMY") as i16)
-                    .saturating_add(self.has_relic(content, "RELIC.FAKE_STRIKE_DUMMY") as i16);
-            }
-            amount =
-                amount.saturating_add(self.creature(source).kind(content, PowerKind::Strength));
-            if attack && source == Actor::Player && self.combat().unwrap().history.attacks == 1 {
-                amount = amount
-                    .saturating_mul(100 + self.creature(source).power(power_id::LETHALITY))
-                    / 100;
-            }
-            if matches!(source, Actor::Player | Actor::Osty)
-                && card.is_some_and(|id| content.cards[id as usize].tags & MINION_TAG != 0)
-                && self.has_relic(content, "RELIC.VITRUVIAN_MINION")
-            {
-                amount = amount.saturating_mul(2);
-            }
-            if attack && matches!(source, Actor::Player | Actor::Osty) && context.pen_nib {
-                amount = amount.saturating_mul(2);
-            }
-            if attack {
-                amount = amount.saturating_add(self.creature(target).power(power_id::TAINTED));
-            }
-            if self.creature(target).kind(content, PowerKind::Vulnerable) > 0 {
-                let vulnerable = if self.creature(target).power(power_id::DEBILITATE) > 0 {
-                    200
-                } else {
-                    150
-                };
-                let cruelty = if matches!(source, Actor::Player | Actor::Osty)
-                    && matches!(target, Actor::Enemy(_))
-                {
-                    self.creature(Actor::Player).power(power_id::CRUELTY)
-                } else {
-                    0
-                };
-                let paper_phrog = 25
-                    * (matches!(source, Actor::Player | Actor::Osty)
-                        && matches!(target, Actor::Enemy(_))
-                        && self.has_relic(content, "RELIC.PAPER_PHROG"))
-                        as i16;
-                amount = amount.saturating_mul(vulnerable + cruelty + paper_phrog) / 100;
-            }
-            if self.creature(source).kind(content, PowerKind::Weak) > 0 {
-                let multiplier = if self.creature(source).power(power_id::DEBILITATE) > 0 {
-                    50
-                } else {
-                    75
-                };
-                let paper_krane = 15
-                    * (target == Actor::Player
-                        && matches!(source, Actor::Enemy(_))
-                        && self.has_relic(content, "RELIC.PAPER_KRANE"))
-                        as i16;
-                amount = amount.saturating_mul(multiplier - paper_krane) / 100;
-            }
-            if target == Actor::Player
-                && matches!(source, Actor::Enemy(_))
-                && self.creature(source).hp <= self.creature(source).power(power_id::DOOM)
-                && self.has_relic(content, "RELIC.UNDYING_SIGIL")
-            {
-                amount /= 2;
-            }
-            if target == Actor::Player && self.combat().unwrap().diamond_diadem {
-                amount /= 2;
-            }
-            amount = amount.saturating_mul(100 + self.creature(target).power(power_id::SLOW)) / 100;
-            for _ in 0..self.creature(source).power(power_id::DOUBLE_DAMAGE).max(0) {
-                amount = amount.saturating_mul(2);
-            }
-            if target == Actor::Player
-                && let Actor::Enemy(index) = source
-                && let Some(surrounded) = self
-                    .creature(Actor::Player)
-                    .powers
-                    .iter()
-                    .find(|power| power.id == power_id::SURROUNDED)
-            {
-                let back = if surrounded.value == 0 {
-                    power_id::BACK_ATTACK_LEFT
-                } else {
-                    power_id::BACK_ATTACK_RIGHT
-                };
-                if self.creature(Actor::Enemy(index)).power(back) > 0 {
-                    amount = amount.saturating_mul(3) / 2;
-                }
-            }
-            if target == Actor::Player
-                && matches!(source, Actor::Enemy(_))
-                && self.creature(source).kind(content, PowerKind::Vulnerable) > 0
-                && self.creature(target).power(power_id::COLOSSUS) > 0
-            {
-                amount /= 2;
-            }
-            if self.creature(source).power(power_id::SHRINK) != 0 {
-                amount = amount.saturating_mul(70) / 100;
-            }
-        }
-        if attack && self.creature(target).power(power_id::FLUTTER) > 0 {
-            amount /= 2;
-        }
-        let cap = self.creature(target).power(power_id::HARD_TO_KILL);
-        if !overflow_kind && cap > 0 {
-            amount = amount.min(cap);
-        }
-        if attack
-            && matches!(source, Actor::Player | Actor::Osty)
-            && card.is_some()
-            && self.creature(target).power(power_id::SOAR) > 0
-        {
-            amount /= 2;
-        }
-        amount = amount.max(0);
-        if attack {
-            if source == Actor::Player && self.creature(target).kind(content, PowerKind::Weak) > 0 {
-                amount =
-                    amount.saturating_mul(self.creature(source).power(power_id::TRACKING).max(1));
-            }
-            if source == Actor::Player
-                && card == Some(card_id::SOVEREIGN_BLADE)
-                && self.creature(target).power(power_id::CONQUEROR) > 0
-            {
-                amount = amount.saturating_mul(2);
-            }
-            if source == Actor::Player
-                && card.is_some()
-                && self.creature(source).power(power_id::GIGANTIFICATION) > 0
-            {
-                amount = amount.saturating_mul(3);
-            }
-            self.trigger(content, Trigger::Attacked, target, amount);
-            if source == Actor::Player
-                && card.is_some()
-                && let Actor::Enemy(index) = target
-            {
-                let curl = self.creature(target).power(power_id::CURL_UP);
-                if curl > 0 {
-                    self.creature_mut(target)
-                        .powers
-                        .retain(|power| power.id != power_id::CURL_UP);
-                    self.combat_mut().unwrap().queue.push(Pending {
-                        effect: Effect::RawBlock(Target::Source, Amount::fixed(curl, curl)),
-                        context: Context {
-                            source: target,
-                            target: Some(index),
-                            card,
-                            upgraded: false,
-                            x: 0,
-                            event: 0,
-                            orb: false,
-                            orb_id: None,
-                            pen_nib: false,
-                        },
-                    });
-                }
-            }
-        }
-        if !overflow_kind && self.creature(target).kind(content, PowerKind::Intangible) > 0 {
-            amount = amount.min(1);
-        }
-        if target == Actor::Player && matches!(source, Actor::Enemy(_)) {
-            let expected = self.incoming_damage_amount(content, source, base, kind);
-            debug_assert_eq!(amount, expected);
         }
         let block_target = if target == Actor::Osty {
             Actor::Player
@@ -4954,29 +4266,14 @@ impl Game {
             amount.min(self.creature(block_target).block)
         };
         self.creature_mut(block_target).block -= blocked;
-        if blocked > 0
-            && self.creature(target).block == 0
-            && matches!(target, Actor::Enemy(_))
-            && matches!(source, Actor::Player | Actor::Osty)
-            && self.has_relic(content, "RELIC.HAND_DRILL")
-        {
-            self.apply_power(content, target, power_id::VULNERABLE, 2);
-        }
-        if blocked > 0
-            && self.creature(target).block == 0
-            && self.creature(target).power(power_id::BURROWED) > 0
-        {
-            self.creature_mut(target).consume_power(power_id::BURROWED);
-            if let Actor::Enemy(index) = target
-                && content.enemies[self.creature(target).id as usize].id == "MONSTER.TUNNELER"
-            {
-                let enemy = &mut self.combat_mut().unwrap().enemies[index];
-                enemy.move_index = 3;
-                enemy.last_move = 3;
-                enemy.repeats = 1;
-            }
-        }
         let mut lost = amount - blocked;
+        if target == Actor::Player
+            && (matches!(kind, DamageKind::Unblockable) && base > 0
+                || blocked == 0 && self.creature(Actor::Player).block == 0
+                || lost > 0)
+        {
+            self.combat_mut().unwrap().history.unblocked_hits += 1;
+        }
         let shell = if overflow_kind {
             0
         } else {
@@ -4990,7 +4287,9 @@ impl Game {
                 .find(|power| power.id == power_id::HARDENED_SHELL)
                 .unwrap()
                 .value;
-            lost = lost.min((shell - received).max(0));
+            // Not floored at 0: once The Boot pushed a hit past the cap, the next hit "loses"
+            // negative HP and heals the excess back (LoseHpInternal).
+            lost = lost.min(shell - received);
         }
         let hp_target = if attack
             && target == Actor::Player
@@ -5001,29 +4300,32 @@ impl Game {
         } else {
             target
         };
-        let slippery = lost > 0 && self.creature(hp_target).power(power_id::SLIPPERY) > 0;
-        if slippery {
+        // Hook.ModifyHpLost after Osty took the hit: Slippery, then the relics (Tungsten Rod,
+        // Beating Remnant), then Buffer (Late) cancels what is left; The Boot raises a small hit.
+        if lost > 0 && self.creature(hp_target).power(power_id::SLIPPERY) > 0 {
             lost = 1;
         }
-        if lost > 0 && self.creature(hp_target).kind(content, PowerKind::Buffer) > 0 {
-            let id = self
-                .creature(hp_target)
-                .powers
-                .iter()
-                .find(|power| content.powers[power.id as usize].kind == PowerKind::Buffer)
-                .unwrap()
-                .id;
+        if lost > 0 && hp_target == Actor::Player {
+            let remaining = (20 - self.combat().unwrap().history.remnant_lost).max(0);
+            for (index, &id) in self.run.relics.iter().enumerate() {
+                if self.melted_relics.contains(&index) {
+                    continue;
+                }
+                match content.relics[id as usize].id {
+                    "RELIC.TUNGSTEN_ROD" => lost = (lost - 1).max(0),
+                    "RELIC.BEATING_REMNANT" => lost = lost.min(remaining),
+                    _ => {}
+                }
+            }
+        }
+        let buffer = self.creature(hp_target).powers.iter().find(|power| {
+            content.powers[power.id as usize].kind == PowerKind::Buffer && power.amount > 0
+        });
+        if let Some(id) = buffer.map(|power| power.id)
+            && lost > 0
+        {
             self.creature_mut(hp_target).consume_power(id);
             lost = 0;
-        }
-        if lost > 0 && hp_target == Actor::Player && self.has_relic(content, "RELIC.TUNGSTEN_ROD") {
-            lost -= 1;
-        }
-        if lost > 0
-            && hp_target == Actor::Player
-            && self.has_relic(content, "RELIC.BEATING_REMNANT")
-        {
-            lost = lost.min((20 - self.combat().unwrap().history.hp_lost).max(0));
         }
         if attack
             && (1..5).contains(&lost)
@@ -5037,117 +4339,17 @@ impl Game {
         let overflow = (target == Actor::Player && hp_target == Actor::Osty)
             .then(|| lost.saturating_sub(hp))
             .unwrap_or(0);
+        // The game's TotalDamage + OverkillDamage: blocked plus HP loss before the HP cap.
+        let dealt = blocked + lost;
         lost = lost.min(hp);
         self.creature_mut(hp_target).hp -= lost;
-        if lost > 0
-            && hp_target == Actor::Player
-            && !self.combat().unwrap().enemy_turn
-            && self.has_relic(content, "RELIC.DEMON_TONGUE")
-            && !self.combat().unwrap().demon_tongue
-        {
-            self.combat_mut().unwrap().demon_tongue = true;
-            self.creature_mut(hp_target).hp =
-                (self.creature(hp_target).hp + lost).min(self.creature(hp_target).max_hp);
-        }
         self.sync_red_skull(content);
-        if lost > 0
-            && hp_target == Actor::Player
-            && self.has_relic(content, "RELIC.CENTENNIAL_PUZZLE")
-            && !self.combat().unwrap().centennial_puzzle
-        {
-            self.combat_mut().unwrap().centennial_puzzle = true;
-            self.combat_mut().unwrap().queue.push(Pending {
-                effect: Effect::Draw(3),
-                context: Context::player(),
-            });
+        if blocked > 0 && self.creature(target).block == 0 {
+            self.break_burrow(content, target);
         }
-        if lost > 0
-            && hp_target == Actor::Player
-            && self.has_relic(content, "RELIC.SELF_FORMING_CLAY")
-        {
-            self.apply_power(content, Actor::Player, power_id::BLOCK_NEXT_TURN, 3);
-        }
-        if lost > 0
-            && let Some(power) = self
-                .creature_mut(target)
-                .powers
-                .iter_mut()
-                .find(|power| power.id == power_id::HARDENED_SHELL)
-        {
-            power.value = power.value.saturating_add(lost);
-        }
-        if lost > 0
-            && let Actor::Enemy(index) = hp_target
-            && self.creature(hp_target).hp > 0
-            && self.creature(hp_target).power(power_id::SHRIEK) > 0
-            && self.creature(hp_target).hp <= self.creature(hp_target).power(power_id::SHRIEK)
-        {
-            self.creature_mut(hp_target)
-                .powers
-                .retain(|power| power.id != power_id::SHRIEK);
-            let enemy = &mut self.combat_mut().unwrap().enemies[index];
-            enemy.move_index = 2;
-            enemy.last_move = 2;
-            enemy.repeats = 1;
-            enemy.move_history.push(2);
-        }
-        if lost > 0
-            && let Actor::Enemy(index) = hp_target
-            && content.enemies[self.combat().unwrap().enemies[index].creature.id as usize].id
-                == "MONSTER.SLUMBERING_BEETLE"
-            && self.creature(hp_target).power(power_id::SLUMBER) > 0
-        {
-            self.creature_mut(hp_target)
-                .consume_power(power_id::SLUMBER);
-            if self.creature(hp_target).power(power_id::SLUMBER) == 0 {
-                self.creature_mut(hp_target)
-                    .powers
-                    .retain(|power| power.id != 79);
-                let enemy = &mut self.combat_mut().unwrap().enemies[index];
-                enemy.move_index = 2;
-                enemy.last_move = usize::MAX;
-                enemy.repeats = 0;
-            }
-        }
-        if lost > 0
-            && let Actor::Enemy(index) = hp_target
-            && content.enemies[self.combat().unwrap().enemies[index].creature.id as usize].id
-                == "MONSTER.LAGAVULIN_MATRIARCH"
-            && self.creature(hp_target).power(power_id::ASLEEP) > 0
-        {
-            self.creature_mut(hp_target)
-                .powers
-                .retain(|power| !matches!(power.id, 79 | power_id::ASLEEP));
-            let enemy = &mut self.combat_mut().unwrap().enemies[index];
-            enemy.move_index = 5;
-            enemy.last_move = usize::MAX;
-            enemy.repeats = 0;
-        }
-        if lost > 0
-            && let Actor::Enemy(index) = hp_target
-            && self.creature(hp_target).hp <= self.creature(hp_target).power(power_id::PLOW)
-            && self.creature(hp_target).power(power_id::PLOW) > 0
-        {
-            self.creature_mut(hp_target).powers.retain(|power| {
-                !matches!(
-                    power.id,
-                    power_id::PLOW
-                        | power_id::STRENGTH
-                        | power_id::FLEX_POTION
-                        | power_id::FEEDING_FRENZY
-                )
-            });
-            let enemy = &mut self.combat_mut().unwrap().enemies[index];
-            enemy.move_index = 2;
-            enemy.last_move = 2;
-            enemy.repeats = 1;
-            enemy.move_history.push(2);
-        }
-        if slippery && lost > 0 {
-            self.creature_mut(hp_target)
-                .consume_power(power_id::SLIPPERY);
-        }
-        if attack
+        // Skittish reacts to any hit of a card's attack command, Omnislice's splash included.
+        if (matches!(kind, DamageKind::Attack | DamageKind::Move)
+            || card.is_some_and(|card| content.cards[card as usize].id == "CARD.OMNISLICE"))
             && lost > 0
             && matches!(source, Actor::Player | Actor::Osty)
             && card.is_some()
@@ -5169,36 +4371,11 @@ impl Game {
                         _ => None,
                     },
                     card,
-                    upgraded: false,
-                    x: 0,
-                    event: 0,
-                    orb: false,
-                    orb_id: None,
-                    pen_nib: false,
+                    ..Context::player()
                 },
             });
         }
-        if attack
-            && amount > 0
-            && blocked == amount
-            && let Actor::Enemy(index) = source
-            && self.creature(source).power(power_id::IMBALANCED) > 0
-        {
-            let enemy = &mut self.combat_mut().unwrap().enemies[index];
-            if content.enemies[enemy.creature.id as usize].id == "MONSTER.BOWLBUG_ROCK" {
-                enemy.move_index = 1;
-                enemy.last_move = usize::MAX;
-                enemy.repeats = 0;
-            }
-        }
         if (attack || overflow_kind) && hp_target == Actor::Player && lost > 0 {
-            let paper_cuts = self.creature(source).power(power_id::PAPER_CUTS).max(0);
-            if paper_cuts > 0 {
-                let player = self.creature_mut(Actor::Player);
-                player.max_hp = (player.max_hp - paper_cuts).max(1);
-                player.hp = player.hp.min(player.max_hp);
-                self.run.max_hp = player.max_hp;
-            }
             for _ in 0..self.creature(source).power(power_id::PAINFUL_STABS).max(0) {
                 self.add_generated(
                     content,
@@ -5210,24 +4387,14 @@ impl Game {
                 );
             }
         }
-        if attack && lost > 0 && self.creature(target).power(power_id::FLUTTER) > 0 {
-            self.creature_mut(target).consume_power(power_id::FLUTTER);
-            if self.creature(target).power(power_id::FLUTTER) == 0
-                && let Actor::Enemy(index) = target
-                && content.enemies[self.creature(target).id as usize].id
-                    == "MONSTER.THIEVING_HOPPER"
-            {
-                let enemy = &mut self.combat_mut().unwrap().enemies[index];
-                enemy.move_index = 5;
-                enemy.last_move = 5;
-                enemy.repeats = 1;
-            }
-        }
         if hp_target == Actor::Osty && lost > 0 {
             self.necro_mastery(content, lost);
         }
         if hp_target == Actor::Player {
             self.combat_mut().unwrap().history.hp_lost += lost;
+            if self.creature(Actor::Player).hp > 0 {
+                self.combat_mut().unwrap().history.remnant_lost += lost;
+            }
             if lost > 0 {
                 self.combat_mut().unwrap().history.hp_loss_events += 1;
                 if !matches!(kind, DamageKind::Unblockable) {
@@ -5235,91 +4402,21 @@ impl Game {
                 }
             }
         }
-        if lost > 0 {
-            self.trigger(content, Trigger::HpLost, hp_target, lost);
-            if hp_target == Actor::Player {
-                self.inferno();
-            }
-        }
-        if blocked > 0 {
-            self.trigger(content, Trigger::Blocked, block_target, blocked);
-        }
-        if attack
-            && target == Actor::Player
-            && matches!(source, Actor::Enemy(_))
-            && blocked > 0
-            && self.creature(target).power(power_id::REFLECT) > 0
-        {
-            self.damage(
-                content,
-                target,
-                source,
-                blocked,
-                DamageKind::Unpowered,
-                None,
-            );
-        }
-        if lost > 0 {
-            self.trigger(content, Trigger::Damaged, hp_target, lost);
-        }
-        if attack && lost > 0 {
-            let poison = self.creature(source).power(power_id::ENVENOM);
-            if poison > 0 {
-                self.apply_power(content, hp_target, power_id::POISON, poison);
-            }
-        }
-        if attack && source == Actor::Player {
-            let loss = self.creature(source).power(power_id::MONARCHS_GAZE);
-            if loss > 0 && self.apply_debuff(content, target, power_id::STRENGTH, -loss) {
-                self.creature_mut(target)
-                    .add_power(power_id::MONARCHS_GAZE_STRENGTH_DOWN, loss);
-            }
-        }
-        if attack && target == Actor::Player && matches!(source, Actor::Enemy(_)) {
-            let barrier = self.creature(Actor::Player).power(power_id::FLAME_BARRIER);
-            if barrier > 0 {
-                self.damage(
-                    content,
-                    Actor::Player,
-                    source,
-                    barrier,
-                    DamageKind::Unpowered,
-                    None,
-                );
-            }
-        }
-        if attack {
-            let thorns = self.creature(target).kind(content, PowerKind::Thorns);
-            if thorns > 0 {
-                self.damage(content, target, source, thorns, DamageKind::Unpowered, None);
-            }
-        }
-        if attack && matches!(source, Actor::Player | Actor::Osty) {
-            for _ in 0..self.creature(target).power(power_id::PERSONAL_HIVE) {
-                self.add_random(
-                    content,
-                    Pile::Draw,
-                    Card {
-                        id: card_id::DAZED,
-                        ..Card::default()
-                    },
-                );
-            }
-        }
-        if (attack || overflow_kind)
-            && hp_target == Actor::Player
-            && matches!(source, Actor::Enemy(_))
-            && lost > 0
-            && self.creature(Actor::Player).power(power_id::THE_GAMBIT) > 0
-        {
-            self.creature_mut(Actor::Player)
-                .powers
-                .retain(|power| power.id != power_id::THE_GAMBIT);
-            self.creature_mut(Actor::Player).hp = 0;
-        }
-        if self.creature(hp_target).hp <= 0 {
-            self.died(content, hp_target);
-        }
+        let fully_blocked = !matches!(kind, DamageKind::Unblockable)
+            && (blocked > 0 || self.creature(block_target).block > 0)
+            && lost == 0;
+        let hit = Hit {
+            dealer: source,
+            target,
+            receiver: hp_target,
+            card,
+            kind,
+            blocked,
+            lost,
+            fully_blocked,
+            killed: false,
+        };
+        self.hit(content, hit);
         let overflow = if overflow > 0 {
             self.damage(
                 content,
@@ -5335,7 +4432,26 @@ impl Game {
         };
         DamageResult {
             lost: lost.saturating_add(overflow),
-            resolved: amount,
+            blocked,
+            dealt,
+        }
+    }
+
+    /// A hit's hooks and its receiver's death, or both later when one damage command hits
+    /// several targets (CreatureCmd.Damage).
+    fn hit(&mut self, content: &Content, hit: Hit) {
+        let hit = Hit {
+            killed: self.creature(hit.receiver).hp <= 0,
+            ..hit
+        };
+        match &mut self.combat_mut().unwrap().pending_hits {
+            Some(hits) => hits.push(hit),
+            None => {
+                self.hit_hooks(content, hit);
+                if hit.killed {
+                    self.died(content, hit.receiver);
+                }
+            }
         }
     }
 
@@ -5351,16 +4467,34 @@ impl Game {
         self.died(content, actor);
     }
 
+    /// An enemy's death is fatal unless one of its powers denies it (ShouldOwnerDeathTriggerFatal):
+    /// Minion always, Reattach while another segment lives.
+    fn fatal(&self, index: usize) -> bool {
+        let enemies = &self.combat().unwrap().enemies;
+        let creature = &enemies[index].creature;
+        creature.power(power_id::MINION) == 0
+            && (creature.power(power_id::REATTACH) == 0
+                || enemies.iter().enumerate().all(|(i, enemy)| {
+                    i == index
+                        || enemy.creature.hp <= 0
+                        || enemy.creature.power(power_id::REATTACH) == 0
+                }))
+    }
+
     fn doom_kill(&mut self, content: &Content, actors: Vec<Actor>) {
-        let mut killed = 0;
+        let mut doomed = Vec::new();
         for actor in actors {
             if self.creature(actor).hp > 0
                 && self.creature(actor).hp <= self.creature(actor).power(power_id::DOOM)
             {
                 self.kill_actor(content, actor);
-                killed += matches!(actor, Actor::Enemy(_)) as i16;
+                doomed.push(actor);
             }
         }
+        // Book Repair Knife counts the deaths that were fatal once all the doomed died.
+        let killed = (doomed.into_iter())
+            .filter(|&actor| matches!(actor, Actor::Enemy(x) if self.fatal(x)))
+            .count() as i16;
         if killed > 0 && self.has_relic(content, "RELIC.BOOK_REPAIR_KNIFE") {
             let player = self.creature_mut(Actor::Player);
             player.hp = (player.hp + 3 * killed).min(player.max_hp);
@@ -5378,6 +4512,12 @@ impl Game {
         {
             self.run.potions[slot] = None;
             self.creature_mut(actor).hp = (self.creature(actor).max_hp * 3 / 10).max(1);
+            // It's used like any potion, so AfterPotionUsed relics fire (Reptile Trinket).
+            for _ in 0..self.relic_count(content, "RELIC.REPTILE_TRINKET") {
+                for power in [power_id::REPTILE_TRINKET, power_id::STRENGTH] {
+                    self.apply_power(content, Actor::Player, power, 3);
+                }
+            }
             return;
         }
         if actor == Actor::Player
@@ -5388,261 +4528,56 @@ impl Game {
             self.creature_mut(actor).hp = (self.creature(actor).max_hp / 2).max(1);
             return;
         }
-        let infested = self.creature(actor).power(power_id::INFESTED);
-        let (stock, surprise, stolen, heist) = match actor {
-            Actor::Enemy(_) => (
-                self.creature(actor).power(power_id::STOCK),
-                self.creature(actor).power(power_id::SURPRISE) > 0,
-                self.creature(actor)
-                    .powers
-                    .iter()
-                    .filter(|power| power.id == power_id::THIEVERY)
-                    .map(|power| power.value)
-                    .sum(),
-                self.creature(actor).power(power_id::HEIST).max(0) as i32,
-            ),
-            _ => (0, false, 0, 0),
-        };
-        if let Actor::Enemy(dead) = actor {
+        if let Actor::Enemy(_) = actor {
+            let heist = self.creature(actor).power(power_id::HEIST).max(0) as i32;
             if heist > 0 {
                 self.reward_gold_parts.push(heist);
             }
-            let ravenous: Vec<_> = self
-                .combat()
-                .unwrap()
-                .enemies
-                .iter()
-                .enumerate()
-                .filter(|(index, enemy)| {
-                    *index != dead
-                        && enemy.creature.hp > 0
-                        && enemy.creature.power(power_id::RAVENOUS) > 0
-                })
-                .map(|(index, _)| index)
-                .collect();
-            for index in ravenous {
-                let amount = self.creature(Actor::Enemy(index)).power(power_id::RAVENOUS);
-                self.creature_mut(Actor::Enemy(index))
-                    .add_power(power_id::STRENGTH, amount);
-                self.combat_mut().unwrap().enemies[index].stunned = true;
-            }
-            let steam = self.creature(actor).power(power_id::STEAM_ERUPTION);
-            if steam > 0
-                && content.enemies[self.combat().unwrap().enemies[dead].creature.id as usize].id
-                    == "MONSTER.WATERFALL_GIANT"
-            {
-                let creature = self.creature_mut(actor);
-                creature.hp = i16::MAX;
-                creature.max_hp = i16::MAX;
-                creature
-                    .powers
-                    .retain(|power| power.id != power_id::STEAM_ERUPTION);
-                let enemy = &mut self.combat_mut().unwrap().enemies[dead];
-                enemy.move_index = 7;
-                enemy.last_move = 7;
-                enemy.repeats = 1;
-                enemy.move_history.push(7);
-                enemy.value = steam;
-                return;
-            }
-            let enraged: Vec<_> = self
-                .combat()
-                .unwrap()
-                .enemies
-                .iter()
-                .enumerate()
-                .filter(|(index, enemy)| {
-                    *index != dead
-                        && enemy.creature.hp > 0
-                        && enemy.creature.power(power_id::CRAB_RAGE) > 0
-                })
-                .map(|(index, _)| index)
-                .collect();
-            for index in enraged {
-                let creature = self.creature_mut(Actor::Enemy(index));
-                creature.add_power(power_id::STRENGTH, 6);
-                creature.block = creature.block.saturating_add(99);
-                creature
-                    .powers
-                    .retain(|power| power.id != power_id::CRAB_RAGE);
-            }
         }
-        if let Actor::Enemy(index) = actor
-            && self.creature(actor).power(power_id::ADAPTABLE) > 0
-            && content.enemies[self.combat().unwrap().enemies[index].creature.id as usize].id
-                == "MONSTER.TEST_SUBJECT"
+        // A Waterfall Giant with Steam Eruption prevents its removal, which most AfterDeath hooks
+        // check (not Gremlin Horn or Crab Rage).
+        let prevented = matches!(actor, Actor::Enemy(_))
+            && self.creature(actor).power(power_id::STEAM_ERUPTION) > 0
+            && content.enemies[self.creature(actor).id as usize].id == "MONSTER.WATERFALL_GIANT";
+        if let Actor::Enemy(_) = actor
+            && content.enemies[self.creature(actor).id as usize].id == "MONSTER.TORCH_HEAD_AMALGAM"
+            && let Some(queen) = self.combat_mut().unwrap().enemies.iter_mut().find(|enemy| {
+                enemy.creature.hp > 0
+                    && content.enemies[enemy.creature.id as usize].id == "MONSTER.QUEEN"
+            })
+            && queen.move_index == 2
         {
-            let creature = &mut self.combat_mut().unwrap().enemies[index].creature;
-            creature.block = 0;
-            creature
-                .powers
-                .retain(|power| matches!(power.id, power_id::ADAPTABLE | power_id::PAINFUL_STABS));
-            let enemy = &mut self.combat_mut().unwrap().enemies[index];
-            enemy.move_index = 0;
-            enemy.last_move = 0;
-            enemy.repeats = 1;
-            enemy.move_history.push(0);
+            queen.move_index = 5;
+            queen.last_move = 5;
+            queen.repeats = 1;
         }
-        if let Actor::Enemy(index) = actor
-            && self.creature(actor).power(power_id::ILLUSION) > 0
-        {
-            let creature = &mut self.combat_mut().unwrap().enemies[index].creature;
-            creature.block = 0;
-            creature.powers.retain(|power| {
-                !content.powers[power.id as usize].debuff
-                    && (power.id != power_id::STRENGTH || power.amount > 0)
-            });
-            let enemy = &mut self.combat_mut().unwrap().enemies[index];
-            enemy.move_index = 1;
-            enemy.last_move = 1;
-            enemy.repeats = 1;
-        }
-        if let Actor::Enemy(index) = actor
-            && self.creature(actor).power(power_id::REATTACH) > 0
-        {
-            let revive = self
-                .combat()
-                .unwrap()
-                .enemies
-                .iter()
-                .enumerate()
-                .any(|(other, enemy)| {
-                    other != index
-                        && enemy.creature.hp > 0
-                        && enemy.creature.power(power_id::REATTACH) > 0
-                });
-            let creature = &mut self.combat_mut().unwrap().enemies[index].creature;
-            creature.block = 0;
-            creature
-                .powers
-                .retain(|power| power.id == power_id::REATTACH);
-            if revive {
-                let enemy = &mut self.combat_mut().unwrap().enemies[index];
-                enemy.move_index = 3;
-                enemy.last_move = 3;
-                enemy.repeats = 1;
-            }
-        }
-        let combat = self.combat_mut().unwrap();
-        for pile in [
-            &mut combat.draw,
-            &mut combat.hand,
-            &mut combat.discard,
-            &mut combat.exhaust,
-        ] {
-            for card in pile
-                .iter_mut()
-                .filter(|card| card.id == card_id::MELANCHOLY)
-            {
-                card.cost_delta = card.cost_delta.saturating_sub(1);
-            }
-        }
-        if matches!(actor, Actor::Enemy(_)) {
-            if let Actor::Enemy(index) = actor {
-                let enemy_id =
-                    content.enemies[self.combat().unwrap().enemies[index].creature.id as usize].id;
-                if enemy_id == "MONSTER.SPECTRAL_KNIGHT" {
-                    self.creature_mut(Actor::Player)
-                        .powers
-                        .retain(|power| power.id != power_id::HEX);
-                } else if enemy_id == "MONSTER.MAGI_KNIGHT"
-                    && !self
-                        .combat()
-                        .unwrap()
-                        .enemies
-                        .iter()
-                        .enumerate()
-                        .any(|(other, enemy)| {
-                            other != index
-                                && enemy.creature.hp > 0
-                                && content.enemies[enemy.creature.id as usize].id
-                                    == "MONSTER.MAGI_KNIGHT"
-                        })
-                {
-                    let dampened = std::mem::take(&mut self.combat_mut().unwrap().dampened);
-                    let combat = self.combat_mut().unwrap();
-                    for pile in [
-                        &mut combat.draw,
-                        &mut combat.hand,
-                        &mut combat.discard,
-                        &mut combat.exhaust,
-                    ] {
-                        for card in pile {
-                            if let Some((_, upgrades)) = dampened
-                                .iter()
-                                .find(|(instance, _)| *instance == card.instance)
-                            {
-                                card.upgrades = *upgrades;
-                            }
-                        }
-                    }
-                    combat
-                        .player
-                        .powers
-                        .retain(|power| power.id != power_id::DAMPEN);
-                } else if enemy_id == "MONSTER.TORCH_HEAD_AMALGAM"
-                    && let Some(queen) =
-                        self.combat_mut().unwrap().enemies.iter_mut().find(|enemy| {
-                            enemy.creature.hp > 0
-                                && content.enemies[enemy.creature.id as usize].id == "MONSTER.QUEEN"
-                        })
-                    && queen.move_index == 2
-                {
-                    queen.move_index = 5;
-                    queen.last_move = 5;
-                    queen.repeats = 1;
-                }
-                let strength = self.combat().unwrap().enemies[index]
-                    .creature
-                    .powers
-                    .iter()
-                    .find(|power| power.id == power_id::POSSESS_STRENGTH)
-                    .map_or(0, |power| power.value);
-                let dexterity = self.combat().unwrap().enemies[index]
-                    .creature
-                    .powers
-                    .iter()
-                    .find(|power| power.id == power_id::POSSESS_SPEED)
-                    .map_or(0, |power| power.value);
-                self.creature_mut(Actor::Player)
-                    .add_power(power_id::STRENGTH, strength);
-                self.creature_mut(Actor::Player)
-                    .add_power(power_id::DEXTERITY, dexterity);
-                self.creature_mut(Actor::Player).powers.retain(|power| {
-                    power.id != power_id::CONSTRICT || power.value != index as i16 + 1
+        let dead = self.instance(actor);
+        self.death_hooks(content, actor, prevented);
+        if let Actor::Enemy(_) = actor {
+            // Its spawning powers go with its other powers once AfterDeath is done, unless a
+            // spawn took its slot.
+            if self.instance(actor) == dead {
+                (self.creature_mut(actor).powers).retain(|power| {
+                    !matches!(
+                        power.id,
+                        power_id::INFESTED | power_id::STOCK | power_id::SURPRISE
+                    )
                 });
             }
-            self.trigger(content, Trigger::EnemyDied, actor, 0);
-            if self.has_relic(content, "RELIC.GREMLIN_HORN") {
-                push_effects(
-                    &mut self.combat_mut().unwrap().queue,
-                    &[Effect::Energy(1), Effect::Draw(1)],
-                    Context::player(),
-                );
-            }
-            if stock > 0 {
-                let spawned = self.spawn_enemy(content, "MONSTER.AXEBOT");
-                let creature = self.creature_mut(Actor::Enemy(spawned));
-                creature.powers.retain(|power| power.id != power_id::STOCK);
-                if stock > 1 {
-                    creature.add_power(power_id::STOCK, stock - 1);
+            // The last primary enemy's death takes its minions with it.
+            let enemies = &self.combat().unwrap().enemies;
+            let minions: Vec<_> = (0..enemies.len())
+                .filter(|&i| enemies[i].creature.hp > 0)
+                .collect();
+            if self.creature(actor).power(power_id::MINION) == 0
+                && !minions.is_empty()
+                && minions
+                    .iter()
+                    .all(|&i| enemies[i].creature.power(power_id::MINION) > 0)
+            {
+                for i in minions {
+                    self.kill_actor(content, Actor::Enemy(i));
                 }
-                let enemy = &mut self.combat_mut().unwrap().enemies[spawned];
-                enemy.move_index = 0;
-                enemy.last_move = usize::MAX;
-                enemy.repeats = 0;
-                enemy.move_history.clear();
-            }
-            if surprise {
-                self.spawn_enemy(content, "MONSTER.SNEAKY_GREMLIN");
-                let fat = self.spawn_enemy(content, "MONSTER.FAT_GREMLIN");
-                if stolen > 0 {
-                    self.creature_mut(Actor::Enemy(fat))
-                        .add_power(power_id::HEIST, stolen);
-                }
-            }
-            if infested > 0 {
-                self.spawn_wrigglers(content, infested);
             }
             if let Some(target) = self
                 .combat()
@@ -5656,6 +4591,21 @@ impl Game {
         }
     }
 
+    /// A new creature's instance: the game's next creature id + 1.
+    fn next_instance(&mut self) -> u32 {
+        let combat = self.combat_mut().unwrap();
+        let instance = combat
+            .enemies
+            .iter()
+            .map(|enemy| enemy.instance)
+            .max()
+            .unwrap_or(1)
+            .max(combat.next_creature)
+            + 1;
+        combat.next_creature = instance;
+        instance
+    }
+
     pub(crate) fn spawn_wrigglers(&mut self, content: &Content, count: i16) {
         let id = content
             .enemies
@@ -5663,21 +4613,8 @@ impl Game {
             .position(|enemy| enemy.id == "MONSTER.WRIGGLER")
             .unwrap() as Id;
         let range = content.enemies[id as usize].hp(self.run.ascension);
-        for _ in 0..count {
-            let instance = self
-                .combat()
-                .unwrap()
-                .enemies
-                .iter()
-                .map(|enemy| enemy.instance)
-                .max()
-                .unwrap_or(1)
-                .max(if self.combat().unwrap().osty.max_hp > 0 {
-                    3
-                } else {
-                    1
-                })
-                + 1;
+        for wriggler in 1..=count {
+            let instance = self.next_instance();
             let candidates: Vec<_> = range
                 .clone()
                 .filter(|hp| {
@@ -5694,22 +4631,26 @@ impl Game {
                 candidates[self.rngs.niche.below(candidates.len() as u32) as usize]
             };
             let fur_coat = self.fur_coat_active();
-            self.insert_enemy(Enemy {
-                instance,
-                creature: Creature {
-                    id,
-                    hp: if fur_coat { 1 } else { hp },
-                    max_hp: hp,
-                    block: 0,
-                    powers: vec![],
+            self.insert_enemy(
+                Enemy {
+                    instance,
+                    creature: Creature {
+                        id,
+                        hp: if fur_coat { 1 } else { hp },
+                        max_hp: hp,
+                        block: 0,
+                        powers: vec![],
+                    },
+                    move_index: 0,
+                    last_move: 0,
+                    repeats: 1,
+                    move_history: vec![0],
+                    stunned: false,
+                    value: wriggler,
+                    slot: 0,
                 },
-                move_index: 0,
-                last_move: 0,
-                repeats: 1,
-                move_history: vec![0],
-                stunned: false,
-                value: 0,
-            });
+                false,
+            );
         }
     }
 
@@ -5720,33 +4661,33 @@ impl Game {
             .position(|enemy| enemy.id == name)
             .unwrap() as Id;
         let def = &content.enemies[id as usize];
-        let range = def.hp(self.run.ascension);
-        let hp = self.rngs.niche.range(*range.start(), *range.end());
-        let instance = self
+        let taken: Vec<_> = self
             .combat()
             .unwrap()
             .enemies
             .iter()
-            .map(|enemy| enemy.instance)
-            .max()
-            .unwrap_or(1)
-            .max(if self.combat().unwrap().osty.max_hp > 0 {
-                3
-            } else {
-                1
-            })
-            + 1;
+            .filter(|enemy| enemy.creature.hp > 0)
+            .map(|enemy| enemy.creature.max_hp)
+            .chain(self.corpse_hp)
+            .collect();
+        let hp = self.unique_hp(def.hp(self.run.ascension), &taken);
+        let instance = self.next_instance();
         let powers = def
             .powers(self.run.ascension)
             .into_iter()
             .map(|(id, amount)| Power {
                 id,
                 amount,
-                skip_next_decay: false,
-                value: 0,
+                ..Power::default()
             })
             .collect();
         let fur_coat = self.fur_coat_active();
+        let enemies = &self.combat().unwrap().enemies;
+        let free = |slot: &u8| {
+            enemies
+                .iter()
+                .all(|e| e.creature.hp <= 0 || e.slot != *slot)
+        };
         let enemy = Enemy {
             instance,
             creature: Creature {
@@ -5762,17 +4703,65 @@ impl Game {
             move_history: vec![],
             stunned: false,
             value: 0,
+            // A rat called for backup or a laid egg takes the last free slot.
+            slot: if matches!(name, "MONSTER.TWO_TAILED_RAT" | "MONSTER.TOUGH_EGG") {
+                let last = enemies.iter().map(|enemy| enemy.slot).max();
+                (1..=last.unwrap_or_default().max(5))
+                    .rev()
+                    .find(free)
+                    .unwrap_or(0)
+            } else if FABRICATOR_BOTS.contains(&name) {
+                // A fabricated bot takes the first free slot (bot1, bot2, fabricator, bot3, bot4).
+                (1..=5).find(free).unwrap_or(0)
+            } else {
+                0
+            },
         };
-        self.insert_enemy(enemy)
+        self.insert_enemy(enemy, true)
     }
 
-    fn insert_enemy(&mut self, enemy: Enemy) -> usize {
+    /// Summons the game slots in front of their summoner, so they come first in its enemy list.
+    fn slot_order(&self, content: &Content, index: usize) -> (bool, u8) {
+        let enemy = &self.combat().unwrap().enemies[index];
+        let front = matches!(
+            content.enemies[enemy.creature.id as usize].id,
+            "MONSTER.GAS_BOMB"
+                | "MONSTER.EYE_WITH_TEETH"
+                | "MONSTER.PARAFRIGHT"
+                | "MONSTER.TOUGH_EGG"
+        );
+        (!front, enemy.slot)
+    }
+
+    fn alive_in_slot_order(&self, content: &Content) -> Vec<usize> {
+        let mut alive: Vec<_> = (0..self.combat().unwrap().enemies.len())
+            .filter(|&index| self.combat().unwrap().enemies[index].creature.hp > 0)
+            .collect();
+        alive.sort_by_key(|&index| self.slot_order(content, index));
+        alive
+    }
+
+    fn random_enemy(&mut self, content: &Content) -> Option<usize> {
+        let alive = self.alive_in_slot_order(content);
+        if alive.is_empty() {
+            return None;
+        }
+        let choice = if self.expectation.is_some() {
+            self.expectation_choice(alive.len()).unwrap_or(0)
+        } else {
+            self.rngs.combat_targets.below(alive.len() as u32) as usize
+        };
+        Some(alive[choice])
+    }
+
+    fn insert_enemy(&mut self, enemy: Enemy, reuse_dead: bool) -> usize {
         let combat = self.combat_mut().unwrap();
         let index = combat
             .enemies
             .iter()
             .position(|enemy| {
-                enemy.creature.hp <= 0
+                reuse_dead
+                    && enemy.creature.hp <= 0
                     && enemy.creature.power(power_id::ADAPTABLE) == 0
                     && enemy.creature.power(power_id::ILLUSION) == 0
                     && enemy.creature.power(power_id::REATTACH) == 0
@@ -5785,11 +4774,9 @@ impl Game {
         }
         combat.hits.resize(combat.enemies.len(), 0);
         combat.hits[index] = 0;
-        if !combat.enemy_power_snapshot.is_empty() {
-            combat
-                .enemy_power_snapshot
-                .resize(combat.enemies.len(), vec![]);
-            combat.enemy_power_snapshot[index].clear();
+        for play in &mut combat.plays {
+            play.recorded
+                .retain(|(actor, _)| *actor != Actor::Enemy(index));
         }
         index
     }
@@ -5816,32 +4803,42 @@ impl Game {
         }
     }
 
-    fn reaper(&mut self, content: &Content, source: Actor, target: Actor, dealt: i16) {
-        if matches!(source, Actor::Player | Actor::Osty) && dealt > 0 {
-            let doom =
-                dealt.saturating_mul(self.creature(Actor::Player).power(power_id::REAPER_FORM));
-            self.apply_power(content, target, power_id::DOOM, doom);
+    /// Relic counters that tick as each play finishes (AfterCardPlayed).
+    /// Ornamental Fan, Kunai, Shuriken and Kusarigama count finished attack plays this turn.
+    fn every_third_attack(&mut self, content: &Content) {
+        let attacks = self.combat().unwrap().attacks_mod3 + 1;
+        self.combat_mut().unwrap().attacks_mod3 = attacks % 3;
+        if attacks == 3 {
+            for _ in 0..self.relic_count(content, "RELIC.ORNAMENTAL_FAN") {
+                self.combat_mut().unwrap().queue.push(Pending {
+                    effect: Effect::RawBlock(Target::Player, Amount::fixed(4, 4)),
+                    context: Context::player(),
+                });
+            }
+            for _ in 0..self.relic_count(content, "RELIC.KUNAI") {
+                self.apply_power(content, Actor::Player, power_id::DEXTERITY, 1);
+            }
+            for _ in 0..self.relic_count(content, "RELIC.SHURIKEN") {
+                self.apply_power(content, Actor::Player, power_id::STRENGTH, 1);
+            }
+            for _ in 0..self.relic_count(content, "RELIC.KUSARIGAMA") {
+                self.combat_mut().unwrap().queue.push(Pending {
+                    effect: Effect::Damage(Target::RandomEnemy, Amount::fixed(6, 6)),
+                    context: Context::player(),
+                });
+            }
         }
     }
 
-    fn sic_em(&mut self, target: Actor) {
-        let amount = self.creature(target).power(power_id::SIC_EM);
-        if amount > 0 {
-            self.combat_mut().unwrap().queue.push(Pending {
-                effect: Effect::Summon(Amount::fixed(amount, amount)),
-                context: Context::player(),
-            });
-        }
-    }
-
-    fn inferno(&mut self) {
-        let amount = self.creature(Actor::Player).power(power_id::INFERNO);
-        if amount > 0 && !self.combat().unwrap().enemy_turn {
-            self.combat_mut().unwrap().queue.push(Pending {
-                effect: Effect::Damage(Target::AllEnemies, Amount::fixed(amount, amount)),
-                context: Context::player(),
-            });
-        }
+    /// Fabricator spawns a bot from FABRICATOR_BOTS[set..set + 2], never repeating its last spawn;
+    /// its `value` holds 1 + the last bot's index.
+    fn spawn_bot(&mut self, content: &Content, fabricator: usize, set: usize) {
+        let last = self.combat().unwrap().enemies[fabricator].value as usize;
+        let options: Vec<_> = (set..set + 2).filter(|&bot| bot + 1 != last).collect();
+        let bot = options[self.rngs.monster_ai.below(options.len() as u32) as usize];
+        self.combat_mut().unwrap().enemies[fabricator].value = bot as i16 + 1;
+        let spawned = self.spawn_enemy(content, FABRICATOR_BOTS[bot]);
+        self.apply_power(content, Actor::Enemy(spawned), power_id::MINION, 1);
     }
 
     fn sync_red_skull(&mut self, content: &Content) {
@@ -5890,6 +4887,114 @@ impl Game {
         }
     }
 
+    /// The card being played (placed after its hooks), if `card` is it.
+    fn played_card(&self, card: Id) -> Option<Card> {
+        self.combat()?
+            .queue
+            .iter()
+            .rev()
+            .find_map(|pending| match pending.effect {
+                Effect::PlacePlayed(played, ..) if played.id == card => Some(played),
+                _ => None,
+            })
+    }
+
+    /// The played card with this instance: in the play pile (still resolving or waiting for its
+    /// result pile), or wherever its play moved it (Shining Strike).
+    pub(super) fn played_mut(&mut self, instance: u32) -> Option<&mut Card> {
+        let Combat {
+            plays,
+            queue,
+            draw,
+            hand,
+            discard,
+            exhaust,
+            ..
+        } = self.combat_mut()?;
+        (plays.iter_mut().rev().map(|play| &mut play.card))
+            .chain(played(queue))
+            .chain(draw)
+            .chain(hand)
+            .chain(discard)
+            .chain(exhaust)
+            .find(|card| card.instance == instance)
+    }
+
+    /// CardCmd.Afflict on every combat card of a matching type that has no affliction yet.
+    pub(super) fn afflict_all(
+        &mut self,
+        content: &Content,
+        affliction: Affliction,
+        types: &[CardType],
+    ) {
+        let combat = self.combat_mut().unwrap();
+        for card in combat
+            .hand
+            .iter_mut()
+            .chain(&mut combat.draw)
+            .chain(&mut combat.discard)
+            .chain(&mut combat.exhaust)
+            .chain(combat.plays.first_mut().map(|play| &mut play.card))
+            .filter(|card| {
+                card.affliction == Affliction::None
+                    && (types.is_empty()
+                        || types.contains(&card.card_type(content.cards[card.id as usize])))
+            })
+        {
+            card.affliction = affliction;
+        }
+    }
+
+    /// AfterCardEnteredCombat: the affliction powers afflict a new card that has none.
+    fn afflict_new(&self, content: &Content, card: &mut Card) {
+        let combat = self.combat().unwrap();
+        if card.affliction != Affliction::None {
+            return;
+        }
+        let card_type = card.card_type(content.cards[card.id as usize]);
+        let enemy_power = |id| {
+            combat
+                .enemies
+                .iter()
+                .any(|enemy| enemy.creature.hp > 0 && enemy.creature.power(id) > 0)
+        };
+        card.affliction = if card_type == CardType::Power && enemy_power(power_id::GALVANIC) {
+            Affliction::Galvanized
+        } else if card_type == CardType::Skill && enemy_power(power_id::VITAL_SPARK) {
+            Affliction::Tainted
+        } else if card_type == CardType::Attack && combat.player.power(power_id::TANGLED) > 0 {
+            Affliction::Entangled
+        } else if combat.player.power(power_id::RINGING) > 0 {
+            Affliction::Ringing
+        } else if card_type == CardType::Skill
+            && combat.player.power(power_id::SMOGGY) > 0
+            && combat.history.skills > 0
+        {
+            Affliction::Smog
+        } else {
+            Affliction::None
+        };
+    }
+
+    /// Burrowed (Tunneler) ends once its block breaks, stunning it into its dizzy move.
+    fn break_burrow(&mut self, content: &Content, target: Actor) {
+        if self.creature(target).power(power_id::BURROWED) == 0 {
+            return;
+        }
+        self.creature_mut(target).consume_power(power_id::BURROWED);
+        if let Actor::Enemy(index) = target
+            && content.enemies[self.creature(target).id as usize].id == "MONSTER.TUNNELER"
+        {
+            let combat = self.combat_mut().unwrap();
+            let held = combat.enemy_turn;
+            let enemy = &mut combat.enemies[index];
+            enemy.move_index = 3;
+            enemy.last_move = 3;
+            enemy.repeats = 1;
+            enemy.stunned |= held;
+        }
+    }
+
     fn gain_block(
         &mut self,
         content: &Content,
@@ -5898,98 +5003,99 @@ impl Game {
         card: Option<Id>,
         powered: bool,
     ) -> i16 {
-        if actor == Actor::Player
-            && card.is_some()
-            && self.creature(actor).power(power_id::NO_BLOCK) > 0
-        {
-            return 0;
-        }
-        let fasten = card
-            .filter(|&id| content.cards[id as usize].tags & DEFEND_TAG != 0)
-            .map_or(0, |_| self.creature(actor).power(power_id::FASTEN));
-        let enchantment = (actor == Actor::Player)
-            .then(|| {
-                self.combat()
-                    .unwrap()
-                    .auto_plays
-                    .last()
-                    .map(|play| play.card)
-                    .or(self.combat().unwrap().playing)
-            })
-            .flatten()
-            .filter(|played| card == Some(played.id))
-            .map_or(0, |card| match card.enchantment {
-                Some(Enchantment::Nimble) => card.enchantment_amount,
-                Some(Enchantment::Goopy) => card.enchantment_amount.saturating_sub(1),
-                _ => 0,
-            });
-        let mut amount = self.modified_block(
-            content,
-            actor,
-            base.saturating_add(fasten).saturating_add(enchantment),
-            powered,
-        );
-        if actor == Actor::Player
-            && card.is_some_and(|id| content.cards[id as usize].tags & MINION_TAG != 0)
-            && self.has_relic(content, "RELIC.VITRUVIAN_MINION")
-        {
-            amount = amount.saturating_mul(2);
-        }
-        let combat = self.combat().unwrap();
-        if actor == Actor::Player
-            && card.is_some()
-            && !combat.vambrace
-            && self.has_relic(content, "RELIC.VAMBRACE")
-        {
-            amount = amount.saturating_mul(2);
-        }
-        if actor == Actor::Player
-            && card.is_some()
-            && combat.paels_legion == 0
-            && self.has_relic(content, "RELIC.PAELS_LEGION")
-        {
-            amount = amount.saturating_mul(2);
-        }
+        let (amount, positive) = self.modify_block(content, actor, base, card, powered);
+        self.claim_block_doubler(content, actor, amount, card);
         self.creature_mut(actor).block = self.creature(actor).block.saturating_add(amount);
-        if amount > 0 {
+        if positive {
             if actor == Actor::Player && card.is_some() {
+                let play = self.play_key();
                 let history = &mut self.combat_mut().unwrap().history;
-                if history.block_card != history.cards {
-                    history.block_card = history.cards;
+                if history.block_card != play {
+                    history.block_card = play;
                     history.block_card_gains = 0;
                 }
                 history.block_gains += 1;
                 history.block_card_gains += 1;
             }
-            self.trigger(content, Trigger::BlockGained, actor, amount);
+            self.trigger(content, Trigger::AfterBlockGained, actor, amount);
         }
         amount
     }
 
-    pub(crate) fn modified_block(
+    /// Hook.ModifyMaxEnergy over the run's max energy.
+    pub(crate) fn max_energy(&self, content: &Content) -> i16 {
+        let combat = self.combat().unwrap();
+        let power = |id| combat.player.power(id);
+        combat.max_energy
+            + (combat.turn >= 2 && self.has_relic(content, "RELIC.BREAD")) as i16
+            + (combat.turn >= 3) as i16 * self.relic_count(content, "RELIC.PAELS_FLESH")
+            + (self.pumpkin_candle > 0) as i16
+            + power(power_id::DEMESNE)
+            + power(power_id::FRIENDSHIP)
+            + power(power_id::PYRE)
+            - power(power_id::WASTE_AWAY)
+    }
+
+    /// Hook.ModifyBlock: the block gained, and whether it counts as a gain. The game's block is
+    /// a decimal floored only when added: Frail turning 1 block into 0.75 still records a block
+    /// gain (Unmovable) and fires AfterBlockGained (Juggernaut).
+    pub(crate) fn modify_block(
         &self,
         content: &Content,
         actor: Actor,
         base: i16,
-        card_or_move: bool,
-    ) -> i16 {
-        let mut amount = base
-            .saturating_add(if card_or_move {
-                self.creature(actor).kind(content, PowerKind::Dexterity)
-            } else {
-                0
-            })
-            .max(0);
+        card: Option<Id>,
+        powered: bool,
+    ) -> (i16, bool) {
+        // No Block stops powered card block only (Entrench's unpowered block still lands).
+        if actor == Actor::Player
+            && card.is_some()
+            && powered
+            && self.creature(actor).power(power_id::NO_BLOCK) > 0
+        {
+            return (0, false);
+        }
+        // Fasten adds to powered Defend block only.
+        let fasten = card
+            .filter(|&id| powered && content.cards[id as usize].tags & DEFEND_TAG != 0)
+            .map_or(0, |_| self.creature(actor).power(power_id::FASTEN));
+        let combat = self.combat().unwrap();
+        let enchantment = match combat.plays.last().map(|play| play.card) {
+            Some(played) if actor == Actor::Player && card == Some(played.id) => {
+                match played.enchantment {
+                    Some(Enchantment::Nimble) => played.enchantment_amount,
+                    Some(Enchantment::Goopy) => played.enchantment_amount.saturating_sub(1),
+                    _ => 0,
+                }
+            }
+            _ => 0,
+        };
+        // Relic multipliers apply before Frail's floor, like the game's decimal block modifiers.
+        let factor = if actor == Actor::Player && card.is_some() {
+            let vitruvian = card
+                .is_some_and(|id| content.cards[id as usize].tags & MINION_TAG != 0)
+                && self.has_relic(content, "RELIC.VITRUVIAN_MINION");
+            (1 + vitruvian as i16) * self.relic_block_multiplier(content)
+        } else {
+            1
+        };
+        let base = base.saturating_add(fasten).saturating_add(enchantment);
+        // Dexterity and Frail need powered block; Unmovable any card or move block (Entrench).
+        let dexterity = if powered {
+            self.creature(actor).kind(content, PowerKind::Dexterity)
+        } else {
+            0
+        };
+        let mut amount = base.saturating_add(dexterity).max(0);
         for _ in 0..self.creature(actor).power(power_id::SHADOWMELD).max(0) {
             amount = amount.saturating_mul(2);
         }
+        let history = &combat.history;
         if actor == Actor::Player
-            && card_or_move
-            && self.combat().unwrap().history.block_gains
-                - if self.combat().unwrap().history.block_card
-                    == self.combat().unwrap().history.cards
-                {
-                    self.combat().unwrap().history.block_card_gains
+            && (powered || card.is_some())
+            && history.block_gains
+                - if history.block_card == self.play_key() {
+                    history.block_card_gains
                 } else {
                     0
                 }
@@ -5997,64 +5103,100 @@ impl Game {
         {
             amount = amount.saturating_mul(2);
         }
-        if card_or_move && self.creature(actor).kind(content, PowerKind::Frail) > 0 {
+        amount = amount.saturating_mul(factor);
+        if powered && self.creature(actor).kind(content, PowerKind::Frail) > 0 {
             amount = amount * 3 / 4;
         }
-        amount
+        (
+            amount,
+            amount > 0 || factor > 0 && base.saturating_add(dexterity) > 0,
+        )
     }
 
-    pub(super) fn apply_power(&mut self, content: &Content, actor: Actor, id: Id, mut amount: i16) {
-        if actor == Actor::Player
-            && id == power_id::STRENGTH
-            && amount > 0
-            && self.has_relic(content, "RELIC.RUINED_HELMET")
-            && !self.combat().unwrap().ruined_helmet
+    /// Vambrace doubles the block of the first card that gains block; Pael's Legion doubles all
+    /// card block (a Sly card auto-played by it included) until that first card's play finishes.
+    fn relic_block_multiplier(&self, content: &Content) -> i16 {
+        let combat = self.combat().unwrap();
+        let instance = combat.plays.last().map_or(0, |play| play.card.instance);
+        let first = combat.block_doubler.is_none_or(|card| card == instance);
+        let vambrace = first && !combat.vambrace && self.has_relic(content, "RELIC.VAMBRACE");
+        let legion = combat.paels_legion == 0 && self.has_relic(content, "RELIC.PAELS_LEGION");
+        (1 + vambrace as i16) * (1 + legion as i16)
+    }
+
+    /// AfterModifyingBlockAmount: the first card whose block a doubler raised claims it.
+    fn claim_block_doubler(
+        &mut self,
+        content: &Content,
+        actor: Actor,
+        amount: i16,
+        card: Option<Id>,
+    ) {
+        if amount > 0
+            && actor == Actor::Player
+            && card.is_some()
+            && self.combat().unwrap().block_doubler.is_none()
+            && self.relic_block_multiplier(content) > 1
         {
-            amount *= 2;
-            self.combat_mut().unwrap().ruined_helmet = true;
+            let combat = self.combat_mut().unwrap();
+            combat.block_doubler = Some(combat.plays.last().map_or(0, |play| play.card.instance));
         }
-        if matches!(actor, Actor::Enemy(_))
-            && (amount < 0 || content.powers[id as usize].debuff && amount > 0)
-            && self.has_relic(content, "RELIC.UNSETTLING_LAMP")
-            && !self.combat().unwrap().unsettling_used
-            && !self.combat().unwrap().enemy_turn
-            && let Some(card) = self
-                .combat()
-                .unwrap()
-                .auto_plays
-                .last()
-                .map(|play| play.card.id)
-                .or(self.combat().unwrap().playing.map(|card| card.id))
-        {
-            if self.combat().unwrap().unsettling_lamp.is_none() {
-                self.combat_mut().unwrap().unsettling_lamp = Some(card);
+    }
+
+    /// Identifies the current card play: each replay of a series is its own play (CardPlay).
+    fn play_key(&self) -> i32 {
+        let combat = self.combat().unwrap();
+        let index = 256 * combat.plays.len() as i32
+            + combat.plays.last().map_or(0, |play| play.done as i32);
+        combat.history.cards as i32 * 4096 + index
+    }
+
+    pub(super) fn apply_power(&mut self, content: &Content, actor: Actor, id: Id, amount: i16) {
+        // Dead enemies can't receive powers (e.g. Reaper Form's Doom on the creature it killed).
+        if matches!(actor, Actor::Enemy(_)) && self.creature(actor).hp <= 0 {
+            return;
+        }
+        // Feral counts the zero-energy attacks already started this turn (AfterApplied).
+        if actor == Actor::Player && id == power_id::FERAL && self.creature(actor).power(id) == 0 {
+            let history = &mut self.combat_mut().unwrap().history;
+            history.feral_returns = history.zero_attacks;
+        }
+        // Tangled entangles every attack, Ringing every card, that has no affliction yet.
+        if actor == Actor::Player && amount > 0 && self.creature(actor).power(id) == 0 {
+            match id {
+                power_id::TANGLED => {
+                    self.afflict_all(content, Affliction::Entangled, &[CardType::Attack])
+                }
+                power_id::RINGING => self.afflict_all(content, Affliction::Ringing, &[]),
+                _ => {}
             }
-            if self.combat().unwrap().unsettling_lamp == Some(card) {
-                amount *= 2;
+        }
+        // Sword Sage adds replays to every Sovereign Blade in combat (TryAddReplays).
+        if actor == Actor::Player && id == power_id::SWORD_SAGE {
+            let combat = self.combat_mut().unwrap();
+            for card in combat
+                .draw
+                .iter_mut()
+                .chain(&mut combat.hand)
+                .chain(&mut combat.discard)
+                .chain(&mut combat.exhaust)
+                .chain(combat.plays.iter_mut().map(|play| &mut play.card))
+                .chain(played(&mut combat.queue))
+                .filter(|card| card.id == card_id::SOVEREIGN_BLADE)
+            {
+                card.replays = (card.replays as i16 + amount).clamp(0, u8::MAX as i16) as u8;
             }
         }
-        if id == power_id::POISON
-            && matches!(actor, Actor::Enemy(_))
-            && amount > 0
-            && self.has_relic(content, "RELIC.SNECKO_SKULL")
-        {
-            amount += 1;
-        }
+        let amount = self.modify_power_amount(content, actor, id, amount);
         if content.powers[id as usize].debuff {
             self.apply_debuff(content, actor, id, amount);
         } else {
-            let energy = actor == Actor::Player
-                && matches!(
-                    id,
-                    power_id::DEMESNE | power_id::FRIENDSHIP | power_id::PYRE
-                );
             let before = self.creature(actor).power(id);
             if actor == Actor::Player && id == power_id::ORBIT && amount != 0 {
                 self.creature_mut(actor).powers.push(Power {
                     id,
                     amount,
-                    skip_next_decay: false,
-                    value: 0,
+                    ..Power::default()
                 });
             } else if id == power_id::RITUAL && before == 0 {
                 self.creature_mut(actor)
@@ -6079,15 +5221,49 @@ impl Game {
             {
                 power.value += 1;
             }
-            if energy {
-                let delta = self.creature(actor).power(id).saturating_sub(before);
-                let max_energy = self.combat().unwrap().max_energy.saturating_add(delta);
-                self.combat_mut().unwrap().max_energy = max_energy;
-            }
             if actor == Actor::Player && id == power_id::PHANTOM_BLADES {
                 self.retain_shivs(content);
             }
         }
+    }
+
+    /// Hook.ModifyPowerAmount: Ruined Helmet doubles the first Strength gain; Snecko Skull adds
+    /// to Poison before Unsettling Lamp doubles every debuff of the combat's first debuffing card.
+    fn modify_power_amount(&mut self, content: &Content, actor: Actor, id: Id, amount: i16) -> i16 {
+        let mut amount = amount;
+        if actor == Actor::Player
+            && id == power_id::STRENGTH
+            && amount > 0
+            && self.has_relic(content, "RELIC.RUINED_HELMET")
+            && !self.combat().unwrap().ruined_helmet
+        {
+            amount *= 2;
+            self.combat_mut().unwrap().ruined_helmet = true;
+        }
+        if id == power_id::POISON
+            && matches!(actor, Actor::Enemy(_))
+            && amount > 0
+            && self.has_relic(content, "RELIC.SNECKO_SKULL")
+        {
+            amount += 1;
+        }
+        // Power and relic hooks apply their debuffs with no card source.
+        if !self.combat().unwrap().applying_hook
+            && matches!(actor, Actor::Enemy(_))
+            && (amount < 0 || content.powers[id as usize].debuff && amount > 0)
+            && self.has_relic(content, "RELIC.UNSETTLING_LAMP")
+            && !self.combat().unwrap().unsettling_used
+            && !self.combat().unwrap().enemy_turn
+            && let Some(card) = self.combat().unwrap().plays.last().map(|play| play.card.id)
+        {
+            if self.combat().unwrap().unsettling_lamp.is_none() {
+                self.combat_mut().unwrap().unsettling_lamp = Some(card);
+            }
+            if self.combat().unwrap().unsettling_lamp == Some(card) {
+                return amount * 2;
+            }
+        }
+        amount
     }
 
     fn apply_debuff(&mut self, content: &Content, actor: Actor, id: Id, amount: i16) -> bool {
@@ -6119,8 +5295,7 @@ impl Game {
                 self.creature_mut(actor).powers.push(Power {
                     id,
                     amount: 0,
-                    skip_next_decay: false,
-                    value: 0,
+                    ..Power::default()
                 });
                 return true;
             }
@@ -6135,16 +5310,17 @@ impl Game {
                 .add_power_with_skip_next_decay(id, amount, skip_next_decay);
             if actor == Actor::Player && id == power_id::DAMPEN && new {
                 let combat = self.combat_mut().unwrap();
-                for pile in [
-                    &mut combat.draw,
-                    &mut combat.hand,
-                    &mut combat.discard,
-                    &mut combat.exhaust,
-                ] {
-                    for card in pile.iter_mut().filter(|card| card.upgrades > 0) {
-                        combat.dampened.push((card.instance, card.upgrades));
-                        card.upgrades = 0;
-                    }
+                for card in combat
+                    .draw
+                    .iter_mut()
+                    .chain(&mut combat.hand)
+                    .chain(&mut combat.discard)
+                    .chain(&mut combat.exhaust)
+                    .chain(played(&mut combat.queue))
+                    .filter(|card| card.upgrades > 0)
+                {
+                    combat.dampened.push((card.instance, card.upgrades));
+                    card.upgrades = 0;
                 }
             }
             if matches!(id, power_id::ENFEEBLING_TOUCH | power_id::MANGLE) {
@@ -6155,14 +5331,12 @@ impl Game {
                 self.combat_mut().unwrap().history.doom_applied += 1;
                 let block = self.creature(Actor::Player).power(power_id::SHROUD).max(0);
                 if block > 0 {
-                    self.creature_mut(Actor::Player).block =
-                        self.creature(Actor::Player).block.saturating_add(block);
-                    self.trigger(content, Trigger::BlockGained, Actor::Player, block);
+                    self.gain_block(content, Actor::Player, block, None, false);
                 }
             }
-            if matches!(actor, Actor::Enemy(_))
-                && !matches!(id, power_id::ENFEEBLING_TOUCH | power_id::MANGLE)
-            {
+            // Sleight of Flesh needs the player as applier; enemy-turn debuffs (Plow) come from enemies.
+            // Temporary Strength downs (Enfeebling Touch, Mangle) count once, through their Strength.
+            if matches!(actor, Actor::Enemy(_)) && !self.combat().unwrap().enemy_turn {
                 let damage = self
                     .creature(Actor::Player)
                     .power(power_id::SLEIGHT_OF_FLESH);
@@ -6245,17 +5419,26 @@ impl Game {
         else {
             return;
         };
-        self.damage(
-            content,
-            actor,
-            actor,
-            power.amount,
-            DamageKind::Unblockable,
-            None,
-        );
-        self.resolve(content);
-        if self.creature(actor).hp > 0 && self.creature(actor).power(power.id) > 0 {
-            self.creature_mut(actor).consume_power(power.id);
+        // Accelerant makes enemy Poison tick extra times, at most once per stack.
+        let accelerant = match actor {
+            Actor::Enemy(_) => self
+                .creature(Actor::Player)
+                .power(power_id::ACCELERANT)
+                .max(0),
+            _ => 0,
+        };
+        for _ in 0..(1 + accelerant).min(power.amount) {
+            let amount = self.creature(actor).power(power.id);
+            if self.creature(actor).hp <= 0 || amount <= 0 {
+                break;
+            }
+            // The hit's own hooks resolve before the decrement.
+            let base = self.combat().unwrap().queue.len();
+            self.damage(content, actor, actor, amount, DamageKind::Unblockable, None);
+            self.settle(content, base);
+            if self.creature(actor).hp > 0 && self.creature(actor).power(power.id) > 0 {
+                self.creature_mut(actor).consume_power(power.id);
+            }
         }
     }
 
@@ -6269,7 +5452,13 @@ impl Game {
         {
             return;
         }
-        self.combat_mut().unwrap().orb_slots = self.combat().unwrap().orb_slots.max(1);
+        // Only characters without base orb slots get one; a Defect with no slots channels nothing.
+        if content.characters[self.run.character as usize].orb_slots == 0 {
+            self.combat_mut().unwrap().orb_slots = self.combat().unwrap().orb_slots.max(1);
+        }
+        if self.combat().unwrap().orb_slots == 0 {
+            return;
+        }
         if id == orb_id::LIGHTNING {
             let combat = self.combat_mut().unwrap();
             combat.lightning_channeled = combat.lightning_channeled.saturating_add(1);
@@ -6278,8 +5467,21 @@ impl Game {
             let mut pending = std::mem::take(&mut self.combat_mut().unwrap().queue);
             self.evoke(content, true);
             self.resolve(content);
-            pending.append(&mut self.combat_mut().unwrap().queue);
-            self.combat_mut().unwrap().queue = pending;
+            let combat = self.combat_mut().unwrap();
+            // An evoke kill can restore Dampen's upgrades mid-play; the card's remaining effects
+            // read the restored upgrade.
+            if let Some(card) =
+                (combat.plays.first().map(|play| play.card)).filter(|card| card.upgrades > 0)
+            {
+                for entry in pending
+                    .iter_mut()
+                    .filter(|entry| entry.context.card == Some(card.id) && !entry.context.hook)
+                {
+                    entry.context.upgraded = true;
+                }
+            }
+            pending.append(&mut combat.queue);
+            combat.queue = pending;
         }
         self.combat_mut().unwrap().orbs.push(Orb {
             id,
@@ -6287,12 +5489,22 @@ impl Game {
         });
         let combat = self.combat_mut().unwrap();
         combat.orbs_channeled = combat.orbs_channeled.saturating_add(1);
+        // Metronome hits at once (AfterOrbChanneled), so a kill stops the remaining channels.
+        // One damage command hits every enemy before any death resolves (Crab Rage).
         if self.combat().unwrap().orbs_channeled == 7 && self.has_relic(content, "RELIC.METRONOME")
         {
-            self.combat_mut().unwrap().queue.push(Pending {
-                effect: Effect::Damage(Target::AllEnemies, Amount::fixed(30, 30)),
-                context: Context::player(),
-            });
+            let previous = self.combat_mut().unwrap().pending_hits.replace(vec![]);
+            for enemy in self.targets(content, Target::AllEnemies, Context::player()) {
+                self.damage(
+                    content,
+                    Actor::Player,
+                    enemy,
+                    30,
+                    DamageKind::Unpowered,
+                    None,
+                );
+            }
+            self.resolve_deaths(content, previous);
         }
     }
 
@@ -6307,41 +5519,44 @@ impl Game {
         };
         let def = content.orbs[orb.id as usize];
         let context = Context {
-            source: Actor::Player,
-            target: None,
-            card: None,
-            upgraded: false,
-            x: 0,
             event: orb.value,
             orb: true,
             orb_id: Some(orb.id),
-            pen_nib: false,
+            ..Context::player()
         };
         push_effects(&mut self.combat_mut().unwrap().queue, def.evoke, context);
     }
 
+    /// Only the turn's own orb passives (OrbQueue) trigger the first orb again for Gold-Plated Cables.
     fn passive_orbs(&mut self, content: &Content, timing: OrbTiming) {
         let orbs = self.combat().unwrap().orbs.clone();
         for (index, orb) in orbs.into_iter().enumerate().rev() {
             if content.orbs[orb.id as usize].timing == timing {
-                self.passive_orb(content, Some(index));
+                let triggers = 1
+                    + (index == 0) as usize
+                        * self.relic_count(content, "RELIC.GOLD_PLATED_CABLES") as usize;
+                self.passive_orb_target(content, index, None, triggers);
             }
         }
     }
 
     pub(super) fn passive_orb(&mut self, content: &Content, index: Option<usize>) {
         let Some(index) = index else { return };
-        self.passive_orb_target(content, index, None);
+        self.passive_orb_target(content, index, None, 1);
     }
 
-    fn passive_orb_target(&mut self, content: &Content, index: usize, target: Option<usize>) {
+    fn passive_orb_target(
+        &mut self,
+        content: &Content,
+        index: usize,
+        target: Option<usize>,
+        triggers: usize,
+    ) {
         let Some(orb) = self.combat().unwrap().orbs.get(index).copied() else {
             return;
         };
         let def = content.orbs[orb.id as usize];
         let focus = self.creature(Actor::Player).kind(content, PowerKind::Focus);
-        let triggers =
-            1 + (index == 0 && self.has_relic(content, "RELIC.GOLD_PLATED_CABLES")) as usize;
         let mut contexts = Vec::with_capacity(triggers);
         for _ in 0..triggers {
             let value = self.combat().unwrap().orbs[index].value.saturating_add(
@@ -6353,15 +5568,11 @@ impl Game {
                 self.combat_mut().unwrap().orbs[index].value = (event - def.passive_decay).max(0);
             }
             contexts.push(Context {
-                source: Actor::Player,
                 target,
-                card: None,
-                upgraded: false,
-                x: 0,
                 event,
                 orb: target.is_some(),
                 orb_id: Some(orb.id),
-                pen_nib: false,
+                ..Context::player()
             });
         }
         for context in contexts.into_iter().rev() {
@@ -6369,232 +5580,7 @@ impl Game {
         }
     }
 
-    fn decay(&mut self, content: &Content, actor: Actor) {
-        let powers: Vec<_> = self
-            .creature(actor)
-            .powers
-            .iter()
-            .filter(|x| {
-                matches!(
-                    content.powers[x.id as usize].kind,
-                    PowerKind::Weak
-                        | PowerKind::Vulnerable
-                        | PowerKind::Frail
-                        | PowerKind::Intangible
-                ) || x.id == power_id::SHRINK && x.amount > 0
-            })
-            .map(|power| (power.id, power.skip_next_decay))
-            .collect();
-        for (id, skip) in powers {
-            if skip {
-                self.creature_mut(actor)
-                    .powers
-                    .iter_mut()
-                    .find(|power| power.id == id)
-                    .unwrap()
-                    .skip_next_decay = false;
-            } else {
-                self.creature_mut(actor).consume_power(id);
-            }
-        }
-        if matches!(actor, Actor::Enemy(_)) {
-            self.creature_mut(actor).consume_power(power_id::CONQUEROR);
-            self.creature_mut(actor).consume_power(power_id::DEBILITATE);
-            self.creature_mut(actor)
-                .powers
-                .retain(|power| power.id != power_id::SIC_EM);
-        }
-    }
-
-    pub(super) fn trigger(
-        &mut self,
-        content: &Content,
-        trigger: Trigger,
-        owner: Actor,
-        event: i16,
-    ) {
-        if trigger == Trigger::CardExhausted
-            && owner == Actor::Player
-            && self.has_relic(content, "RELIC.JOSS_PAPER")
-        {
-            self.joss_paper = (self.joss_paper + 1) % 5;
-            if self.joss_paper == 0 {
-                self.combat_mut().unwrap().queue.push(Pending {
-                    effect: Effect::Draw(1),
-                    context: Context::player(),
-                });
-            }
-        }
-        let target = match owner {
-            Actor::Player | Actor::Osty => None,
-            Actor::Enemy(i) => Some(i),
-        };
-        let context = Context {
-            source: owner,
-            target,
-            card: None,
-            upgraded: false,
-            x: 0,
-            event,
-            orb: false,
-            orb_id: None,
-            pen_nib: false,
-        };
-        let powers = self.creature(owner).powers.clone();
-        self.dispatch(content, trigger, owner, context, powers);
-    }
-
-    fn dispatch(
-        &mut self,
-        content: &Content,
-        trigger: Trigger,
-        owner: Actor,
-        context: Context,
-        powers: Vec<Power>,
-    ) {
-        for power in powers.into_iter().rev() {
-            if trigger == Trigger::TurnStart && power.id == power_id::FURNACE {
-                continue;
-            }
-            if trigger == Trigger::TurnEnd && power.id == power_id::MONARCHS_GAZE_STRENGTH_DOWN {
-                self.creature_mut(owner)
-                    .add_power(power_id::STRENGTH, power.amount);
-                self.creature_mut(owner)
-                    .powers
-                    .retain(|current| current.id != power.id);
-                continue;
-            }
-            if trigger == Trigger::TurnEnd && power.id == power_id::RITUAL && power.skip_next_decay
-            {
-                self.creature_mut(owner)
-                    .powers
-                    .iter_mut()
-                    .find(|current| current.id == power.id)
-                    .unwrap()
-                    .skip_next_decay = false;
-                continue;
-            }
-            if power.id == 79
-                && trigger == Trigger::TurnStart
-                && self.combat().is_some_and(|combat| combat.turn == 1)
-            {
-                continue;
-            }
-            if trigger == Trigger::CardPlayed
-                && power.id == power_id::ENRAGE
-                && context
-                    .card
-                    .is_some_and(|card| content.cards[card as usize].card_type == CardType::Skill)
-            {
-                self.apply_power(content, owner, power_id::STRENGTH, power.amount);
-            }
-            if trigger == Trigger::CardPlayed
-                && power.id == power_id::GALVANIC
-                && context
-                    .card
-                    .is_some_and(|card| content.cards[card as usize].card_type == CardType::Power)
-            {
-                self.damage(
-                    content,
-                    owner,
-                    Actor::Player,
-                    power.amount,
-                    DamageKind::Unpowered,
-                    None,
-                );
-            }
-            if trigger == Trigger::CardPlayed && power.id == power_id::WITHERING_PRESENCE {
-                let generate = {
-                    let power = self
-                        .creature_mut(owner)
-                        .powers
-                        .iter_mut()
-                        .find(|x| x.id == power.id)
-                        .unwrap();
-                    if power.value <= 0 {
-                        power.value = power.amount;
-                    }
-                    power.value -= 1;
-                    if power.value == 0 {
-                        power.value = 6;
-                        true
-                    } else {
-                        false
-                    }
-                };
-                if generate {
-                    self.combat_mut().unwrap().queue.push(Pending {
-                        effect: Effect::AddCard(Pile::Hand, card_id::WITHER, 1),
-                        context,
-                    });
-                }
-            }
-            if trigger == Trigger::TurnEnd
-                && matches!(
-                    power.id,
-                    power_id::FOCUSED_STRIKE | power_id::HOTFIX | power_id::SYNCHRONIZE
-                )
-            {
-                self.creature_mut(owner)
-                    .add_power(power_id::FOCUS, -power.amount);
-            }
-            if matches!(content.powers[power.id as usize].kind, PowerKind::OneShot(at) if at == trigger)
-            {
-                self.combat_mut().unwrap().queue.push(Pending {
-                    effect: Effect::RemovePower(Target::Source, power.id),
-                    context,
-                });
-            }
-            for hook in content.powers[power.id as usize]
-                .hooks
-                .iter()
-                .rev()
-                .filter(|x| x.trigger == trigger)
-            {
-                let mut context = context;
-                if matches!(
-                    trigger,
-                    Trigger::PowerPlayed | Trigger::CardDrawn | Trigger::CardGenerated
-                ) {
-                    context.event = power.amount;
-                }
-                push_effects(&mut self.combat_mut().unwrap().queue, hook.effects, context);
-            }
-        }
-        if owner == Actor::Player {
-            for i in (0..self.run.relics.len()).rev() {
-                if self.melted_relics.contains(&i) {
-                    continue;
-                }
-                let id = self.run.relics[i];
-                for hook in content.relics[id as usize]
-                    .hooks
-                    .iter()
-                    .rev()
-                    .filter(|x| x.trigger == trigger)
-                {
-                    push_effects(&mut self.combat_mut().unwrap().queue, hook.effects, context);
-                }
-            }
-        }
-    }
-
     fn trigger_card(&mut self, content: &Content, card: Card, trigger: Trigger) {
-        if trigger == Trigger::CardExhausted
-            && !self.combat().unwrap().burning_sticks
-            && self.has_relic(content, "RELIC.BURNING_STICKS")
-            && card.card_type(content.cards[card.id as usize]) == CardType::Skill
-        {
-            self.combat_mut().unwrap().burning_sticks = true;
-            self.add_generated(
-                content,
-                Pile::Hand,
-                Card {
-                    instance: 0,
-                    ..card
-                },
-            );
-        }
         let context = Context {
             event: card.value,
             ..Context::card(card)
@@ -6610,6 +5596,16 @@ impl Game {
     }
 
     fn trigger_generated(&mut self, content: &Content, card: Id) {
+        // Withering Presence creates Wither with no creator, so player generation hooks
+        // (Regalite, Smokestack, ...) and the generated count (Supermassive) ignore it.
+        if card == card_id::WITHER {
+            return;
+        }
+        self.trigger_created(content, card);
+    }
+
+    /// Generation hooks for a card the player created (a transform into Wither included).
+    fn trigger_created(&mut self, content: &Content, card: Id) {
         self.combat_mut().unwrap().history.generated += 1;
         if content.cards[card as usize].tags & SHIV_TAG != 0
             && self.creature(Actor::Player).power(power_id::PHANTOM_BLADES) > 0
@@ -6617,20 +5613,13 @@ impl Game {
             self.retain_shivs(content);
         }
         let powers = self.creature(Actor::Player).powers.clone();
-        self.dispatch(
+        self.fire(
             content,
-            Trigger::CardGenerated,
-            Actor::Player,
+            Trigger::AfterCardGeneratedForCombat,
             Context {
-                source: Actor::Player,
-                target: None,
                 card: Some(card),
-                upgraded: false,
-                x: 0,
                 event: 1,
-                orb: false,
-                orb_id: None,
-                pen_nib: false,
+                ..Context::player()
             },
             powers,
         );
@@ -6657,21 +5646,30 @@ impl Game {
                     .card
                     .is_some_and(|card| content.cards[card as usize].id == "CARD.GOLD_AXE") =>
             {
-                combat.total_cards
+                // Gold Axe counts finished plays; its own later replays haven't happened yet, nor
+                // have the plays it's auto-played inside (Uproar, Havoc).
+                combat.total_cards - (combat.unfinished() - 1).max(0)
             }
             Scale::CardsPlayed => combat.history.cards,
             Scale::AttacksPlayed => combat.history.attacks,
-            Scale::PriorAttacks => (combat.history.attacks - 1).max(0),
-            Scale::SkillsPlayed => combat.history.skills,
-            Scale::EnergySpent => combat.history.energy,
+            // Finished attack plays, the playing series' earlier ones included (Duplication).
+            Scale::PriorAttacks => self.played_this_turn(content, CardType::Attack),
+            // Lunar Blast counts finished skill plays, so skills still resolving don't count.
+            Scale::SkillsPlayed => self.finished_plays(content, CardType::Skill),
+            // Helix Drill leaves out its own cost while it's being played.
+            Scale::EnergySpent => {
+                combat.history.energy
+                    - combat.plays.last().map(|play| play.card).map_or(0, |card| {
+                        card_cost(card, content.cards[card.id as usize], combat.energy)
+                    })
+            }
             Scale::Exhausted => combat.history.exhausted,
             Scale::HpLost => combat.history.hp_lost,
             Scale::HpLossEvents => combat.history.hp_loss_events,
             Scale::CardValue => combat
-                .auto_plays
+                .plays
                 .last()
                 .map(|play| play.card)
-                .or(combat.playing)
                 .map_or(context.event, |card| card.value),
             Scale::LivingEnemies => {
                 combat.enemies.iter().filter(|x| x.creature.hp > 0).count() as i16
@@ -6697,14 +5695,45 @@ impl Game {
                 self.creature(Actor::Enemy(target)).power(id) / divisor.max(1)
             }),
             Scale::Tagged(tag) => {
+                // Cards waiting in the play pile (Cascade's picks, played cards not yet placed)
+                // count too; the card being played is counted below.
+                let play_pile = combat
+                    .queue
+                    .iter()
+                    .filter_map(|pending| match pending.effect {
+                        Effect::AutoPlay(card) | Effect::PlacePlayed(card, ..)
+                            if card.flags & DUPE == 0
+                                && !(combat.plays.iter())
+                                    .any(|play| play.card.instance == card.instance) =>
+                        {
+                            Some(card)
+                        }
+                        _ => None,
+                    });
+                // So do plays still resolving under the current one (Pommel Strike whose draw let
+                // Hellraiser auto-play this card).
+                let current = combat.plays.last().map(|play| play.card.instance);
+                let resolving = (combat.plays.iter().map(|play| play.card))
+                    .filter(|card| Some(card.instance) != current && card.flags & DUPE == 0);
                 let piles = combat
                     .draw
                     .iter()
                     .chain(&combat.hand)
                     .chain(&combat.discard)
-                    .chain(&combat.exhaust);
+                    .chain(&combat.exhaust)
+                    .copied()
+                    .chain(play_pile)
+                    .chain(resolving);
+                // A queued pick still sitting in its pile (Beat Down's later picks) counts once.
+                let mut seen = Vec::new();
                 piles
-                    .filter(|card| content.cards[card.id as usize].tags & tag != 0)
+                    .filter(|card| {
+                        content.cards[card.id as usize].tags & tag != 0 && {
+                            let new = !seen.contains(&card.instance);
+                            seen.push(card.instance);
+                            new
+                        }
+                    })
                     .count() as i16
                     + context
                         .card
@@ -6722,7 +5751,7 @@ impl Game {
             Scale::HandType(kind) => combat
                 .hand
                 .iter()
-                .filter(|card| content.cards[card.id as usize].card_type == kind)
+                .filter(|card| card.card_type(content.cards[card.id as usize]) == kind)
                 .count() as i16,
             Scale::EnemyPowerTotal(id) => combat
                 .enemies
@@ -6735,28 +5764,56 @@ impl Game {
                 creature
                     .powers
                     .iter()
+                    // Temporary Strength downs count through their Strength alone.
                     .filter(|power| {
                         content.powers[power.id as usize].debuff
-                            || power.id == power_id::STRENGTH
-                                && power.amount < 0
-                                && creature.power(power_id::RESTORE_STRENGTH) == 0
+                            && !matches!(power.id, power_id::ENFEEBLING_TOUCH | power_id::MANGLE)
+                            || power.id == power_id::STRENGTH && power.amount < 0
                     })
                     .count() as i16
             }),
             Scale::Discarded => combat.history.discarded,
             Scale::DrawnCombat => combat.drawn,
-            Scale::StarCards => combat
-                .draw
-                .iter()
-                .chain(&combat.hand)
-                .chain(&combat.discard)
-                .chain(&combat.exhaust)
-                .chain(combat.playing.iter())
-                .chain(combat.auto_plays.iter().map(|play| &play.card))
-                .filter(|card| {
-                    content.cards[card.id as usize].star_cost[card.upgrades.min(1) as usize] != -1
-                })
-                .count() as i16,
+            Scale::StarCards => {
+                // AllCards includes the play pile (cards waiting for their result pile) and cards
+                // queued to auto-play that left their pile (Distilled Chaos's picks).
+                let held: Vec<&Card> = combat
+                    .draw
+                    .iter()
+                    .chain(&combat.hand)
+                    .chain(&combat.discard)
+                    .chain(&combat.exhaust)
+                    .chain(combat.plays.iter().map(|play| &play.card))
+                    .chain(
+                        combat
+                            .queue
+                            .iter()
+                            .filter_map(|pending| match &pending.effect {
+                                Effect::PlacePlayed(card, ..) => Some(card),
+                                _ => None,
+                            }),
+                    )
+                    .collect();
+                let queued = combat
+                    .queue
+                    .iter()
+                    .filter_map(|pending| match &pending.effect {
+                        Effect::AutoPlay(card)
+                            if !held.iter().any(|other| other.instance == card.instance) =>
+                        {
+                            Some(card)
+                        }
+                        _ => None,
+                    });
+                held.iter()
+                    .copied()
+                    .chain(queued)
+                    .filter(|card| {
+                        content.cards[card.id as usize].star_cost[card.upgrades.min(1) as usize]
+                            != -1
+                    })
+                    .count() as i16
+            }
             Scale::StarsGained => combat.history.stars_gained,
             Scale::Generated => combat.history.generated,
             Scale::PriorTargetHits => context
@@ -6806,7 +5863,7 @@ impl Game {
                 .unwrap()
                 .hand
                 .iter()
-                .all(|card| content.cards[card.id as usize].card_type != kind),
+                .all(|card| card.card_type(content.cards[card.id as usize]) != kind),
             Condition::HandEmpty => self.combat().unwrap().hand.is_empty(),
             Condition::EventAtLeast(value) => context.event >= value,
             Condition::ExhaustAtLeast(count) => {
@@ -6814,22 +5871,35 @@ impl Game {
             }
             Condition::ExhaustedThisTurn => self.combat().unwrap().history.exhausted > 0,
             Condition::HpLostThisTurn => self.combat().unwrap().history.hp_lost > 0,
-            Condition::TargetDead => context
-                .target
-                .is_some_and(|x| self.creature(Actor::Enemy(x)).hp <= 0),
+            // Feed, The Hunt and Hand of Greed need a fatal kill, which Minion denies, and Reattach
+            // denies unless every other segment is dead too.
+            // The card's own attack must have landed the kill (a replay on a corpse doesn't).
+            Condition::TargetDead => context.target.is_some_and(|x| {
+                self.combat().unwrap().last_killed
+                    && (self.fatal(x as usize)
+                        || !context.card.is_some_and(|card| {
+                            matches!(
+                                content.cards[card as usize].id,
+                                "CARD.FEED" | "CARD.THE_HUNT" | "CARD.HAND_OF_GREED"
+                            )
+                        }))
+            }),
             Condition::FirstTurn => self.combat().unwrap().turn == 1,
             Condition::HasOrb(id) => self.combat().unwrap().orbs.iter().any(|orb| orb.id == id),
             Condition::CardType(kind) => context
                 .card
                 .is_some_and(|id| content.cards[id as usize].card_type == kind),
+            // FTL counts finished plays: not the card playing it (Beat Down) nor itself.
             Condition::PriorCardsBelow(count) => {
-                self.combat().unwrap().history.cards - 1 < count[context.upgraded as usize] as i16
+                let combat = self.combat().unwrap();
+                combat.history.cards - combat.unfinished() < count[context.upgraded as usize] as i16
             }
             Condition::TargetAttacking => context.target.is_some_and(|target| {
                 let enemy = &self.combat().unwrap().enemies[target];
-                effects_attack(
-                    content.enemies[enemy.creature.id as usize].moves[enemy.move_index].effects,
-                )
+                let def = &content.enemies[enemy.creature.id as usize];
+                !enemy.stunned
+                    && (def.moves[enemy.move_index].intent.starts_with("Attack")
+                        || effects_attack(def.moves[enemy.move_index].effects))
             }),
             Condition::XAtLeast(value) => context.x >= value,
             Condition::OstyAlive => self.creature(Actor::Osty).hp > 0,
@@ -6838,7 +5908,11 @@ impl Game {
         }
     }
 
-    fn targets(&mut self, target: Target, context: Context) -> Vec<Actor> {
+    fn targets(&mut self, content: &Content, target: Target, context: Context) -> Vec<Actor> {
+        // A card's target is a creature, not a slot: a respawn into the slot (Axebot's Stock)
+        // isn't the creature the card was played on.
+        let targeted =
+            |instance, context: Context| context.target_instance.is_none_or(|x| x == instance);
         match target {
             Target::Source => vec![context.source],
             Target::Player => vec![Actor::Player],
@@ -6859,17 +5933,32 @@ impl Game {
             Target::ChosenEnemy => context
                 .target
                 .filter(|&x| {
-                    self.combat()
-                        .unwrap()
-                        .enemies
-                        .get(x)
-                        .is_some_and(|enemy| enemy.creature.hp > 0)
+                    self.combat().unwrap().enemies.get(x).is_some_and(|enemy| {
+                        enemy.creature.hp > 0 && targeted(enemy.instance, context)
+                    })
                 })
                 .map(|x| vec![Actor::Enemy(x)])
                 .unwrap_or_default(),
+            // Reviving enemies cannot receive powers.
             Target::ChosenEnemyOrDead => context
                 .target
-                .filter(|&index| self.combat().unwrap().enemies.get(index).is_some())
+                .filter(|&index| {
+                    self.combat()
+                        .unwrap()
+                        .enemies
+                        .get(index)
+                        .is_some_and(|enemy| {
+                            targeted(enemy.instance, context)
+                                && (enemy.creature.hp > 0
+                                    || [
+                                        power_id::ILLUSION,
+                                        power_id::REATTACH,
+                                        power_id::ADAPTABLE,
+                                    ]
+                                    .iter()
+                                    .all(|&power| enemy.creature.power(power) == 0))
+                        })
+                })
                 .map(|index| vec![Actor::Enemy(index)])
                 .unwrap_or_default(),
             Target::AllEnemies => self
@@ -6898,36 +5987,14 @@ impl Game {
                 .map(|(i, _)| Actor::Enemy(i))
                 .collect(),
             Target::RandomEnemy => {
+                // Orbs aimed by a card (Tesla Coil) hit that target even if it already died.
                 if context.orb
                     && let Some(target) = context.target
-                    && self
-                        .combat()
-                        .unwrap()
-                        .enemies
-                        .get(target)
-                        .is_some_and(|enemy| enemy.creature.hp > 0)
                 {
-                    return vec![Actor::Enemy(target)];
+                    let alive = self.combat().unwrap().enemies[target].creature.hp > 0;
+                    return Vec::from_iter(alive.then_some(Actor::Enemy(target)));
                 }
-                let alive: Vec<_> = self
-                    .combat()
-                    .unwrap()
-                    .enemies
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, x)| x.creature.hp > 0)
-                    .map(|(i, _)| Actor::Enemy(i))
-                    .collect();
-                if alive.is_empty() {
-                    vec![]
-                } else {
-                    let choice = if self.expectation.is_some() {
-                        self.expectation_choice(alive.len()).unwrap_or(0)
-                    } else {
-                        self.rngs.combat_targets.below(alive.len() as u32) as usize
-                    };
-                    vec![alive[choice]]
-                }
+                Vec::from_iter(self.random_enemy(content).map(Actor::Enemy))
             }
             Target::LowestHpEnemy => self
                 .combat()
@@ -6954,6 +6021,12 @@ impl Game {
         optional: bool,
     ) {
         let random = random && count != u8::MAX;
+        // Dredge and Neow's Fury only pick what fits in hand.
+        let count = if pile == Pile::Discard && op == CardOp::Move(Pile::Hand) && count > 1 {
+            count.min(10u8.saturating_sub(self.combat().unwrap().hand.len() as u8))
+        } else {
+            count
+        };
         let candidates: Vec<_> = cards(self.combat().unwrap(), pile)
             .iter()
             .enumerate()
@@ -6961,7 +6034,14 @@ impl Game {
             .map(|(i, _)| i)
             .collect();
         let count = count.min(candidates.len() as u8);
-        let random = random && count as usize != candidates.len();
+        let take_random = random && matches!(op, CardOp::Upgrade);
+        let random = random && (count as usize != candidates.len() || count == 1 || take_random);
+        if !random
+            && pile != Pile::Offer
+            && (self.enemies_defeated() || self.creature(Actor::Player).hp <= 0)
+        {
+            return;
+        }
         if random {
             let mut candidates = candidates;
             if self.expectation.is_some() {
@@ -6971,7 +6051,7 @@ impl Game {
                     selected.push(candidates.swap_remove(index));
                 }
                 candidates = selected;
-            } else if count == 1 {
+            } else if count == 1 && !take_random {
                 let index = self
                     .rngs
                     .combat_card_selection
@@ -6986,8 +6066,54 @@ impl Game {
             for index in candidates {
                 removed += self.apply_card_op(content, pile, index - removed, op) as usize;
             }
-        } else if !optional && count as usize == candidates.len() {
+        } else if count > 0
+            && self.combat().unwrap().queue.iter().any(
+                |pending| matches!(pending.effect, Effect::WhisperingEarring(played) if played > 0),
+            )
+        {
+            // Whispering Earring's selector takes the first options; a draw pile is listed from
+            // its top, then ordered by rarity and id (CardSelectCmd.FromCombatPile).
+            let mut candidates = candidates;
             if pile == Pile::Draw {
+                candidates.reverse();
+                let pile_cards = cards(self.combat().unwrap(), pile);
+                candidates.sort_by_key(|&index| {
+                    let def = content.cards[pile_cards[index].id as usize];
+                    let rarity = match def.card_type {
+                        CardType::Status => 8,
+                        CardType::Curse => 9,
+                        _ if TOKEN_CARDS.contains(&def.id) => 7,
+                        _ => match def.rarity {
+                            CardRarity::Basic => 1,
+                            CardRarity::Common => 2,
+                            CardRarity::Uncommon => 3,
+                            CardRarity::Rare => 4,
+                            CardRarity::Ancient => 5,
+                            CardRarity::Event => 6,
+                            CardRarity::Quest => 10,
+                        },
+                    };
+                    (rarity, def.id)
+                });
+            }
+            candidates.truncate(count as usize);
+            candidates.sort_unstable();
+            // Several picked cards go through one CardCmd.Discard: every discard first, then the
+            // Sly cards auto-play in hand order.
+            if pile == Pile::Hand && op == CardOp::Move(Pile::Discard) && candidates.len() > 1 {
+                self.discard_indices(content, &candidates);
+                return;
+            }
+            let mut removed = 0;
+            for index in candidates {
+                removed += self.apply_card_op(content, pile, index - removed, op) as usize;
+            }
+        } else if !optional && count as usize == candidates.len() {
+            if pile == Pile::Hand && op == CardOp::Move(Pile::Discard) && candidates.len() > 1 {
+                let mut candidates = candidates;
+                candidates.sort_unstable();
+                self.discard_indices(content, &candidates);
+            } else if pile == Pile::Draw {
                 for index in candidates.into_iter().rev() {
                     self.apply_card_op(content, pile, index, op);
                 }
@@ -7013,10 +6139,10 @@ impl Game {
             CardOp::Move(to) => {
                 let card = self.remove_pile(pile, index);
                 let sly = pile == Pile::Hand && to == Pile::Discard && self.is_sly(content, card);
-                if pile == Pile::Hand && to == Pile::Discard {
+                let discarded = pile == Pile::Hand && to == Pile::Discard;
+                if discarded {
                     self.expectation_discard(1);
                     self.combat_mut().unwrap().history.discarded += 1;
-                    self.after_discard(content, 1);
                 }
                 if !sly {
                     if to == Pile::Hand {
@@ -7026,58 +6152,75 @@ impl Game {
                     }
                 }
                 if sly {
-                    self.sly(content, card);
+                    self.auto_play_off_pile(card);
                 }
-                if pile == Pile::Hand {
-                    self.unceasing_top(content);
+                // AfterCardDiscarded (Tingsha, Tough Bandages) resolves before the Sly auto-play.
+                if discarded {
+                    self.after_discard(content, 1);
                 }
                 if to == Pile::Exhaust {
-                    self.combat_mut().unwrap().history.exhausted += 1;
-                    self.trigger(content, Trigger::CardExhausted, Actor::Player, 1);
-                    self.trigger_card(content, card, Trigger::CardExhausted);
+                    self.thrash_gain(content, card);
+                    self.exhausted(content, card, false);
                 }
                 return true;
             }
-            CardOp::Upgrade => self.pile_mut(pile)[index].upgrades = 1,
-            CardOp::Cost(delta) => {
-                let card = &mut self.pile_mut(pile)[index];
-                card.cost_delta = card.cost_delta.saturating_add(delta);
-            }
-            CardOp::SetCost(cost) => {
-                let card = self.pile_mut(pile)[index];
-                let base = content.cards[card.id as usize].cost[card.upgrades.min(1) as usize];
-                self.pile_mut(pile)[index].cost_delta = if base < 0 { 0 } else { cost - base };
-            }
+            // CardCmd.Upgrade does nothing once combat is ending.
+            CardOp::Upgrade if self.enemies_defeated() => {}
+            CardOp::Upgrade => self.pile_mut(pile)[index].upgrade(content),
+            CardOp::Cost(delta) => self.pile_mut(pile)[index].add_cost(delta, 0),
+            CardOp::SetCost(cost) => self.pile_mut(pile)[index].add_cost(cost, ABSOLUTE),
             CardOp::Flag(flag) => self.pile_mut(pile)[index].flags |= flag,
             CardOp::TurnFlag(flag) => self.pile_mut(pile)[index].turn_flags |= flag,
             CardOp::CopyNextTurn(count) => {
                 let mut card = self.pile_mut(pile)[index];
                 card.instance = 0;
-                card.free = false;
+                card.expire_costs(THIS_TURN);
                 card.turn_flags = 0;
                 self.combat_mut().unwrap().nightmares.push((card, count));
+                self.creature_mut(Actor::Player)
+                    .add_power(power_id::NIGHTMARE, count as i16);
             }
+            // Combat transforms count as generating the new card (Regalite, ...).
             CardOp::Transform(id, upgrades) => {
-                self.pile_mut(pile)[index] = Card {
+                let mut card = Card {
                     id,
                     upgrades,
                     ..Card::default()
-                }
+                };
+                self.afflict_new(content, &mut card);
+                self.pile_mut(pile)[index] = card;
+                self.trigger_generated(content, id);
             }
             CardOp::AutoPlay(count) => {
                 let card = self.remove_pile(pile, index);
-                self.combat_mut().unwrap().queue.push(Pending {
-                    effect: Effect::AutoPlay(card),
-                    context: Context::card(card),
-                });
+                let context = Context {
+                    off_pile: pile != Pile::Hand,
+                    ..Context::card(card)
+                };
+                // The repeats play the same card: a cost set until played (Snecko Oil) is gone
+                // after the first play, a Confused cost lasts the combat, and Razor Tooth's
+                // upgrade from the first play stays. The queue is a stack: repeats go under the first play.
+                // They find the card in its result pile, outside the hand (Void Form, Free Skill).
+                let razor_tooth = self.razor_tooth(content, card);
                 for _ in 1..count {
                     let mut replay = card;
                     replay.flags |= REPLAY;
+                    if razor_tooth {
+                        replay.upgrade(content);
+                    }
+                    replay.expire_costs(UNTIL_PLAYED);
                     self.combat_mut().unwrap().queue.push(Pending {
                         effect: Effect::AutoPlay(replay),
-                        context: Context::card(card),
+                        context: Context {
+                            off_pile: true,
+                            ..context
+                        },
                     });
                 }
+                self.combat_mut().unwrap().queue.push(Pending {
+                    effect: Effect::AutoPlay(card),
+                    context,
+                });
                 return true;
             }
             CardOp::CopySelected(count) => {
@@ -7088,8 +6231,9 @@ impl Game {
                 }
             }
             CardOp::TakeOffer => {
-                let card = self.remove_pile(pile, index);
+                let mut card = self.remove_pile(pile, index);
                 self.combat_mut().unwrap().offer.clear();
+                self.afflict_new(content, &mut card);
                 self.add_to_hand(card);
                 self.trigger_generated(content, card.id);
                 return true;
@@ -7097,7 +6241,7 @@ impl Game {
             CardOp::Transfigure => {
                 let card = &mut self.pile_mut(pile)[index];
                 if content.cards[card.id as usize].cost[card.upgrades.min(1) as usize] >= 0 {
-                    card.cost_delta = card.cost_delta.saturating_add(1);
+                    card.add_cost(1, 0);
                 }
                 card.replays = card.replays.saturating_add(1);
             }
@@ -7117,71 +6261,115 @@ impl Game {
             CardOp::TransformRandom => {
                 self.expectation_unknown();
                 let old = self.pile_mut(pile)[index];
-                let pool: Vec<_> = content.characters[self.run.character as usize]
-                    .cards
-                    .iter()
-                    .copied()
+                // In combat only cards that can be generated (CanBeGeneratedInCombat); NO_GENERATE
+                // also marks curses and statuses that only modifiers can't generate.
+                let status_or_curse = matches!(
+                    content.cards[old.id as usize].card_type,
+                    CardType::Status | CardType::Curse
+                );
+                let pool: Vec<_> = transform_options(content, old.id)
+                    .into_iter()
                     .filter(|&id| {
-                        id != old.id && content.cards[id as usize].flags[0] & NO_GENERATE == 0
+                        if status_or_curse {
+                            !matches!(
+                                content.cards[id as usize].id,
+                                "CARD.FRANTIC_ESCAPE" | "CARD.SOOT"
+                            )
+                        } else {
+                            content.cards[id as usize].flags[0] & NO_GENERATE == 0
+                        }
                     })
                     .collect();
                 if !pool.is_empty() {
-                    let mut rng = self.rngs.combat_card_generation;
-                    let id = pool[rng.below(pool.len() as u32) as usize];
-                    self.pile_mut(pile)[index] = Card {
+                    let id = if self.expectation.is_some() {
+                        pool[0]
+                    } else {
+                        pool[self.rngs.combat_card_selection.below(pool.len() as u32) as usize]
+                    };
+                    // CardFactory.CreateRandomCardForTransform: the new card is never upgraded.
+                    let mut card = Card {
                         id,
-                        upgrades: old.upgrades,
                         ..Card::default()
                     };
+                    self.afflict_new(content, &mut card);
+                    self.pile_mut(pile)[index] = card;
+                    self.trigger_created(content, id);
                 }
             }
             CardOp::DiscardDraw => {
                 let card = self.remove_pile(pile, index);
                 self.expectation_discard(1);
-                self.combat_mut().unwrap().discard.push(card);
-                self.combat_mut().unwrap().history.discarded += 1;
+                let combat = self.combat_mut().unwrap();
+                combat.discard.push(card);
+                combat.history.discarded += 1;
+                if combat.discard_draw.1.is_empty() {
+                    combat.discard_draw.0 = combat.queue.len();
+                }
+                combat.discard_draw.1.push(card);
                 self.after_discard(content, 1);
-                self.combat_mut().unwrap().queue.push(Pending {
-                    effect: Effect::Draw(1),
-                    context: Context::player(),
-                });
                 return true;
             }
             CardOp::MoveFree(to) => {
                 let mut card = self.remove_pile(pile, index);
-                card.free = true;
+                card.free_this_turn();
                 self.push_pile(to, card);
                 return true;
             }
-            CardOp::FreeCombat => self.pile_mut(pile)[index].flags |= FREE_COMBAT,
+            CardOp::FreeCombat => self.pile_mut(pile)[index].free_this_combat(),
         }
         false
     }
 
-    fn sly(&mut self, _content: &Content, card: Card) {
+    fn auto_play_off_pile(&mut self, card: Card) {
         self.combat_mut().unwrap().queue.push(Pending {
             effect: Effect::AutoPlay(card),
-            context: Context::card(card),
+            context: Context {
+                off_pile: true,
+                ..Context::card(card)
+            },
         });
     }
 
-    fn discard_hand(&mut self, content: &Content) {
+    /// CardCmd.DiscardAndDraw: every discard's hooks (Tingsha, Tough Bandages), then the draw,
+    /// then the Sly cards auto-play in hand order.
+    fn discard_hand(&mut self, content: &Content, draw: u8) {
         let hand = std::mem::take(&mut self.combat_mut().unwrap().hand);
+        self.discard_cards(content, hand, draw);
+    }
+
+    /// Discards the hand cards at `indices` (ascending) as one CardCmd.Discard.
+    fn discard_indices(&mut self, content: &Content, indices: &[usize]) {
+        let mut cards: Vec<_> = indices
+            .iter()
+            .rev()
+            .map(|&index| self.combat_mut().unwrap().hand.remove(index))
+            .collect();
+        cards.reverse();
+        self.discard_cards(content, cards, 0);
+    }
+
+    fn discard_cards(&mut self, content: &Content, hand: Vec<Card>, draw: u8) {
         self.expectation_discard(hand.len());
         self.combat_mut().unwrap().history.discarded += hand.len() as i16;
-        self.after_discard(content, hand.len());
-        let discarded: Vec<_> = hand
-            .iter()
-            .copied()
-            .filter(|&card| !self.is_sly(content, card))
-            .collect();
-        self.combat_mut().unwrap().discard.extend(discarded);
+        let count = hand.len();
+        // Sly cards wait in the discard pile and auto-play from there in hand order, after
+        // every discard's AfterCardDiscarded hooks (Tingsha, Tough Bandages).
+        self.combat_mut()
+            .unwrap()
+            .discard
+            .extend(hand.iter().copied());
         for card in hand.into_iter().rev() {
             if self.is_sly(content, card) {
-                self.sly(content, card);
+                self.auto_play_off_pile(card);
             }
         }
-        self.unceasing_top(content);
+        if draw > 0 {
+            self.combat_mut().unwrap().queue.push(Pending {
+                effect: Effect::Draw(draw),
+                context: Context::player(),
+            });
+        }
+        self.after_discard(content, count);
     }
 
     fn after_discard(&mut self, content: &Content, count: usize) {
@@ -7189,13 +6377,13 @@ impl Game {
             return;
         }
         for _ in 0..count {
-            if self.has_relic(content, "RELIC.TOUGH_BANDAGES") {
+            for _ in 0..self.relic_count(content, "RELIC.TOUGH_BANDAGES") {
                 self.combat_mut().unwrap().queue.push(Pending {
                     effect: Effect::RawBlock(Target::Player, Amount::fixed(3, 3)),
                     context: Context::player(),
                 });
             }
-            if self.has_relic(content, "RELIC.TINGSHA") {
+            for _ in 0..self.relic_count(content, "RELIC.TINGSHA") {
                 self.combat_mut().unwrap().queue.push(Pending {
                     effect: Effect::Damage(Target::RandomEnemy, Amount::fixed(3, 3)),
                     context: Context::player(),
@@ -7205,6 +6393,8 @@ impl Game {
     }
 
     fn unceasing_top(&mut self, content: &Content) {
+        let combat = self.combat_mut().unwrap();
+        combat.potions = combat.potions.saturating_sub(1);
         if self.combat().unwrap().hand.is_empty()
             && !self.combat().unwrap().enemy_turn
             && self.has_relic(content, "RELIC.UNCEASING_TOP")
@@ -7224,9 +6414,12 @@ impl Game {
             def.cost[card.upgrades.min(1) as usize] > 0
                 || def.star_cost[card.upgrades.min(1) as usize] > 0
         };
+        // X-cost cards never count as costing energy here (CostsEnergyOrStars).
         let costs = |card: &Card| {
             let def = content.cards[card.id as usize];
-            energy_cost(combat, *card, def, spiked) > 0 || star_cost(combat, *card, def) > 0
+            def.cost[card.upgrades.min(1) as usize] >= 0
+                && energy_cost(combat, *card, def, spiked, true) > 0
+                || star_cost(combat, *card, def) > 0
         };
         let mut choices: Vec<_> = combat
             .hand
@@ -7261,173 +6454,255 @@ impl Game {
         if !choices.is_empty() {
             let choice =
                 choices[self.rngs.combat_card_selection.below(choices.len() as u32) as usize];
-            self.combat_mut().unwrap().hand[choice].free = true;
+            self.combat_mut().unwrap().hand[choice].free_this_turn();
         }
     }
 
+    fn razor_tooth(&self, content: &Content, card: Card) -> bool {
+        card.upgrades == 0
+            && matches!(
+                card.card_type(content.cards[card.id as usize]),
+                CardType::Attack | CardType::Skill
+            )
+            && self.has_relic(content, "RELIC.RAZOR_TOOTH")
+    }
+
     fn begin_auto_play(&mut self, content: &Content, mut card: Card, mut context: Context) {
-        let def = content.cards[card.id as usize];
-        let card_type = card.card_type(def);
-        let throwing_axe =
-            self.has_relic(content, "RELIC.THROWING_AXE") && !self.combat().unwrap().throwing_axe;
-        self.combat_mut().unwrap().throwing_axe |= throwing_axe;
-        let pen_nib = card_type == CardType::Attack && self.has_relic(content, "RELIC.PEN_NIB");
-        let mut pen_nib_counter = self.pen_nib;
-        if card.target(def) == Target::ChosenEnemy
-            && !(card.id == card_id::SOVEREIGN_BLADE
-                && self.creature(Actor::Player).power(power_id::SEEKING_EDGE) > 0)
-            && context.target.is_none()
-        {
-            let alive: Vec<_> = self
-                .combat()
-                .unwrap()
-                .enemies
-                .iter()
-                .enumerate()
-                .filter(|(_, enemy)| enemy.creature.hp > 0)
-                .map(|(index, _)| index)
-                .collect();
-            if !alive.is_empty() {
-                let choice = if self.expectation.is_some() {
-                    self.expectation_choice(alive.len()).unwrap_or(0)
-                } else {
-                    self.rngs.combat_targets.below(alive.len() as u32) as usize
-                };
-                context.target = Some(alive[choice]);
+        // CardCmd.AutoPlay does nothing once the combat is ending.
+        if self.enemies_defeated() {
+            if card.flags & REPLAY == 0 {
+                self.combat_mut().unwrap().discard.push(card);
             }
+            return;
+        }
+        // A repeat (Decisions, Decisions) plays the same card again from wherever its earlier play
+        // left it (CardCmd.AutoPlay moves it to the play pile, then to its result pile: an exhausting
+        // card exhausts again).
+        if card.flags & (REPLAY | DUPE) == REPLAY {
+            let combat = self.combat_mut().unwrap();
+            let piles = [
+                &mut combat.discard,
+                &mut combat.draw,
+                &mut combat.hand,
+                &mut combat.exhaust,
+            ];
+            for pile in piles {
+                if let Some(index) = pile
+                    .iter()
+                    .rposition(|other| other.instance == card.instance && other.id == card.id)
+                {
+                    card = pile.remove(index);
+                    // Each play picks its own result pile.
+                    card.turn_flags &= !EXHAUST;
+                    break;
+                }
+            }
+        }
+        let def = content.cards[card.id as usize];
+        // History Course's Stomp copy is cloned now, with this turn's attack discounts.
+        if def.id == "CARD.STOMP" && card.flags & (REPLAY | DUPE) == REPLAY | DUPE {
+            card.retain_costs(|cost| cost.kind != THIS_TURN);
+            let attacks = self.combat().unwrap().history.attacks;
+            card.add_cost(-attacks.clamp(0, 127) as i8, THIS_TURN);
+        }
+        let flags = card.flags(def);
+        // Fan of Knives Shivs and Seeking Edge's Sovereign Blade hit all enemies: no target roll.
+        let fan_shiv = def.id == "CARD.SHIV"
+            && self.creature(Actor::Player).power(power_id::FAN_OF_KNIVES) > 0
+            || card.id == card_id::SOVEREIGN_BLADE
+                && self.creature(Actor::Player).power(power_id::SEEKING_EDGE) > 0;
+        if let Some(index) = self
+            .combat()
+            .unwrap()
+            .beat_down
+            .iter()
+            .position(|&i| i == card.instance)
+        {
+            self.combat_mut().unwrap().beat_down.swap_remove(index);
+            if card.target(def) == Target::ChosenEnemy && !fan_shiv && context.target.is_none() {
+                context.target = self.random_enemy(content);
+            }
+        }
+        // Smoggy afflicts skills only once a skill play has finished.
+        let combat = self.combat().unwrap();
+        let smogged = card.affliction == Affliction::Smog;
+        let bound = card.affliction == Affliction::Bound && combat.bound_played;
+        // An enemy-targeted auto-play with no hittable enemy goes to its pile unplayed.
+        let no_target = card.target(def) == Target::ChosenEnemy
+            && !fan_shiv
+            && context.target.is_none()
+            && self.alive_in_slot_order(content).is_empty();
+        // Normality, Velvet Choker, Sloth and Ringing stop auto-plays too (Hook.ShouldPlay).
+        let sloth = combat.player.power(power_id::SLOTH);
+        // Velvet Choker counts finished plays: not the card this auto-play happens inside.
+        let finished = combat.history.cards - combat.unfinished();
+        let limited = card.affliction == Affliction::Ringing && combat.history.cards > 0
+            || combat.history.cards >= 3
+                && combat
+                    .hand
+                    .iter()
+                    .any(|card| card.flags(content.cards[card.id as usize]) & LIMIT_THREE != 0)
+            || finished >= 6 && self.has_relic(content, "RELIC.VELVET_CHOKER")
+            || sloth > 0 && combat.history.cards >= sloth;
+        if flags & UNPLAYABLE != 0 || smogged || bound || no_target || limited {
+            // A repeat (Decisions, Decisions) is the same card, already placed by the first.
+            if flags & DUPE != 0 || card.flags & REPLAY != 0 {
+            } else if flags & EXHAUST != 0 {
+                let combat = self.combat_mut().unwrap();
+                combat.exhaust.push(card);
+                self.exhausted(content, card, false);
+            } else {
+                self.combat_mut().unwrap().discard.push(card);
+            }
+            return;
+        }
+        if flags & DUPE == 0 {
+            self.combat_mut().unwrap().bound_played |= card.affliction == Affliction::Bound;
+        }
+        if card.target(def) == Target::ChosenEnemy && !fan_shiv && context.target.is_none() {
+            context.target = self.random_enemy(content);
         }
         context.source = Actor::Player;
         context.card = Some(card.id);
         context.upgraded = card.upgrades > 0;
         context.pen_nib = false;
-        context.x = if def.cost[card.upgrades.min(1) as usize] < 0 {
-            self.combat().unwrap().energy
+        context.target_instance = context
+            .target
+            .map(|slot| self.combat().unwrap().enemies[slot].instance);
+        let chemical_x = 2 * self.has_relic(content, "RELIC.CHEMICAL_X") as i16;
+        let x = def.cost[card.upgrades.min(1) as usize] < 0;
+        context.x = if x {
+            self.combat().unwrap().energy + chemical_x
         } else {
             0
         };
-        if matches!(card_type, CardType::Attack | CardType::Skill)
-            && self.combat().unwrap().history.attacks + self.combat().unwrap().history.skills
-                < self.creature(Actor::Player).power(power_id::NOSTALGIA)
-        {
-            card.flags |= RETURN_TO_DRAW;
+        // A star X-cost auto-play counts the current stars without spending them (Stardust).
+        if def.star_cost[card.upgrades.min(1) as usize] == -2 {
+            context.event = self.combat().unwrap().stars + chemical_x;
         }
+        // An auto-play's energy value is its modified cost (Borrowed Time, Corruption, ...), but
+        // Void Form only frees cards in the hand or play pile (Mayhem, Havoc and Cascade move
+        // theirs there first).
+        let spiked_gauntlets = self.has_relic(content, "RELIC.SPIKED_GAUNTLETS");
+        let brilliant_scarf = self.has_relic(content, "RELIC.BRILLIANT_SCARF");
         let combat = self.combat_mut().unwrap();
-        let throne = combat.player.power(power_id::THE_SEALED_THRONE);
-        let duplicate = (combat.player.power(power_id::DUPLICATION) > 0) as u8;
-        if duplicate > 0 {
-            combat.player.consume_power(power_id::DUPLICATION);
-        }
-        if throne > 0 {
-            combat.stars = combat.stars.saturating_add(throne);
-            combat.history.stars_gained = combat.history.stars_gained.saturating_add(throne);
-        }
-        let plays = 1
-            + throwing_axe as u8
-            + card.replays
-            + duplicate
-            + if card.id == card_id::SOVEREIGN_BLADE {
-                combat.player.power(power_id::SWORD_SAGE).max(0) as u8
-            } else {
-                0
-            };
-        combat.auto_plays.push(AutoPlay {
+        // Brilliant Scarf frees cards in the hand or play pile while its 5th manual play resolves
+        // (an X cost still counts the current energy).
+        let finished_manual = combat.history.manual_plays
+            - (combat.plays.first())
+                .filter(|play| play.manual)
+                .map_or(0, |play| (play.plays - play.done) as i16);
+        let energy = if brilliant_scarf && finished_manual == 4 && !context.off_pile && !x {
+            0
+        } else if context.off_pile && combat.void_free() {
+            card_cost(card, def, combat.energy) + combat.player.power(power_id::BORROWED_TIME)
+        } else {
+            energy_cost(combat, card, def, spiked_gauntlets, !context.off_pile)
+        };
+        let play = Play {
             card,
-            powers: combat.player.powers.clone(),
-            enemy_powers: combat
-                .enemies
-                .iter()
-                .map(|enemy| enemy.creature.powers.clone())
-                .collect(),
-            plays,
-        });
-        combat.history.cards += plays as i16;
-        combat.total_cards += plays as i16;
-        match card_type {
-            CardType::Attack => combat.history.attacks += plays as i16,
-            CardType::Skill => combat.history.skills += plays as i16,
-            CardType::Power => combat.history.powers += plays as i16,
-            _ => {}
-        }
-        combat.queue.push(Pending {
-            effect: Effect::FinishAutoPlay,
+            plays: 0,
+            done: 0,
+            energy,
+            stars: 0,
+            manual: false,
             context,
-        });
-        let mut pen_nibs = vec![false; plays as usize];
-        for doubled in &mut pen_nibs {
-            if pen_nib {
-                pen_nib_counter = (pen_nib_counter + 1) % 10;
-                *doubled = pen_nib_counter == 0;
-            }
-        }
-        for play in (0..plays).rev() {
-            let context = Context {
-                pen_nib: pen_nibs[play as usize],
-                ..context
-            };
-            push_card_effects(&mut combat.queue, card, def, context);
-            if card.flags & INKY != 0 {
-                combat.queue.push(Pending {
-                    effect: Effect::ApplyPower(
-                        Target::ChosenEnemy,
-                        power_id::WEAK,
-                        Amount::fixed(1, 1),
-                    ),
-                    context,
-                });
-            }
-        }
-        let black_hole = combat.player.power(power_id::BLACK_HOLE);
-        if throne > 0 && black_hole > 0 {
-            combat.queue.push(Pending {
-                effect: Effect::Damage(Target::AllEnemies, Amount::fixed(black_hole, black_hole)),
-                context,
-            });
-        }
-        if card.id != card_id::BOMBARDMENT && !self.replaying {
-            self.queue_bombardments();
-        }
-        self.pen_nib = pen_nib_counter;
+            recorded: Vec::new(),
+        };
+        self.start_play(content, play);
     }
 
-    pub(super) fn finish_card_destination(
+    /// A played card reaches its result pile after its AfterCardPlayed hooks, except Shining
+    /// Strike, which moves itself to the draw pile during its play.
+    fn place_played(&mut self, content: &Content, card: Card, replay: bool, feral: bool) {
+        let place = Pending {
+            effect: Effect::PlacePlayed(card, replay, feral),
+            context: Context::card(card),
+        };
+        if content.cards[card.id as usize].flags[card.upgrades.min(1) as usize] & RETURN_TO_DRAW
+            != 0
+        {
+            self.apply(content, place);
+            let combat = self.combat_mut().unwrap();
+            let draw = std::mem::take(&mut combat.swift_after_return);
+            if draw > 0 {
+                combat.queue.push(Pending {
+                    effect: Effect::Draw(draw),
+                    context: Context::card(card),
+                });
+            }
+        } else {
+            self.combat_mut().unwrap().queue.push(place);
+        }
+    }
+
+    /// Moves a finished card to its result pile; true when it was exhausted.
+    pub(super) fn place_card(
         &mut self,
         content: &Content,
         mut card: Card,
         replay: bool,
         feral: bool,
-    ) -> (Card, bool) {
+    ) -> bool {
         let def = content.cards[card.id as usize];
-        if def.id == "CARD.BOLAS" {
+        let card_type = card.card_type(def);
+        let flags = card.flags(def);
+        // Played this turn, it returns next turn (not its AfterCardPlayed clones).
+        if matches!(def.id, "CARD.BOLAS" | "CARD.THRUMMING_HATCHET") {
             card.value = 1;
         }
-        let card_type = card.card_type(def);
-        let corruption = card_type == CardType::Skill
-            && self.creature(Actor::Player).power(power_id::CORRUPTION) > 0;
-        if card_type == CardType::Skill
-            && self.creature(Actor::Player).power(power_id::MASTER_PLANNER) > 0
-        {
-            card.flags |= SLY;
-        }
-        let flags = card.flags(def);
-        card.cost_override = None;
-        card.free = false;
         let combat = self.combat_mut().unwrap();
-        if flags & ETHEREAL != 0 {
+        // An Ethereal play (as Razor Tooth left the card) makes every Banshee's Cry 2 cheaper.
+        if is_ethereal(combat, card, def) {
             combat.history.ethereal += 1;
+            for other in combat
+                .draw
+                .iter_mut()
+                .chain(&mut combat.hand)
+                .chain(&mut combat.discard)
+                .chain(&mut combat.exhaust)
+                .chain(std::iter::once(&mut card))
+                .chain(played(&mut combat.queue))
+                .filter(|other| other.id == card_id::BANSHEES_CRY)
+            {
+                other.add_cost(-2, 0);
+            }
         }
-        if def.tags & SHIV_TAG != 0 {
-            combat.history.shivs += 1;
+        // Only "until played" costs wear off once the card is placed (AfterCardPlayedCleanup), so
+        // the AfterCardPlayed clones (Juggling, Music Box) keep them, and an exhausted card keeps
+        // them through its exhaust hooks (Step::PlayedCleanup); combat-long ones (Confused) stay.
+        let unexpired = card;
+        card.expire_costs(UNTIL_PLAYED);
+        // History Course replays the card as its play left it (Razor Tooth's upgrade).
+        if matches!(card_type, CardType::Attack | CardType::Skill) && card.flags & DUPE == 0 {
+            combat.history_course = Some(card);
         }
-        let exhausted = if replay {
+        // A dupe (History Course's copy) has no result pile, but Feral still sends it to the hand
+        // and Corruption still exhausts a skill.
+        let dupe = card.flags & DUPE != 0
+            && !(card_type == CardType::Skill && combat.player.power(power_id::CORRUPTION) > 0);
+        if replay && card.flags & DUPE == 0 {
             false
-        } else if feral && combat.history.feral_returns < combat.player.power(power_id::FERAL) {
+        } else if feral {
+            // Feral returns it to the top of the hand, which a full hand redirects to the top
+            // (index 0) of the discard pile.
             if combat.hand.len() < 10 {
-                combat.hand.push(card);
-                combat.history.feral_returns += 1;
+                combat.hand.insert(0, card);
             } else {
-                combat.discard.push(card);
+                combat.discard.insert(0, card);
             }
             false
+        } else if dupe {
+            // Shining Strike moves even a dupe (CreateDupe drops Exhaust) onto the draw pile.
+            if def.flags[card.upgrades.min(1) as usize] & RETURN_TO_DRAW != 0 {
+                card.flags &= !RETURN_TO_DRAW;
+                combat.push_draw(card);
+            }
+            false
+        } else if card.flags & DUPE != 0 {
+            // Corruption's skill dupe (DUPE shares RETURN_TO_HAND's bit).
+            combat.exhaust.push(unexpired);
+            true
         } else if flags & RETURN_TO_HAND != 0 {
             if combat.hand.len() < 10 {
                 combat.hand.push(card);
@@ -7435,229 +6710,201 @@ impl Game {
                 combat.discard.push(card);
             }
             false
+        } else if card_type != CardType::Power && flags & EXHAUST != 0 {
+            combat.exhaust.push(Card {
+                flags: unexpired.flags & !RETURN_TO_DRAW,
+                ..unexpired
+            });
+            true
         } else if flags & RETURN_TO_DRAW != 0 {
+            // Nostalgia only redirects cards headed for the discard pile.
+            card.flags &= !RETURN_TO_DRAW;
             combat.push_draw(card);
             false
-        } else if flags & EXHAUST != 0 || corruption {
-            combat.exhaust.push(card);
-            true
+        } else if let Some(index) = combat.rebounds.iter().position(|&id| id == card.instance) {
+            combat.rebounds.swap_remove(index);
+            combat.push_draw(card);
+            false
         } else {
             if card_type != CardType::Power {
                 combat.discard.push(card);
             }
             false
-        };
-        if exhausted {
-            combat.history.exhausted += 1;
         }
-        (card, exhausted)
     }
 
-    fn queue_card_triggers(
-        &mut self,
-        content: &Content,
-        card: Card,
-        powers: Vec<Power>,
-        enemies: Vec<Vec<Power>>,
-    ) -> Context {
-        self.tender();
-        let trigger = match card.card_type(content.cards[card.id as usize]) {
-            CardType::Attack => Trigger::AttackPlayed,
-            CardType::Skill => Trigger::SkillPlayed,
-            CardType::Power => Trigger::PowerPlayed,
-            _ => Trigger::CardPlayed,
+    fn release_rupture(&mut self, content: &Content) {
+        let player = &mut self.combat_mut().unwrap().player;
+        let Some(power) = player
+            .powers
+            .iter_mut()
+            .find(|power| power.id == power_id::RUPTURE && power.value > 0)
+        else {
+            return;
         };
-        let context = Context {
-            event: 1,
-            ..Context::card(card)
-        };
-        if content.cards[card.id as usize].tags & SHIV_TAG != 0
-            && self.has_relic(content, "RELIC.HELICAL_DART")
-        {
-            self.apply_power(content, Actor::Player, power_id::DEXTERITY, 1);
-            self.apply_power(content, Actor::Player, power_id::HELICAL_DART, 1);
-        }
-        self.dispatch(content, trigger, Actor::Player, context, powers.clone());
-        self.dispatch(content, Trigger::CardPlayed, Actor::Player, context, powers);
-        for (index, powers) in enemies.into_iter().enumerate() {
-            self.dispatch(
-                content,
-                Trigger::CardPlayed,
-                Actor::Enemy(index),
-                Context {
-                    source: Actor::Enemy(index),
-                    target: Some(index),
-                    ..context
-                },
-                powers,
-            );
-        }
-        context
+        let strength = std::mem::take(&mut power.value);
+        self.apply_power(content, Actor::Player, power_id::STRENGTH, strength);
     }
 
-    fn finish_auto_play(&mut self, content: &Content) {
-        let AutoPlay {
-            mut card,
-            powers,
-            enemy_powers: enemies,
-            plays,
-        } = self.combat_mut().unwrap().auto_plays.pop().unwrap();
-        let def = content.cards[card.id as usize];
-        let card_type = card.card_type(def);
-        let replay = card.flags & REPLAY != 0;
-        card.flags &= !REPLAY;
-        if card.upgrades == 0
-            && matches!(card_type, CardType::Attack | CardType::Skill)
-            && self.has_relic(content, "RELIC.RAZOR_TOOTH")
-        {
-            card.upgrades = 1;
-        }
-        let feral = card_type == CardType::Attack;
-        let (card, exhausted) = self.finish_card_destination(content, card, replay, feral);
-        if matches!(card_type, CardType::Attack | CardType::Skill) && card.flags & DUPE == 0 {
-            self.combat_mut().unwrap().history_course = Some(card);
-        }
-        if self.combat().unwrap().unsettling_lamp == Some(card.id) {
-            self.combat_mut().unwrap().unsettling_lamp = None;
-            self.combat_mut().unwrap().unsettling_used = true;
-        }
-        if card_type == CardType::Attack
-            && self.has_relic(content, "RELIC.MUSIC_BOX")
-            && !self.combat().unwrap().music_box
-        {
-            let mut copy = card;
-            copy.instance = 0;
-            copy.flags |= ETHEREAL;
-            self.combat_mut().unwrap().music_box = true;
-            self.add_generated(content, Pile::Hand, copy);
-        }
-        if card_type == CardType::Power
-            && self.has_relic(content, "RELIC.PERMAFROST")
-            && !self.combat().unwrap().permafrost
-        {
-            self.combat_mut().unwrap().permafrost = true;
-            self.gain_block(content, Actor::Player, 7, None, false);
-        }
-        if card_type == CardType::Power && self.has_relic(content, "RELIC.MUMMIFIED_HAND") {
-            for _ in 0..plays {
-                self.mummified_hand(content);
-            }
-        }
-        if !self.combat().unwrap().vambrace
-            && self.has_relic(content, "RELIC.VAMBRACE")
-            && self.combat().unwrap().history.block_card == self.combat().unwrap().history.cards
-        {
-            self.combat_mut().unwrap().vambrace = true;
-        }
-        if self.combat().unwrap().paels_legion == 0
-            && self.has_relic(content, "RELIC.PAELS_LEGION")
-            && self.combat().unwrap().history.block_card == self.combat().unwrap().history.cards
-        {
-            self.combat_mut().unwrap().paels_legion = 2;
-        }
-        let old_attacks = self.combat().unwrap().history.attacks
-            - (card_type == CardType::Attack) as i16 * plays as i16;
-        let old_skills = self.combat().unwrap().history.skills
-            - (card_type == CardType::Skill) as i16 * plays as i16;
-        if card_type == CardType::Attack {
-            let attacks = self.combat().unwrap().history.attacks;
-            if old_attacks < 3 && attacks >= 3 {
-                let copies = self
-                    .creature(Actor::Player)
-                    .power(power_id::JUGGLING)
-                    .max(0) as u8;
-                for _ in 0..copies {
-                    self.add_generated(
-                        content,
-                        Pile::Hand,
-                        Card {
-                            instance: 0,
-                            ..card
-                        },
-                    );
-                }
-            }
-            if self.has_relic(content, "RELIC.ORNAMENTAL_FAN") {
-                for _ in 0..attacks / 3 - old_attacks / 3 {
-                    self.gain_block(content, Actor::Player, 4, None, false);
-                }
-            }
-            for _ in 0..attacks / 3 - old_attacks / 3 {
-                if self.has_relic(content, "RELIC.KUNAI") {
-                    self.apply_power(content, Actor::Player, power_id::DEXTERITY, 1);
-                }
-                if self.has_relic(content, "RELIC.SHURIKEN") {
-                    self.apply_power(content, Actor::Player, power_id::STRENGTH, 1);
-                }
-            }
-            if self.has_relic(content, "RELIC.NUNCHAKU") {
-                let attacks = self.nunchaku as i16 + plays as i16;
-                self.combat_mut().unwrap().energy += attacks / 10;
-                self.nunchaku = (attacks % 10) as u8;
-            }
-            if self.has_relic(content, "RELIC.KUSARIGAMA") {
-                let attacks = self.combat().unwrap().kusarigama as i16 + plays as i16;
-                self.combat_mut().unwrap().kusarigama = (attacks % 3) as u8;
-                for _ in 0..attacks / 3 {
-                    self.combat_mut().unwrap().queue.push(Pending {
-                        effect: Effect::Damage(Target::RandomEnemy, Amount::fixed(6, 6)),
-                        context: Context::player(),
-                    });
-                }
-            }
-        }
-        if card_type == CardType::Skill && self.has_relic(content, "RELIC.LETTER_OPENER") {
-            for _ in 0..self.combat().unwrap().history.skills / 3 - old_skills / 3 {
-                self.combat_mut().unwrap().queue.push(Pending {
-                    effect: Effect::Damage(Target::AllEnemies, Amount::fixed(5, 5)),
-                    context: Context::player(),
-                });
-            }
-        }
-        if self.has_relic(content, "RELIC.IRON_CLUB") {
-            let cards = self.iron_club as i16 + plays as i16;
-            self.iron_club = (cards % 4) as u8;
-            for _ in 0..cards / 4 {
-                self.combat_mut().unwrap().queue.push(Pending {
-                    effect: Effect::Draw(1),
-                    context: Context::player(),
-                });
-            }
-        }
-        if card_type == CardType::Skill && self.has_relic(content, "RELIC.TUNING_FORK") {
-            let skills = self.tuning_fork as i16 + plays as i16;
-            self.tuning_fork = (skills % 10) as u8;
-            for _ in 0..skills / 10 {
-                self.gain_block(content, Actor::Player, 7, None, false);
-            }
-        }
-        if !self.combat().unwrap().rainbow_ring
-            && self.has_relic(content, "RELIC.RAINBOW_RING")
-            && self.combat().unwrap().history.attacks > 0
-            && self.combat().unwrap().history.skills > 0
-            && self.combat().unwrap().history.powers > 0
-        {
-            self.combat_mut().unwrap().rainbow_ring = true;
-            self.apply_power(content, Actor::Player, power_id::STRENGTH, 1);
-            self.apply_power(content, Actor::Player, power_id::DEXTERITY, 1);
-        }
-        if exhausted {
-            self.trigger(content, Trigger::CardExhausted, Actor::Player, 1);
-            self.trigger_card(content, card, Trigger::CardExhausted);
-        }
-        for _ in 0..plays {
-            self.queue_card_triggers(content, card, powers.clone(), enemies.clone());
-        }
-        if card_type == CardType::Skill {
-            self.return_make_it_so(old_skills);
-        }
-        self.tick_panache();
-    }
-
-    fn return_make_it_so(&mut self, old_skills: i16) {
-        if self.combat().unwrap().history.skills / 3 == old_skills / 3 {
+    fn uproar(&mut self, content: &Content) {
+        if self.creature(Actor::Player).hp <= 0 {
             return;
         }
+        let draw = self.combat().unwrap().draw.iter().rev().copied();
+        let mut attacks: Vec<_> = draw
+            .filter(|card| card.card_type(content.cards[card.id as usize]) == CardType::Attack)
+            .collect();
+        let playable = |card: &Card| card.flags(content.cards[card.id as usize]) & UNPLAYABLE == 0;
+        if attacks.iter().any(playable) {
+            attacks.retain(playable);
+        }
+        sort_for_shuffle(&mut attacks, content);
+        self.rngs.shuffle.shuffle(&mut attacks);
+        if let Some(card) = attacks.first() {
+            let index = self
+                .combat()
+                .unwrap()
+                .draw
+                .iter()
+                .position(|candidate| candidate.instance == card.instance)
+                .unwrap();
+            let card = self.combat_mut().unwrap().remove_draw(index);
+            self.auto_play_off_pile(card);
+        }
+    }
+
+    fn resolve_deaths(&mut self, content: &Content, previous: Option<Vec<Hit>>) {
+        let hits = std::mem::replace(&mut self.combat_mut().unwrap().pending_hits, previous);
+        let hits = hits.unwrap_or_default();
+        for &hit in &hits {
+            self.hit_hooks(content, hit);
+        }
+        for hit in hits.iter().filter(|hit| hit.killed) {
+            self.died(content, hit.receiver);
+        }
+    }
+
+    /// Thrash gains the damage of the attack it exhausts, modified with no target
+    /// (Hook.ModifyDamage, Move).
+    fn thrash_gain(&mut self, content: &Content, exhausted: Card) {
+        let def = content.cards[exhausted.id as usize];
+        if exhausted.card_type(def) != CardType::Attack
+            || (self.combat().unwrap().plays.last())
+                .is_none_or(|play| content.cards[play.card.id as usize].id != "CARD.THRASH")
+        {
+            return;
+        }
+        let Some(damage) = def.damage_cents(exhausted) else {
+            return;
+        };
+        let context = Context {
+            card: Some(exhausted.id),
+            ..Context::player()
+        };
+        // Thrash keeps the decimal (its damage is in hundredths).
+        let damage = self.modify_damage_cents(
+            content,
+            None,
+            damage,
+            DamageKind::Move,
+            context,
+            Some(exhausted),
+        );
+        let combat = self.combat_mut().unwrap();
+        let value = &mut combat.plays.last_mut().unwrap().card.value;
+        *value = value.saturating_add(damage.clamp(0, i16::MAX as i64) as i16);
+    }
+
+    /// A played Maul makes every Maul hit harder, auto-plays included.
+    fn grow_maul(&mut self, card: &mut Card) {
+        if card.id != card_id::MAUL {
+            return;
+        }
+        let increase = 1 + card.upgrades.min(1) as i16;
+        card.value += increase;
+        let combat = self.combat_mut().unwrap();
+        for other in combat
+            .draw
+            .iter_mut()
+            .chain(&mut combat.hand)
+            .chain(&mut combat.discard)
+            .chain(&mut combat.exhaust)
+            .chain(played(&mut combat.queue))
+        {
+            if other.id == card_id::MAUL {
+                other.value += increase;
+            }
+        }
+        for other in &mut self.run.deck {
+            if other.id == card_id::MAUL {
+                other.value += increase;
+            }
+        }
+    }
+
+    fn spend_enchantment(&mut self, card: &mut Card) {
+        match card.enchantment {
+            Some(Enchantment::Glam | Enchantment::Vigorous) => card.enchantment_value = 0,
+            // Momentum's extra damage grows on every play (OnPlay).
+            Some(Enchantment::Momentum) => {
+                card.enchantment_value = card
+                    .enchantment_value
+                    .saturating_add(card.enchantment_amount)
+            }
+            Some(Enchantment::Goopy) => {
+                card.enchantment_amount = card.enchantment_amount.saturating_add(1);
+                card.enchantment_value = card.enchantment_amount;
+                if let Some(deck) = self
+                    .run
+                    .deck
+                    .iter_mut()
+                    .find(|deck| deck.instance == card.instance)
+                {
+                    deck.enchantment_amount = card.enchantment_amount;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Plays of this type finished this turn, the finished plays of cards still resolving included.
+    pub(super) fn played_this_turn(&self, content: &Content, card_type: CardType) -> i16 {
+        let of_type = |card: Card| card.card_type(content.cards[card.id as usize]) == card_type;
+        let plays = self.combat().unwrap().plays.iter();
+        let done = plays
+            .filter(|play| of_type(play.card))
+            .map(|play| play.done as i16);
+        self.finished_plays(content, card_type) + done.sum::<i16>()
+    }
+
+    /// Plays of this type finished this turn (AfterCardPlayed), excluding cards still resolving.
+    fn finished_plays(&self, content: &Content, card_type: CardType) -> i16 {
+        let combat = self.combat().unwrap();
+        let of_type = |card: Card| card.card_type(content.cards[card.id as usize]) == card_type;
+        let played = match card_type {
+            CardType::Attack => combat.history.attacks,
+            CardType::Skill => combat.history.skills,
+            _ => combat.history.powers,
+        };
+        played
+            - (combat.plays.iter())
+                .filter(|play| of_type(play.card))
+                .map(|play| play.plays as i16)
+                .sum::<i16>()
+    }
+
+    /// Make It So and Right Hand Hand return after each play's card-played hooks
+    /// (AfterCardPlayedLate), before the card reaches its pile; Make It So when the finished
+    /// skill count crosses a multiple of 3 between `skills`.
+    fn queue_return_late(&mut self, card_type: CardType, skills: (i16, i16), energy: i16) {
+        let make_it_so = card_type == CardType::Skill && skills.0 / 3 != skills.1 / 3;
+        self.combat_mut().unwrap().queue.push(Pending {
+            effect: Effect::ReturnLate(make_it_so, energy),
+            context: Context::player(),
+        });
+    }
+
+    fn return_make_it_so(&mut self) {
         for pile in [Pile::Draw, Pile::Discard, Pile::Exhaust] {
             let mut cards = Vec::new();
             if pile == Pile::Draw {
@@ -7669,10 +6916,10 @@ impl Game {
                     .enumerate()
                     .filter_map(|(index, card)| (card.id == card_id::MAKE_IT_SO).then_some(index))
                     .collect::<Vec<_>>();
+                // Hook listeners visit the draw pile from its top.
                 for index in indices.into_iter().rev() {
                     cards.push(self.combat_mut().unwrap().remove_draw(index));
                 }
-                cards.reverse();
             } else {
                 self.pile_mut(pile).retain(|card| {
                     let remove = card.id == card_id::MAKE_IT_SO;
@@ -7686,24 +6933,17 @@ impl Game {
                 self.add_to_hand(card);
             }
         }
-    }
-
-    fn return_bolas(&mut self, content: &Content) {
-        let id = content.card_id("CARD.BOLAS").unwrap();
-        let mut returned = Vec::new();
-        let combat = self.combat_mut().unwrap();
-        for pile in [&mut combat.draw, &mut combat.discard, &mut combat.exhaust] {
-            let mut index = 0;
-            while index < pile.len() {
-                if pile[index].id == id && pile[index].value > 0 {
-                    returned.push(pile.remove(index));
-                } else {
-                    index += 1;
-                }
+        // A Make It So still in the play pile (the skill that crossed the count) returns last.
+        let queue = &mut self.combat_mut().unwrap().queue;
+        let mut played = Vec::new();
+        queue.retain(|pending| match pending.effect {
+            Effect::PlacePlayed(card, ..) if card.id == card_id::MAKE_IT_SO => {
+                played.push(card);
+                false
             }
-        }
-        for mut card in returned {
-            card.value = 0;
+            _ => true,
+        });
+        for card in played.into_iter().rev() {
             self.add_to_hand(card);
         }
     }
@@ -7718,32 +6958,10 @@ impl Game {
                 true
             }
         });
-        for card in cards {
-            self.combat_mut().unwrap().queue.push(Pending {
-                effect: Effect::AutoPlay(card),
-                context: Context::card(card),
-            });
+        // They play in exhaust-pile order.
+        for card in cards.into_iter().rev() {
+            self.auto_play_off_pile(card);
         }
-    }
-
-    fn auto_play_top(&mut self) {
-        if self
-            .combat()
-            .unwrap()
-            .draw
-            .last()
-            .is_none_or(|card| card.id != card_id::I_AM_INVINCIBLE)
-        {
-            return;
-        }
-        let card = self.combat_mut().unwrap().pop_draw().unwrap();
-        self.combat_mut().unwrap().queue.insert(
-            0,
-            Pending {
-                effect: Effect::AutoPlay(card),
-                context: Context::card(card),
-            },
-        );
     }
 
     fn is_sly(&self, content: &Content, card: Card) -> bool {
@@ -7763,18 +6981,51 @@ impl Game {
         }
     }
 
-    fn add_generated(&mut self, content: &Content, pile: Pile, mut card: Card) {
+    fn add_generated(&mut self, content: &Content, pile: Pile, card: Card) {
+        let card = self.add_to_pile(content, pile, card);
+        self.trigger_generated(content, card.id);
+    }
+
+    /// Adds a new card to a pile without the generation hooks (CardPileCmd.Add).
+    fn add_to_pile(&mut self, content: &Content, pile: Pile, mut card: Card) -> Card {
         let def = content.cards[card.id as usize];
+        if card.id == card_id::SOVEREIGN_BLADE {
+            let sage = self
+                .creature(Actor::Player)
+                .power(power_id::SWORD_SAGE)
+                .max(0);
+            card.replays = card.replays.saturating_add(sage as u8);
+        }
         if self.has_relic(content, "RELIC.GHOST_SEED")
             && def.rarity == CardRarity::Basic
             && def.tags & (STRIKE_TAG | DEFEND_TAG) != 0
         {
             card.flags |= ETHEREAL;
         }
+        // Stomp and Pinpoint enter combat with this turn's discounts (a copy has them already),
+        // Banshee's Cry with the combat's, and Flatten free once Osty attacked this turn.
+        let history = self.combat().unwrap().history;
+        let discount = match def.id {
+            "CARD.STOMP" => Some(history.attacks),
+            _ => (card.id == card_id::PINPOINT).then_some(history.skills),
+        };
+        if let Some(discount) = discount {
+            card.retain_costs(|cost| cost.kind != THIS_TURN);
+            card.add_cost(-discount.clamp(0, 127) as i8, THIS_TURN);
+        }
+        if card.id == card_id::BANSHEES_CRY {
+            card.add_cost(-(2 * history.ethereal).clamp(0, 127) as i8, 0);
+        }
+        if card.id == card_id::FLATTEN && history.osty_attacks > 0 {
+            card.add_cost(0, ABSOLUTE | THIS_TURN);
+        }
+        // A new card, a clone too (CreateClone), has no plays of its own this turn (Fetch).
         if card.instance == 0 {
             card.instance = self.next_card;
             self.next_card = self.next_card.saturating_add(1);
+            card.turn_flags &= !FETCHED;
         }
+        self.afflict_new(content, &mut card);
         if pile == Pile::Hand {
             self.add_to_hand(card);
         } else if pile == Pile::Draw {
@@ -7782,10 +7033,17 @@ impl Game {
         } else {
             self.pile_mut(pile).push(card);
         }
-        self.trigger_generated(content, card.id);
+        card
     }
 
     pub(super) fn add_random(&mut self, content: &Content, pile: Pile, mut card: Card) {
+        self.afflict_new(content, &mut card);
+        let card = self.insert_random(pile, card);
+        self.trigger_generated(content, card.id);
+    }
+
+    /// Shuffles a card into a random position of a pile without crediting the player as creator.
+    fn insert_random(&mut self, pile: Pile, mut card: Card) -> Card {
         self.expectation_unknown();
         card.instance = self.next_card;
         self.next_card = self.next_card.saturating_add(1);
@@ -7797,7 +7055,7 @@ impl Game {
         } else {
             self.pile_mut(pile).insert(index, card);
         }
-        self.trigger_generated(content, card.id);
+        card
     }
 
     fn pile_mut(&mut self, pile: Pile) -> &mut Vec<Card> {
@@ -7827,26 +7085,35 @@ impl Game {
         }
     }
 
-    fn shuffle_draw(&mut self) {
-        let Phase::Combat(combat) = &mut self.phase else {
-            return;
-        };
-        if self.expectation.is_none() {
-            self.rngs.shuffle.shuffle(&mut combat.draw);
+    fn after_shuffle(&mut self, content: &Content) {
+        // Biiig Hug's Soot goes in ahead of the AfterShuffle pass (the game lists the relic
+        // after the powers, so only a Stratagem pick could tell).
+        for _ in 0..self.relic_count(content, "RELIC.BIIIG_HUG") {
+            self.add_random(
+                content,
+                Pile::Draw,
+                Card {
+                    id: card_id::SOOT,
+                    ..Card::default()
+                },
+            );
         }
-        combat.forget_draw_order();
+        self.trigger(content, Trigger::AfterShuffle, Actor::Player, 0);
     }
 
     fn shuffle_discard_into_draw(&mut self, content: &Content) {
         let Phase::Combat(combat) = &mut self.phase else {
             return;
         };
-        sort_for_shuffle(&mut combat.discard, content);
-        combat.draw.append(&mut combat.discard);
+        // The game shuffles discard followed by the draw pile (top first).
+        let mut cards = std::mem::take(&mut combat.discard);
+        cards.extend(combat.draw.drain(..).rev());
+        sort_for_shuffle(&mut cards, content);
         if self.expectation.is_none() {
-            self.rngs.shuffle.shuffle(&mut combat.draw);
+            self.rngs.shuffle.shuffle(&mut cards);
         }
-        combat.draw.reverse();
+        cards.reverse();
+        combat.draw = cards;
         combat.forget_draw_order();
         if let Some(index) = combat
             .draw
@@ -7874,6 +7141,13 @@ impl Game {
         }
     }
 
+    fn instance(&self, actor: Actor) -> Option<u32> {
+        match actor {
+            Actor::Enemy(index) => Some(self.combat().unwrap().enemies[index].instance),
+            _ => None,
+        }
+    }
+
     pub(super) fn creature(&self, actor: Actor) -> &Creature {
         let combat = self.combat().unwrap();
         match actor {
@@ -7892,42 +7166,56 @@ impl Game {
         }
     }
 
-    pub(super) fn finish_combat(&mut self, content: &Content) {
+    /// No living primary enemy, unless a power stops the combat from ending
+    /// (ShouldStopCombatFromEnding): a dying enemy's spawns, the Test Subject's revive.
+    fn enemies_defeated(&self) -> bool {
+        let enemies = &self.combat().unwrap().enemies;
+        let stops = |power: &Power| {
+            matches!(
+                power.id,
+                power_id::ADAPTABLE
+                    | power_id::INFESTED
+                    | power_id::STOCK
+                    | power_id::SURPRISE
+                    | power_id::STEAM_ERUPTION
+            )
+        };
+        enemies
+            .iter()
+            .all(|x| x.creature.hp <= 0 || x.creature.power(power_id::MINION) > 0)
+            && !enemies.iter().any(|x| x.creature.powers.iter().any(stops))
+    }
+
+    pub(crate) fn finish_combat(&mut self, content: &Content) {
         let Some(combat) = self.combat() else {
             return;
         };
         if combat.player.hp <= 0 {
             self.run.hp = 0;
             self.phase = Phase::Dead;
-        } else if combat
-            .enemies
-            .iter()
-            .all(|x| x.creature.hp <= 0 || x.creature.power(power_id::MINION) > 0)
-            && combat
-                .enemies
-                .iter()
-                .all(|x| x.creature.power(power_id::ADAPTABLE) == 0)
+        } else if self.enemies_defeated()
             && combat.choice.is_none()
             && combat.queue.is_empty()
-            && combat.playing.is_none()
+            && combat.plays.is_empty()
         {
             for enemy in &mut self.combat_mut().unwrap().enemies {
                 if enemy.creature.power(power_id::MINION) > 0 {
                     enemy.creature.hp = 0;
                 }
             }
-            if self.has_relic(content, "RELIC.MEAT_ON_THE_BONE")
-                && self.creature(Actor::Player).hp * 2 <= self.creature(Actor::Player).max_hp
-            {
+            // Chosen Cheese's max HP lands first (AfterCombatEnd); Meat on the Bone checks HP next
+            // (AfterCombatVictoryEarly), before the other victory relics heal.
+            let cheese = self.relic_count(content, "RELIC.CHOSEN_CHEESE");
+            self.creature_mut(Actor::Player).hp += cheese;
+            self.creature_mut(Actor::Player).max_hp += cheese;
+            for _ in 0..self.relic_count(content, "RELIC.MEAT_ON_THE_BONE") {
                 let player = self.creature_mut(Actor::Player);
-                player.hp = (player.hp + 12).min(player.max_hp);
+                if player.hp * 2 <= player.max_hp {
+                    player.hp = (player.hp + 12).min(player.max_hp);
+                }
             }
-            self.trigger(content, Trigger::Victory, Actor::Player, 0);
+            self.trigger(content, Trigger::AfterCombatVictory, Actor::Player, 0);
             self.resolve(content);
-            if self.has_relic(content, "RELIC.CHOSEN_CHEESE") {
-                self.creature_mut(Actor::Player).hp += 1;
-                self.creature_mut(Actor::Player).max_hp += 1;
-            }
             let improvement = self
                 .combat()
                 .unwrap()
@@ -7995,24 +7283,9 @@ impl Game {
                     }
                 }
             }
-            if self.room == Room::Elite && self.has_relic(content, "RELIC.WAR_HAMMER") {
-                let mut cards: Vec<_> = self
-                    .run
-                    .deck
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, card)| {
-                        card.upgrades == 0
-                            && !matches!(
-                                card.card_type(content.cards[card.id as usize]),
-                                CardType::Status | CardType::Curse | CardType::Quest
-                            )
-                    })
-                    .map(|(index, _)| index)
-                    .collect();
-                self.rngs.niche.shuffle(&mut cards);
-                for index in cards.into_iter().take(4) {
-                    self.run.deck[index].upgrades = 1;
+            if self.room == Room::Elite {
+                for _ in 0..self.relic_count(content, "RELIC.WAR_HAMMER") {
+                    self.upgrade_random(content, 4, None, false);
                 }
             }
             if self.room == Room::Elite
@@ -8066,10 +7339,11 @@ impl Game {
             let (hp, max_hp) = (player.hp, player.max_hp);
             let royalties = player.power(power_id::ROYALTIES) as i32;
             let removals = player.power(power_id::FORBIDDEN_GRIMOIRE).max(0) as u8;
+            let hunts = player.power(power_id::THE_HUNT).max(0) as usize;
             self.run.hp = hp;
             self.run.max_hp = max_hp;
             if self.event_combat != 0 {
-                self.phase = self.finish_event_combat(content, royalties, removals);
+                self.phase = self.finish_event_combat(content, royalties, removals, hunts);
                 return;
             }
             self.phase = if self.room == Room::Boss && self.run.act == 3 {
@@ -8079,7 +7353,7 @@ impl Game {
                     Phase::Won
                 }
             } else if content.acts.get(self.act as usize).is_some() {
-                let mut rewards = self.rewards(content);
+                let mut rewards = self.rewards(content, hunts);
                 rewards.gold += royalties;
                 rewards.removals = removals;
                 Phase::Rewards(rewards)

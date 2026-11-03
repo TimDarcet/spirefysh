@@ -110,24 +110,43 @@ pub enum PowerKind {
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum Trigger {
-    CombatStart,
-    TurnStart,
+    AfterRoomEntered,
+    BeforeCombatStart,
+    BeforeCombatStartLate,
+    BeforeSideTurnStart,
+    AfterBlockCleared,
+    AfterEnergyReset,
+    AfterEnergyResetLate,
+    BeforeHandDraw,
+    AfterPlayerTurnStart,
+    AfterPlayerTurnStartLate,
+    AfterSideTurnStart,
+    AfterSideTurnStartLate,
+    AutoPrePlay,
+    AutoPrePlayLate,
+    BeforeSideTurnEndVeryEarly,
+    BeforeSideTurnEndEarly,
+    BeforeSideTurnEnd,
+    AfterSideTurnEnd,
+    AfterSideTurnEndLate,
+    /// A card's turn-end-in-hand effect (Regret, Burn, Doubt).
     TurnEnd,
-    CardPlayed,
+    /// A played card of any type; AttackPlayed, SkillPlayed and PowerPlayed are its typed aliases.
+    AfterCardPlayed,
     AttackPlayed,
     SkillPlayed,
     PowerPlayed,
-    Attacked,
-    Damaged,
-    Blocked,
-    BlockGained,
-    HpLost,
-    CardDrawn,
-    CardGenerated,
-    CardExhausted,
-    Shuffle,
-    EnemyDied,
-    Victory,
+    AfterBlockGained,
+    AfterDamageGiven,
+    AfterDamageReceived,
+    AfterDeath,
+    AfterCardDrawn,
+    AfterCardGeneratedForCombat,
+    AfterCardExhausted,
+    AfterShuffle,
+    AfterPotionUsed,
+    AfterCombatVictory,
+    BeforeCardPlayed,
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -308,6 +327,12 @@ pub enum CardOp {
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum Effect {
+    /// A hook pass starts: its listeners are snapshotted and queued.
+    Fire(Trigger),
+    /// One listener of a hook pass, run when popped so it sees the earlier listeners' results.
+    Listen(Trigger, Listener),
+    /// A step of the turn flow that isn't a hook pass.
+    Step(Step),
     Attack(Target, Amount, u8),
     AttackMany(Target, Amount, Amount),
     OstyAttack(Target, Amount, u8),
@@ -380,7 +405,6 @@ pub enum Effect {
     AutoPlayDraw(Amount, bool),
     Stoke,
     Stampede,
-    ContinueEndTurn,
     FlakCannon(Amount),
     CopyCard(Pile, u8),
     Discard(u8, bool),
@@ -388,7 +412,24 @@ pub enum Effect {
     DiscardHandAdd(Id),
     PlayExhaustedShivs,
     AutoPlay(Card),
-    FinishAutoPlay,
+    /// Uproar auto-plays a random draw-pile attack at the end of its OnPlay.
+    Uproar,
+    Juggle,
+    /// Confused rolls a Strike's cost after Hellraiser auto-played it (AfterCardDrawnEarly first).
+    ConfusedRoll(Card),
+    /// The next play of the card being played starts (BeforeCardPlayed, then its OnPlay).
+    BeforePlay,
+    /// A play's OnPlay, enchantment and affliction, after its BeforeCardPlayed pass.
+    OnPlay,
+    /// A play of the card being played finished: its AfterCardPlayed hooks, then the next play or
+    /// the result pile.
+    AfterPlay,
+    /// A played card reaches its result pile once its AfterCardPlayed hooks resolved.
+    PlacePlayed(Card, bool, bool),
+    CheckEmptyHand,
+    /// Mummified Hand frees a random hand card (AfterCardPlayed, in relic order).
+    MummifiedHand,
+    ReturnLate(bool, i16),
     WhisperingEarring(u8),
     MoveAll(Pile, CardFilter, Pile),
     DrawFiltered(u8, CardFilter),
@@ -451,7 +492,6 @@ const RETURN_TO_HAND: u16 = 1024;
 const RETURN_TO_DRAW: u16 = 2048;
 const NO_GENERATE: u16 = 4096;
 const FETCHED: u16 = 8192;
-const FREE_COMBAT: u16 = 16384;
 const FILTERED_DRAW: u16 = 32768;
 pub const STRIKE_TAG: u16 = 1;
 pub const DEFEND_TAG: u16 = 2;
@@ -475,7 +515,6 @@ mod foundation_id {
         pub const FETCH: Id = 388;
         pub const FLATTEN: Id = 389;
         pub const HANG: Id = 395;
-        pub const MELANCHOLY: Id = 401;
         pub const RIGHT_HAND_HAND: Id = 419;
         pub const THE_SCYTHE: Id = 437;
         pub const TORIC_TOUGHNESS: Id = 518;
@@ -489,6 +528,7 @@ mod foundation_id {
         pub const BECKON: Id = 548;
         pub const CORRUPTION: Id = 550;
         pub const MAUL: Id = 554;
+        pub const SOOT: Id = 557;
     }
 
     pub(crate) mod power {
@@ -499,6 +539,8 @@ mod foundation_id {
         pub const WEAK: Id = 2;
         pub const VULNERABLE: Id = 3;
         pub const STRANGLE: Id = 55;
+        pub const SERPENT_FORM: Id = 53;
+        pub const AFTERIMAGE: Id = 46;
         pub const FRAIL: Id = 4;
         pub const MINION: Id = 16;
         pub const INTANGIBLE: Id = 5;
@@ -518,7 +560,6 @@ mod foundation_id {
         pub const NEMESIS: Id = 221;
         pub const MIND_ROT: Id = 219;
         pub const PAINFUL_STABS: Id = 223;
-        pub const RAVENOUS: Id = 231;
         pub const ANTICIPATE: Id = 165;
         pub const SLUMBER: Id = 244;
         pub const SKITTISH: Id = 240;
@@ -536,14 +577,12 @@ mod foundation_id {
         pub const SIGNAL_BOOST: Id = 39;
         pub const ECHO_FORM: Id = 40;
         pub const BLOCK_NEXT_TURN: Id = 41;
-        pub const RESTORE_STRENGTH: Id = 42;
         pub const HELICAL_DART: Id = 206;
         pub const REPTILE_TRINKET: Id = 234;
         pub const FREE_SKILL: Id = 44;
         pub const BURST: Id = 47;
         pub const SHADOWMELD: Id = 49;
         pub const DOUBLE_DAMAGE: Id = 51;
-        pub const ENVENOM: Id = 58;
         pub const FAN_OF_KNIVES: Id = 59;
         pub const TOOLS_OF_THE_TRADE: Id = 60;
         pub const MASTER_PLANNER: Id = 61;
@@ -558,13 +597,17 @@ mod foundation_id {
         pub const CHILD_OF_THE_STARS: Id = 69;
         pub const CONQUEROR: Id = 70;
         pub const RETAIN_HAND: Id = 71;
-        pub const FURNACE: Id = 74;
-        pub const MONARCHS_GAZE: Id = 76;
         pub const ORBIT: Id = 80;
+        pub const ACCELERANT: Id = 57;
+        pub const DARK_EMBRACE: Id = 11;
+        pub const RUPTURE: Id = 12;
+        pub const REBOUND: Id = 233;
+        pub const NIGHTMARE: Id = 222;
+        pub const SPEEDSTER: Id = 63;
         pub const PALE_BLUE_DOT: Id = 81;
         pub const VIGOR: Id = 83;
-        pub const REFLECT: Id = 85;
         pub const ROYALTIES: Id = 86;
+        pub const THE_HUNT: Id = 56;
         pub const SEEKING_EDGE: Id = 87;
         pub const SWORD_SAGE: Id = 89;
         pub const THE_SEALED_THRONE: Id = 90;
@@ -584,7 +627,6 @@ mod foundation_id {
         pub const NECRO_MASTERY: Id = 110;
         pub const OBLIVION: Id = 112;
         pub const PAGESTORM: Id = 113;
-        pub const REAPER_FORM: Id = 114;
         pub const SHROUD: Id = 116;
         pub const SIC_EM: Id = 117;
         pub const SLEIGHT_OF_FLESH: Id = 118;
@@ -604,8 +646,9 @@ mod foundation_id {
         pub const IMBALANCED: Id = 212;
         pub const MONARCHS_GAZE_STRENGTH_DOWN: Id = 220;
         pub const HELLRAISER: Id = 128;
-        pub const INFERNO: Id = 129;
         pub const INFERNO_DAMAGE: Id = 130;
+        pub const MONOLOGUE: Id = 77;
+        pub const MONOLOGUE_RESTORE: Id = 78;
         pub const JUGGLING: Id = 131;
         pub const MANGLE: Id = 132;
         pub const ONE_TWO_PUNCH: Id = 133;
@@ -620,6 +663,7 @@ mod foundation_id {
         pub const ENTROPY: Id = 148;
         pub const FASTEN: Id = 149;
         pub const NOSTALGIA: Id = 151;
+        pub const CONFUSED: Id = 172;
         pub const PANACHE: Id = 152;
         pub const ROLLING_BOULDER: Id = 154;
         pub const SHRINK: Id = 156;
@@ -633,6 +677,8 @@ mod foundation_id {
         pub const GIGANTIFICATION: Id = 159;
         pub const BURROWED: Id = 170;
         pub const RITUAL: Id = 160;
+        pub const REGEN: Id = 163;
+        pub const DIAMOND_DIADEM: Id = 183;
         pub const CURL_UP: Id = 180;
         pub const GALVANIC: Id = 197;
         pub const PLATING: Id = 79;
@@ -656,6 +702,7 @@ mod foundation_id {
         pub const REATTACH: Id = 232;
         pub const RINGING: Id = 235;
         pub const SANDPIT: Id = 236;
+        pub const SELF_FORMING_CLAY: Id = 237;
         pub const SHACKLING_POTION: Id = 238;
         pub const SLOW: Id = 243;
         pub const SMOGGY: Id = 245;
@@ -670,6 +717,7 @@ mod foundation_id {
         pub const HEIST: Id = 205;
         pub const TORIC_TOUGHNESS: Id = 264;
         pub const PAPER_CUTS: Id = 224;
+        pub const VITAL_SPARK: Id = 265;
         pub const TAINTED: Id = 267;
     }
 
@@ -686,6 +734,7 @@ mod foundation_id {
         use crate::Id;
 
         pub const LIGHTNING: Id = 0;
+        pub const FROST: Id = 1;
     }
 }
 
@@ -704,6 +753,30 @@ pub struct CardDef {
     pub effects: &'static [Effect],
     pub hooks: &'static [Hook],
     pub tags: u16,
+}
+
+impl CardDef {
+    /// The card's own damage (its DamageVar).
+    pub fn damage(&self) -> Option<Amount> {
+        self.effects.iter().find_map(|effect| match effect {
+            Effect::Attack(_, amount, _)
+            | Effect::AttackMany(_, amount, _)
+            | Effect::ExhaustForAttack(_, amount)
+            | Effect::MoveDamage(_, amount)
+            | Effect::OstyAttack(_, amount, _)
+            | Effect::OstyAttackMany(_, amount, _) => Some(*amount),
+            _ => None,
+        })
+    }
+
+    /// The card's DamageVar.BaseValue, a decimal (Thrash's grows by fractions), in hundredths.
+    pub fn damage_cents(&self, card: Card) -> Option<i64> {
+        self.damage().map(|amount| {
+            let base = [amount.base, amount.upgraded][card.upgrades.min(1) as usize];
+            let value = (amount.scale == Scale::CardValue) as i64 * card.value as i64;
+            (base as i64 + value) * 100 / amount.divisor.max(1) as i64
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Hash)]
@@ -753,9 +826,9 @@ impl EnemyDef {
             "MONSTER.KIN_FOLLOWER" => [58..=59, 62..=63],
             "MONSTER.KIN_PRIEST" => [190..=190, 199..=199],
             "MONSTER.AXEBOT" => [70..=78, 76..=86],
-            "MONSTER.BATTLE_FRIEND_V1_0" => [75..=75, 75..=75],
-            "MONSTER.BATTLE_FRIEND_V2_0" => [150..=150, 150..=150],
-            "MONSTER.BATTLE_FRIEND_V3_0" => [300..=300, 300..=300],
+            "MONSTER.BATTLE_FRIEND_V1" => [75..=75, 75..=75],
+            "MONSTER.BATTLE_FRIEND_V2" => [150..=150, 150..=150],
+            "MONSTER.BATTLE_FRIEND_V3" => [300..=300, 300..=300],
             "MONSTER.BOWLBUG_EGG" => [21..=22, 23..=24],
             "MONSTER.BOWLBUG_NECTAR" => [35..=38, 36..=39],
             "MONSTER.BOWLBUG_ROCK" => [45..=48, 46..=49],
@@ -878,9 +951,9 @@ impl EnemyDef {
     fn powers(&self, ascension: u8) -> Vec<(Id, i16)> {
         let profiles: &[(Id, i16, i16, u8)] = match self.id {
             "MONSTER.AXEBOT" => &[(250, 2, 2, 0)],
-            "MONSTER.BATTLE_FRIEND_V1_0"
-            | "MONSTER.BATTLE_FRIEND_V2_0"
-            | "MONSTER.BATTLE_FRIEND_V3_0" => &[(power_id::TIME_LIMIT, 3, 3, 0)],
+            "MONSTER.BATTLE_FRIEND_V1"
+            | "MONSTER.BATTLE_FRIEND_V2"
+            | "MONSTER.BATTLE_FRIEND_V3" => &[(power_id::TIME_LIMIT, 3, 3, 0)],
             "MONSTER.CORPSE_SLUG" => &[(231, 4, 5, 9)],
             "MONSTER.FROG_KNIGHT" => &[(79, 15, 19, 8)],
             "MONSTER.GLOBE_HEAD" => &[(power_id::GALVANIC, 6, 6, 0)],
@@ -1357,7 +1430,7 @@ impl Content {
                 self.valid_filter(filter) && self.valid_amount(amount) && self.valid_op(op)
             }
             Effect::ChannelSlots(id) | Effect::Channel(id, _) => (id as usize) < self.orbs.len(),
-            Effect::AutoPlay(card) => self.valid_card(card.id),
+            Effect::AutoPlay(card) | Effect::PlacePlayed(card, ..) => self.valid_card(card.id),
             Effect::MoveAll(_, filter, _)
             | Effect::DrawFiltered(_, filter)
             | Effect::DrawFilteredStep(_, filter)
@@ -1399,12 +1472,22 @@ impl Content {
             | Effect::FranticEscape
             | Effect::Stoke
             | Effect::Stampede
-            | Effect::ContinueEndTurn
             | Effect::CopyCard(..)
             | Effect::Discard(..)
             | Effect::DiscardHandDraw
             | Effect::PlayExhaustedShivs
-            | Effect::FinishAutoPlay
+            | Effect::BeforePlay
+            | Effect::OnPlay
+            | Effect::AfterPlay
+            | Effect::Uproar
+            | Effect::Fire(_)
+            | Effect::Listen(..)
+            | Effect::Step(_)
+            | Effect::Juggle
+            | Effect::ConfusedRoll(..)
+            | Effect::CheckEmptyHand
+            | Effect::MummifiedHand
+            | Effect::ReturnLate(..)
             | Effect::WhisperingEarring(_)
             | Effect::Exhaust(..)
             | Effect::Upgrade(..)
@@ -1442,30 +1525,77 @@ pub struct Card {
     pub id: Id,
     pub instance: u32,
     pub upgrades: u8,
-    pub cost_delta: i8,
     pub flags: u16,
     pub turn_flags: u16,
     pub value: i16,
     pub replays: u8,
-    pub free: bool,
-    pub cost_override: Option<i8>,
+    /// Local cost modifiers in the order applied, then empty slots.
+    pub costs: [CostMod; 6],
     pub enchantment: Option<Enchantment>,
     pub enchantment_amount: i16,
     pub enchantment_value: i16,
     pub variant: u8,
+    /// The card's affliction (one at most; a card already afflicted can't take another).
+    pub affliction: Affliction,
 }
 
-fn card_key(card: &Card) -> [i64; 13] {
+/// A local cost modifier (CardEnergyCost's LocalCostModifier; with STAR_COST, a
+/// TemporaryCardCost of the star cost).
+#[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq)]
+pub struct CostMod {
+    pub amount: i8,
+    pub kind: u8,
+}
+
+/// Cost modifier kinds: absolute (else relative), expiring at turn end and/or once played (else at
+/// combat end), reduce only, and the star cost instead of the energy cost.
+pub const ABSOLUTE: u8 = 1;
+pub const THIS_TURN: u8 = 2;
+pub const UNTIL_PLAYED: u8 = 4;
+pub const REDUCE_ONLY: u8 = 8;
+pub const STAR_COST: u8 = 16;
+
+/// Card afflictions, each applied by a power: Bound (Chains of Binding), Galvanized (Galvanic),
+/// Entangled (Tangled), Ringing, Smog (Smoggy), Tainted (Vital Spark), Hexed (Hex).
+#[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq)]
+pub enum Affliction {
+    #[default]
+    None,
+    Bound,
+    Galvanized,
+    Entangled,
+    Ringing,
+    Smog,
+    Tainted,
+    Hexed,
+}
+
+impl Affliction {
+    fn from_model(id: &str) -> Self {
+        match id {
+            "AFFLICTION.BOUND" => Self::Bound,
+            "AFFLICTION.GALVANIZED" => Self::Galvanized,
+            "AFFLICTION.ENTANGLED" => Self::Entangled,
+            "AFFLICTION.RINGING" => Self::Ringing,
+            "AFFLICTION.SMOG" => Self::Smog,
+            "AFFLICTION.TAINTED" => Self::Tainted,
+            "AFFLICTION.HEXED" => Self::Hexed,
+            _ => Self::None,
+        }
+    }
+}
+
+fn card_key(card: &Card) -> [i64; 11] {
     [
         card.id as i64,
         card.upgrades as i64,
-        card.cost_delta as i64,
         card.flags as i64,
         card.turn_flags as i64,
         card.value as i64,
         card.replays as i64,
-        card.free as i64,
-        card.cost_override.unwrap_or(-1) as i64,
+        (card.costs.iter()).fold(0, |key, cost| {
+            key << 10 ^ (cost.amount as i64) << 5 ^ cost.kind as i64
+        }),
         card.enchantment.map_or(0, |x| x as i64 + 1),
         card.enchantment_amount as i64,
         card.enchantment_value as i64,
@@ -1474,13 +1604,120 @@ fn card_key(card: &Card) -> [i64; 13] {
 }
 
 impl Card {
+    /// Adds a local cost modifier. An absolute one drops the earlier ones it outlasts (overridden
+    /// for good) and relatives that expire together merge, which keeps the cost exact.
+    pub fn add_cost(&mut self, amount: i8, kind: u8) {
+        let expiry = |kind: u8| kind & (THIS_TURN | UNTIL_PLAYED);
+        if kind & (ABSOLUTE | REDUCE_ONLY) == ABSOLUTE {
+            self.retain_costs(|cost| {
+                (cost.kind ^ kind) & STAR_COST != 0
+                    || expiry(cost.kind) & expiry(kind) != expiry(kind)
+            });
+        }
+        let len = self.cost_mods().count();
+        let new = CostMod { amount, kind };
+        // A repeated reduce-only cap changes nothing (Enlightenment twice).
+        if len > 0 && self.costs[len - 1] == new && kind & REDUCE_ONLY != 0 {
+            return;
+        }
+        if kind & (ABSOLUTE | REDUCE_ONLY) == 0 && len > 0 && self.costs[len - 1].kind == kind {
+            self.costs[len - 1].amount = self.costs[len - 1].amount.saturating_add(amount);
+            self.retain_costs(|cost| cost.kind & ABSOLUTE != 0 || cost.amount != 0);
+        } else if kind & ABSOLUTE != 0 || amount != 0 {
+            debug_assert!(
+                len < self.costs.len(),
+                "cost modifiers overflow: {:?}",
+                self.costs
+            );
+            if len == self.costs.len() {
+                self.costs.copy_within(1.., 0);
+            }
+            self.costs[len.min(self.costs.len() - 1)] = new;
+        }
+    }
+
+    /// CardCmd.Upgrade: a lower upgraded cost caps the absolute energy cost modifiers above it
+    /// (CardEnergyCost.UpgradeBy), so a Snecko Eye roll can't outlast the cheaper upgrade.
+    pub fn upgrade(&mut self, content: &Content) {
+        let def = content.cards[self.id as usize];
+        let new = def.cost[1];
+        if self.upgrades == 0
+            && (0..def.cost[0]).contains(&new)
+            && self.enchantment != Some(Enchantment::TezcatarasEmber)
+        {
+            for cost in &mut self.costs {
+                if cost.kind & (ABSOLUTE | STAR_COST) == ABSOLUTE && cost.amount > new {
+                    cost.amount = new;
+                }
+            }
+        }
+        self.upgrades = self.upgrades.max(1);
+    }
+
+    /// Clears the cost modifiers that expire with `expiry` (EndOfTurnCleanup,
+    /// AfterCardPlayedCleanup).
+    pub fn expire_costs(&mut self, expiry: u8) {
+        self.retain_costs(|cost| cost.kind & expiry == 0);
+    }
+
+    fn retain_costs(&mut self, keep: impl Fn(CostMod) -> bool) {
+        let mut kept = self
+            .costs
+            .into_iter()
+            .filter(|&x| x != CostMod::default() && keep(x));
+        self.costs = std::array::from_fn(|_| kept.next().unwrap_or_default());
+    }
+
+    pub fn cost_mods(&self) -> impl Iterator<Item = CostMod> + '_ {
+        self.costs
+            .iter()
+            .copied()
+            .take_while(|&cost| cost != CostMod::default())
+    }
+
+    /// SetToFreeThisTurn: no energy or star cost this turn or until played.
+    pub fn free_this_turn(&mut self) {
+        self.add_cost(0, ABSOLUTE | THIS_TURN | UNTIL_PLAYED);
+        self.add_cost(0, ABSOLUTE | THIS_TURN | UNTIL_PLAYED | STAR_COST);
+    }
+
+    /// SetToFreeThisCombat.
+    pub fn free_this_combat(&mut self) {
+        self.add_cost(0, ABSOLUTE);
+        self.add_cost(0, ABSOLUTE | STAR_COST);
+    }
+
+    /// The energy cost through the local modifiers (GetWithModifiers(Local)), before the final
+    /// clamp at 0: global modifiers (Borrowed Time) add to it first.
+    fn local_energy(&self, base: i16) -> i16 {
+        (self.cost_mods().filter(|cost| cost.kind & STAR_COST == 0)).fold(base, |current, cost| {
+            let set = cost.amount as i16 + (cost.kind & ABSOLUTE == 0) as i16 * current;
+            if cost.kind & REDUCE_ONLY != 0 {
+                current.min(set)
+            } else {
+                set
+            }
+        })
+    }
+
+    /// The last temporary star cost (CurrentStarCost).
+    fn star_override(&self) -> Option<i16> {
+        (self.cost_mods().filter(|cost| cost.kind & STAR_COST != 0))
+            .last()
+            .map(|cost| cost.amount as i16)
+    }
+
     fn flags(self, def: CardDef) -> u16 {
-        let mut flags = def.flags[self.upgrades.min(1) as usize] | self.flags | self.turn_flags;
+        let mut flags = def.flags[self.upgrades.min(1) as usize];
+        // Soul's Power removes the card's own Exhaust, not a forced one (Havoc).
+        if self.enchantment == Some(Enchantment::SoulsPower) {
+            flags &= !EXHAUST;
+        }
+        flags |= self.flags | self.turn_flags;
         match self.enchantment {
             Some(Enchantment::Goopy) => flags |= EXHAUST,
             Some(Enchantment::Inky) => flags |= INKY,
             Some(Enchantment::RoyallyApproved) => flags |= INNATE | RETAIN,
-            Some(Enchantment::SoulsPower) => flags &= !EXHAUST,
             Some(Enchantment::Steady) => flags |= RETAIN,
             Some(Enchantment::TezcatarasEmber) => flags |= ETERNAL,
             _ => {}
@@ -1508,12 +1745,14 @@ impl Card {
     }
 }
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq)]
 pub struct Power {
     pub id: Id,
     pub amount: i16,
     pub skip_next_decay: bool,
     pub value: i16,
+    /// Instanced powers (The Bomb, Panache, ...) keep one entry per application.
+    pub instance: u8,
 }
 
 #[derive(Clone, Debug)]
@@ -1545,6 +1784,23 @@ impl Creature {
         self.add_power_with_skip_next_decay(id, amount, false);
     }
 
+    fn add_instance(&mut self, id: Id, amount: i16, value: i16) {
+        let same = self.powers.iter().filter(|x| x.id == id);
+        let instance = same.map(|x| x.instance + 1).max().unwrap_or_default();
+        self.powers.push(Power {
+            id,
+            amount,
+            value,
+            instance,
+            ..Power::default()
+        });
+    }
+
+    /// The live entry a listener's snapshot stands for.
+    fn instance_mut(&mut self, power: Power) -> Option<&mut Power> {
+        (self.powers.iter_mut()).find(|x| x.id == power.id && x.instance == power.instance)
+    }
+
     fn consume_power(&mut self, id: Id) {
         if self.power(id) > 0 {
             self.add_power(id, -1);
@@ -1562,7 +1818,7 @@ impl Creature {
                 id,
                 amount,
                 skip_next_decay,
-                value: 0,
+                ..Power::default()
             });
         }
     }
@@ -1578,6 +1834,7 @@ pub struct Enemy {
     pub move_history: Vec<usize>,
     pub stunned: bool,
     pub value: i16,
+    pub slot: u8,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1591,6 +1848,8 @@ pub struct History {
     pub cards: i16,
     pub manual_cards: i16,
     pub manual_plays: i16,
+    /// Card plays started this turn, auto-plays included and replays not (Echo Form).
+    pub first_plays: i16,
     pub attacks: i16,
     pub skills: i16,
     pub powers: i16,
@@ -1605,15 +1864,24 @@ pub struct History {
     pub doom_applied: i16,
     pub osty_attacks: i16,
     pub block_gains: i16,
-    block_card: i16,
+    /// The play (series and index within it) whose block gains `block_card_gains` counts (Unmovable).
+    block_card: i32,
     block_card_gains: i16,
     pub hp_lost: i16,
+    /// HP lost to hits that didn't kill: a killing hit skips AfterDamageReceived, so Beating
+    /// Remnant doesn't count it even when Lizard Tail prevents the death.
+    pub remnant_lost: i16,
     pub hp_loss_events: i16,
+    /// Hits on the player not fully blocked, even when Osty takes the HP loss (Emotion Chip).
+    unblocked_hits: i16,
     pub feral_returns: i16,
+    /// Attack plays started this turn with an energy value of 0 (Feral counts them on apply).
+    pub zero_attacks: i16,
+    pub statuses_drawn: i16,
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-enum Actor {
+pub enum Actor {
     Player,
     Osty,
     Enemy(usize),
@@ -1630,6 +1898,20 @@ struct Context {
     orb: bool,
     orb_id: Option<Id>,
     pen_nib: bool,
+    /// The first play of the turn's first attack (Lethality).
+    lethal: bool,
+    /// Queued by a power or relic hook rather than by the card itself (no card source).
+    hook: bool,
+    /// Auto-played from outside the hand and play pile, so Free Attack, Free Skill, Free Power
+    /// and Veilpiercer don't lower its energy value.
+    off_pile: bool,
+    /// The targeted enemy's instance, so a later play of the series skips a creature that
+    /// respawned into its slot (Axebot's Stock).
+    target_instance: Option<u32>,
+    /// An exhaust by Ethereal at turn end (causedByEthereal): Dark Embrace defers its draws.
+    ethereal: bool,
+    /// The instance of the card a card hook is about (the exhausted, drawn or played card).
+    subject: Option<u32>,
 }
 
 impl Context {
@@ -1644,6 +1926,12 @@ impl Context {
             orb: false,
             orb_id: None,
             pen_nib: false,
+            lethal: false,
+            hook: false,
+            off_pile: false,
+            target_instance: None,
+            ethereal: false,
+            subject: None,
         }
     }
 
@@ -1662,9 +1950,50 @@ struct Pending {
     context: Context,
 }
 
+/// A hook listener snapshotted when its pass starts: a removed power still fires as it was.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-enum ControlContinuation {
-    StartExtraPlayerTurnAfterResolution,
+pub enum Listener {
+    Power(Actor, Power),
+    Relic(u8),
+    Card(Card),
+}
+
+/// The turn's non-hook steps (CombatManager.StartTurn, SetupPlayerTurn, EndPlayerTurnPhaseOne).
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum Step {
+    TurnStart,
+    RollMoves,
+    ClearBlock,
+    ResetEnergy,
+    HandDraw,
+    TurnStartOrbs,
+    Bombardments,
+    IAmInvincible,
+    Stampede,
+    HowlFromBeyond,
+    TurnEndOrbs,
+    DoTurnEnd,
+    /// An Ethereal card in hand exhausts (causedByEthereal).
+    EtherealExhaust(Card),
+    /// A turn-end-in-hand card's effect, with the hand size at BeforeSideTurnEnd (Regret).
+    TurnEndCard(Card, i16),
+    TurnEndCardDone(Card),
+    Retain,
+    Flush,
+    Bookmark,
+    SwitchSide,
+    EnemyMoves,
+    /// An enemy's move, with its instance when the moves started.
+    EnemyMove(u8, u32),
+    /// After an enemy's move resolved, with the move and whether it was stunned.
+    EnemyMoveDone(u8, u8, bool),
+    /// The Fabricator's second bot, once its move's effects resolved.
+    FabricatorBot(u8),
+    /// The enemies' turn end: the player's turn follows.
+    EnemyTurnEnd,
+    /// An exhausted played card's until-played costs wear off once its exhaust hooks resolved
+    /// (AfterCardPlayedCleanup), so Burning Sticks' clone keeps them.
+    PlayedCleanup(u32),
 }
 
 #[derive(Clone, Debug)]
@@ -1673,12 +2002,21 @@ enum RewardContinuation {
     PrefetchedCards(Vec<Card>),
 }
 
+/// A card being played (CardModel.OnPlayWrapper), manually or automatically.
 #[derive(Clone, Debug, Hash)]
-struct AutoPlay {
+struct Play {
     card: Card,
-    powers: Vec<Power>,
-    enemy_powers: Vec<Vec<Power>>,
     plays: u8,
+    /// Plays whose AfterCardPlayed hooks already ran.
+    done: u8,
+    /// The play's energy value and the stars it spent (ResourceInfo).
+    energy: i16,
+    stars: i16,
+    manual: bool,
+    context: Context,
+    /// What the powers that remember a play record in its BeforeCardPlayed (StormPower's
+    /// amountsForPlayedCards): only those hear its AfterCardPlayed, with the recorded amount.
+    recorded: Vec<(Actor, Power)>,
 }
 
 #[derive(Clone, Debug)]
@@ -1702,32 +2040,33 @@ pub struct Combat {
     pub orb_slots: u8,
     pub history: History,
     total_cards: i16,
-    last_cards: i16,
+    last_turn: History,
+    /// History Course's card: last turn's last finished attack or skill.
+    last_turn_card: Option<Card>,
     orbit_spent: i16,
     hits: Vec<i16>,
     last_damage: i16,
+    /// Whether the last attack killed one of its targets (DamageResult.WasTargetKilled).
+    last_killed: bool,
     drawn: i16,
+    /// Turn 1's innate/Imbued draw-pile reorder has run (after BeforeHandDraw).
+    innate_ordered: bool,
     lightning_channeled: i16,
     orbs_channeled: u8,
     poisoned: u8,
     nightmares: Vec<(Card, u8)>,
-    bombs: Vec<(u8, i16)>,
-    automation: Vec<(u8, i16)>,
-    panache: Vec<(u8, i16, i16)>,
-    boulders: Vec<i16>,
     dampened: Vec<(u32, u8)>,
     paels_tears: bool,
-    ending: bool,
-    playing: Option<Card>,
-    auto_plays: Vec<AutoPlay>,
+    orichalcum: bool,
+    /// Cards being played, the innermost last.
+    plays: Vec<Play>,
     queue: Vec<Pending>,
-    control: Vec<ControlContinuation>,
     choice: Option<Choice>,
-    power_snapshot: Vec<Power>,
-    enemy_power_snapshot: Vec<Vec<Power>>,
-    card_energy: i16,
-    card_stars: i16,
-    card_plays: u8,
+    /// Card instances whose play started under Rebound (the result pile is chosen at play start).
+    rebounds: Vec<u32>,
+    ferals: Vec<u32>,
+    /// One damage command's hits: their hooks, then their kills, wait until it hit every target.
+    pending_hits: Option<Vec<Hit>>,
     force_end: bool,
     enemy_turn: bool,
     centennial_puzzle: bool,
@@ -1735,20 +2074,42 @@ pub struct Combat {
     permafrost: bool,
     ruined_helmet: bool,
     music_box: bool,
+    /// Music Box copies the first attack whose play started this turn, once that play finishes.
+    music_box_card: Option<u32>,
+    /// Swift's draw on a card that moves itself to the draw pile (Shining Strike), which comes
+    /// after that move.
+    swift_after_return: u8,
     mini_regent: bool,
     rainbow_ring: bool,
-    kusarigama: u8,
+    attacks_mod3: u8,
+    discard_draw: (usize, Vec<Card>),
+    letter_opener: u8,
+    bound_played: bool,
+    bound_this_turn: u8,
+    /// The player's turn setup (PlayerTurnPhase.Start), when an emptied hand doesn't count.
+    setup: bool,
+    /// Potions whose effects are still resolving (IsExecutingCardOrPotionEffect).
+    potions: u8,
     unsettling_lamp: Option<Id>,
     unsettling_used: bool,
-    diamond_diadem: bool,
+    applying_hook: bool,
     belt_buckle: bool,
     burning_sticks: bool,
     red_skull: bool,
     throwing_axe: bool,
     vambrace: bool,
+    block_doubler: Option<u32>,
+    /// Enemies whose Curl Up a card hit; they curl once that card's play finishes.
+    curled: Vec<usize>,
     paels_eye: bool,
+    /// Pael's Eye earned an extra turn, until its setup ends (Rampart skips it).
+    extra_turn: bool,
     paels_legion: u8,
+    /// The game's next creature combat id; pets (Osty, Pael's Legion) take ids too.
+    next_creature: u32,
     history_course: Option<Card>,
+    /// Beat Down's picks: each one's target is rolled before CardCmd.AutoPlay checks it can play.
+    beat_down: Vec<u32>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1760,7 +2121,7 @@ struct Choice {
     optional: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Run {
     pub ascension: u8,
     pub character: Id,
@@ -1855,13 +2216,29 @@ enum DamageKind {
     Unblockable,
 }
 
+/// One hit's result as CreatureCmd.Damage hands it to its hooks. Osty soaks the player's hits
+/// (`target` the player, `receiver` Osty).
+#[derive(Clone, Copy, Debug)]
+struct Hit {
+    dealer: Actor,
+    target: Actor,
+    receiver: Actor,
+    card: Option<Id>,
+    kind: DamageKind,
+    blocked: i16,
+    lost: i16,
+    fully_blocked: bool,
+    killed: bool,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct DamageResult {
     lost: i16,
-    resolved: i16,
+    blocked: i16,
+    dealt: i16,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct Rng([u64; 4], u64);
 
 impl Rng {
@@ -2116,6 +2493,8 @@ pub struct Game {
     relic_deques: [Vec<Id>; 4],
     shared_relic_deques: [Vec<Id>; 4],
     reward_continuation: Option<RewardContinuation>,
+    /// Extra card rewards (Prayer Wheel, White Star) rolled with the combat rewards, as the game does.
+    prefetched_card_rewards: Vec<Vec<Card>>,
     wongo_combats: Option<u8>,
     spoils: Option<(u8, u8)>,
     event_combat: u8,
@@ -2125,7 +2504,7 @@ pub struct Game {
     silver_crucible: u8,
     silken_tress: bool,
     rerolled_cards: bool,
-    maw_bank: bool,
+    maw_bank: u8,
     silver_treasures: u8,
     golden_compass: Option<u8>,
     winged_boots: u8,
@@ -2151,6 +2530,10 @@ pub struct Game {
     reward_gold_parts: Vec<i32>,
     fake_merchant: Vec<Id>,
     fake_shop: bool,
+    /// The Courier refills a slot only once a purchase completes, after any pickup screen it opened.
+    courier_restock: Option<(usize, ShopItem)>,
+    /// A dying enemy's max HP, for unique HP rolls of the enemies its death spawns.
+    corpse_hp: Option<i16>,
     fake_happy_flower: u8,
     lizard_tail: bool,
     nunchaku: u8,
@@ -2158,6 +2541,8 @@ pub struct Game {
     pen_nib: u8,
     iron_club: u8,
     joss_paper: u8,
+    /// Ethereal exhausts Joss Paper only counts at AfterSideTurnEnd (its EtherealCount).
+    joss_paper_ethereal: u8,
     tuning_fork: u8,
     bone_tea: bool,
     tea_of_discourtesy: bool,

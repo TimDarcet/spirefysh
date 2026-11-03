@@ -44,9 +44,9 @@ public static class BridgeEntry
         try
         {
             VerifyGameAssembly();
-            _advisor = AdvisorClient.CreateFromConfiguration();
-            _verifier = TransitionVerifier.CreateFromConfiguration();
             _policy = PolicyClient.CreateFromConfiguration();
+            _advisor = _policy is null ? AdvisorClient.CreateFromConfiguration() : null;
+            _verifier = _policy is null ? TransitionVerifier.CreateFromConfiguration() : null;
             _capture = TraceCapture.CreateFromConfiguration(_verifier);
             if (_policy is not null && _capture?.RecordsTrace != true)
                 throw new InvalidOperationException("Policy AutoSlay requires trace capture.");

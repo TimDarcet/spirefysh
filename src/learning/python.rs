@@ -2775,10 +2775,8 @@ fn game_state(game: &Game, content: &Content) -> serde_json::Value {
             "id": content.cards[card.id as usize].id,
             "instance": card.instance,
             "upgrades": card.upgrades,
-            "cost_delta": card.cost_delta,
             "value": card.value,
-            "free": card.free,
-            "cost_override": card.cost_override,
+            "costs": card.cost_mods().map(|cost| (cost.amount, cost.kind)).collect::<Vec<_>>(),
         })
     };
     let powers = |creature: &Creature| {
@@ -2824,7 +2822,7 @@ fn game_state(game: &Game, content: &Content) -> serde_json::Value {
             "common": common,
             "turn": combat.turn,
             "energy": combat.energy,
-            "max_energy": combat.max_energy,
+            "max_energy": game.max_energy(content),
             "stars": combat.stars,
             "player": creature(&combat.player),
             "osty": creature(&combat.osty),
@@ -6401,7 +6399,11 @@ impl Batch {
                     game.run.hp,
                     game.run.max_hp,
                     phase_index(&game.phase).map_or(
-                        if matches!(game.phase, Phase::Won) { 12 } else { 13 },
+                        if matches!(game.phase, Phase::Won) {
+                            12
+                        } else {
+                            13
+                        },
                         |phase| phase as u8,
                     ),
                     turn,
@@ -6446,7 +6448,7 @@ impl Batch {
                     combat.discard.len(),
                     combat.exhaust.len(),
                     combat.queue.len(),
-                    combat.auto_plays.len(),
+                    combat.plays.iter().filter(|play| !play.manual).count(),
                     combat.enemies.len(),
                     combat.player.powers.len(),
                     combat
@@ -7298,6 +7300,20 @@ impl Batch {
                 diagnostics.as_array_mut().column_mut(0).fill(value);
             }
         };
+        fn stage_marks<'a>(
+            diagnostics: &'a mut Option<PyReadwriteArray2<'_, i64>>,
+            len: usize,
+        ) -> Vec<Option<&'a mut i64>> {
+            match diagnostics {
+                Some(values) => values
+                    .as_array_mut()
+                    .index_axis_move(ndarray::Axis(1), 0)
+                    .into_iter()
+                    .map(Some)
+                    .collect(),
+                None => (0..len).map(|_| None).collect(),
+            }
+        }
         if let Some(diagnostics) = &mut diagnostics {
             diagnostics.as_array_mut().fill(-1);
         }
@@ -7328,6 +7344,7 @@ impl Batch {
         let bonuses = (self.training_strength, self.training_dexterity);
         let skip_forced = (cache_features || skip_forced) && !search_enabled;
         self.map_caches.resize_with(self.games.len(), || None);
+        let marks = stage_marks(&mut diagnostics, self.games.len());
         let rows = py.allow_threads(|| {
             self.games
                 .par_iter()
@@ -7359,6 +7376,13 @@ impl Batch {
                             legal: true,
                         }],
                     }
+                })
+                .zip(marks)
+                .map(|(row, mark)| {
+                    if let Some(mark) = mark {
+                        *mark = 1;
+                    }
+                    row
                 })
                 .collect::<Vec<_>>()
         });
@@ -7646,6 +7670,7 @@ impl Batch {
                 .map(|action| matches!(action, Action::Path(_)))
                 .collect::<Vec<_>>();
             let content = &self.content;
+            let marks = stage_marks(&mut diagnostics, self.games.len());
             let results = py
                 .allow_threads(|| {
                     self.games
@@ -7661,6 +7686,13 @@ impl Batch {
                                 was_combat,
                                 !was_combat && game.combat().is_some(),
                             ))
+                        })
+                        .zip(marks)
+                        .map(|(result, mark)| {
+                            if let Some(mark) = mark {
+                                *mark = 6;
+                            }
+                            result
                         })
                         .collect::<Result<Vec<_>, String>>()
                 })

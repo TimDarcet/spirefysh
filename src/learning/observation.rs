@@ -487,6 +487,15 @@ fn push_semantic(row: &mut DomainRow, layout: Layout, namespace: Semantic, value
     row.c[slot] = layout.semantic(namespace, value);
 }
 
+/// The turn is ending: the next turn step is the hand flush (Well-Laid Plans' pick).
+fn ending(combat: &Combat) -> bool {
+    (combat.queue.iter().rev()).find_map(|pending| match pending.effect {
+        Effect::Step(Step::PlayedCleanup(_)) => None,
+        Effect::Step(step) => Some(step),
+        _ => None,
+    }) == Some(Step::Flush)
+}
+
 fn push_boolean(row: &mut DomainRow, layout: Layout, field: u32, value: bool) {
     push_semantic(row, layout, Semantic::Boolean, field * 2 + value as u32);
 }
@@ -855,7 +864,7 @@ fn populate_domain_features(
                 Phase::Combat(combat) => {
                     push_boolean(row, layout, 0, combat.choice.is_some());
                     push_boolean(row, layout, 1, combat.enemy_turn);
-                    push_boolean(row, layout, 2, combat.ending);
+                    push_boolean(row, layout, 2, ending(combat));
                     push_boolean(row, layout, 3, combat.force_end);
                     if let Some(choice) = combat.choice {
                         push_boolean(row, layout, 4, choice.optional);
@@ -1541,9 +1550,9 @@ struct PreviewHit {
     amount: i16,
     count: i16,
     card: Option<Card>,
-    pen_nib: bool,
+    context: Context,
+    /// The player's Vigor and Gigantification left when the hit lands; attacks spend them.
     vigor: i16,
-    lethality: bool,
     gigantification: bool,
 }
 
@@ -1579,8 +1588,7 @@ impl CardPreview {
                 .iter()
                 .chain(&combat.hand)
                 .chain(&combat.discard)
-                .chain(combat.playing.iter())
-                .chain(combat.auto_plays.iter().map(|play| &play.card))
+                .chain(combat.plays.iter().map(|play| &play.card))
                 .any(|card| card.id == card_id::SOVEREIGN_BLADE),
             ..Self::default()
         }
@@ -1631,86 +1639,22 @@ fn preview_attack(game: &Game, _content: &Content, source: Actor, base: i16) -> 
     if source.hp <= 0 {
         return 0;
     }
-    base.max(0)
-}
-
-fn weak_damage(game: &Game, content: &Content, source: Actor, damage: i16) -> i16 {
-    let Some(combat) = game.combat() else {
-        return damage;
-    };
-    let source = match source {
-        Actor::Osty => &combat.osty,
-        _ => &combat.player,
-    };
-    if source.kind(content, PowerKind::Weak) > 0 {
-        damage.saturating_mul(if source.power(power_id::DEBILITATE) > 0 {
-            50
-        } else {
-            75
-        }) / 100
-    } else {
-        damage
-    }
+    // Calculated damage (Precise Cut) may go negative; ModifyDamage clamps it at the end.
+    base
 }
 
 fn preview_block(
     game: &Game,
     content: &Content,
-    context: Context,
+    card: Option<Id>,
     base: i16,
     powered: bool,
 ) -> i16 {
-    let Some(combat) = game.combat() else {
+    if game.combat().is_none() {
         return base.max(0);
-    };
-    if context.card.is_some() && combat.player.power(power_id::NO_BLOCK) > 0 {
-        return 0;
     }
-    let relic = |id| {
-        game.run
-            .relics
-            .iter()
-            .any(|&relic| content.relics[relic as usize].id == id)
-    };
-    let fasten = context
-        .card
-        .filter(|&id| content.cards[id as usize].tags & DEFEND_TAG != 0)
-        .map_or(0, |_| combat.player.power(power_id::FASTEN));
-    let enchantment = context
-        .card
-        .and_then(|id| {
-            combat
-                .auto_plays
-                .last()
-                .map(|play| play.card)
-                .or(combat.playing)
-                .filter(|card| card.id == id)
-        })
-        .map_or(0, |card| match card.enchantment {
-            Some(Enchantment::Nimble) => card.enchantment_amount,
-            Some(Enchantment::Goopy) => card.enchantment_amount.saturating_sub(1),
-            _ => 0,
-        });
-    let mut amount = game.modified_block(
-        content,
-        Actor::Player,
-        base.saturating_add(fasten).saturating_add(enchantment),
-        powered,
-    );
-    if context
-        .card
-        .is_some_and(|id| content.cards[id as usize].tags & MINION_TAG != 0)
-        && relic("RELIC.VITRUVIAN_MINION")
-    {
-        amount = amount.saturating_mul(2);
-    }
-    if context.card.is_some() && !combat.vambrace && relic("RELIC.VAMBRACE") {
-        amount = amount.saturating_mul(2);
-    }
-    if context.card.is_some() && combat.paels_legion == 0 && relic("RELIC.PAELS_LEGION") {
-        amount = amount.saturating_mul(2);
-    }
-    amount
+    game.modify_block(content, Actor::Player, base, card, powered)
+        .0
 }
 
 fn preview_gain_block(
@@ -1729,7 +1673,7 @@ fn preview_gain_block(
             preview_hooks(
                 game,
                 content,
-                Trigger::BlockGained,
+                Trigger::AfterBlockGained,
                 Actor::Player,
                 Context::player(),
                 &powers,
@@ -1795,31 +1739,25 @@ fn push_preview_hit(
     }
     let card = game.combat().and_then(|combat| {
         combat
-            .auto_plays
+            .plays
             .last()
             .map(|play| play.card)
-            .or(combat.playing)
             .filter(|card| Some(card.id) == context.card)
     });
-    let player_attack = matches!(damage, PreviewDamage::Attack(Actor::Player));
-    let vigor = if player_attack { preview.vigor } else { 0 };
-    let gigantification = player_attack && preview.gigantification;
     preview.hits.push(PreviewHit {
         target,
         damage,
         amount,
         count,
         card,
-        pen_nib: context.pen_nib,
-        vigor,
-        lethality: player_attack
-            && game
-                .combat()
-                .is_some_and(|combat| combat.history.attacks == 1),
-        gigantification,
+        context,
+        vigor: preview.vigor,
+        gigantification: preview.gigantification,
     });
-    if player_attack {
+    if matches!(damage, PreviewDamage::Attack(Actor::Player)) {
         preview.vigor = 0;
+    }
+    if matches!(damage, PreviewDamage::Attack(Actor::Player | Actor::Osty)) {
         preview.gigantification = false;
     }
 }
@@ -1897,7 +1835,7 @@ fn preview_draw_count(
         preview_hooks(
             game,
             content,
-            Trigger::CardDrawn,
+            Trigger::AfterCardDrawn,
             Actor::Player,
             context,
             &powers,
@@ -1907,7 +1845,7 @@ fn preview_draw_count(
             for hook in content.cards[card.id as usize]
                 .hooks
                 .iter()
-                .filter(|hook| hook.trigger == Trigger::CardDrawn)
+                .filter(|hook| hook.trigger == Trigger::AfterCardDrawn)
             {
                 preview_effects(game, content, context, hook.effects, 1, preview);
             }
@@ -1925,7 +1863,7 @@ fn preview_exhaust(game: &Game, content: &Content, count: i16, preview: &mut Car
         preview_hooks(
             game,
             content,
-            Trigger::CardExhausted,
+            Trigger::AfterCardExhausted,
             Actor::Player,
             Context::player(),
             &powers,
@@ -2131,7 +2069,7 @@ fn preview_attack_total(
     };
     Some(targets.into_iter().fold(0i16, |total, target| {
         total.saturating_add(
-            modified_preview_damage(game, content, hit, Some(target), false)
+            modified_preview_damage(game, content, hit, Some(target), true)
                 .0
                 .saturating_mul(hit.count.max(0)),
         )
@@ -2157,7 +2095,7 @@ fn preview_generated(
         preview_hooks(
             game,
             content,
-            Trigger::CardGenerated,
+            Trigger::AfterCardGeneratedForCombat,
             Actor::Player,
             context,
             &powers,
@@ -2270,20 +2208,18 @@ fn preview_effects(
                     game,
                     content,
                     preview,
-                    preview_block(game, content, context, base, context.card.is_some()),
+                    preview_block(game, content, context.card, base, context.card.is_some()),
                     repeats,
                 );
             }
             Effect::RawBlock(Target::Player, amount) | Effect::RawBlock(Target::Source, amount)
                 if context.source == Actor::Player =>
             {
-                preview_gain_block(
-                    game,
-                    content,
-                    preview,
-                    preview_amount(game, content, context, amount).max(0),
-                    repeats,
-                )
+                // Entrench's own block is unpowered card block; other raw block has no card.
+                let card = context.card.filter(|_| amount.scale == Scale::Block);
+                let base = preview_amount(game, content, context, amount);
+                let block = preview_block(game, content, card, base, false);
+                preview_gain_block(game, content, preview, block, repeats)
             }
             Effect::DodgeRoll(amount) => {
                 let base = preview_amount(game, content, context, amount);
@@ -2291,7 +2227,7 @@ fn preview_effects(
                     game,
                     content,
                     preview,
-                    preview_block(game, content, context, base, true),
+                    preview_block(game, content, context.card, base, true),
                     repeats,
                 );
             }
@@ -2322,7 +2258,7 @@ fn preview_effects(
                         game,
                         content,
                         preview,
-                        preview_block(game, content, context, base, true),
+                        preview_block(game, content, context.card, base, true),
                         repeats,
                     );
                 }
@@ -2451,7 +2387,8 @@ fn preview_effects(
                         ) as i16
                 });
                 let base = preview_amount(game, content, context, amount);
-                let block = preview_block(game, content, context, base, true);
+                let block =
+                    preview_block(game, content, context.card, base, context.card.is_some());
                 preview_gain_block(game, content, preview, block, count.saturating_mul(repeats));
                 preview_exhaust(game, content, count.saturating_mul(repeats), preview);
                 preview.hand = preview.hand.saturating_sub(count.saturating_mul(repeats));
@@ -3047,7 +2984,10 @@ fn preview_hooks(
     for power in powers {
         if matches!(
             trigger,
-            Trigger::PowerPlayed | Trigger::CardDrawn | Trigger::CardGenerated
+            Trigger::PowerPlayed | Trigger::AfterCardDrawn | Trigger::AfterCardGeneratedForCombat
+        ) || matches!(
+            power.id,
+            power_id::STRANGLE | power_id::SERPENT_FORM | power_id::AFTERIMAGE
         ) {
             context.event = power.amount;
         }
@@ -3103,7 +3043,7 @@ fn preview_card_effects(
 
 fn card_preview(game: &Game, content: &Content, card: Card, target: Option<usize>) -> CardPreview {
     let def = content.cards[card.id as usize];
-    let (x, stars) = game.combat().map_or((0, 0), |combat| {
+    let (x, stars, lethal) = game.combat().map_or((0, 0, false), |combat| {
         (
             if def.cost[card.upgrades.min(1) as usize] < 0 {
                 combat.energy
@@ -3111,6 +3051,7 @@ fn card_preview(game: &Game, content: &Content, card: Card, target: Option<usize
                 0
             },
             crate::game::star_cost(combat, card, def),
+            card.card_type(def) == CardType::Attack && combat.history.attacks == 0,
         )
     });
     preview_card_effects(
@@ -3121,6 +3062,7 @@ fn card_preview(game: &Game, content: &Content, card: Card, target: Option<usize
             target,
             x,
             event: stars,
+            lethal,
             ..Context::card(card)
         }],
         CardPreview::new(game, content),
@@ -3156,8 +3098,18 @@ fn played_card_preview(
     if let Some(index) = combat.hand.iter().position(|&candidate| candidate == card) {
         combat.hand.remove(index);
     }
-    combat.playing = Some(card);
-    let void_free = combat.history.manual_cards < combat.player.power(power_id::VOID_FORM);
+    combat.plays.push(Play {
+        card,
+        plays: 1,
+        done: 0,
+        energy: 0,
+        stars: 0,
+        manual: true,
+        context: Context::card(card),
+        recorded: vec![],
+    });
+    combat.history.manual_cards += 1;
+    let void_free = combat.void_free();
     let free = match card_type {
         _ if void_free => None,
         CardType::Power if combat.player.power(power_id::FREE_POWER) > 0 => {
@@ -3171,12 +3123,13 @@ fn played_card_preview(
     let cost = if scarf {
         0
     } else {
-        crate::game::energy_cost(combat, card, def, gauntlets)
+        crate::game::energy_cost(combat, card, def, gauntlets, true)
     };
     if let Some(power) = free {
         combat.player.consume_power(power);
     }
-    if card.flags(def) & ETHEREAL != 0 && combat.player.power(power_id::VEILPIERCER) > 0 {
+    if crate::game::is_ethereal(combat, card, def) && combat.player.power(power_id::VEILPIERCER) > 0
+    {
         combat.player.consume_power(power_id::VEILPIERCER);
     }
     if card_type == CardType::Attack && combat.player.power(power_id::FREE_ATTACK) > 0 {
@@ -3230,12 +3183,10 @@ fn played_card_preview(
     {
         combat.player.consume_power(power);
     }
-    combat.card_energy = cost;
-    combat.card_stars = stars;
-    combat.card_plays = plays;
+    let play = combat.plays.last_mut().unwrap();
+    (play.energy, play.stars, play.plays) = (cost, stars, plays);
     combat.history.energy += cost;
     combat.history.cards += plays as i16;
-    combat.history.manual_cards += 1;
     combat.history.manual_plays += plays as i16;
     match card_type {
         CardType::Attack => combat.history.attacks += plays as i16,
@@ -3245,12 +3196,13 @@ fn played_card_preview(
     }
     if card.enchantment == Some(Enchantment::Sown) && card.enchantment_value > 0 {
         combat.energy = combat.energy.saturating_add(card.enchantment_amount);
-        combat.playing.as_mut().unwrap().enchantment_value = 0;
+        combat.plays.last_mut().unwrap().card.enchantment_value = 0;
     }
     let pen_nib = card_type == CardType::Attack && relic("RELIC.PEN_NIB");
     let mut counter = game.pen_nib;
+    let lethal = card_type == CardType::Attack && original.history.attacks == 0;
     let contexts = (0..plays)
-        .map(|_| {
+        .map(|index| {
             if pen_nib {
                 counter = (counter + 1) % 10;
             }
@@ -3259,6 +3211,7 @@ fn played_card_preview(
                 x,
                 event: stars,
                 pen_nib: pen_nib && counter == 0,
+                lethal: lethal && index == 0,
                 ..Context::card(card)
             }
         })
@@ -3281,9 +3234,8 @@ fn played_card_preview(
         amount: black_hole,
         count: 1,
         card: Some(card),
-        pen_nib: false,
+        context: Context::card(card),
         vigor: 0,
-        lethality: false,
         gigantification: false,
     };
     let mut preview = CardPreview::new(&projected, content);
@@ -3292,12 +3244,13 @@ fn played_card_preview(
         &projected,
         content,
         &mut preview,
-        4,
+        preview_block(&projected, content, None, 4, false),
         plays as i16 * (cost >= 2 && helmet) as i16,
     );
+    let ash = preview_block(&projected, content, None, ash, false);
     preview_gain_block(&projected, content, &mut preview, ash, 1);
     if danse > 0 {
-        let block = preview_block(&projected, content, contexts[0], danse, true);
+        let block = preview_block(&projected, content, None, danse, false);
         preview_gain_block(&projected, content, &mut preview, block, 1);
     }
     if throne > 0 && black_hole > 0 {
@@ -3308,7 +3261,7 @@ fn played_card_preview(
             let block = preview_block(
                 &projected,
                 content,
-                contexts[0],
+                Some(card.id),
                 card.enchantment_amount,
                 true,
             );
@@ -3363,7 +3316,7 @@ fn played_card_preview(
         preview_gain_block(&projected, content, &mut preview, 4, attack_triggers);
     }
     let kusarigama = if card_type == CardType::Attack && relic("RELIC.KUSARIGAMA") {
-        (original.kusarigama as i16 + plays as i16) / 3
+        (original.attacks_mod3 as i16 + plays as i16) / 3
     } else {
         0
     };
@@ -3401,7 +3354,7 @@ fn played_card_preview(
             &projected,
             content,
             &mut preview,
-            projected.modified_block(content, Actor::Player, 7, false),
+            preview_block(&projected, content, None, 7, false),
             triggers,
         );
     }
@@ -3409,7 +3362,7 @@ fn played_card_preview(
         CardType::Attack => Trigger::AttackPlayed,
         CardType::Skill => Trigger::SkillPlayed,
         CardType::Power => Trigger::PowerPlayed,
-        _ => Trigger::CardPlayed,
+        _ => Trigger::AfterCardPlayed,
     };
     let context = Context {
         event: 1,
@@ -3420,7 +3373,7 @@ fn played_card_preview(
             preview_hooks(
                 &projected,
                 content,
-                Trigger::CardPlayed,
+                Trigger::AfterCardPlayed,
                 Actor::Enemy(target),
                 Context {
                     source: Actor::Enemy(target),
@@ -3434,13 +3387,13 @@ fn played_card_preview(
         preview_hooks(
             &projected,
             content,
-            Trigger::CardPlayed,
+            Trigger::AfterCardPlayed,
             Actor::Player,
             context,
             &original.player.powers,
             &mut preview,
         );
-        if trigger != Trigger::CardPlayed {
+        if trigger != Trigger::AfterCardPlayed {
             preview_hooks(
                 &projected,
                 content,
@@ -3473,6 +3426,8 @@ fn played_card_preview(
     preview
 }
 
+/// A hit's damage through the simulator's ModifyDamage, with the Vigor, Gigantification and
+/// Flutter that earlier hits of the preview already spent.
 fn modified_preview_damage(
     game: &Game,
     content: &Content,
@@ -3480,210 +3435,68 @@ fn modified_preview_damage(
     target: Option<usize>,
     flutter: bool,
 ) -> (i16, bool, i16) {
-    let attack = matches!(hit.damage, PreviewDamage::Attack(_));
-    let powered = matches!(
-        hit.damage,
-        PreviewDamage::Attack(_) | PreviewDamage::Move(_)
-    );
-    let source = match hit.damage {
-        PreviewDamage::Attack(source) | PreviewDamage::Move(source) => Some(source),
-        _ => None,
+    let (kind, source) = match hit.damage {
+        PreviewDamage::Attack(source) => (DamageKind::Attack, source),
+        PreviewDamage::Move(source) => (DamageKind::Move, source),
+        _ => (DamageKind::Unpowered, hit.context.source),
     };
+    let attack = matches!(kind, DamageKind::Attack);
     let Some(combat) = game.combat() else {
         return (hit.amount.max(0), attack, 0);
     };
-    let relic = |id| {
-        game.run
-            .relics
-            .iter()
-            .any(|&relic| content.relics[relic as usize].id == id)
+    let enemy = target.map(|target| &combat.enemies[target].creature);
+    let spent = hit.vigor != combat.player.power(power_id::VIGOR)
+        || hit.gigantification != (combat.player.power(power_id::GIGANTIFICATION) > 0)
+        || !flutter && enemy.is_some_and(|enemy| enemy.power(power_id::FLUTTER) > 0);
+    let projected;
+    let game = if spent {
+        let mut clone = game.clone();
+        let Phase::Combat(combat) = &mut clone.phase else {
+            unreachable!()
+        };
+        let player = &mut combat.player;
+        player
+            .powers
+            .retain(|power| ![power_id::VIGOR, power_id::GIGANTIFICATION].contains(&power.id));
+        for (id, amount) in [
+            (power_id::VIGOR, hit.vigor),
+            (power_id::GIGANTIFICATION, hit.gigantification as i16),
+        ] {
+            if amount != 0 {
+                player.add_power(id, amount);
+            }
+        }
+        if !flutter && let Some(target) = target {
+            let enemy = &mut combat.enemies[target].creature;
+            enemy.powers.retain(|power| power.id != power_id::FLUTTER);
+        }
+        projected = clone;
+        &projected
+    } else {
+        game
     };
-    let mut damage = hit.amount.max(0);
-    if powered && source == Some(Actor::Player) {
-        match hit
-            .card
-            .and_then(|card| card.enchantment.map(|x| (card, x)))
-        {
-            Some((_, Enchantment::Corrupted)) => damage = damage.saturating_mul(3) / 2,
-            Some((_, Enchantment::Instinct)) => damage = damage.saturating_mul(2),
-            Some((card, Enchantment::Sharp)) => {
-                damage = damage.saturating_add(card.enchantment_amount)
-            }
-            Some((card, Enchantment::Vigorous)) if card.enchantment_value > 0 => {
-                damage = damage.saturating_add(card.enchantment_amount)
-            }
-            Some((card, Enchantment::Momentum)) => {
-                damage = damage.saturating_add(card.enchantment_value)
-            }
-            Some((_, Enchantment::TezcatarasEmber)) => damage = damage.saturating_add(3),
-            _ => {}
-        }
-        if let Some(card) = hit.card {
-            damage = damage
-                .saturating_add(3 * (card.upgrades > 0 && relic("RELIC.MINIATURE_CANNON")) as i16)
-                .saturating_add(
-                    9 * (card.enchantment.is_some() && relic("RELIC.MYSTIC_LIGHTER")) as i16,
-                );
-        }
-    }
-    let source_creature = source.map(|source| match source {
-        Actor::Osty => &combat.osty,
-        _ => &combat.player,
-    });
-    if attack {
-        if source == Some(Actor::Player)
-            && hit
-                .card
-                .is_some_and(|card| content.cards[card.id as usize].tags & SHIV_TAG != 0)
-        {
-            damage = damage.saturating_add(combat.player.power(power_id::ACCURACY));
-            if combat.history.shivs == 0 {
-                damage = damage.saturating_add(combat.player.power(power_id::PHANTOM_BLADES));
-            }
-        }
-        if source == Some(Actor::Player)
-            && hit
-                .card
-                .is_some_and(|card| card.flags(content.cards[card.id as usize]) & INKY != 0)
-        {
-            damage = damage.saturating_add(1);
-        }
-        if source == Some(Actor::Player) {
-            damage = damage.saturating_add(hit.vigor);
-        }
-        if let Some(target) = target
-            && hit.card.is_some_and(|card| card.id == card_id::HANG)
-        {
-            damage =
-                damage.saturating_mul(combat.enemies[target].creature.power(power_id::HANG).max(1));
-        }
-        if hit.lethality {
-            damage = damage.saturating_mul(100 + combat.player.power(power_id::LETHALITY)) / 100;
-        }
-        if source == Some(Actor::Osty) {
-            damage = damage.saturating_add(combat.player.power(power_id::CALCIFY));
-        }
-    }
-    if let Some(source) = source_creature
-        && powered
-    {
-        if attack
-            && matches!(
-                hit.damage,
-                PreviewDamage::Attack(Actor::Player | Actor::Osty)
-            )
-            && hit
-                .card
-                .is_some_and(|card| content.cards[card.id as usize].tags & STRIKE_TAG != 0)
-        {
-            damage = damage
-                .saturating_add(3 * relic("RELIC.STRIKE_DUMMY") as i16)
-                .saturating_add(relic("RELIC.FAKE_STRIKE_DUMMY") as i16);
-        }
-        damage = damage.saturating_add(source.kind(content, PowerKind::Strength));
-        if matches!(
-            hit.damage,
-            PreviewDamage::Attack(Actor::Player | Actor::Osty)
-        ) && hit
-            .card
-            .is_some_and(|card| content.cards[card.id as usize].tags & MINION_TAG != 0)
-            && relic("RELIC.VITRUVIAN_MINION")
-        {
-            damage = damage.saturating_mul(2);
-        }
-        if attack && hit.pen_nib {
-            damage = damage.saturating_mul(2);
-        }
-        if let Some(target) = target {
-            let enemy = &combat.enemies[target].creature;
-            if attack {
-                damage = damage.saturating_add(enemy.power(power_id::TAINTED));
-            }
-            damage = vulnerable_damage(game, content, target, damage);
-        }
-        damage = weak_damage(
-            game,
-            content,
-            match hit.damage {
-                PreviewDamage::Attack(source) | PreviewDamage::Move(source) => source,
-                _ => unreachable!(),
-            },
-            damage,
-        );
-        if let Some(target) = target {
-            damage = damage
-                .saturating_mul(100 + combat.enemies[target].creature.power(power_id::SLOW))
-                / 100;
-        }
-        for _ in 0..source.power(power_id::DOUBLE_DAMAGE).max(0) {
-            damage = damage.saturating_mul(2);
-        }
-        if source.power(power_id::SHRINK) != 0 {
-            damage = damage.saturating_mul(70) / 100;
-        }
-    }
-    let mut cap = 0;
-    if let Some(target) = target {
-        let enemy = &combat.enemies[target].creature;
-        if attack && flutter {
-            damage /= 2;
-        }
+    let context = Context {
+        source,
+        ..hit.context
+    };
+    let damage = game.modify_damage(
+        content,
+        target.map(Actor::Enemy),
+        hit.amount,
+        kind,
+        context,
+        hit.card,
+    );
+    let cap = enemy.map_or(0, |enemy| {
         let hard = enemy.power(power_id::HARD_TO_KILL).max(0);
-        if hard > 0 {
-            damage = damage.min(hard);
-        }
-        if attack && hit.card.is_some() && enemy.power(power_id::SOAR) > 0 {
-            damage /= 2;
-        }
-        if attack && source == Some(Actor::Player) && enemy.kind(content, PowerKind::Weak) > 0 {
-            damage = damage.saturating_mul(combat.player.power(power_id::TRACKING).max(1));
-        }
-        if attack
-            && source == Some(Actor::Player)
-            && hit
-                .card
-                .is_some_and(|card| card.id == card_id::SOVEREIGN_BLADE)
-            && enemy.power(power_id::CONQUEROR) > 0
-        {
-            damage = damage.saturating_mul(2);
-        }
-        if hit.gigantification {
-            damage = damage.saturating_mul(3);
-        }
         let intangible = (enemy.kind(content, PowerKind::Intangible) > 0) as i16;
-        if intangible > 0 {
-            damage = damage.min(1);
-        }
-        cap = if hard > 0 && intangible > 0 {
+        if hard > 0 && intangible > 0 {
             hard.min(1)
         } else {
             hard.max(intangible)
-        };
-    } else if hit.gigantification {
-        damage = damage.saturating_mul(3);
-    }
-    (damage.max(0), attack, cap)
-}
-
-fn vulnerable_damage(game: &Game, content: &Content, target: usize, damage: i16) -> i16 {
-    let combat = game.combat().unwrap();
-    let enemy = &combat.enemies[target].creature;
-    if enemy.kind(content, PowerKind::Vulnerable) == 0 {
-        return damage;
-    }
-    let base = if enemy.power(power_id::DEBILITATE) > 0 {
-        200
-    } else {
-        150
-    };
-    let cruelty = combat.player.power(power_id::CRUELTY);
-    let phrog = 25
-        * game
-            .run
-            .relics
-            .iter()
-            .any(|&id| content.relics[id as usize].id == "RELIC.PAPER_PHROG") as i16;
-    damage.saturating_mul(base + cruelty + phrog) / 100
+        }
+    });
+    (damage, attack, cap)
 }
 
 fn resolved_hits(
@@ -3794,7 +3607,11 @@ fn resolved_hits(
                 if slippery > 0 {
                     slippery -= 1;
                 }
-                if attack && flutter > 0 {
+                if matches!(
+                    hit.damage,
+                    PreviewDamage::Attack(_) | PreviewDamage::Move(_)
+                ) && flutter > 0
+                {
                     flutter -= 1;
                 }
                 shell_received = shell_received.saturating_add(lost);
@@ -4064,15 +3881,26 @@ fn effect_index(effect: &Effect) -> usize {
         Effect::AutoPlayDraw(..) => 69,
         Effect::Stoke => 70,
         Effect::Stampede => 71,
-        Effect::ContinueEndTurn => 72,
         Effect::FlakCannon(..) => 73,
         Effect::CopyCard(..) => 74,
         Effect::Discard(..) => 75,
         Effect::DiscardHandDraw => 76,
         Effect::DiscardHandAdd(..) => 77,
         Effect::PlayExhaustedShivs => 78,
-        Effect::AutoPlay(..) => 79,
-        Effect::FinishAutoPlay => 80,
+        Effect::AutoPlay(..)
+        | Effect::Uproar
+        | Effect::Fire(_)
+        | Effect::Listen(..)
+        | Effect::Step(_)
+        | Effect::Juggle
+        | Effect::ConfusedRoll(..) => 79,
+        Effect::BeforePlay
+        | Effect::OnPlay
+        | Effect::AfterPlay
+        | Effect::PlacePlayed(..)
+        | Effect::CheckEmptyHand
+        | Effect::MummifiedHand
+        | Effect::ReturnLate(..) => 80,
         Effect::WhisperingEarring(..) => 81,
         Effect::MoveAll(..) => 82,
         Effect::DrawFiltered(..) => 83,
@@ -4204,7 +4032,7 @@ fn relic_state(game: &Game, content: &Content, id: Id) -> [f32; 4] {
         "RELIC.BOOK_OF_FIVE_RINGS" => [game.book_of_five_rings as f32, 0.0, 0.0, 0.0],
         "RELIC.EMBER_TEA" => [game.ember_tea as f32, 0.0, 0.0, 0.0],
         "RELIC.SWORD_OF_STONE" => [game.sword_of_stone as f32, 0.0, 0.0, 0.0],
-        "RELIC.MAW_BANK" => [flag(game.maw_bank), 0.0, 0.0, 0.0],
+        "RELIC.MAW_BANK" => [flag(game.maw_bank > 0), 0.0, 0.0, 0.0],
         "RELIC.LIZARD_TAIL" => [flag(game.lizard_tail), 0.0, 0.0, 0.0],
         "RELIC.SILKEN_TRESS" => [flag(game.silken_tress), 0.0, 0.0, 0.0],
         "RELIC.BONE_TEA" => [flag(game.bone_tea), 0.0, 0.0, 0.0],
@@ -4275,7 +4103,7 @@ fn relic_state(game: &Game, content: &Content, id: Id) -> [f32; 4] {
             0.0,
         ],
         "RELIC.KUSARIGAMA" => [
-            combat.map_or(0, |combat| combat.kusarigama) as f32,
+            combat.map_or(0, |combat| combat.attacks_mod3) as f32,
             0.0,
             0.0,
             0.0,
@@ -4287,7 +4115,7 @@ fn relic_state(game: &Game, content: &Content, id: Id) -> [f32; 4] {
             0.0,
         ],
         "RELIC.DIAMOND_DIADEM" => [
-            flag(combat.is_some_and(|combat| combat.diamond_diadem)),
+            flag(combat.is_some_and(|combat| combat.player.power(power_id::DIAMOND_DIADEM) > 0)),
             0.0,
             0.0,
             0.0,
@@ -4456,6 +4284,18 @@ fn card_domain_row(
         .map_or(&[][..], |combat| combat.dampened.as_slice());
     let (master, dampened) =
         card_relation(card, &game.run.deck, &encoding.masters, combat_dampened);
+    // The energy cost modifiers as free this turn, the last absolute cost and the relative sum.
+    let energy = || card.cost_mods().filter(|cost| cost.kind & STAR_COST == 0);
+    let freed = |cost: &CostMod| cost.amount == 0 && cost.kind & THIS_TURN != 0;
+    let sets = || energy().filter(|cost| cost.kind & (ABSOLUTE | REDUCE_ONLY) == ABSOLUTE);
+    let free = sets().any(|cost| freed(&cost));
+    let cost_override = sets()
+        .filter(|cost| !freed(cost))
+        .last()
+        .map(|cost| cost.amount);
+    let cost_delta: i32 = (energy().filter(|cost| cost.kind & ABSOLUTE == 0))
+        .map(|cost| cost.amount as i32)
+        .sum();
     let mut row = DomainRow::new(CARD_DOMAIN, scope);
     row.u.copy_from_slice(&[
         zone,
@@ -4467,8 +4307,8 @@ fn card_domain_row(
         card.flags as u32,
         card.turn_flags as u32,
         card.replays as u32,
-        card.free as u32,
-        card.cost_override.is_some() as u32,
+        free as u32,
+        cost_override.is_some() as u32,
         card.enchantment.map_or(0, |value| value as u32 + 1),
         card.variant as u32,
         dampened as u32,
@@ -4480,9 +4320,10 @@ fn card_domain_row(
         master as u32,
     ]);
     row.s[..6].copy_from_slice(&[
-        card.cost_delta as i32,
-        card.value as i32,
-        card.cost_override.unwrap_or_default() as i32,
+        cost_delta,
+        // In whole points (Thrash keeps hundredths).
+        card.value as i32 / def.damage().map_or(1, |amount| amount.divisor.max(1)) as i32,
+        cost_override.unwrap_or_default() as i32,
         card.enchantment_amount as i32,
         card.enchantment_value as i32,
         context,
@@ -4661,7 +4502,7 @@ fn phase_domain_row(game: &Game, content: &Content, phase: &Phase, suspended: bo
         Phase::Combat(combat) => {
             row.u[4] = combat.choice.is_some() as u32;
             row.u[13] = combat.enemy_turn as u32;
-            row.u[14] = combat.ending as u32;
+            row.u[14] = ending(combat) as u32;
             row.u[15] = combat.force_end as u32;
             if let Some(choice) = combat.choice {
                 let (filter, filter_value, filter_signed) = filter_payload(choice.filter);
@@ -4914,7 +4755,7 @@ fn push_actor_domains(game: &Game, content: &Content, domains: &mut [Vec<DomainR
             value as i32,
             hits as i32,
             if owner == 1 {
-                combat.max_energy as i32
+                game.max_energy(content) as i32
             } else {
                 0
             },
@@ -5008,7 +4849,7 @@ fn push_actor_domains(game: &Game, content: &Content, domains: &mut [Vec<DomainR
         history.hp_lost as i32,
         history.hp_loss_events as i32,
         history.feral_returns as i32,
-        combat.last_cards as i32,
+        combat.last_turn.cards as i32,
         combat.orbit_spent as i32,
         combat.lightning_channeled as i32,
         combat.orbs_channeled as i32,
@@ -5020,35 +4861,23 @@ fn push_actor_domains(game: &Game, content: &Content, domains: &mut [Vec<DomainR
     if game.damage_taken {
         push_status_domain(&mut domains[STATUS_DOMAIN], 1, 0, 0, &[]);
     }
-    for (order, &(turns, amount)) in combat.bombs.iter().enumerate() {
-        push_status_domain(
-            &mut domains[STATUS_DOMAIN],
-            1,
-            2,
-            order,
-            &[turns as i32, amount as i32],
-        );
+    let instances = |id| (combat.player.powers.iter()).filter(move |power| power.id == id);
+    for (order, bomb) in instances(power_id::THE_BOMB).enumerate() {
+        let values = [bomb.amount as i32, bomb.value as i32];
+        push_status_domain(&mut domains[STATUS_DOMAIN], 1, 2, order, &values);
     }
-    for (order, &(turns, energy)) in combat.automation.iter().enumerate() {
-        push_status_domain(
-            &mut domains[STATUS_DOMAIN],
-            1,
-            3,
-            order,
-            &[turns as i32, energy as i32],
-        );
+    for (order, automation) in instances(power_id::AUTOMATION).enumerate() {
+        let values = [automation.value as i32, automation.amount as i32];
+        push_status_domain(&mut domains[STATUS_DOMAIN], 1, 3, order, &values);
     }
-    for (order, &(cards, damage, start)) in combat.panache.iter().enumerate() {
-        push_status_domain(
-            &mut domains[STATUS_DOMAIN],
-            1,
-            4,
-            order,
-            &[cards as i32, damage as i32, start as i32],
-        );
+    let cards = combat.history.cards as i32;
+    for (order, panache) in instances(power_id::PANACHE).enumerate() {
+        let values = [panache.value as i32, panache.amount as i32, cards];
+        push_status_domain(&mut domains[STATUS_DOMAIN], 1, 4, order, &values);
     }
-    for (order, &amount) in combat.boulders.iter().enumerate() {
-        push_status_domain(&mut domains[STATUS_DOMAIN], 1, 5, order, &[amount as i32]);
+    for (order, boulder) in instances(power_id::ROLLING_BOULDER).enumerate() {
+        let values = [boulder.amount as i32];
+        push_status_domain(&mut domains[STATUS_DOMAIN], 1, 5, order, &values);
     }
 }
 
@@ -5066,7 +4895,7 @@ fn push_power_domains(
             owner,
             power.id as u32,
             snapshot as u32,
-            power.skip_next_decay as u32,
+            (power.skip_next_decay && power.id != power_id::PANACHE) as u32,
             (name == "POWER.SURROUNDED_POWER") as u32 * (power.value > 0) as u32,
             if name == "POWER.CONSTRICT_POWER" {
                 power.value.max(0) as u32 + 1
@@ -5076,7 +4905,12 @@ fn push_power_domains(
             order as u32 + 1,
         ]);
         row.s[0] = power.amount as i32;
-        row.s[1] = power.value as i32;
+        // Instance counters are encoded as status rows.
+        let counter = matches!(
+            power.id,
+            power_id::THE_BOMB | power_id::AUTOMATION | power_id::PANACHE
+        );
+        row.s[1] = if counter { 0 } else { power.value as i32 };
         out.push(row);
     }
 }
@@ -5679,10 +5513,21 @@ impl ContinuationBuilder {
             | Effect::FranticEscape
             | Effect::Stoke
             | Effect::Stampede
-            | Effect::ContinueEndTurn
             | Effect::DiscardHandDraw
             | Effect::PlayExhaustedShivs
-            | Effect::FinishAutoPlay
+            | Effect::BeforePlay
+            | Effect::OnPlay
+            | Effect::AfterPlay
+            | Effect::Uproar
+            | Effect::Fire(_)
+            | Effect::Listen(..)
+            | Effect::Step(_)
+            | Effect::Juggle
+            | Effect::ConfusedRoll(..)
+            | Effect::PlacePlayed(..)
+            | Effect::CheckEmptyHand
+            | Effect::MummifiedHand
+            | Effect::ReturnLate(..)
             | Effect::PassiveAll
             | Effect::CapHandCosts
             | Effect::EndTurn => {}
@@ -6325,10 +6170,21 @@ fn continuation_domains(
                 &mut order,
             );
         }
-        for play in combat.auto_plays.iter().rev() {
+        for play in combat.plays.iter().rev() {
             let before = out.rows.len();
-            let item = out.row(3, 0, NO_NODE, 0, 0, 0, order, 1);
-            out.rows[item].u[11] = play.plays as u32;
+            let item = if play.manual {
+                let item = out.row(9, 0, NO_NODE, 0, 0, 0, order, 1);
+                out.rows[item].u[11..14].copy_from_slice(&[
+                    play.energy.max(0) as u32,
+                    play.stars.max(0) as u32,
+                    play.plays as u32,
+                ]);
+                item
+            } else {
+                let item = out.row(3, 0, NO_NODE, 0, 0, 0, order, 1);
+                out.rows[item].u[11] = play.plays as u32;
+                item
+            };
             out.card(play.card, item);
             if combat.unsettling_lamp == Some(play.card.id) {
                 out.rows[item].u[23] = 1;
@@ -6337,26 +6193,7 @@ fn continuation_domains(
             group_continuation_item(&mut out.rows[before..], frame, order);
             order += 1;
         }
-        if let Some(card) = combat.playing {
-            let before = out.rows.len();
-            let item = out.row(9, 0, NO_NODE, 0, 0, 0, order, 1);
-            out.rows[item].u[11..14].copy_from_slice(&[
-                combat.card_energy.max(0) as u32,
-                combat.card_stars.max(0) as u32,
-                combat.card_plays as u32,
-            ]);
-            out.card(card, item);
-            if combat.unsettling_lamp == Some(card.id) {
-                out.rows[item].u[23] = 1;
-            }
-            let frame = out.rows[before].u[2];
-            group_continuation_item(&mut out.rows[before..], frame, order);
-            order += 1;
-        }
-        if combat
-            .control
-            .contains(&ControlContinuation::StartExtraPlayerTurnAfterResolution)
-        {
+        if combat.extra_turn && !combat.setup {
             let row = out.row(9, 3, NO_NODE, 0, 0, 0, order, 0);
             let frame = out.rows[row].u[2];
             group_continuation_item(&mut out.rows[row..], frame, order);
