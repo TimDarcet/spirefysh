@@ -1484,7 +1484,9 @@ fn card_flags_are_dense_numeric_features() {
         (actual.c.clone(), actual.f.clone()),
         (expected.c, expected.f)
     );
-    assert!(actual.f[6..].iter().all(|&value| value == 1.0));
+    assert!(actual.f[6..38].iter().all(|&value| value == 1.0));
+    // Absolute, this turn, until played, not reduce-only, star; three modifiers.
+    assert_eq!(actual.f[38..], [1.0, 1.0, 1.0, 0.0, 1.0, 0.5]);
 }
 
 #[test]
@@ -2430,7 +2432,7 @@ fn v55_action_and_phase_discriminants_are_exhaustive() {
 #[test]
 fn v56_layout_uses_explicit_token_dimensions_and_positions() {
     let layout = Layout::new(&foundation_content());
-    assert_eq!((VERSION, VALUE_MODEL_VERSION), (61, 79));
+    assert_eq!((VERSION, VALUE_MODEL_VERSION), (62, 79));
     assert_eq!(
         (
             DEFAULT_MODEL_WIDTH,
@@ -2766,5 +2768,5 @@ fn traced_state_observations_are_stable() {
         }
     }
     assert_eq!(states, 200);
-    assert_eq!(digest, 5169903605075966011);
+    assert_eq!(digest, 1224650189650828057);
 }

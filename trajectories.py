@@ -239,7 +239,8 @@ def decision_labels(concepts, inputs, actions):
     domains = {name: values for (name, *_), values in zip(TOKEN_SPECS, inputs[2])}
     flags = [_readable(concept, False) for concept in concepts if concept.startswith("flag_bit: ")]
     channels = dict(NUMERIC_CHANNELS, card=NUMERIC_CHANNELS["card"] + tuple(flags) + tuple(
-        f"{flag} this turn" for flag in flags) + ("free", "cost override set"))
+        f"{flag} this turn" for flag in flags) + tuple(f"{kind} cost modifier" for kind in (
+        "absolute", "this-turn", "until-played", "reduce-only", "star")) + ("cost modifiers ÷ 6",))
     action_names = [_title(action[3] or action[0]) for action in actions]
 
     def row(codes):

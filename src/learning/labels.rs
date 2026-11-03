@@ -2,7 +2,7 @@ use super::*;
 
 // Tables mirror effect_index, event_effect_index, action_kind, *_payload, room_index,
 // target_index, pile_index and phase_index; the model tags token roles and collections.
-const EFFECTS: [&str; 120] = [
+const EFFECTS: [&str; 125] = [
     "Attack",
     "AttackMany",
     "OstyAttack",
@@ -75,7 +75,7 @@ const EFFECTS: [&str; 120] = [
     "AutoPlayDraw",
     "Stoke",
     "Stampede",
-    "ContinueEndTurn",
+    "Fire",
     "FlakCannon",
     "CopyCard",
     "Discard",
@@ -83,7 +83,7 @@ const EFFECTS: [&str; 120] = [
     "DiscardHandAdd",
     "PlayExhaustedShivs",
     "AutoPlay",
-    "FinishAutoPlay",
+    "PlacePlayed",
     "WhisperingEarring",
     "MoveAll",
     "DrawFiltered",
@@ -123,6 +123,49 @@ const EFFECTS: [&str; 120] = [
     "EndTurn",
     "Select",
     "PassiveLightning",
+    "Listen",
+    "Step",
+    "BeforePlay",
+    "OnPlay",
+    "AfterPlay",
+];
+
+const TRIGGERS: [&str; 35] = [
+    "AfterRoomEntered",
+    "BeforeCombatStart",
+    "BeforeCombatStartLate",
+    "BeforeSideTurnStart",
+    "AfterBlockCleared",
+    "AfterEnergyReset",
+    "AfterEnergyResetLate",
+    "BeforeHandDraw",
+    "AfterPlayerTurnStart",
+    "AfterPlayerTurnStartLate",
+    "AfterSideTurnStart",
+    "AfterSideTurnStartLate",
+    "AutoPrePlay",
+    "AutoPrePlayLate",
+    "BeforeSideTurnEndVeryEarly",
+    "BeforeSideTurnEndEarly",
+    "BeforeSideTurnEnd",
+    "AfterSideTurnEnd",
+    "AfterSideTurnEndLate",
+    "TurnEnd",
+    "AfterCardPlayed",
+    "AttackPlayed",
+    "SkillPlayed",
+    "PowerPlayed",
+    "AfterBlockGained",
+    "AfterDamageGiven",
+    "AfterDamageReceived",
+    "AfterDeath",
+    "AfterCardDrawn",
+    "AfterCardGeneratedForCombat",
+    "AfterCardExhausted",
+    "AfterShuffle",
+    "AfterPotionUsed",
+    "AfterCombatVictory",
+    "BeforeCardPlayed",
 ];
 
 const RUN_EFFECTS: [&str; 37] = [
@@ -528,6 +571,7 @@ pub(super) fn concept_labels(content: &Content) -> Vec<String> {
                 }
                 n if n == Semantic::TokenRole as usize => named(&TOKEN_ROLES, value),
                 n if n == Semantic::Collection as usize => named(&COLLECTIONS, value),
+                n if n == Semantic::Trigger as usize => named(&TRIGGERS, value),
                 _ => format!("{value}"),
             };
             labels[layout.semantic_offsets[namespace] as usize + value] =

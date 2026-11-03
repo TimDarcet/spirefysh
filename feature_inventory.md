@@ -9,7 +9,7 @@ unsigned/signed row fields, `÷ n` the scale applied.
 | Domain | Columns |
 |---|---|
 | run (22) | ascension ÷20, act ÷3, floor ÷60, bosses visited ÷3, weak/regular/elite encounters left ÷20, HP ÷30, max HP ÷30, HP fraction, missing HP fraction, gold ÷1000, energy ÷10, draw ÷10, orb slots ÷10, shop removals ÷10, rarity offset ÷10000, potion odds ÷100, unknown combat/elite/treasure/shop weight ÷1000 |
-| card (40) | cost delta ÷10, value ÷30, cost override ÷10, enchantment amount ÷30, enchantment value ÷30, replays ÷5, 16 card flags, 16 turn flags, free, cost override set |
+| card (44) | own energy cost ÷10, value ÷30, own star cost ÷10, enchantment amount ÷30, enchantment value ÷30, replays ÷5, 16 card flags, 16 turn flags, 5 cost-modifier kinds (absolute, this turn, until played, reduce-only, star), cost modifiers ÷6 |
 | actor (12) | HP ÷30, max HP ÷30, block ÷30, (player only:) max energy ÷5, draw per turn ÷10, orb slots ÷10, energy ÷5, stars ÷5, turn ÷10; HP fraction, missing HP fraction, block fraction |
 | power (2) | amount ÷30, value ÷30 |
 | relic (1) | Pumpkin Candle counter (raw, unscaled, only that relic) |
@@ -105,6 +105,7 @@ Continuation kinds actually emitted: 0–5 and 7–9 (kind 6 never is; its featu
 | TransformHand, RandomOrb, RecycleHand | f10, f11 the two values ÷10 |
 | Select | f10, f11 the two values ÷10 |
 | PassiveLightning | shares index 118 with Select, so its count (u11) is read from Select's slots and **lost** |
+| Fire, Listen | no numbers: the hook trigger, and Listen's power, relic or card listener, are semantics |
 | effects with amounts (Attack, Block, Damage, ApplyPower, …) | amount base / upgraded / multiplier / divisor are stored but only featured as f16–f23 **when the effect is being executed**; queued or offered effects carry no amount |
 
 **Other kinds**

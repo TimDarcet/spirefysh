@@ -43,7 +43,7 @@ NUMERIC_CHANNELS = {
             "card rarity offset ÷ 10000", "potion odds ÷ 100", "unknown combat weight ÷ 1000",
             "unknown elite weight ÷ 1000", "unknown treasure weight ÷ 1000",
             "unknown shop weight ÷ 1000"),
-    "card": ("cost delta ÷ 10", "card value ÷ 30", "cost override ÷ 10",
+    "card": ("own energy cost ÷ 10", "card value ÷ 30", "own star cost ÷ 10",
              "enchantment amount ÷ 30", "enchantment value ÷ 30", "replays ÷ 5"),
     "actor": ("HP ÷ 30", "maximum HP ÷ 30", "block ÷ 30", "maximum energy ÷ 5",
               "draw per turn ÷ 10", "orb slots ÷ 10", "energy ÷ 5", "stars ÷ 5", "turn ÷ 10",
