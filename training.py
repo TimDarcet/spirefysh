@@ -96,6 +96,9 @@ def start_collator(model):
     global COLLATOR_MODEL
     COLLATOR_MODEL = model
     ctypes.CDLL(None).pthread_set_qos_class_self_np(0x21, 0)
+    # Wider pools spin: 4 Rust threads cost the CPU time of one, torch ops here are tiny.
+    os.environ["RAYON_NUM_THREADS"] = "4"
+    torch.set_num_threads(1)
 
 
 def collate(rows, training):
@@ -106,9 +109,9 @@ def collate(rows, training):
 
 
 def clip_gradients(parameters):
-    norm = nn.utils.clip_grad_norm_(
-        [parameter for parameter in parameters if parameter.grad is not None], .5,
-    )
+    gradients = [parameter.grad for parameter in parameters if parameter.grad is not None]
+    norm = torch.linalg.vector_norm(torch.stack(torch._foreach_norm(gradients)))
+    torch._foreach_mul_(gradients, (.5 / (norm + 1e-6)).clamp(max=1))
     value = float(norm)
     return value, math.isfinite(value) and value < float(torch.finfo(norm.dtype).max)
 

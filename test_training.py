@@ -146,11 +146,8 @@ print('restored')
         _, finite = train.critic_only_step(model, optimizer)
         self.assertTrue(finite)
         optimizer.step.assert_called_once_with()
-        with mock.patch(
-            "training.nn.utils.clip_grad_norm_",
-            return_value=torch.tensor(torch.finfo(torch.float32).max),
-        ):
-            _, finite = train.clip_gradients((parameter,))
+        parameter.grad = torch.full_like(parameter, torch.finfo(torch.float32).max)
+        _, finite = train.clip_gradients((parameter,))
         self.assertFalse(finite)
 
     def test_uniform_cross_entropy(self):
@@ -1159,7 +1156,11 @@ class ModelKernelTest(unittest.TestCase):
         values = torch.randn(510, 64, device=target)
         metadata = torch.zeros(512, 4, dtype=torch.long, device=target)
         metadata[:510, 3] = 1
-        self.assertEqual(agent._card_context(values, metadata).shape, values.shape)
+        metadata[:300, :3] = torch.tensor([2, 1, 5])
+        output = agent._card_context(values, metadata, agent.concepts.flattened())
+        self.assertEqual(output.shape, values.shape)
+        expected = agent.cpu()._card_context(values.cpu(), metadata.cpu(), agent.concepts.flattened())
+        torch.testing.assert_close(output.cpu(), expected)
 
     def test_native_sequence_deduplication_preserves_empty_groups(self):
         selected, groups, inverse = train.sts2_sim.deduplicate_sequences(
@@ -1243,6 +1244,50 @@ class ModelKernelTest(unittest.TestCase):
             for left, right in zip(actual, expected):
                 torch.testing.assert_close(left.float(), right.float(), rtol=1e-2,
                                            atol=1e-2 * float(right.abs().max()))
+
+    @unittest.skipUnless(torch.backends.mps.is_available(), "requires MPS")
+    def test_mps_sparse_attention_matches_ragged(self):
+        torch.manual_seed(0)
+        lengths = torch.tensor([1, 5, 40, 17, 9, 70])
+        offsets = torch.cat((torch.zeros(1, dtype=torch.long), lengths.cumsum(0)))
+        sequence = torch.repeat_interleave(torch.arange(len(lengths)), lengths)
+        positions = torch.cat([torch.randperm(int(n))[:int(k)].sort().values + int(start) for n, k, start in
+                               zip(lengths, (1, 3, 12, 0, 9, 20), offsets)])
+        query_offsets = torch.cat((torch.zeros(1, dtype=torch.long),
+                                   torch.bincount(sequence[positions], minlength=len(lengths)).cumsum(0)))
+        qkv = (torch.randn(int(offsets[-1]), 384) * 2).bfloat16().to("mps").requires_grad_()
+        grad = torch.randn(len(positions), 128).bfloat16().to("mps")
+        mps = lambda value: value.to("mps", torch.int32)
+        expected = model._RaggedAttention.apply(qkv, mps(offsets), mps(sequence), 4, mps(positions),
+                                                mps(query_offsets), True, True)
+        expected.backward(grad)
+        q = qkv.detach()[positions.to("mps"), :128].requires_grad_()
+        kv = qkv.detach()[:, 128:].contiguous().requires_grad_()
+        actual = model._SparseAttention.apply(q, kv, mps(offsets), mps(query_offsets))
+        actual.backward(grad)
+        for left, right in ((expected, actual), (qkv.grad[positions.to("mps"), :128], q.grad),
+                            (qkv.grad[:, 128:], kv.grad)):
+            torch.testing.assert_close(right.float().cpu(), left.float().cpu(), rtol=2e-2,
+                                       atol=2e-2 * float(left.abs().max()))
+
+    @unittest.skipUnless(torch.backends.mps.is_available(), "requires MPS")
+    def test_mps_feed_forward_matches_unfused(self):
+        torch.manual_seed(0)
+        modules = torch.nn.LayerNorm(128), torch.nn.Linear(128, 128), torch.nn.Linear(128, 128)
+        value = torch.randn(4097, 128)
+        results = []
+        for device in ("cpu", "mps"):
+            for module in modules:
+                module.to(device).zero_grad()
+            inputs = value.to(device).detach().requires_grad_()
+            with torch.autocast(device, dtype=torch.bfloat16):
+                output = model._feed_forward(inputs, *modules)
+            output.float().square().sum().backward()
+            results.append([tensor.detach().float().cpu() for tensor in (
+                output, inputs.grad, *(parameter.grad for module in modules for parameter in module.parameters())
+            )])
+        for expected, actual in zip(*results):
+            torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2 * float(expected.abs().max()))
 
 
 class TrajectoryTest(unittest.TestCase):

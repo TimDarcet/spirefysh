@@ -1,6 +1,7 @@
 import copy
 import contextvars
 import fcntl
+import functools
 import hashlib
 import json
 import math
@@ -897,6 +898,19 @@ kernel void semantic_backward_embedding(
     }
 }
 
+kernel void embedding_add(
+    device const float *values, device const int *semantic, device const float *embedding,
+    device float *output, constant uint& fields, constant uint& width,
+    uint index [[thread_position_in_grid]]) {
+    uint row = index / width, column = index % width;
+    float value = values[index];
+    for (uint field = 0; field < fields; ++field) {
+        int id = semantic[row * fields + field];
+        if (id) value += embedding[id * width + column];
+    }
+    output[index] = value;
+}
+
 kernel void group_sum_forward(
     device const float *input, device const long *group, device atomic_float *output,
     constant uint& width, uint index [[thread_position_in_grid]]) {
@@ -1262,7 +1276,8 @@ class _RaggedAttention(torch.autograd.Function):
                 *arguments, ctx.heads, ctx.dimension, ctx.sparse,
                 threads=key_threads, group_size=32,
             )
-        if ctx.fp32_value_backward and qkv.dtype == torch.bfloat16:
+        # The tiled kernels already accumulate dV in fp32 from fp32 probabilities.
+        if ctx.fp32_value_backward and qkv.dtype == torch.bfloat16 and not tiled:
             width = qkv.shape[1] // 3
             grad_value = torch.empty((len(qkv), width), dtype=torch.float32, device=qkv.device)
             _RaggedAttention.library.attention_backward_value_bfloat(
@@ -1275,15 +1290,48 @@ class _RaggedAttention(torch.autograd.Function):
 
 
 @_committed
+class _SparseAttention(torch.autograd.Function):
+    # Final-layer attention of sparse queries (rows of q in sequence order) over their sequences' keys
+    # and values (rows of kv), 4 heads of width 32.
+    @staticmethod
+    def forward(ctx, q, kv, offsets, query_offsets):
+        library = _FlashAttention.compiled()
+        output = q.new_empty(q.shape)
+        lse = torch.empty((len(q), 4), dtype=torch.float32, device=q.device)
+        library.sparse_forward(offsets, query_offsets, q, kv, output, lse,
+                               threads=(len(offsets) - 1) * 128, group_size=128)
+        ctx.save_for_backward(q, kv, offsets, query_offsets, output, lse)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        q, kv, offsets, query_offsets, output, lse = ctx.saved_tensors
+        grad_output = grad_output.to(torch.bfloat16).contiguous()
+        grad_q, grad_kv, delta = torch.empty_like(q), torch.empty_like(kv), torch.empty_like(lse)
+        arguments, threads, library = (offsets, query_offsets, q, kv), (len(offsets) - 1) * 128, _FlashAttention.library
+        library.sparse_delta(output, grad_output, delta, threads=delta.numel(), group_size=256)
+        library.sparse_backward_key_value(*arguments, lse, delta, grad_output, grad_kv,
+                                          threads=threads, group_size=128)
+        library.sparse_backward_query(*arguments, output, lse, grad_output, grad_q,
+                                      threads=threads, group_size=128)
+        return grad_q, grad_kv, None, None
+
+
+@_committed
 class _FlashAttention(torch.autograd.Function):
     library = None
 
     @staticmethod
-    def forward(ctx, qkv, offsets, lengths, chunk_rows, chunk_starts, real_tokens):
+    def compiled():
         if _FlashAttention.library is None:
             _FlashAttention.library = torch.mps.compile_shader(
                 Path(__file__).with_name("attention.metal").read_text()
             )
+        return _FlashAttention.library
+
+    @staticmethod
+    def forward(ctx, qkv, offsets, lengths, chunk_rows, chunk_starts, real_tokens):
+        _FlashAttention.compiled()
         output = qkv.new_empty((len(qkv), qkv.shape[1] // 3))
         output[real_tokens:] = 0
         lse = torch.empty((len(qkv), 4), dtype=torch.float32, device=qkv.device)
@@ -1342,19 +1390,24 @@ class _GruStep(torch.autograd.Function):
         return grad_input, grad_hidden, grad_previous
 
 
-def _linear_kernel(name, a, b, output, rows, columns, depth, bias=None, residual=None, splits=1):
+def _linear_library():
     if _FastLinear.library is None:
         _FastLinear.library = torch.mps.compile_shader(
             Path(__file__).with_name("linear.metal").read_text()
         )
-    getattr(_FastLinear.library, name)(
+    return _FastLinear.library
+
+
+def _linear_kernel(name, a, b, output, rows, columns, depth, bias=None, residual=None, splits=1):
+    getattr(_linear_library(), name)(
         a, b, output, output if bias is None else bias, output if residual is None else residual,
         rows, columns, depth, (depth + splits - 1) // splits,
         threads=((columns + 31) // 32 * 32, (rows + 31) // 32, splits), group_size=(32, 1, 1),
     )
 
 
-def _linear_forward(value_bfloat, weight, bias, residual=None):
+def _linear_forward(value_bfloat, weight, bias, residual=None, hidden=None):
+    # With hidden, the biased output goes to hidden and its gelu is returned.
     weight_bfloat = weight.to(torch.bfloat16)
     output = value_bfloat.new_empty(
         (len(value_bfloat), len(weight)),
@@ -1362,28 +1415,63 @@ def _linear_forward(value_bfloat, weight, bias, residual=None):
     )
     bias = bias.float() if bias is not None else weight.new_zeros(len(weight), dtype=torch.float32)
     _linear_kernel(
-        "linear" if residual is None else "linear_residual", value_bfloat, weight_bfloat, output,
-        len(value_bfloat), len(weight), value_bfloat.shape[1], bias, residual,
+        "linear_gelu" if hidden is not None else "linear" if residual is None else "linear_residual",
+        value_bfloat, weight_bfloat, output, len(value_bfloat), len(weight), value_bfloat.shape[1], bias,
+        residual if hidden is None else hidden,
     )
     return output, weight_bfloat
 
 
-def _linear_backward(value, weight, grad_output):
+def _linear_residual_norm(value_bfloat, weight, bias, residual, gamma, beta):
+    # residual + linear(value) of width 128, with the following layer norm's bf16 output and stats.
+    weight_bfloat, rows = weight.to(torch.bfloat16), len(value_bfloat)
+    output, stats = torch.empty_like(residual), residual.new_empty((rows, 2))
+    normalized = torch.empty_like(residual, dtype=torch.bfloat16)
+    _linear_library().linear_residual_norm(
+        value_bfloat, weight_bfloat, output, bias.float(), residual.contiguous(), gamma, beta, normalized,
+        stats, rows, value_bfloat.shape[1], threads=(rows + 31) // 32 * 128, group_size=128,
+    )
+    return output, weight_bfloat, normalized, stats
+
+
+def _linear_weight_backward(value, grad_output):
+    grad_weight = value.new_zeros((grad_output.shape[1], value.shape[1]), dtype=torch.float32)
+    grad_bias = value.new_zeros(grad_output.shape[1], dtype=torch.float32)
+    _linear_kernel(
+        "linear_weight_grad" + ("_float" if grad_output.dtype == torch.float32 else ""), grad_output,
+        value, grad_weight, grad_output.shape[1], value.shape[1], len(value), grad_bias,
+        splits=max(1, min(128, len(value) // 128)),
+    )
+    return grad_weight, grad_bias
+
+
+def _linear_backward(value, weight, grad_output, hidden=None, norm=None, extra=None):
+    # With hidden, value is gelu(hidden) and grad_value is the gradient of hidden. With
+    # norm = (input, gamma, stats, residual), value is layer_norm(input) of width 128 and grad_value is
+    # (gradient of input plus residual, gradient of gamma, gradient of beta); extra = (rows, inverse)
+    # then adds rows[inverse[m]] to the gradient of normalized row m where inverse[m] >= 0.
     grad_output = grad_output.contiguous() if grad_output.dtype == torch.float32 \
         else grad_output.to(torch.bfloat16).contiguous()
     suffix = "_float" if grad_output.dtype == torch.float32 else ""
+    gelu = "_gelu" if hidden is not None else ""
     rows, columns, depth = len(value), value.shape[1], len(weight)
-    grad_value = torch.empty_like(value)
-    _linear_kernel(
-        "linear_input_grad" + suffix, grad_output, weight, grad_value, rows, columns, depth,
-    )
-    grad_weight = weight.new_zeros((depth, columns), dtype=torch.float32)
-    grad_bias = weight.new_zeros(depth, dtype=torch.float32)
-    _linear_kernel(
-        "linear_weight_grad" + suffix, grad_output, value, grad_weight, depth, columns, rows,
-        grad_bias, splits=max(1, min(128, rows // 128)),
-    )
-    return grad_value, grad_weight, grad_bias
+    if norm is None:
+        grad_value = torch.empty_like(value)
+        _linear_kernel(
+            "linear_input_grad" + suffix + gelu, grad_output, weight, grad_value, rows, columns, depth,
+            residual=hidden,
+        )
+    else:
+        input, gamma, stats, residual = norm
+        blocks = (rows + 31) // 32
+        grad_input, partial = torch.empty_like(input), input.new_empty((blocks, 2, columns))
+        getattr(_linear_library(), "linear_input_grad_norm" + suffix)(
+            grad_output, weight, input, gamma, stats, input if residual is None else residual.contiguous(),
+            grad_input, partial, rows, depth, residual is not None, *(extra or (input, stats)),
+            extra is not None, threads=blocks * 128, group_size=128,
+        )
+        grad_value = grad_input, *_norm_reduce(partial, gamma)
+    return grad_value, *_linear_weight_backward(value, grad_output)
 
 
 @_committed
@@ -1407,27 +1495,41 @@ class _FastLinear(torch.autograd.Function):
 
 @_committed
 class _LinearResidual(torch.autograd.Function):
+    # With gamma and beta, also returns the following layer norm's bf16 output and stats.
     @staticmethod
-    def forward(ctx, value, weight, bias, residual):
+    def forward(ctx, value, weight, bias, residual, gamma=None, beta=None):
         value_bfloat = value.to(torch.bfloat16)
-        output, weight_bfloat = _linear_forward(value_bfloat, weight, bias, residual)
+        if gamma is None:
+            output, weight_bfloat = _linear_forward(value_bfloat, weight, bias, residual)
+        else:
+            output, weight_bfloat, normalized, stats = _linear_residual_norm(
+                value_bfloat, weight, bias, residual, gamma, beta,
+            )
+            ctx.mark_non_differentiable(normalized, stats)
         ctx.save_for_backward(value_bfloat, weight_bfloat)
         ctx.value_dtype, ctx.bias = value.dtype, bias is not None
-        return output
+        return output if gamma is None else (output, normalized, stats)
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, grad_output, *_):
         value, weight = ctx.saved_tensors
         grad_value, grad_weight, grad_bias = _linear_backward(value, weight, grad_output)
         return grad_value.to(ctx.value_dtype), grad_weight, grad_bias if ctx.bias else None, \
-            grad_output
+            grad_output, None, None
+
+
+def _norm_reduce(partial, gamma):
+    grad_gamma, grad_beta = torch.empty_like(gamma), torch.empty_like(gamma)
+    _RaggedAttention.library.token_backward_norm_reduce(
+        partial, grad_gamma, grad_beta, len(partial), len(gamma), threads=len(gamma) * 128, group_size=128,
+    )
+    return grad_gamma, grad_beta
 
 
 def _layer_norm_backward(value, gamma, stats, grad_normalized, residual=None, block_rows=32):
     rows, width = value.shape
     blocks = (rows + block_rows - 1) // block_rows
     grad_value, partial = torch.empty_like(value), value.new_empty((blocks, 2, width))
-    grad_gamma, grad_beta = torch.empty_like(gamma), torch.empty_like(gamma)
     getattr(_RaggedAttention.library, "layer_norm_backward_" + (
         "float" if grad_normalized.dtype == torch.float32 else "bfloat"
     ))(
@@ -1435,10 +1537,7 @@ def _layer_norm_backward(value, gamma, stats, grad_normalized, residual=None, bl
         grad_value, partial, rows, block_rows, width, residual is not None,
         threads=blocks * 32, group_size=32,
     )
-    _RaggedAttention.library.token_backward_norm_reduce(
-        partial, grad_gamma, grad_beta, blocks, width, threads=width * 128, group_size=128,
-    )
-    return grad_value, grad_gamma, grad_beta
+    return grad_value, *_norm_reduce(partial, gamma)
 
 
 @_committed
@@ -1461,18 +1560,25 @@ class _LayerNorm(torch.autograd.Function):
         return _layer_norm_backward(value, gamma, stats, grad_output.float().contiguous())
 
 
+def _layer_norm_forward(value, gamma, beta):
+    if _RaggedAttention.library is None:
+        _RaggedAttention.library = torch.mps.compile_shader(_TRAINING_METAL)
+    normalized = torch.empty_like(value, dtype=torch.bfloat16)
+    stats = value.new_empty((len(value), 2))
+    _RaggedAttention.library.layer_norm_forward_bfloat(
+        value, gamma, beta, normalized, stats, len(value), value.shape[1],
+        threads=len(value) * 32, group_size=32,
+    )
+    return normalized, stats
+
+
 @_committed
 class _NormLinear(torch.autograd.Function):
+    # normalized and stats may come precomputed from the matmul that produced value.
     @staticmethod
-    def forward(ctx, value, gamma, beta, weight, bias):
-        if _RaggedAttention.library is None:
-            _RaggedAttention.library = torch.mps.compile_shader(_TRAINING_METAL)
-        normalized = torch.empty_like(value, dtype=torch.bfloat16)
-        stats = value.new_empty((len(value), 2))
-        _RaggedAttention.library.layer_norm_forward_bfloat(
-            value, gamma, beta, normalized, stats, len(value), value.shape[1],
-            threads=len(value) * 32, group_size=32,
-        )
+    def forward(ctx, value, gamma, beta, weight, bias, normalized=None, stats=None):
+        if normalized is None:
+            normalized, stats = _layer_norm_forward(value, gamma, beta)
         output, weight_bfloat = _linear_forward(normalized, weight, bias)
         ctx.save_for_backward(value, gamma, normalized, stats, weight_bfloat)
         return output, value.view_as(value)
@@ -1482,13 +1588,75 @@ class _NormLinear(torch.autograd.Function):
         # The second output aliases the input for residual connections; its gradient is added
         # by the layer-norm kernel instead of a separate pass.
         value, gamma, normalized, stats, weight = ctx.saved_tensors
-        grad_normalized, grad_weight, grad_bias = _linear_backward(
-            normalized, weight, grad_output,
+        (grad_value, grad_gamma, grad_beta), grad_weight, grad_bias = _linear_backward(
+            normalized, weight, grad_output, norm=(value, gamma, stats, grad_residual),
         )
-        grad_value, grad_gamma, grad_beta = _layer_norm_backward(
-            value, gamma, stats, grad_normalized, grad_residual,
+        return grad_value, grad_gamma, grad_beta, grad_weight, grad_bias, None, None
+
+
+@_committed
+class _FeedForward(torch.autograd.Function):
+    # value + second(gelu(first(norm(value)))), with gelu applied in the matmul epilogues. The norm may
+    # come precomputed as for _NormLinear, and with next_gamma and next_beta the following layer norm
+    # is returned as for _LinearResidual.
+    @staticmethod
+    def forward(ctx, value, gamma, beta, weight1, bias1, weight2, bias2, normalized=None, stats=None,
+                next_gamma=None, next_beta=None):
+        if normalized is None:
+            normalized, stats = _layer_norm_forward(value, gamma, beta)
+        hidden = value.new_empty((len(value), len(weight1)), dtype=torch.bfloat16)
+        activated, weight1_bfloat = _linear_forward(normalized, weight1, bias1, hidden=hidden)
+        if next_gamma is None:
+            output, weight2_bfloat = _linear_forward(activated, weight2, bias2, value)
+        else:
+            output, weight2_bfloat, next_normalized, next_stats = _linear_residual_norm(
+                activated, weight2, bias2, value, next_gamma, next_beta,
+            )
+            ctx.mark_non_differentiable(next_normalized, next_stats)
+        ctx.save_for_backward(value, gamma, normalized, stats, weight1_bfloat, hidden, activated,
+                              weight2_bfloat)
+        return output if next_gamma is None else (output, next_normalized, next_stats)
+
+    @staticmethod
+    def backward(ctx, grad_output, *_):
+        value, gamma, normalized, stats, weight1, hidden, activated, weight2 = ctx.saved_tensors
+        grad_hidden, grad_weight2, grad_bias2 = _linear_backward(
+            activated, weight2, grad_output.float(), hidden,
         )
-        return grad_value, grad_gamma, grad_beta, grad_weight, grad_bias
+        (grad_value, grad_gamma, grad_beta), grad_weight1, grad_bias1 = _linear_backward(
+            normalized, weight1, grad_hidden, norm=(value, gamma, stats, grad_output),
+        )
+        return grad_value, grad_gamma, grad_beta, grad_weight1, grad_bias1, grad_weight2, grad_bias2, \
+            None, None, None, None
+
+
+@_committed
+class _SparseQKV(torch.autograd.Function):
+    # Final-layer projection: keys and values of every row, queries only of the rows at positions
+    # (inverse maps rows to their query index or -1). Returns (q, kv, value) like _NormLinear.
+    @staticmethod
+    def forward(ctx, value, gamma, beta, weight, bias, positions, inverse, normalized=None, stats=None):
+        if normalized is None:
+            normalized, stats = _layer_norm_forward(value, gamma, beta)
+        selected = normalized[positions]
+        q, query_weight = _linear_forward(selected, weight[:128], bias[:128])
+        kv, kv_weight = _linear_forward(normalized, weight[128:], bias[128:])
+        ctx.save_for_backward(value, gamma, normalized, stats, selected, query_weight, kv_weight, inverse)
+        return q, kv, value.view_as(value)
+
+    @staticmethod
+    def backward(ctx, grad_q, grad_kv, grad_residual):
+        value, gamma, normalized, stats, selected, query_weight, kv_weight, inverse = ctx.saved_tensors
+        grad_q = grad_q.to(torch.bfloat16).contiguous()
+        grad_selected = torch.empty_like(selected, dtype=torch.float32)
+        _linear_kernel("linear_input_grad_float_out", grad_q, query_weight, grad_selected, len(selected), 128, 128)
+        grad_query_weight, grad_query_bias = _linear_weight_backward(selected, grad_q)
+        (grad_value, grad_gamma, grad_beta), grad_kv_weight, grad_kv_bias = _linear_backward(
+            normalized, kv_weight, grad_kv, norm=(value, gamma, stats, grad_residual),
+            extra=(grad_selected, inverse),
+        )
+        return grad_value, grad_gamma, grad_beta, torch.cat((grad_query_weight, grad_kv_weight)), \
+            torch.cat((grad_query_bias, grad_kv_bias)), None, None, None, None
 
 
 @_committed
@@ -1510,10 +1678,9 @@ class _NormHead(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         value, gamma, normalized, stats, weight = ctx.saved_tensors
-        grad_normalized, grad_weight, grad_bias = _linear_backward(
-            normalized, weight, grad_output[:, None],
+        (grad_value, grad_gamma, grad_beta), grad_weight, grad_bias = _linear_backward(
+            normalized, weight, grad_output[:, None], norm=(value, gamma, stats, None),
         )
-        grad_value, grad_gamma, grad_beta = _layer_norm_backward(value, gamma, stats, grad_normalized)
         return grad_value, grad_gamma, grad_beta, grad_weight, grad_bias
 
 
@@ -1526,15 +1693,38 @@ def _linear(value, layer, residual=None):
     return output if residual is None else residual + output
 
 
-def _residual_linear(value, layer, residual):
-    return _linear(value, layer, residual)
+def _residual_linear(value, layer, residual, next_norm=None):
+    # With next_norm, returns (output, norm) where norm is next_norm's precomputed (bf16 output, stats)
+    # or None.
+    if next_norm is None:
+        return _linear(value, layer, residual)
+    if (value.device.type == "mps" and torch.is_autocast_enabled("mps") and value.shape[1] == 128
+            and residual.dtype == torch.float32 and len(layer.weight) == 128):
+        output, *norm = _LinearResidual.apply(
+            value, layer.weight, layer.bias, residual, next_norm.weight, next_norm.bias,
+        )
+        return output, norm
+    return _linear(value, layer, residual), None
 
 
-def _norm_linear(value, norm, weight, bias):
+def _norm_linear(value, norm, weight, bias, normalized=None):
     if (value.device.type == "mps" and value.dtype == torch.float32
             and torch.is_autocast_enabled("mps") and value.shape[1] == 128):
-        return _NormLinear.apply(value, norm.weight, norm.bias, weight, bias)
+        return _NormLinear.apply(value, norm.weight, norm.bias, weight, bias, *(normalized or ()))
     return nn.functional.linear(norm(value), weight, bias), value
+
+
+def _feed_forward(value, norm, first, second, normalized=None, next_norm=None):
+    # normalized and next_norm as for _norm_linear and _residual_linear.
+    if (value.device.type == "mps" and value.dtype == torch.float32
+            and torch.is_autocast_enabled("mps") and value.shape[1] == len(first.weight) == 128):
+        output = _FeedForward.apply(
+            value, norm.weight, norm.bias, first.weight, first.bias, second.weight, second.bias,
+            *(normalized or (None, None)), *(() if next_norm is None else (next_norm.weight, next_norm.bias)),
+        )
+        return output if next_norm is None else (output[0], list(output[1:]))
+    hidden, value = _norm_linear(value, norm, first.weight, first.bias)
+    return _residual_linear(nn.functional.gelu(hidden), second, value, next_norm)
 
 
 def _layer_norm(value, norm):
@@ -1733,6 +1923,56 @@ class _FusedDomains(torch.autograd.Function):
 
 
 @_committed
+class _EmbeddingAdd(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, values, semantic, embedding):
+        if _RaggedAttention.library is None:
+            _RaggedAttention.library = torch.mps.compile_shader(_TRAINING_METAL)
+        output = torch.empty_like(values)
+        _RaggedAttention.library.embedding_add(
+            values, semantic, embedding, output, semantic.shape[1], values.shape[1],
+            threads=values.numel(), group_size=256,
+        )
+        ctx.save_for_backward(semantic, embedding)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        semantic, embedding = ctx.saved_tensors
+        grad_output = grad_output.contiguous()
+        grad_embedding = torch.zeros_like(embedding)
+        _RaggedAttention.library.semantic_backward_embedding(
+            semantic, grad_output, grad_embedding, len(semantic), semantic.shape[1],
+            embedding.shape[1], threads=grad_output.numel(), group_size=256,
+        )
+        return grad_output, None, grad_embedding
+
+
+class _Assemble(torch.autograd.Function):
+    # Padded sequence rows: seeds at offsets, parts at their destinations, zeros after the real tokens.
+    @staticmethod
+    def forward(ctx, total, offsets, destination, seed, *parts):
+        dtype = functools.reduce(torch.promote_types, (part.dtype for part in parts))
+        sizes = [len(part) for part in parts]
+        current = seed.new_empty((total, seed.shape[-1]), dtype=dtype)
+        current[sum(sizes) + len(offsets):] = 0
+        current[offsets] = seed.to(dtype)
+        for part, rows in zip(parts, destination.split(sizes)):
+            current[rows] = part.to(dtype)
+        ctx.save_for_backward(offsets, destination)
+        ctx.sizes, ctx.seed, ctx.dtypes = sizes, (seed.dim(), seed.dtype), [part.dtype for part in parts]
+        return current
+
+    @staticmethod
+    def backward(ctx, grad):
+        offsets, destination = ctx.saved_tensors
+        grad_seed = grad[offsets].to(ctx.seed[1])
+        return None, None, None, grad_seed.sum(0) if ctx.seed[0] == 1 else grad_seed, *(
+            grad[rows].to(dtype) for rows, dtype in zip(destination.split(ctx.sizes), ctx.dtypes)
+        )
+
+
+@_committed
 class _GroupSum(torch.autograd.Function):
     @staticmethod
     def forward(ctx, values, group, groups):
@@ -1873,6 +2113,10 @@ class ConceptEmbeddings(nn.Module):
     def flattened(self):
         return torch.cat((self.tables[0].weight[:1] * 0,
                           *(table.weight[1:] for table in self.tables)))
+
+    def code(self, name, index):
+        table = SEMANTIC_NAMES.index(name)
+        return 1 + sum(self.sizes[:table]) + index
 
     def local(self, name, index):
         return graph_name(self.tables[SEMANTIC_NAMES.index(name)].weight[index + 1], name)
@@ -2038,7 +2282,7 @@ class Agent(nn.Module):
         return torch.where(legal, value, torch.zeros_like(value))
 
     def encode_map(self, encoded, index):
-        node_source, edge_source, levels, offsets, current, current_inverse, keys = index
+        node_source, edge_source, levels, offsets, current, current_inverse, keys, rows, sizes, parents = index
         cacheable = not self.training and not self._trace_graph and node_source.device.type == "cpu"
         cached = [self._graph_cache.get(key) for key in keys] if cacheable else [None] * len(keys)
         if cacheable and all(x is not None for x in cached):
@@ -2054,20 +2298,21 @@ class Agent(nn.Module):
                 for graph, value in enumerate(cached):
                     if value is not None:
                         nodes[ranges[graph]:ranges[graph + 1]] = value
-            for parents, children, edge_rows, sequence, degree, count, _edge_count in levels:
+            # Parents are read before their only update, so one gather serves every level.
+            gathered, updates = nodes[rows].split(sizes), []
+            for (local, sequence, count, gap), parent_rows, leaves in zip(levels, gathered[::2], gathered[1::2]):
                 query, parent = _norm_linear(
-                    nodes[parents], self.graph_norm, self.graph_query.weight, self.graph_query.bias,
+                    parent_rows, self.graph_norm, self.graph_query.weight, self.graph_query.bias,
                 )
+                children = torch.cat((leaves, *updates[len(updates) - gap:]))[local]
                 attended = self.attend(query, _norm_linear(
-                    nodes[children], self.graph_norm, self.graph_key_value.weight,
-                    self.graph_key_value.bias,
+                    children, self.graph_norm, self.graph_key_value.weight, self.graph_key_value.bias,
                 )[0], sequence)
                 updated = _residual_linear(attended, self.graph_out, parent)
-                hidden, updated = _norm_linear(
-                    updated, self.graph_ff_norm, self.graph_ff[0].weight, self.graph_ff[0].bias,
-                )
-                updated = _residual_linear(self.graph_ff[1](hidden), self.graph_ff[2], updated)
-                nodes.index_put_((parents[:count],), updated[:count])
+                updated = _feed_forward(updated, self.graph_ff_norm, self.graph_ff[0], self.graph_ff[2])
+                updates.append(updated[:count])
+            if updates:
+                nodes = nodes.index_put((parents,), torch.cat(updates))
             if cacheable:
                 offsets = offsets.tolist()
                 for graph, key in enumerate(keys):
@@ -2127,10 +2372,24 @@ class Agent(nn.Module):
     def _tag(self, values, collection):
         return values + self.concepts.local("collection", collection).to(values.dtype)
 
-    def _card_context(self, values, metadata):
+    def _context(self, values, concepts, *lookups):
+        # Adds concept rows for (present, name, index) lookups; index 0 of the flat table is zero.
+        semantic = torch.stack([
+            torch.where(present, self.concepts.code(name, index), 0) for present, name, index in lookups
+        ], 1).int()
+        if values.device.type == "mps" and values.dtype == torch.float32:
+            return _EmbeddingAdd.apply(values, semantic, concepts)
+        return values + concepts[semantic].sum(1)
+
+    def _card_context(self, values, metadata, concepts):
         if not len(values):
             return values
         zone, order_kind, order, origin = metadata[:len(values)].T
+        if values.device.type == "mps":
+            return self._context(values, concepts, *(
+                ((zone == 2) & (order_kind == kind) & (order > 0), name, (order - 1).clamp(max=256))
+                for kind, name in ((1, "draw_top_position"), (2, "draw_bottom_position"))
+            ), (origin > 0, "deck_origin", (origin - 1).clamp(max=256)))
         for kind, name in ((1, "draw_top_position"), (2, "draw_bottom_position")):
             present = (zone == 2) & (order_kind == kind) & (order > 0)
             values = values + present[:, None] * self.concepts.local(
@@ -2141,10 +2400,12 @@ class Agent(nn.Module):
             "deck_origin", (origin - 1).clamp(max=256),
         ).to(values.dtype)
 
-    def _relic_context(self, values, metadata):
+    def _relic_context(self, values, metadata, concepts):
         if not len(values):
             return values
         position = metadata[:len(values), 0]
+        if values.device.type == "mps":
+            return self._context(values, concepts, (position > 0, "relic_position", (position - 1).clamp(max=256)))
         return values + (position > 0)[:, None] * self.concepts.local(
             "relic_position", (position - 1).clamp(max=256),
         ).to(values.dtype)
@@ -2163,10 +2424,13 @@ class Agent(nn.Module):
         return projection[inverse[root]], rows[root], metadata[root]
 
     def _sequence(self, values, group, groups, seed, transformer, selected=None, layout=None):
+        # values may be a list of parts, in row order of group.
+        parts = values if isinstance(values, list) else [values]
+        count, device = sum(map(len, parts)), seed.device
         selected_count = selected
-        real_tokens = len(values) + groups
+        real_tokens = count + groups
         final_attention = transformer is self.global_transformer
-        flash = values.device.type == "mps" and self.width == 128 and self.heads == 4 \
+        flash = device.type == "mps" and self.width == 128 and self.heads == 4 \
             and torch.is_autocast_enabled("mps") \
             and torch.get_autocast_dtype("mps") == torch.bfloat16
         reuse = flash and getattr(self, "_reuse_sequence_layouts", False)
@@ -2184,27 +2448,27 @@ class Agent(nn.Module):
             inverse[order] = torch.arange(len(order), device=order.device)
             group = group[order]
             counts = torch.bincount(group, minlength=groups)
-        if values.device.type == "mps" and self.width // self.heads in (16, 32) \
+        if device.type == "mps" and self.width // self.heads in (16, 32) \
                 and layout is None and not reuse:
             lengths = counts + 1
             padded_groups = (groups // 256 + 1) * 256
             lengths = nn.functional.pad(lengths, (0, padded_groups - groups), value=1)
-            total = len(values) + padded_groups
+            total = count + padded_groups
             extra = (-total) % 16_384
             lengths[groups:] += extra // (padded_groups - groups)
             lengths[groups:groups + extra % (padded_groups - groups)] += 1
             offsets = torch.cat((counts.new_zeros(1), lengths.cumsum(0)))
             starts = torch.repeat_interleave(offsets[:groups], counts)
-            position = torch.arange(len(values), device=values.device) \
+            position = torch.arange(count, device=device) \
                 - torch.repeat_interleave(counts.cumsum(0) - counts, counts) + 1
             destination = (starts + position)[inverse]
             sequence = torch.repeat_interleave(
-                torch.arange(len(lengths), device=values.device), lengths,
+                torch.arange(len(lengths), device=device), lengths,
             )
             if flash:
                 blocks = (lengths[:groups] + 31) // 32
                 block_rows = torch.repeat_interleave(
-                    torch.arange(groups, device=values.device), blocks,
+                    torch.arange(groups, device=device), blocks,
                 ).to(torch.int32)
                 block_starts = torch.cat((counts.new_zeros(1), blocks.cumsum(0)[:-1])).to(
                     torch.int32
@@ -2219,24 +2483,30 @@ class Agent(nn.Module):
                 query_counts = torch.bincount(sequence[positions], minlength=len(lengths))
                 query_offsets = torch.cat((query_counts.new_zeros(1), query_counts.cumsum(0)))
                 item_positions = torch.empty_like(query_order)
-                item_positions[query_order] = torch.arange(len(query_order), device=values.device)
+                item_positions[query_order] = torch.arange(len(query_order), device=device)
                 sparse = positions, item_positions[groups:], query_offsets
             if flash and self.training and torch.is_grad_enabled():
                 self._sequence_layouts.append((
                     order, inverse, selected, counts, lengths, offsets, destination, sequence,
                     block_rows, block_starts, metal_offsets, metal_lengths, sparse,
                 ))
-        if values.device.type == "mps" and self.width // self.heads in (16, 32):
-            total = len(sequence)
-            current = values.new_zeros((total, self.width))
-            current[offsets[:groups]] = seed.to(current.dtype)
-            current[destination] = values.to(current.dtype)
+        if device.type == "mps" and self.width // self.heads in (16, 32):
+            current = _Assemble.apply(len(sequence), offsets[:groups], destination, seed, *parts)
 
-            def attend_layer(current, layer, selected, query_offsets, sparse):
-                qkv, current = _norm_linear(
-                    current, layer.norm1, layer.self_attn.in_proj_weight,
-                    layer.self_attn.in_proj_bias,
-                )
+            # Each residual matmul also computes the next layer norm, passed on as normalized.
+            def attend_layer(current, layer, selected, query_offsets, sparse, normalized):
+                weights = layer.self_attn.in_proj_weight, layer.self_attn.in_proj_bias
+                if flash and sparse:
+                    inverse = torch.full((len(current),), -1, dtype=torch.int32, device=device)
+                    inverse[selected] = torch.arange(len(selected), dtype=torch.int32, device=device)
+                    q, kv, current = _SparseQKV.apply(
+                        current, layer.norm1.weight, layer.norm1.bias, *weights, selected, inverse,
+                        *(normalized or ()),
+                    )
+                    attended = _SparseAttention.apply(q, kv, metal_offsets, query_offsets.to(torch.int32))
+                    return _residual_linear(attended, layer.self_attn.out_proj, current[selected],
+                                            layer.norm2)
+                qkv, current = _norm_linear(current, layer.norm1, *weights, normalized)
                 fp32_value_backward = final_attention \
                     and layer_index + 1 == len(transformer.layers) \
                     and self.precision == "bf16_with_fp32_dV"
@@ -2257,27 +2527,28 @@ class Agent(nn.Module):
                         query_offsets.to(torch.int32), sparse, False,
                     )
                 residual = current[selected] if sparse else current
-                return _residual_linear(attended, layer.self_attn.out_proj, residual)
+                return _residual_linear(attended, layer.self_attn.out_proj, residual, layer.norm2)
 
-            def feed_forward(current, layer):
-                hidden, current = _norm_linear(
-                    current, layer.norm2, layer.linear1.weight, layer.linear1.bias,
-                )
-                return _residual_linear(layer.activation(hidden), layer.linear2, current)
-
+            normalized = None
             for layer_index, layer in enumerate(transformer.layers):
                 if selected_count is not None and layer_index == len(transformer.layers) - 1:
                     positions, item_positions, query_offsets = sparse
-                    current = attend_layer(current, layer, positions, query_offsets, True)
-                    current = feed_forward(current, layer)
+                    current, normalized = attend_layer(
+                        current, layer, positions, query_offsets, True, normalized,
+                    )
+                    current = _feed_forward(current, layer.norm2, layer.linear1, layer.linear2, normalized)
                     state = current[query_offsets[:groups]]
                     items = current[item_positions]
                     return state, items
-                current = attend_layer(current, layer, sequence, offsets, False)
-                current = feed_forward(current, layer)
-            items = current[destination] if len(values) else values
+                current, normalized = attend_layer(current, layer, sequence, offsets, False, normalized)
+                following = transformer.layers[layer_index + 1].norm1 \
+                    if layer_index + 1 < len(transformer.layers) else None
+                current = _feed_forward(current, layer.norm2, layer.linear1, layer.linear2, normalized,
+                                        following)
+                current, normalized = current if following is not None else (current, None)
+            items = current[destination] if count else parts[0]
             return current[offsets[:groups]], items
-        values = values[order]
+        values = torch.cat(parts)[order]
         selected = (torch.arange(len(values), device=values.device)
                     >= len(values) - selected_count)[order] if selected_count is not None else None
         maximum = int(counts.max().item()) if len(counts) else 0
@@ -2398,7 +2669,7 @@ class Agent(nn.Module):
                     continue
                 attached_values = encoded[domain]
                 if domain == DOMAIN["card"]:
-                    attached_values = self._card_context(attached_values, row[10])
+                    attached_values = self._card_context(attached_values, row[10], concepts)
                 arguments.extend((attached_values, row[6][row[9]]))
             attached = _ActionAttachments.apply(
                 nodes, path[:action_count], attachment_rows, *tuple(arguments),
@@ -2411,7 +2682,7 @@ class Agent(nn.Module):
                     continue
                 item = encoded[domain][row[6][row[9]]]
                 if domain == DOMAIN["card"]:
-                    item = self._card_context(item, row[3][row[9]])
+                    item = self._card_context(item, row[3][row[9]], concepts)
                 values.append(item)
             if values:
                 attached.index_add_(0, attachment_rows, torch.cat(values).to(attached.dtype))
@@ -2421,7 +2692,7 @@ class Agent(nn.Module):
         action = _layer_norm(action + attached, self.action_norm)
         return action, action_row[:action_count], action_flat[:action_count], actions, policy_sequence
 
-    def _continuations(self, domains, encoded, plan):
+    def _continuations(self, domains, encoded, plan, concepts):
         values, rows, u = self._domain_rows(domains, encoded, DOMAIN["continuation"])
         if not len(values):
             return values, rows, plan[3:-1]
@@ -2431,29 +2702,26 @@ class Agent(nn.Module):
         for domain, source, item in plan[-1]:
             linked = encoded[domain][domains[domain][6][source]]
             if domain == DOMAIN["card"]:
-                linked = self._card_context(linked, domains[domain][3][source])
+                linked = self._card_context(linked, domains[domain][3][source], concepts)
             items.index_put_((item,), linked.to(items.dtype), accumulate=True)
         return items, item_rows, plan[3:-1]
 
     def _packed_gru(self, values, batch_sizes, gru, parents=None):
-        gates = _FastLinear.apply(values, gru.weight_ih_l0, gru.bias_ih_l0)
+        gates = _FastLinear.apply(values, gru.weight_ih_l0, gru.bias_ih_l0).split(batch_sizes)
         if parents is not None:
             levels = []
-            offset = 0
-            for size in batch_sizes:
-                previous = values.new_zeros((size, self.width)) if not levels \
-                    else levels[-1][parents[offset:offset + size]]
+            for level_gates, level_parents in zip(gates, parents.split(batch_sizes)):
+                previous = values.new_zeros((len(level_gates), self.width)) if not levels \
+                    else levels[-1][level_parents]
                 hidden = _FastLinear.apply(previous, gru.weight_hh_l0, gru.bias_hh_l0)
-                levels.append(_GruStep.apply(gates[offset:offset + size], hidden, previous))
-                offset += size
+                levels.append(_GruStep.apply(level_gates, hidden, previous))
             return torch.cat(levels)
-        state = torch.zeros((batch_sizes[0], self.width), device=gates.device)
-        offset = 0
-        for size in batch_sizes:
+        state = torch.zeros((batch_sizes[0], self.width), device=values.device)
+        for level_gates in gates:
+            size = len(level_gates)
             hidden = _FastLinear.apply(state[:size], gru.weight_hh_l0, gru.bias_hh_l0)
-            current = _GruStep.apply(gates[offset:offset + size], hidden, state[:size])
+            current = _GruStep.apply(level_gates, hidden, state[:size])
             state = torch.cat((current, state[size:])) if size < len(state) else current
-            offset += size
         return state
 
     def encode_state(self, domains, encoded, phase_projection, index, action_values,
@@ -2522,9 +2790,9 @@ class Agent(nn.Module):
                 source=None if filtered is None else filters[filtered],
             )
             if domain == DOMAIN["card"]:
-                item = self._card_context(item, item_u)
+                item = self._card_context(item, item_u, concepts)
             if name == "relic" and len(item):
-                item = self._relic_context(item, item_u)
+                item = self._relic_context(item, item_u, concepts)
                 stored, stored_rows, _ = self._domain_rows(
                     domains, encoded, DOMAIN["card"], source=filters[10],
                 )
@@ -2541,7 +2809,7 @@ class Agent(nn.Module):
             add(value, row, "effect")
 
         continuation, continuation_rows, continuation_gru = self._continuations(
-            domains, encoded, continuation_plan,
+            domains, encoded, continuation_plan, concepts,
         )
         mode = self.pooling["continuation"]
         if mode == "global_tokens":
@@ -2576,8 +2844,7 @@ class Agent(nn.Module):
         add(crystal, crystal_rows, "crystal")
         add(action, action_rows, "action")
 
-        values = torch.cat(values)
-        if global_layout is not None and len(global_layout[1]) != len(values):
+        if global_layout is not None and len(global_layout[1]) != sum(map(len, values)):
             raise RuntimeError("invalid precomputed sequence layout")
         rows = None if global_layout is not None else torch.cat(rows)
         self._sequence_lengths = global_layout[6][:batch] if global_layout is not None else \
@@ -2996,32 +3263,33 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
         selected = selected[missing[graph_for_node[parents]][group]]
         if len(selected):
             parents, group = np.unique(edge_src[selected], return_inverse=True)
-            levels.append((
-                parents, edge_dst[selected], selected, group,
-                np.zeros(len(parents), np.float32),
-            ))
-    if pad:
-        padded = []
-        for parents, children, edges, group, degree in levels:
-            count, edge_count = len(parents), len(children)
-            edge_size = bucket(edge_count)
-            parent_size = bucket(count + (edge_size > edge_count))
-            extra = edge_size - edge_count
-            padded.append((
-                tensor(np.pad(parents, (0, parent_size - count))),
-                tensor(np.pad(children, (0, extra))), tensor(np.pad(edges, (0, extra))),
-                candidate_index(np.r_[group, np.full(extra, count, np.int32)],
-                                parent_size, target, True),
-                torch.as_tensor(np.pad(degree, (0, parent_size - count)), device=target),
-                count, edge_count,
-            ))
-        levels = padded
-    else:
-        levels = [(
-            tensor(parents), tensor(children), tensor(edges),
-            candidate_index(group, len(parents), target),
-            torch.as_tensor(degree, device=target), len(parents), len(children),
-        ) for parents, children, edges, group, degree in levels]
+            levels.append((parents, edge_dst[selected], group))
+    # Children are leaves or nodes updated by recent levels: each level reads them from a small pool of
+    # its leaves followed by the outputs of the previous `gap` levels.
+    node_level, node_position = np.full(len(node_source), -1), np.zeros(len(node_source), np.int64)
+    for level, (parents, _children, _group) in enumerate(levels):
+        node_level[parents], node_position[parents] = level, np.arange(len(parents))
+    map_rows, map_sizes, padded = [], [], []
+    for level, (parents, children, group) in enumerate(levels):
+        child_level = node_level[children]
+        leaves = np.unique(children[child_level < 0])
+        gap = level - int(child_level[child_level >= 0].min(initial=level))
+        starts = np.cumsum([len(leaves)] + [len(levels[previous][0]) for previous in range(level - gap, level)])
+        local = np.where(child_level < 0, np.searchsorted(leaves, children),
+                         starts[np.clip(child_level - level + gap, 0, None)] + node_position[children])
+        count, edge_count = len(parents), len(children)
+        edge_size = bucket(edge_count) if pad else edge_count
+        parent_size = bucket(count + (edge_size > edge_count)) if pad else count
+        extra = edge_size - edge_count
+        map_rows += [np.pad(parents, (0, parent_size - count)), leaves]
+        map_sizes += [parent_size, len(leaves)]
+        padded.append((
+            tensor(np.pad(local, (0, extra))),
+            candidate_index(np.r_[group, np.full(extra, count, np.int32)], parent_size, target, bool(pad)),
+            count, gap,
+        ))
+    map_parents = np.concatenate([parents for parents, _children, _group in levels] or [np.empty(0, np.int64)])
+    levels = padded
     run_u, _run_s, _run_c, _run_f, run_row, run_scope = domains[DOMAIN["run"]]
     run_source = np.flatnonzero(run_scope == -1)
     current_id = np.full(batch, np.iinfo(np.uint32).max, np.uint32)
@@ -3040,6 +3308,8 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
         tensor(inverse_rows[DOMAIN["map_edge"]][edge_source]), tuple(levels),
         tensor(node_offsets), tensor(current), tensor(current_inverse),
         tuple(graph_keys[row] for row in representatives) if graph_keys else (),
+        tensor(np.concatenate(map_rows or [np.empty(0, np.int64)])), tuple(map_sizes),
+        tensor(map_parents),
     )
 
     action_u, _action_s, action_c, action_f = action
