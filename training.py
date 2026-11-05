@@ -11,7 +11,7 @@ import tempfile
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from itertools import islice
 from pathlib import Path
 from queue import Empty, Full, Queue
@@ -50,39 +50,55 @@ def terminal_floor(category, won, args):
 
 
 
-def upload(value, target):
-    marker = object()
+def stage_upload(value):
     tensors = []
 
     def flatten(item):
         if torch.is_tensor(item):
             tensors.append(item)
-            return marker, len(tensors) - 1
+            return stage_upload, len(tensors) - 1
         if isinstance(item, tuple):
             return tuple(flatten(child) for child in item)
         return item
 
     structure = flatten(value)
-    uploaded = [None] * len(tensors)
+    places = [None] * len(tensors)
+    buffers = {}
     for dtype in {tensor.dtype for tensor in tensors}:
         selected = [index for index, tensor in enumerate(tensors) if tensor.dtype == dtype]
-        sizes = [tensors[index].numel() for index in selected]
-        buffer = torch.cat([tensors[index].reshape(-1) for index in selected]).to(
-            target, non_blocking=True,
-        )
         offset = 0
-        for index, size in zip(selected, sizes):
-            uploaded[index] = buffer[offset:offset + size].view(tensors[index].shape)
-            offset += size
+        for index in selected:
+            places[index] = dtype, offset, tensors[index].shape
+            offset += tensors[index].numel()
+        buffers[dtype] = torch.cat([tensors[index].reshape(-1) for index in selected])
+    return structure, places, buffers
+
+
+def upload(value, target, staged=False):
+    structure, places, buffers = value if staged else stage_upload(value)
+    buffers = {dtype: buffer.to(target, non_blocking=True) for dtype, buffer in buffers.items()}
 
     def rebuild(item):
-        if isinstance(item, tuple) and len(item) == 2 and item[0] is marker:
-            return uploaded[item[1]]
+        if isinstance(item, tuple) and len(item) == 2 and item[0] is stage_upload:
+            dtype, offset, shape = places[item[1]]
+            return buffers[dtype][offset:offset + shape.numel()].view(shape)
         if isinstance(item, tuple):
             return tuple(rebuild(child) for child in item)
         return item
 
     return rebuild(structure)
+
+
+def start_collator(model):
+    global COLLATOR_MODEL
+    COLLATOR_MODEL = model
+
+
+def collate(rows, training):
+    return stage_upload((
+        unpack(rows, torch.device("cpu"), COLLATOR_MODEL, False, True),
+        tuple(map(torch.from_numpy, training)),
+    ))
 
 
 def clip_gradients(parameters):
@@ -220,10 +236,12 @@ def uniform_cross_entropy(log_probability, legal, action_row=None, row_count=Non
     terms = torch.where(legal, -log_probability, 0.)
     if action_row is None:
         return (terms.sum(1) / legal.sum(1)).mean()
-    counts = log_probability.new_zeros(row_count).index_add(
-        0, action_row, legal.to(log_probability.dtype),
+    counts = log_probability.new_zeros(row_count).index_put(
+        (action_row,), legal.to(log_probability.dtype), accumulate=True,
     )
-    return (log_probability.new_zeros(row_count).index_add(0, action_row, terms) / counts).mean()
+    return (log_probability.new_zeros(row_count).index_put(
+        (action_row,), terms, accumulate=True,
+    ) / counts).mean()
 
 
 def resume_curriculum(source, stage):
@@ -704,6 +722,11 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         context.RawArray("q", [-1] * (args.envs * 3)),
     )
     packer = ThreadPoolExecutor(max_workers=1)
+    collator = None
+    if target.type == "mps":
+        collator_model = copy.deepcopy(model).cpu()
+        collator_model._sequence_layouts, collator_model._graph_cache = [], {}
+        collator = ProcessPoolExecutor(1, context, start_collator, (collator_model,))
     workers = [None] * args.samplers
     watchdog_terminated = set()
     watchdog_pending = [False] * args.samplers
@@ -893,17 +916,14 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 break
 
     def prepare(rows, training):
-        prepared = time.monotonic()
-        value = unpack(rows, torch.device("cpu"), model, False)
-        value = (value, training)
-        value = upload(value, target) if target.type != "cpu" else value
-        return value, time.monotonic() - prepared
+        if collator:
+            return collator.submit(collate, rows, tuple(value.numpy() for value in training)).result()
+        value = (unpack(rows, torch.device("cpu"), model, False), training)
+        return stage_upload(value) if target.type != "cpu" else value
 
     def prepare_cached(features, training):
-        prepared = time.monotonic()
         value = (cached_tensors(features, model.width), training)
-        value = upload(value, target) if target.type != "cpu" else value
-        return value, time.monotonic() - prepared
+        return stage_upload(value) if target.type != "cpu" else value
 
     def reserve_batch(size):
         if len(refill_ids):
@@ -992,8 +1012,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             return
         periodic = args.mps_empty_cache_updates \
             and revisions["weights_revision"] % args.mps_empty_cache_updates == 0
-        if force or periodic \
-                or torch.mps.driver_allocated_memory() > torch.mps.recommended_max_memory() * .75:
+        if force or torch.mps.driver_allocated_memory() \
+                > torch.mps.recommended_max_memory() * (.4 if periodic else .75):
             torch.mps.empty_cache()
 
     def prefetch():
@@ -1292,7 +1312,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             flat_policy = not replay
             policy_actions = int(lengths.sum())
             expert_actions = int(expert_lengths.sum())
-            (inputs, training_tensors), _ = packed.result()
+            inputs, training_tensors = upload(packed.result(), target, True) \
+                if target.type != "cpu" else packed.result()
             action, old, choice_index, batch_advantage, batch_target = training_tensors
             unpack_seconds = time.monotonic() - unpack_started
             forward_started = time.monotonic()
@@ -1435,9 +1456,10 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             if flat_policy:
                 action_row = inputs[3] if cached else inputs[5][0][:len(logits)]
                 action_legal = None if cached else inputs[5][2][:len(logits)]
-                entropy_by_row = logits.new_zeros(len(rows)).index_add(
-                    0, action_row, -(logits.exp() * logits
+                entropy_by_row = logits.new_zeros(len(rows)).index_put(
+                    (action_row,), -(logits.exp() * logits
                                      * (1 if action_legal is None else action_legal)),
+                    accumulate=True,
                 )
                 uniform_loss = uniform_cross_entropy(
                     logits, action_legal, action_row, len(rows),
@@ -1750,6 +1772,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 queue.cancel_join_thread()
                 queue.close()
         packer.shutdown(wait=True, cancel_futures=True)
+        if collator:
+            collator.shutdown(cancel_futures=True)
     failed = [] if threaded else [worker.exitcode for worker in started_workers
                                   if worker not in terminated
                                   and worker not in watchdog_terminated and worker.exitcode]

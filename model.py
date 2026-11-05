@@ -1001,43 +1001,77 @@ kernel void layer_norm_forward_bfloat(
     }
 }
 
-kernel void layer_norm_backward_input_bfloat(
+template <typename G>
+void layer_norm_backward(
     device const float *input, device const float *gamma, device const float *stats,
-    device const bfloat *grad_output, device float *grad_input, constant uint& width,
-    uint tid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
-    uint row = tid / 32, base = row * width + lane;
-    float mean = stats[row * 2], inverse_std = stats[row * 2 + 1];
-    float4 normalized, grad;
-    float local_sum = 0.0f, local_product = 0.0f;
-    for (uint part = 0; part < width / 32; ++part) {
-        uint column = lane + part * 32, index = base + part * 32;
-        normalized[part] = (input[index] - mean) * inverse_std;
-        grad[part] = float(grad_output[index]) * gamma[column];
-        local_sum += grad[part];
-        local_product += grad[part] * normalized[part];
+    device const G *grad_output, device const float *residual, device float *grad_input,
+    device float *partial, uint rows, uint block_rows, uint width, bool add_residual, uint block,
+    uint lane) {
+    float4 grad_gamma = 0.0f, grad_beta = 0.0f;
+    for (uint row = block * block_rows; row < min(rows, (block + 1) * block_rows); ++row) {
+        float mean = stats[row * 2], inverse_std = stats[row * 2 + 1];
+        float4 normalized, grad;
+        float local_sum = 0.0f, local_product = 0.0f;
+        for (uint part = 0; part < width / 32; ++part) {
+            uint column = lane + part * 32, index = row * width + column;
+            float gradient = float(grad_output[index]);
+            normalized[part] = (input[index] - mean) * inverse_std;
+            grad_gamma[part] += gradient * normalized[part];
+            grad_beta[part] += gradient;
+            grad[part] = gradient * gamma[column];
+            local_sum += grad[part];
+            local_product += grad[part] * normalized[part];
+        }
+        float sum = simd_sum(local_sum), product = simd_sum(local_product);
+        for (uint part = 0; part < width / 32; ++part) {
+            uint index = row * width + lane + part * 32;
+            grad_input[index] = (
+                grad[part] - sum / width - normalized[part] * product / width
+            ) * inverse_std + (add_residual ? residual[index] : 0.0f);
+        }
     }
-    float sum = simd_sum(local_sum), product = simd_sum(local_product);
-    for (uint part = 0; part < width / 32; ++part)
-        grad_input[base + part * 32] = (
-            grad[part] - sum / width - normalized[part] * product / width
-        ) * inverse_std;
+    for (uint part = 0; part < width / 32; ++part) {
+        partial[block * 2 * width + lane + part * 32] = grad_gamma[part];
+        partial[(block * 2 + 1) * width + lane + part * 32] = grad_beta[part];
+    }
 }
 
-kernel void layer_norm_backward_partial_bfloat(
-    device const float *input, device const float *stats, device const bfloat *grad_output,
-    device float *partial, constant uint& rows, constant uint& block_rows, constant uint& width,
-    uint tid [[thread_position_in_grid]]) {
-    uint block = tid / width, column = tid % width;
-    uint begin = block * block_rows, end = min(rows, begin + block_rows);
-    float dg = 0.0f, db = 0.0f;
-    for (uint row = begin; row < end; ++row) {
-        uint index = row * width + column;
-        float grad = float(grad_output[index]);
-        dg += grad * (input[index] - stats[row * 2]) * stats[row * 2 + 1];
-        db += grad;
+#define LAYER_NORM_BACKWARD(name, G) \
+kernel void name( \
+    device const float *input, device const float *gamma, device const float *stats, \
+    device const G *grad_output, device const float *residual, device float *grad_input, \
+    device float *partial, constant uint& rows, constant uint& block_rows, constant uint& width, \
+    constant uint& add_residual, uint block [[threadgroup_position_in_grid]], \
+    uint lane [[thread_index_in_simdgroup]]) { \
+    layer_norm_backward(input, gamma, stats, grad_output, residual, grad_input, partial, rows, \
+                        block_rows, width, add_residual, block, lane); \
+}
+LAYER_NORM_BACKWARD(layer_norm_backward_bfloat, bfloat)
+LAYER_NORM_BACKWARD(layer_norm_backward_float, float)
+
+kernel void layer_norm_forward_float(
+    device const float *input, device const float *gamma, device const float *beta,
+    device float *output, device float *stats, constant uint& width,
+    uint tid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+    uint row = tid / 32, base = row * width + lane;
+    float4 value;
+    float local_sum = 0.0f, local_square = 0.0f;
+    for (uint part = 0; part < width / 32; ++part) {
+        value[part] = input[base + part * 32];
+        local_sum += value[part];
     }
-    partial[block * 2 * width + column] = dg;
-    partial[(block * 2 + 1) * width + column] = db;
+    float mean = simd_sum(local_sum) / width;
+    for (uint part = 0; part < width / 32; ++part)
+        local_square += (value[part] - mean) * (value[part] - mean);
+    float inverse_std = rsqrt(simd_sum(local_square) / width + 1e-5f);
+    for (uint part = 0; part < width / 32; ++part) {
+        uint column = lane + part * 32;
+        output[base + part * 32] = (value[part] - mean) * inverse_std * gamma[column] + beta[column];
+    }
+    if (lane == 0) {
+        stats[row * 2] = mean;
+        stats[row * 2 + 1] = inverse_std;
+    }
 }
 
 kernel void norm_head_forward(
@@ -1126,6 +1160,22 @@ kernel void ragged_log_softmax_backward_bfloat(
 """
 
 
+def _committed(function):
+    # Commit the MPS command buffer after each custom op so the GPU runs while Python encodes ahead.
+    for name in ("forward", "backward"):
+        def committed(ctx, *args, method=getattr(function, name)):
+            output = method(ctx, *args)
+            first = next(value for value in (output if isinstance(output, tuple) else (output,))
+                         if value is not None)
+            if first.numel() >= 1 << 22:
+                _committed.event = getattr(_committed, "event", None) or torch.mps.Event()
+                _committed.event.record()
+            return output
+        setattr(function, name, staticmethod(committed))
+    return function
+
+
+@_committed
 class _RaggedAttention(torch.autograd.Function):
     library = None
     half_library = None
@@ -1224,11 +1274,12 @@ class _RaggedAttention(torch.autograd.Function):
         return grad_qkv, None, None, None, None, None, None, None
 
 
+@_committed
 class _FlashAttention(torch.autograd.Function):
     library = None
 
     @staticmethod
-    def forward(ctx, qkv, offsets, lengths, block_rows, block_starts, real_tokens):
+    def forward(ctx, qkv, offsets, lengths, chunk_rows, chunk_starts, real_tokens):
         if _FlashAttention.library is None:
             _FlashAttention.library = torch.mps.compile_shader(
                 Path(__file__).with_name("attention.metal").read_text()
@@ -1236,35 +1287,34 @@ class _FlashAttention(torch.autograd.Function):
         output = qkv.new_empty((len(qkv), qkv.shape[1] // 3))
         output[real_tokens:] = 0
         lse = torch.empty((len(qkv), 4), dtype=torch.float32, device=qkv.device)
-        threads = len(block_rows) * 4 * 32
+        layout = offsets, lengths, chunk_rows, chunk_starts
+        threads = len(chunk_rows) * 4 * 128
         _FlashAttention.library.flash_forward(
-            qkv, qkv, qkv, output, lse, offsets, lengths, block_rows, block_starts,
-            threads=threads, group_size=32,
+            *layout, qkv, output, lse, threads=threads, group_size=128,
         )
-        ctx.save_for_backward(qkv, output, lse, offsets, lengths, block_rows, block_starts)
+        ctx.save_for_backward(qkv, output, lse, *layout)
         ctx.threads, ctx.real_tokens = threads, real_tokens
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        qkv, output, lse, offsets, lengths, block_rows, block_starts = ctx.saved_tensors
+        qkv, output, lse, *layout = ctx.saved_tensors
         grad_output = grad_output.contiguous()
         grad_qkv = torch.empty_like(qkv)
         grad_qkv[ctx.real_tokens:] = 0
         delta = torch.empty_like(lse)
         _FlashAttention.library.flash_backward_query(
-            qkv, qkv, qkv, output, lse, delta, grad_output, grad_qkv,
-            offsets, lengths, block_rows, block_starts,
-            threads=ctx.threads, group_size=32,
+            *layout, qkv, output, lse, grad_output, grad_qkv, delta,
+            threads=ctx.threads, group_size=128,
         )
         _FlashAttention.library.flash_backward_key_value(
-            qkv, qkv, qkv, lse, delta, grad_output, grad_qkv, grad_qkv,
-            offsets, lengths, block_rows, block_starts,
-            threads=ctx.threads, group_size=32,
+            *layout, qkv, lse, delta, grad_output, grad_qkv,
+            threads=ctx.threads, group_size=128,
         )
         return grad_qkv, None, None, None, None, None
 
 
+@_committed
 class _GruStep(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input_gates, hidden_gates, previous):
@@ -1292,111 +1342,126 @@ class _GruStep(torch.autograd.Function):
         return grad_input, grad_hidden, grad_previous
 
 
-def _linear_forward(value_bfloat, weight, bias, residual=None):
-    if _FastLinear.libraries is None:
-        sources = Path(__file__).with_name("linear.metal").read_text().split(
-            "// SPIREFYSH_KERNEL"
+def _linear_kernel(name, a, b, output, rows, columns, depth, bias=None, residual=None, splits=1):
+    if _FastLinear.library is None:
+        _FastLinear.library = torch.mps.compile_shader(
+            Path(__file__).with_name("linear.metal").read_text()
         )
-        _FastLinear.libraries = [torch.mps.compile_shader(source) for source in sources]
+    getattr(_FastLinear.library, name)(
+        a, b, output, output if bias is None else bias, output if residual is None else residual,
+        rows, columns, depth, (depth + splits - 1) // splits,
+        threads=((columns + 31) // 32 * 32, (rows + 31) // 32, splits), group_size=(32, 1, 1),
+    )
+
+
+def _linear_forward(value_bfloat, weight, bias, residual=None):
     weight_bfloat = weight.to(torch.bfloat16)
     output = value_bfloat.new_empty(
-        (len(value_bfloat), len(weight)), dtype=residual.dtype if residual is not None else None,
+        (len(value_bfloat), len(weight)),
+        dtype=torch.float32 if residual is not None else torch.bfloat16,
     )
-    name = "linear_residual_128_128" if residual is not None else \
-        f"linear_{value_bfloat.shape[1]}_{len(weight)}"
-    arguments = (value_bfloat, weight_bfloat, output, bias.to(torch.bfloat16))
-    getattr(_FastLinear.libraries[2 if residual is not None else len(weight) != 128], name)(
-        *arguments, *((residual,) if residual is not None else ()), len(value_bfloat),
-        threads=((len(weight) + 31) // 32 * 32, (len(value_bfloat) + 31) // 32),
-        group_size=(32, 1),
+    bias = bias.float() if bias is not None else weight.new_zeros(len(weight), dtype=torch.float32)
+    _linear_kernel(
+        "linear" if residual is None else "linear_residual", value_bfloat, weight_bfloat, output,
+        len(value_bfloat), len(weight), value_bfloat.shape[1], bias, residual,
     )
     return output, weight_bfloat
 
 
 def _linear_backward(value, weight, grad_output):
-    grad_output = grad_output.to(torch.bfloat16).contiguous()
-    if value.device.type != "mps" or len(value) < 4096 or len(weight) not in (128, 384):
-        return torch.ops.aten.linear_backward(
-            value, grad_output, weight, [True, True, True],
-        )
-    if _FastLinear.backward_libraries is None:
-        source_128, source_384, _ = Path(__file__).with_name("linear.metal").read_text().split(
-            "// SPIREFYSH_KERNEL"
-        )
-        source_128 = source_128.replace(
-            "constant bool B_trans = true;", "constant bool B_trans = false;",
-        ).replace("linear_128_128", "linear_backward_128_128").replace(
-            "C->store_bfloat(", "C->store(",
-        )
-        source_384 = source_384.replace(
-            "constant uint N = 384;", "constant uint N = 128;",
-        ).replace(
-            "constant uint K = 128;", "constant uint K = 384;",
-        ).replace(
-            "constant uint A_leading_dimension = 128;",
-            "constant uint A_leading_dimension = 384;",
-        ).replace(
-            "constant uint C_leading_dimension = 384;",
-            "constant uint C_leading_dimension = 128;",
-        ).replace(
-            "constant bool B_trans = true;", "constant bool B_trans = false;",
-        ).replace("linear_128_384", "linear_backward_384_128").replace(
-            "C->store_bfloat(", "C->store(",
-        )
-        _FastLinear.backward_libraries = [
-            torch.mps.compile_shader(source_128), torch.mps.compile_shader(source_384),
-        ]
-        _FastLinear.zero = value.new_zeros(128)
+    grad_output = grad_output.contiguous() if grad_output.dtype == torch.float32 \
+        else grad_output.to(torch.bfloat16).contiguous()
+    suffix = "_float" if grad_output.dtype == torch.float32 else ""
+    rows, columns, depth = len(value), value.shape[1], len(weight)
     grad_value = torch.empty_like(value)
-    getattr(
-        _FastLinear.backward_libraries[len(weight) != 128],
-        f"linear_backward_{len(weight)}_128",
-    )(
-        grad_output, weight, grad_value, _FastLinear.zero, len(value),
-        threads=(128, (len(value) + 31) // 32), group_size=(32, 1),
+    _linear_kernel(
+        "linear_input_grad" + suffix, grad_output, weight, grad_value, rows, columns, depth,
     )
-    _, grad_weight, grad_bias = torch.ops.aten.linear_backward(
-        value, grad_output, weight, [False, True, True],
+    grad_weight = weight.new_zeros((depth, columns), dtype=torch.float32)
+    grad_bias = weight.new_zeros(depth, dtype=torch.float32)
+    _linear_kernel(
+        "linear_weight_grad" + suffix, grad_output, value, grad_weight, depth, columns, rows,
+        grad_bias, splits=max(1, min(128, rows // 128)),
     )
     return grad_value, grad_weight, grad_bias
 
 
+@_committed
 class _FastLinear(torch.autograd.Function):
-    libraries = None
-    backward_libraries = None
-    zero = None
+    library = None
 
     @staticmethod
     def forward(ctx, value, weight, bias):
         value_bfloat = value.to(torch.bfloat16)
         output, weight_bfloat = _linear_forward(value_bfloat, weight, bias)
         ctx.save_for_backward(value_bfloat, weight_bfloat)
-        ctx.value_dtype = value.dtype
+        ctx.value_dtype, ctx.bias = value.dtype, bias is not None
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
         value, weight = ctx.saved_tensors
         grad_value, grad_weight, grad_bias = _linear_backward(value, weight, grad_output)
-        return grad_value.to(ctx.value_dtype), grad_weight.float(), grad_bias.float()
+        return grad_value.to(ctx.value_dtype), grad_weight, grad_bias if ctx.bias else None
 
 
+@_committed
 class _LinearResidual(torch.autograd.Function):
     @staticmethod
     def forward(ctx, value, weight, bias, residual):
         value_bfloat = value.to(torch.bfloat16)
         output, weight_bfloat = _linear_forward(value_bfloat, weight, bias, residual)
         ctx.save_for_backward(value_bfloat, weight_bfloat)
-        ctx.value_dtype = value.dtype
+        ctx.value_dtype, ctx.bias = value.dtype, bias is not None
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
         value, weight = ctx.saved_tensors
         grad_value, grad_weight, grad_bias = _linear_backward(value, weight, grad_output)
-        return grad_value.to(ctx.value_dtype), grad_weight.float(), grad_bias.float(), grad_output
+        return grad_value.to(ctx.value_dtype), grad_weight, grad_bias if ctx.bias else None, \
+            grad_output
 
 
+def _layer_norm_backward(value, gamma, stats, grad_normalized, residual=None, block_rows=32):
+    rows, width = value.shape
+    blocks = (rows + block_rows - 1) // block_rows
+    grad_value, partial = torch.empty_like(value), value.new_empty((blocks, 2, width))
+    grad_gamma, grad_beta = torch.empty_like(gamma), torch.empty_like(gamma)
+    getattr(_RaggedAttention.library, "layer_norm_backward_" + (
+        "float" if grad_normalized.dtype == torch.float32 else "bfloat"
+    ))(
+        value, gamma, stats, grad_normalized, value if residual is None else residual.contiguous(),
+        grad_value, partial, rows, block_rows, width, residual is not None,
+        threads=blocks * 32, group_size=32,
+    )
+    _RaggedAttention.library.token_backward_norm_reduce(
+        partial, grad_gamma, grad_beta, blocks, width, threads=width * 128, group_size=128,
+    )
+    return grad_value, grad_gamma, grad_beta
+
+
+@_committed
+class _LayerNorm(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, value, gamma, beta):
+        if _RaggedAttention.library is None:
+            _RaggedAttention.library = torch.mps.compile_shader(_TRAINING_METAL)
+        output, stats = torch.empty_like(value), value.new_empty((len(value), 2))
+        _RaggedAttention.library.layer_norm_forward_float(
+            value, gamma, beta, output, stats, value.shape[1],
+            threads=len(value) * 32, group_size=32,
+        )
+        ctx.save_for_backward(value, gamma, stats)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        value, gamma, stats = ctx.saved_tensors
+        return _layer_norm_backward(value, gamma, stats, grad_output.float().contiguous())
+
+
+@_committed
 class _NormLinear(torch.autograd.Function):
     @staticmethod
     def forward(ctx, value, gamma, beta, weight, bias):
@@ -1410,34 +1475,23 @@ class _NormLinear(torch.autograd.Function):
         )
         output, weight_bfloat = _linear_forward(normalized, weight, bias)
         ctx.save_for_backward(value, gamma, normalized, stats, weight_bfloat)
-        return output
+        return output, value.view_as(value)
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, grad_output, grad_residual):
+        # The second output aliases the input for residual connections; its gradient is added
+        # by the layer-norm kernel instead of a separate pass.
         value, gamma, normalized, stats, weight = ctx.saved_tensors
         grad_normalized, grad_weight, grad_bias = _linear_backward(
             normalized, weight, grad_output,
         )
-        width = value.shape[1]
-        grad_value = torch.empty_like(value)
-        _RaggedAttention.library.layer_norm_backward_input_bfloat(
-            value, gamma, stats, grad_normalized, grad_value, width,
-            threads=len(value) * 32, group_size=32,
+        grad_value, grad_gamma, grad_beta = _layer_norm_backward(
+            value, gamma, stats, grad_normalized, grad_residual,
         )
-        blocks = (len(value) + 127) // 128
-        partial = value.new_empty((blocks, 2, width))
-        grad_gamma, grad_beta = torch.empty_like(gamma), torch.empty_like(gamma)
-        _RaggedAttention.library.layer_norm_backward_partial_bfloat(
-            value, stats, grad_normalized, partial, len(value), 128, width,
-            threads=blocks * width, group_size=128,
-        )
-        _RaggedAttention.library.token_backward_norm_reduce(
-            partial, grad_gamma, grad_beta, blocks, width,
-            threads=width * 128, group_size=128,
-        )
-        return grad_value, grad_gamma, grad_beta, grad_weight.float(), grad_bias.float()
+        return grad_value, grad_gamma, grad_beta, grad_weight, grad_bias
 
 
+@_committed
 class _NormHead(torch.autograd.Function):
     @staticmethod
     def forward(ctx, value, gamma, beta, weight, bias):
@@ -1456,33 +1510,15 @@ class _NormHead(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         value, gamma, normalized, stats, weight = ctx.saved_tensors
-        grad_normalized, grad_weight, grad_bias = torch.ops.aten.linear_backward(
-            normalized, grad_output[:, None].to(torch.bfloat16), weight, [True, True, True],
+        grad_normalized, grad_weight, grad_bias = _linear_backward(
+            normalized, weight, grad_output[:, None],
         )
-        width = value.shape[1]
-        grad_value = torch.empty_like(value)
-        _RaggedAttention.library.layer_norm_backward_input_bfloat(
-            value, gamma, stats, grad_normalized, grad_value, width,
-            threads=len(value) * 32, group_size=32,
-        )
-        blocks = (len(value) + 127) // 128
-        partial = value.new_empty((blocks, 2, width))
-        grad_gamma, grad_beta = torch.empty_like(gamma), torch.empty_like(gamma)
-        _RaggedAttention.library.layer_norm_backward_partial_bfloat(
-            value, stats, grad_normalized, partial, len(value), 128, width,
-            threads=blocks * width, group_size=128,
-        )
-        _RaggedAttention.library.token_backward_norm_reduce(
-            partial, grad_gamma, grad_beta, blocks, width,
-            threads=width * 128, group_size=128,
-        )
-        return grad_value, grad_gamma, grad_beta, grad_weight.float(), grad_bias.float()
+        grad_value, grad_gamma, grad_beta = _layer_norm_backward(value, gamma, stats, grad_normalized)
+        return grad_value, grad_gamma, grad_beta, grad_weight, grad_bias
 
 
 def _linear(value, layer, residual=None):
-    if (value.device.type == "mps" and torch.is_autocast_enabled("mps")
-            and value.shape[1] == 128 and len(layer.weight) in (128, 384)
-            and len(value) >= 4096):
+    if value.device.type == "mps" and torch.is_autocast_enabled("mps") and value.shape[1] == 128:
         return (_FastLinear if residual is None else _LinearResidual).apply(
             value, layer.weight, layer.bias, *(() if residual is None else (residual,))
         )
@@ -1496,10 +1532,15 @@ def _residual_linear(value, layer, residual):
 
 def _norm_linear(value, norm, weight, bias):
     if (value.device.type == "mps" and value.dtype == torch.float32
-            and torch.is_autocast_enabled("mps") and value.shape[1] == 128
-            and len(weight) in (128, 384) and len(value) >= 4096):
+            and torch.is_autocast_enabled("mps") and value.shape[1] == 128):
         return _NormLinear.apply(value, norm.weight, norm.bias, weight, bias)
-    return nn.functional.linear(norm(value), weight, bias)
+    return nn.functional.linear(norm(value), weight, bias), value
+
+
+def _layer_norm(value, norm):
+    if value.device.type == "mps" and torch.is_autocast_enabled("mps") and value.shape[1] == 128:
+        return _LayerNorm.apply(value.float().contiguous(), norm.weight, norm.bias)
+    return norm(value)
 
 
 def _norm_head(value, norm, head):
@@ -1509,6 +1550,7 @@ def _norm_head(value, norm, head):
     return head(norm(value)).squeeze(-1)
 
 
+@_committed
 class _RaggedSummaryAttention(torch.autograd.Function):
     @staticmethod
     def forward(ctx, query, key_value, offsets, sequence, heads):
@@ -1544,6 +1586,7 @@ class _RaggedSummaryAttention(torch.autograd.Function):
         return grad_query, grad_key_value, None, None, None
 
 
+@_committed
 class _RaggedLogSoftmax(torch.autograd.Function):
     @staticmethod
     def forward(ctx, score, offsets):
@@ -1571,6 +1614,7 @@ class _RaggedLogSoftmax(torch.autograd.Function):
         return grad_score, None
 
 
+@_committed
 class _FusedSemantic(torch.autograd.Function):
     @staticmethod
     def forward(ctx, semantic, numeric, embedding, gamma, beta):
@@ -1618,6 +1662,7 @@ class _FusedSemantic(torch.autograd.Function):
         return None, grad_input.to(torch.bfloat16), grad_embedding, grad_gamma, grad_beta
 
 
+@_committed
 class _FusedDomains(torch.autograd.Function):
     @staticmethod
     def forward(ctx, embedding, *arguments):
@@ -1687,6 +1732,7 @@ class _FusedDomains(torch.autograd.Function):
         return tuple(gradients)
 
 
+@_committed
 class _GroupSum(torch.autograd.Function):
     @staticmethod
     def forward(ctx, values, group, groups):
@@ -1711,6 +1757,7 @@ class _GroupSum(torch.autograd.Function):
         return grad_input, None, None
 
 
+@_committed
 class _IndexedGroupSum(torch.autograd.Function):
     @staticmethod
     def forward(ctx, values, source, group, groups):
@@ -1736,6 +1783,7 @@ class _IndexedGroupSum(torch.autograd.Function):
         return grad_input, None, None, None
 
 
+@_committed
 class _ActionAttachments(torch.autograd.Function):
     @staticmethod
     def forward(ctx, nodes, path, target, *arguments):
@@ -2007,13 +2055,19 @@ class Agent(nn.Module):
                     if value is not None:
                         nodes[ranges[graph]:ranges[graph + 1]] = value
             for parents, children, edge_rows, sequence, degree, count, _edge_count in levels:
-                attended = self.attend(
-                    self.graph_query(self.graph_norm(nodes[parents])),
-                    self.graph_key_value(self.graph_norm(nodes[children])), sequence,
+                query, parent = _norm_linear(
+                    nodes[parents], self.graph_norm, self.graph_query.weight, self.graph_query.bias,
                 )
-                updated = nodes[parents] + self.graph_out(attended)
-                updated = updated + self.graph_ff(self.graph_ff_norm(updated))
-                nodes.index_copy_(0, parents[:count], updated[:count])
+                attended = self.attend(query, _norm_linear(
+                    nodes[children], self.graph_norm, self.graph_key_value.weight,
+                    self.graph_key_value.bias,
+                )[0], sequence)
+                updated = _residual_linear(attended, self.graph_out, parent)
+                hidden, updated = _norm_linear(
+                    updated, self.graph_ff_norm, self.graph_ff[0].weight, self.graph_ff[0].bias,
+                )
+                updated = _residual_linear(self.graph_ff[1](hidden), self.graph_ff[2], updated)
+                nodes.index_put_((parents[:count],), updated[:count])
             if cacheable:
                 offsets = offsets.tolist()
                 for graph, key in enumerate(keys):
@@ -2054,18 +2108,17 @@ class Agent(nn.Module):
         for output, (index, _name, values) in zip(outputs, learned):
             encoded[index] = output[:values[2]]
         phase = domains[DOMAIN["phase"]]
-        projection = nn.functional.embedding(phase[0].long(), concepts).sum(1)
+        projection = concepts[phase[0].long()].sum(1)
         if self.encoders["phase"].numeric is not None:
             projection = projection + self.encoders["phase"].numeric(phase[1].float())
-        encoded[DOMAIN["phase"]] = self.encoders["phase"].norm(projection[:phase[2]])
+        encoded[DOMAIN["phase"]] = _layer_norm(projection[:phase[2]], self.encoders["phase"].norm)
         potion = domains[DOMAIN["potion"]]
-        encoded[DOMAIN["potion"]] = nn.functional.embedding(
-            potion[0][:potion[2], 0].long(), concepts,
-        )
+        encoded[DOMAIN["potion"]] = concepts[potion[0][:potion[2], 0].long()]
         node = domains[DOMAIN["map_node"]]
-        node_semantic = nn.functional.embedding(node[0][:node[2]].long(), concepts).sum(1)
-        encoded[DOMAIN["map_node"]] = self.encoders["map_node"].norm(
-            node_semantic + self.map_nodes(graph_name(node[10][:node[2], 0], "map_node kinds")),
+        node_semantic = concepts[node[0][:node[2]].long()].sum(1)
+        encoded[DOMAIN["map_node"]] = _layer_norm(
+            node_semantic + self.map_nodes.weight[graph_name(node[10][:node[2], 0], "map_node kinds")],
+            self.encoders["map_node"].norm,
         )
         encoded[DOMAIN["map_edge"]] = concepts.new_empty((0, self.width))
         return tuple(graph_name(value, name + " encoding")
@@ -2080,16 +2133,13 @@ class Agent(nn.Module):
         zone, order_kind, order, origin = metadata[:len(values)].T
         for kind, name in ((1, "draw_top_position"), (2, "draw_bottom_position")):
             present = (zone == 2) & (order_kind == kind) & (order > 0)
-            if present.any():
-                values = values + present[:, None] * self.concepts.local(
-                    name, (order - 1).clamp(max=256),
-                ).to(values.dtype)
-        present = origin > 0
-        if present.any():
             values = values + present[:, None] * self.concepts.local(
-                "deck_origin", (origin - 1).clamp(max=256),
+                name, (order - 1).clamp(max=256),
             ).to(values.dtype)
-        return values
+        present = origin > 0
+        return values + present[:, None] * self.concepts.local(
+            "deck_origin", (origin - 1).clamp(max=256),
+        ).to(values.dtype)
 
     def _relic_context(self, values, metadata):
         if not len(values):
@@ -2152,7 +2202,7 @@ class Agent(nn.Module):
                 torch.arange(len(lengths), device=values.device), lengths,
             )
             if flash:
-                blocks = (lengths[:groups] + 7) // 8
+                blocks = (lengths[:groups] + 31) // 32
                 block_rows = torch.repeat_interleave(
                     torch.arange(groups, device=values.device), blocks,
                 ).to(torch.int32)
@@ -2183,11 +2233,8 @@ class Agent(nn.Module):
             current[destination] = values.to(current.dtype)
 
             def attend_layer(current, layer, selected, query_offsets, sparse):
-                qkv = _norm_linear(
+                qkv, current = _norm_linear(
                     current, layer.norm1, layer.self_attn.in_proj_weight,
-                    layer.self_attn.in_proj_bias,
-                ) if flash else nn.functional.linear(
-                    layer.norm1(current), layer.self_attn.in_proj_weight,
                     layer.self_attn.in_proj_bias,
                 )
                 fp32_value_backward = final_attention \
@@ -2213,12 +2260,10 @@ class Agent(nn.Module):
                 return _residual_linear(attended, layer.self_attn.out_proj, residual)
 
             def feed_forward(current, layer):
-                return _residual_linear(
-                    layer.activation(_norm_linear(
-                        current, layer.norm2, layer.linear1.weight, layer.linear1.bias,
-                    )),
-                    layer.linear2, current,
+                hidden, current = _norm_linear(
+                    current, layer.norm2, layer.linear1.weight, layer.linear1.bias,
                 )
+                return _residual_linear(layer.activation(hidden), layer.linear2, current)
 
             for layer_index, layer in enumerate(transformer.layers):
                 if selected_count is not None and layer_index == len(transformer.layers) - 1:
@@ -2283,15 +2328,13 @@ class Agent(nn.Module):
         )
         if len(history):
             if len(player_source):
-                actors = actors.index_add(
-                    0, player_group, history[player_source].to(actors.dtype),
+                actors = actors.index_put(
+                    (player_group,), history[player_source].to(actors.dtype), accumulate=True,
                 )
             if len(move_raw):
                 history_semantic, _numeric, _count, _u, _row, _scope, history_inverse, *_ = \
                     domains[DOMAIN["history"]]
-                move_values = nn.functional.embedding(
-                    history_semantic[history_inverse[move_raw], :1].long(), concepts,
-                ).squeeze(1)
+                move_values = concepts[history_semantic[history_inverse[move_raw], 0].long()]
                 move_values = move_values[move_order][move_packed_order] \
                     if move_terminal is None else move_values
                 if move_values.device.type == "mps" and torch.is_autocast_enabled("mps"):
@@ -2306,8 +2349,8 @@ class Agent(nn.Module):
                         move_values, torch.tensor(move_batch_sizes),
                     )
                     _, output = self.move_gru(packed)
-                move = move_values.new_zeros((len(actors), self.width)).index_copy(
-                    0, move_present, output[0],
+                move = move_values.new_zeros((len(actors), self.width)).index_put(
+                    (move_present,), output[0],
                 )
                 actors = actors + move
 
@@ -2333,11 +2376,11 @@ class Agent(nn.Module):
             pooled_mode = "transformer" if mode.startswith("transformer") else "sum"
             summary = self._summarize(values, local_group, len(actor_index), name, pooled_mode)
             if mode.endswith("into_actor"):
-                actors = actors.index_add(0, actor_index, summary.to(actors.dtype))
+                actors = actors.index_put((actor_index,), summary.to(actors.dtype), accumulate=True)
             else:
                 extra_values.append(self._tag(summary, 8 + (name == "enemy_effect")))
                 extra_rows.append(rows[actor_index])
-        actors = self.actor_norm(actors)
+        actors = _layer_norm(actors, self.actor_norm)
         return actors, rows, u, extra_values, extra_rows
 
     def _actions(self, domains, encoded, values, index, nodes, concepts):
@@ -2375,7 +2418,7 @@ class Agent(nn.Module):
             present = path[:action_count] >= 0
             if present.any():
                 attached[present] += nodes[path[:action_count][present]]
-        action = self.action_norm(action + attached)
+        action = _layer_norm(action + attached, self.action_norm)
         return action, action_row[:action_count], action_flat[:action_count], actions, policy_sequence
 
     def _continuations(self, domains, encoded, plan):
@@ -2384,12 +2427,12 @@ class Agent(nn.Module):
             return values, rows, plan[3:-1]
         order, group, item_rows, groups, *_ = plan
         items = values.new_zeros((groups, self.width))
-        items.index_add_(0, group, values[order])
+        items.index_put_((group,), values[order], accumulate=True)
         for domain, source, item in plan[-1]:
             linked = encoded[domain][domains[domain][6][source]]
             if domain == DOMAIN["card"]:
                 linked = self._card_context(linked, domains[domain][3][source])
-            items.index_add_(0, item, linked.to(items.dtype))
+            items.index_put_((item,), linked.to(items.dtype), accumulate=True)
         return items, item_rows, plan[3:-1]
 
     def _packed_gru(self, values, batch_sizes, gru, parents=None):
@@ -2415,15 +2458,11 @@ class Agent(nn.Module):
 
     def encode_state(self, domains, encoded, phase_projection, index, action_values,
                      action_index, concepts, batch):
-        synchronize = torch.mps.synchronize if concepts.device.type == "mps" \
-            and self.training and torch.is_grad_enabled() else lambda: None
         filters, actor_plan, continuation_plan, global_layout = action_index[8:]
         current, nodes = self.encode_map(encoded, index)
-        synchronize()
         action, action_rows, action_flat, actions, policy_sequence = self._actions(
             domains, encoded, action_values, action_index, nodes, concepts,
         )
-        synchronize()
         values, rows = [], []
         segments = getattr(self, "_explanation_segments", None)
         def add(value, row, name):
@@ -2432,7 +2471,7 @@ class Agent(nn.Module):
                 segments.append((name, len(value)))
 
         run, run_rows, _ = self._domain_rows(domains, encoded, DOMAIN["run"])
-        seed = graph_name(run.new_zeros((batch, self.width)).index_copy(0, run_rows, run), "run")
+        seed = graph_name(run.new_zeros((batch, self.width)).index_put((run_rows,), run), "run")
         phase, phase_rows, phase_u = self._phases(domains, phase_projection)
         payload = phase.new_zeros((batch, self.width))
         for domain in range(len(TOKEN_SPECS)):
@@ -2440,13 +2479,12 @@ class Agent(nn.Module):
                 domains, encoded, domain, scope_value=-2,
             )
             if len(item):
-                payload.index_add_(0, item_rows, item.to(payload.dtype))
+                payload.index_put_((item_rows,), item.to(payload.dtype), accumulate=True)
         suspended = phase_u[:, 0] != 0
         phase = phase + suspended[:, None] * payload[phase_rows].to(phase.dtype)
-        add(self.encoders["phase"].norm(phase), phase_rows, "phase")
+        add(_layer_norm(phase, self.encoders["phase"].norm), phase_rows, "phase")
         add(current + self.concepts.local("token_role", 0).to(current.dtype),
             torch.arange(batch, device=current.device), "map")
-        synchronize()
 
         pool_domains = DOMAIN["relic"], DOMAIN["encounter"], DOMAIN["event"]
         for name, domain, (source, pooled) in zip(POOLS, pool_domains, filters):
@@ -2462,14 +2500,12 @@ class Agent(nn.Module):
                 summary = self._summarize(
                     item, item_rows, batch, name, "sum",
                 )
-            add(self.pool_projections[name](summary), torch.arange(batch, device=summary.device),
-                name)
-        synchronize()
+            add(_linear(summary, self.pool_projections[name]),
+                torch.arange(batch, device=summary.device), name)
 
         actors, actor_rows, actor_u, effect_values, effect_rows = self._actors(
             domains, encoded, batch, concepts, actor_plan,
         )
-        synchronize()
         combat_rows = actor_rows[actor_u[:, 0] == 0]
         for name, domain, filtered, active in (
             ("deck", DOMAIN["card"], 3, torch.arange(batch, device=run.device)),
@@ -2494,8 +2530,8 @@ class Agent(nn.Module):
                 )
                 payload = item.new_zeros((batch, self.width))
                 if len(stored):
-                    payload.index_add_(0, stored_rows, stored.to(payload.dtype))
-                    payload = self.pael_cards(payload)
+                    payload.index_put_((stored_rows,), stored.to(payload.dtype), accumulate=True)
+                    payload = _linear(payload, self.pael_cards)
                 pael = item_u[:, 1] != 0
                 item = item + pael[:, None] * payload[item_rows]
             item, item_rows = self._collection(item, item_rows, active, name)
@@ -2503,7 +2539,6 @@ class Agent(nn.Module):
         add(actors, actor_rows, "actor")
         for value, row in zip(effect_values, effect_rows):
             add(value, row, "effect")
-        synchronize()
 
         continuation, continuation_rows, continuation_gru = self._continuations(
             domains, encoded, continuation_plan,
@@ -2519,15 +2554,15 @@ class Agent(nn.Module):
                     state = self._packed_gru(
                         continuation[packed_order], batch_sizes, self.continuation_gru,
                     )
-                    summary = continuation.new_zeros((batch, self.width)).index_copy(
-                        0, packed_present, state,
+                    summary = continuation.new_zeros((batch, self.width)).index_put(
+                        (packed_present,), state,
                     )
                 else:
                     padded = continuation.new_zeros((batch, maximum, self.width))
                     padded[continuation_rows, position] = continuation
                     output, _ = self.continuation_gru(padded)
-                    summary = continuation.new_zeros((batch, self.width)).index_copy(
-                        0, present, output[present, last],
+                    summary = continuation.new_zeros((batch, self.width)).index_put(
+                        (present,), output[present, last],
                     )
             else:
                 summary = continuation.new_zeros((batch, self.width))
@@ -2540,7 +2575,6 @@ class Agent(nn.Module):
         crystal, crystal_rows, _ = self._domain_rows(domains, encoded, DOMAIN["crystal"])
         add(crystal, crystal_rows, "crystal")
         add(action, action_rows, "action")
-        synchronize()
 
         values = torch.cat(values)
         if global_layout is not None and len(global_layout[1]) != len(values):
@@ -2552,22 +2586,17 @@ class Agent(nn.Module):
             values, rows, batch, seed, self.global_transformer,
             len(action), global_layout,
         )
-        synchronize()
         return state, transformed if len(action) else action, \
             action_rows, action_flat, actions, policy_sequence
 
     def forward(self, character, globals_, domains, state_index, action_values, action_index,
                 return_state=False, policy_only=False, flat_policy=False, temperature=1):
-        synchronize = torch.mps.synchronize if domains[0][0].device.type == "mps" \
-            and self.training and torch.is_grad_enabled() else lambda: None
-        synchronize()
         if self.training and torch.is_grad_enabled():
             self._sequence_layouts.clear()
         if self._reuse_sequence_layouts:
             self._sequence_layout_index = 0
         concepts = graph_name(self.concepts.flattened(), "concepts")
         encoded, phase_projection = self.encode_domains(domains, concepts)
-        synchronize()
         state, action, action_row, action_flat, actions, sequence = self.encode_state(
             domains, encoded, phase_projection, state_index, action_values, action_index, concepts,
             len(character),
@@ -2575,7 +2604,6 @@ class Agent(nn.Module):
         scores = _norm_head(action, self.global_norm, self.policy) / temperature
         legal = torch.ones_like(scores, dtype=torch.bool)
         scores = self.group_log_softmax(scores, legal, sequence)
-        synchronize()
         if flat_policy:
             policy = scores
         else:
@@ -2736,7 +2764,7 @@ def sequence_layout(group, groups, selected, target):
     position = np.arange(len(group)) - np.repeat(np.cumsum(counts) - counts, counts) + 1
     destination = (starts + position)[inverse]
     sequence = np.repeat(np.arange(len(lengths)), lengths)
-    blocks = (lengths[:groups] + 7) // 8
+    blocks = (lengths[:groups] + 31) // 32
     block_rows = np.repeat(np.arange(groups), blocks).astype(np.int32)
     block_starts = np.r_[0, np.cumsum(blocks)[:-1]].astype(np.int32)
     sparse = None
@@ -2800,15 +2828,12 @@ def flat_domains(observation):
 
 
 def ordered(source, *keys):
-    if len(source) < 2:
-        return source
-    values = [np.asarray(key)[source] for key in keys]
-    equal = np.ones(len(source) - 1, bool)
-    for value in values:
-        if np.any(equal & (value[1:] < value[:-1])):
-            return source[np.lexsort(tuple(reversed(values)))]
-        equal &= value[1:] == value[:-1]
-    return source
+    combined = np.zeros(len(source), np.int64)
+    for key in keys:
+        value = np.asarray(key)[source].astype(np.int64)
+        combined = combined * (int(value.max(initial=0)) + 1) + value
+    return source if np.all(combined[1:] >= combined[:-1]) \
+        else source[np.argsort(combined, kind="stable")]
 
 
 def prefix_tree(tokens, counts):
@@ -2835,14 +2860,15 @@ def prefix_tree(tokens, counts):
     ))), tuple(sizes)
 
 
-def model_inputs(character, globals_, domains, action, action_row, action_position, legal, target, model):
+def model_inputs(character, globals_, domains, action, action_row, action_position, legal, target, model,
+                 pad=None):
     batch, actions = len(character), legal.shape[1]
     globals_ = np.asarray(globals_, np.float32)
     if globals_.shape != (batch, model.layout["globals"]) or not np.isfinite(globals_).all():
         raise ValueError("invalid public globals")
     unique_rows = [domain[6:] if len(domain) == 8 else None for domain in domains]
     domains = [domain[:6] for domain in domains]
-    pad = model.training and model.global_norm.weight.device.type == "mps"
+    pad = model.training and model.global_norm.weight.device.type == "mps" if pad is None else pad
     bucket = lambda count: 0 if not count else min(
         size for power in range(max(1, (count - 1).bit_length()), 64)
         for size in (3 * (1 << power) // 4, 1 << power) if size >= count
@@ -2955,8 +2981,11 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
     if np.any(edge_src < 0) or np.any(edge_dst < 0):
         raise ValueError("map edge references missing node")
     topo = np.zeros(len(node_source), np.int32)
-    for parent, child in zip(edge_src, edge_dst):
-        topo[child] = max(topo[child], topo[parent] + 1)
+    for _ in range(len(node_source)):
+        previous = topo.copy()
+        np.maximum.at(topo, edge_dst, topo[edge_src] + 1)
+        if np.array_equal(topo, previous):
+            break
     if len(edge_src) and np.any(topo[edge_dst] <= topo[edge_src]):
         raise ValueError("map is not a forward DAG")
     levels = []
@@ -3379,7 +3408,7 @@ def pack_batch(observation, validate=True):
 
 
 
-def unpack(rows, target, model, validate=True):
+def unpack(rows, target, model, validate=True, pad=None):
     if validate:
         for row in rows:
             validate_packed(row)
@@ -3389,7 +3418,7 @@ def unpack(rows, target, model, validate=True):
         np.asarray(character), np.asarray(globals_),
         [tuple(map(np.asarray, domain)) for domain in domains],
         tuple(map(np.asarray, action)), np.asarray(action_row), np.asarray(action_position),
-        np.asarray(legal), target, model,
+        np.asarray(legal), target, model, pad,
     )
 
 
