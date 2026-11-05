@@ -418,11 +418,12 @@ fn in_code(trigger: Trigger, id: &str) -> bool {
                 by_pass[pass as usize].extend(ids);
             }
         }
+        by_pass.iter_mut().for_each(|ids| ids.sort_unstable());
         by_pass
     });
     BY_PASS
         .get(trigger as usize)
-        .is_some_and(|ids| ids.contains(&id))
+        .is_some_and(|ids| ids.binary_search(&id).is_ok())
 }
 
 /// A pass runs the listeners' hooks for it; a played card's pass (an attack's AttackPlayed) also

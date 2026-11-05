@@ -710,10 +710,12 @@ impl ValueModel {
     }
 
     fn encoder(&self, sequences: &[(Vec<Vec<f32>>, usize)]) -> Vec<f32> {
-        let mut rows = sequences
-            .iter()
-            .flat_map(|(sequence, _)| sequence.iter().flatten().copied())
-            .collect::<Vec<_>>();
+        let mut rows = Vec::with_capacity(
+            sequences.iter().map(|(sequence, _)| sequence.len()).sum::<usize>() * self.width,
+        );
+        for token in sequences.iter().flat_map(|(sequence, _)| sequence) {
+            rows.extend_from_slice(token);
+        }
         let (last, layers) = self.global_layers.split_last().unwrap();
         let full = sequences
             .iter()
@@ -1609,15 +1611,21 @@ fn matmul<'a>(input: &[f32], rows: usize, weights: &[f32], output: &'a mut Vec<f
 }
 
 fn add_bias(values: &mut [f32], bias: &[f32]) {
-    for row in values.chunks_exact_mut(bias.len()) {
-        row.iter_mut().zip(bias).for_each(|(value, bias)| *value += bias);
+    let width = bias.len();
+    for row in values.chunks_exact_mut(width) {
+        let (row, bias) = (&mut row[..width], &bias[..width]);
+        for index in 0..width {
+            row[index] += bias[index];
+        }
     }
 }
 
 fn add_residual(rows: &mut [f32], projected: &[f32], bias: &[f32]) {
-    for (row, projected) in rows.chunks_exact_mut(bias.len()).zip(projected.chunks_exact(bias.len())) {
-        for ((value, projected), bias) in row.iter_mut().zip(projected).zip(bias) {
-            *value += projected + bias;
+    let width = bias.len();
+    for (row, projected) in rows.chunks_exact_mut(width).zip(projected.chunks_exact(width)) {
+        let (row, projected, bias) = (&mut row[..width], &projected[..width], &bias[..width]);
+        for index in 0..width {
+            row[index] += projected[index] + bias[index];
         }
     }
 }
