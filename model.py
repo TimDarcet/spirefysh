@@ -1376,7 +1376,7 @@ def _linear_backward(value, weight, grad_output):
     grad_bias = weight.new_zeros(depth, dtype=torch.float32)
     _linear_kernel(
         "linear_weight_grad" + suffix, grad_output, value, grad_weight, depth, columns, rows,
-        grad_bias, splits=max(1, min(64, rows // 256)),
+        grad_bias, splits=max(1, min(128, rows // 128)),
     )
     return grad_value, grad_weight, grad_bias
 
