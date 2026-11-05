@@ -1241,7 +1241,7 @@ class _FlashAttention(torch.autograd.Function):
     library = None
 
     @staticmethod
-    def forward(ctx, qkv, offsets, lengths, block_rows, block_starts, real_tokens):
+    def forward(ctx, qkv, offsets, lengths, chunk_rows, chunk_starts, real_tokens):
         if _FlashAttention.library is None:
             _FlashAttention.library = torch.mps.compile_shader(
                 Path(__file__).with_name("attention.metal").read_text()
@@ -1249,31 +1249,29 @@ class _FlashAttention(torch.autograd.Function):
         output = qkv.new_empty((len(qkv), qkv.shape[1] // 3))
         output[real_tokens:] = 0
         lse = torch.empty((len(qkv), 4), dtype=torch.float32, device=qkv.device)
-        threads = len(block_rows) * 4 * 32
+        layout = offsets, lengths, chunk_rows, chunk_starts
+        threads = len(chunk_rows) * 4 * 128
         _FlashAttention.library.flash_forward(
-            qkv, qkv, qkv, output, lse, offsets, lengths, block_rows, block_starts,
-            threads=threads, group_size=32,
+            *layout, qkv, output, lse, threads=threads, group_size=128,
         )
-        ctx.save_for_backward(qkv, output, lse, offsets, lengths, block_rows, block_starts)
+        ctx.save_for_backward(qkv, output, lse, *layout)
         ctx.threads, ctx.real_tokens = threads, real_tokens
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        qkv, output, lse, offsets, lengths, block_rows, block_starts = ctx.saved_tensors
+        qkv, output, lse, *layout = ctx.saved_tensors
         grad_output = grad_output.contiguous()
         grad_qkv = torch.empty_like(qkv)
         grad_qkv[ctx.real_tokens:] = 0
         delta = torch.empty_like(lse)
         _FlashAttention.library.flash_backward_query(
-            qkv, qkv, qkv, output, lse, delta, grad_output, grad_qkv,
-            offsets, lengths, block_rows, block_starts,
-            threads=ctx.threads, group_size=32,
+            *layout, qkv, output, lse, grad_output, grad_qkv, delta,
+            threads=ctx.threads, group_size=128,
         )
         _FlashAttention.library.flash_backward_key_value(
-            qkv, qkv, qkv, lse, delta, grad_output, grad_qkv, grad_qkv,
-            offsets, lengths, block_rows, block_starts,
-            threads=ctx.threads, group_size=32,
+            *layout, qkv, lse, delta, grad_output, grad_qkv,
+            threads=ctx.threads, group_size=128,
         )
         return grad_qkv, None, None, None, None, None
 
@@ -2174,7 +2172,7 @@ class Agent(nn.Module):
                 torch.arange(len(lengths), device=values.device), lengths,
             )
             if flash:
-                blocks = (lengths[:groups] + 7) // 8
+                blocks = (lengths[:groups] + 31) // 32
                 block_rows = torch.repeat_interleave(
                     torch.arange(groups, device=values.device), blocks,
                 ).to(torch.int32)
@@ -2743,7 +2741,7 @@ def sequence_layout(group, groups, selected, target):
     position = np.arange(len(group)) - np.repeat(np.cumsum(counts) - counts, counts) + 1
     destination = (starts + position)[inverse]
     sequence = np.repeat(np.arange(len(lengths)), lengths)
-    blocks = (lengths[:groups] + 7) // 8
+    blocks = (lengths[:groups] + 31) // 32
     block_rows = np.repeat(np.arange(groups), blocks).astype(np.int32)
     block_starts = np.r_[0, np.cumsum(blocks)[:-1]].astype(np.int32)
     sparse = None
