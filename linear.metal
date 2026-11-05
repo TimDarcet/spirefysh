@@ -184,3 +184,48 @@ METAL_FUNC void input_grad_norm(device const TA *A, device const bfloat *B, devi
   }
 INPUT_GRAD_NORM(linear_input_grad_norm, bfloat)
 INPUT_GRAD_NORM(linear_input_grad_norm_float, float)
+
+// Residual linear with the next layer norm fused (width 128): C = A B^T + bias + residual, then
+// normalized = layer_norm(C) in bf16 with its (mean, inverse std) rows, as layer_norm_forward_bfloat.
+kernel void linear_residual_norm(device const bfloat *A [[buffer(0)]], device const bfloat *B [[buffer(1)]],
+                                 device float *C [[buffer(2)]], device const float *bias [[buffer(3)]],
+                                 device const float *residual [[buffer(4)]],
+                                 device const float *gamma [[buffer(5)]], device const float *beta [[buffer(6)]],
+                                 device bfloat *normalized [[buffer(7)]], device float *stats [[buffer(8)]],
+                                 constant uint &M [[buffer(9)]], constant uint &K [[buffer(10)]],
+                                 uint block [[threadgroup_position_in_grid]],
+                                 ushort simd [[simdgroup_index_in_threadgroup]],
+                                 ushort lane [[thread_index_in_simdgroup]]) {
+  threadgroup float G[32 * 128];
+  ushort2 p = lane_position(lane);
+  uint m0 = block * 32;
+  tile<float> acc[4][4];
+  float row_sums[4];
+  accumulate<bfloat, false, true, false>(acc, row_sums, A, B, M, 128, K, m0, simd * 32, 0, K, p);
+  for (ushort i = 0; i < 4; i++) {
+    uint m = min(m0 + i * 8 + p.y, M - 1);
+    for (ushort j = 0; j < 4; j++) {
+      uint n = simd * 32 + j * 8 + p.x;
+      *(threadgroup float2 *)(G + (i * 8 + p.y) * 128 + n) =
+          acc[i][j].v() + float2(bias[n], bias[n + 1]) + *(device const float2 *)(residual + m * 128 + n);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint r = simd * 8; r < simd * 8 + 8; r++) {
+    uint m = m0 + r;
+    if (m >= M) break;
+    float4 value;
+    for (ushort part = 0; part < 4; part++) value[part] = G[r * 128 + lane + part * 32];
+    float mean = simd_sum(value[0] + value[1] + value[2] + value[3]) / 128;
+    float inverse_std = rsqrt(max(0.0f, simd_sum(dot(value, value)) / 128 - mean * mean) + 1e-5f);
+    for (ushort part = 0; part < 4; part++) {
+      uint column = lane + part * 32;
+      C[m * 128 + column] = value[part];
+      normalized[m * 128 + column] = bfloat((value[part] - mean) * inverse_std * gamma[column] + beta[column]);
+    }
+    if (lane == 0) {
+      stats[m * 2] = mean;
+      stats[m * 2 + 1] = inverse_std;
+    }
+  }
+}

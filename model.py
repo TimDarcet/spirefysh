@@ -1388,6 +1388,18 @@ def _linear_forward(value_bfloat, weight, bias, residual=None, hidden=None):
     return output, weight_bfloat
 
 
+def _linear_residual_norm(value_bfloat, weight, bias, residual, gamma, beta):
+    # residual + linear(value) of width 128, with the following layer norm's bf16 output and stats.
+    weight_bfloat, rows = weight.to(torch.bfloat16), len(value_bfloat)
+    output, stats = torch.empty_like(residual), residual.new_empty((rows, 2))
+    normalized = torch.empty_like(residual, dtype=torch.bfloat16)
+    _linear_library().linear_residual_norm(
+        value_bfloat, weight_bfloat, output, bias.float(), residual.contiguous(), gamma, beta, normalized,
+        stats, rows, value_bfloat.shape[1], threads=(rows + 31) // 32 * 128, group_size=128,
+    )
+    return output, weight_bfloat, normalized, stats
+
+
 def _linear_backward(value, weight, grad_output, hidden=None, norm=None):
     # With hidden, value is gelu(hidden) and grad_value is the gradient of hidden. With
     # norm = (input, gamma, stats, residual), value is layer_norm(input) of width 128 and grad_value is
@@ -1442,20 +1454,27 @@ class _FastLinear(torch.autograd.Function):
 
 @_committed
 class _LinearResidual(torch.autograd.Function):
+    # With gamma and beta, also returns the following layer norm's bf16 output and stats.
     @staticmethod
-    def forward(ctx, value, weight, bias, residual):
+    def forward(ctx, value, weight, bias, residual, gamma=None, beta=None):
         value_bfloat = value.to(torch.bfloat16)
-        output, weight_bfloat = _linear_forward(value_bfloat, weight, bias, residual)
+        if gamma is None:
+            output, weight_bfloat = _linear_forward(value_bfloat, weight, bias, residual)
+        else:
+            output, weight_bfloat, normalized, stats = _linear_residual_norm(
+                value_bfloat, weight, bias, residual, gamma, beta,
+            )
+            ctx.mark_non_differentiable(normalized, stats)
         ctx.save_for_backward(value_bfloat, weight_bfloat)
         ctx.value_dtype, ctx.bias = value.dtype, bias is not None
-        return output
+        return output if gamma is None else (output, normalized, stats)
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, grad_output, *_):
         value, weight = ctx.saved_tensors
         grad_value, grad_weight, grad_bias = _linear_backward(value, weight, grad_output)
         return grad_value.to(ctx.value_dtype), grad_weight, grad_bias if ctx.bias else None, \
-            grad_output
+            grad_output, None, None
 
 
 def _norm_reduce(partial, gamma):
@@ -1514,9 +1533,11 @@ def _layer_norm_forward(value, gamma, beta):
 
 @_committed
 class _NormLinear(torch.autograd.Function):
+    # normalized and stats may come precomputed from the matmul that produced value.
     @staticmethod
-    def forward(ctx, value, gamma, beta, weight, bias):
-        normalized, stats = _layer_norm_forward(value, gamma, beta)
+    def forward(ctx, value, gamma, beta, weight, bias, normalized=None, stats=None):
+        if normalized is None:
+            normalized, stats = _layer_norm_forward(value, gamma, beta)
         output, weight_bfloat = _linear_forward(normalized, weight, bias)
         ctx.save_for_backward(value, gamma, normalized, stats, weight_bfloat)
         return output, value.view_as(value)
@@ -1529,24 +1550,34 @@ class _NormLinear(torch.autograd.Function):
         (grad_value, grad_gamma, grad_beta), grad_weight, grad_bias = _linear_backward(
             normalized, weight, grad_output, norm=(value, gamma, stats, grad_residual),
         )
-        return grad_value, grad_gamma, grad_beta, grad_weight, grad_bias
+        return grad_value, grad_gamma, grad_beta, grad_weight, grad_bias, None, None
 
 
 @_committed
 class _FeedForward(torch.autograd.Function):
-    # value + second(gelu(first(norm(value)))), with gelu applied in the matmul epilogues.
+    # value + second(gelu(first(norm(value)))), with gelu applied in the matmul epilogues. The norm may
+    # come precomputed as for _NormLinear, and with next_gamma and next_beta the following layer norm
+    # is returned as for _LinearResidual.
     @staticmethod
-    def forward(ctx, value, gamma, beta, weight1, bias1, weight2, bias2):
-        normalized, stats = _layer_norm_forward(value, gamma, beta)
+    def forward(ctx, value, gamma, beta, weight1, bias1, weight2, bias2, normalized=None, stats=None,
+                next_gamma=None, next_beta=None):
+        if normalized is None:
+            normalized, stats = _layer_norm_forward(value, gamma, beta)
         hidden = value.new_empty((len(value), len(weight1)), dtype=torch.bfloat16)
         activated, weight1_bfloat = _linear_forward(normalized, weight1, bias1, hidden=hidden)
-        output, weight2_bfloat = _linear_forward(activated, weight2, bias2, value)
+        if next_gamma is None:
+            output, weight2_bfloat = _linear_forward(activated, weight2, bias2, value)
+        else:
+            output, weight2_bfloat, next_normalized, next_stats = _linear_residual_norm(
+                activated, weight2, bias2, value, next_gamma, next_beta,
+            )
+            ctx.mark_non_differentiable(next_normalized, next_stats)
         ctx.save_for_backward(value, gamma, normalized, stats, weight1_bfloat, hidden, activated,
                               weight2_bfloat)
-        return output
+        return output if next_gamma is None else (output, next_normalized, next_stats)
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, grad_output, *_):
         value, gamma, normalized, stats, weight1, hidden, activated, weight2 = ctx.saved_tensors
         grad_hidden, grad_weight2, grad_bias2 = _linear_backward(
             activated, weight2, grad_output.float(), hidden,
@@ -1554,7 +1585,8 @@ class _FeedForward(torch.autograd.Function):
         (grad_value, grad_gamma, grad_beta), grad_weight1, grad_bias1 = _linear_backward(
             normalized, weight1, grad_hidden, norm=(value, gamma, stats, grad_output),
         )
-        return grad_value, grad_gamma, grad_beta, grad_weight1, grad_bias1, grad_weight2, grad_bias2
+        return grad_value, grad_gamma, grad_beta, grad_weight1, grad_bias1, grad_weight2, grad_bias2, \
+            None, None, None, None
 
 
 @_committed
@@ -1591,24 +1623,38 @@ def _linear(value, layer, residual=None):
     return output if residual is None else residual + output
 
 
-def _residual_linear(value, layer, residual):
-    return _linear(value, layer, residual)
+def _residual_linear(value, layer, residual, next_norm=None):
+    # With next_norm, returns (output, norm) where norm is next_norm's precomputed (bf16 output, stats)
+    # or None.
+    if next_norm is None:
+        return _linear(value, layer, residual)
+    if (value.device.type == "mps" and torch.is_autocast_enabled("mps") and value.shape[1] == 128
+            and residual.dtype == torch.float32 and len(layer.weight) == 128):
+        output, *norm = _LinearResidual.apply(
+            value, layer.weight, layer.bias, residual, next_norm.weight, next_norm.bias,
+        )
+        return output, norm
+    return _linear(value, layer, residual), None
 
 
-def _norm_linear(value, norm, weight, bias):
+def _norm_linear(value, norm, weight, bias, normalized=None):
     if (value.device.type == "mps" and value.dtype == torch.float32
             and torch.is_autocast_enabled("mps") and value.shape[1] == 128):
-        return _NormLinear.apply(value, norm.weight, norm.bias, weight, bias)
+        return _NormLinear.apply(value, norm.weight, norm.bias, weight, bias, *(normalized or ()))
     return nn.functional.linear(norm(value), weight, bias), value
 
 
-def _feed_forward(value, norm, first, second):
+def _feed_forward(value, norm, first, second, normalized=None, next_norm=None):
+    # normalized and next_norm as for _norm_linear and _residual_linear.
     if (value.device.type == "mps" and value.dtype == torch.float32
             and torch.is_autocast_enabled("mps") and value.shape[1] == len(first.weight) == 128):
-        return _FeedForward.apply(value, norm.weight, norm.bias, first.weight, first.bias,
-                                  second.weight, second.bias)
+        output = _FeedForward.apply(
+            value, norm.weight, norm.bias, first.weight, first.bias, second.weight, second.bias,
+            *(normalized or (None, None)), *(() if next_norm is None else (next_norm.weight, next_norm.bias)),
+        )
+        return output if next_norm is None else (output[0], list(output[1:]))
     hidden, value = _norm_linear(value, norm, first.weight, first.bias)
-    return _residual_linear(nn.functional.gelu(hidden), second, value)
+    return _residual_linear(nn.functional.gelu(hidden), second, value, next_norm)
 
 
 def _layer_norm(value, norm):
@@ -2377,10 +2423,11 @@ class Agent(nn.Module):
         if device.type == "mps" and self.width // self.heads in (16, 32):
             current = _Assemble.apply(len(sequence), offsets[:groups], destination, seed, *parts)
 
-            def attend_layer(current, layer, selected, query_offsets, sparse):
+            # Each residual matmul also computes the next layer norm, passed on as normalized.
+            def attend_layer(current, layer, selected, query_offsets, sparse, normalized):
                 qkv, current = _norm_linear(
                     current, layer.norm1, layer.self_attn.in_proj_weight,
-                    layer.self_attn.in_proj_bias,
+                    layer.self_attn.in_proj_bias, normalized,
                 )
                 fp32_value_backward = final_attention \
                     and layer_index + 1 == len(transformer.layers) \
@@ -2402,21 +2449,25 @@ class Agent(nn.Module):
                         query_offsets.to(torch.int32), sparse, False,
                     )
                 residual = current[selected] if sparse else current
-                return _residual_linear(attended, layer.self_attn.out_proj, residual)
+                return _residual_linear(attended, layer.self_attn.out_proj, residual, layer.norm2)
 
-            def feed_forward(current, layer):
-                return _feed_forward(current, layer.norm2, layer.linear1, layer.linear2)
-
+            normalized = None
             for layer_index, layer in enumerate(transformer.layers):
                 if selected_count is not None and layer_index == len(transformer.layers) - 1:
                     positions, item_positions, query_offsets = sparse
-                    current = attend_layer(current, layer, positions, query_offsets, True)
-                    current = feed_forward(current, layer)
+                    current, normalized = attend_layer(
+                        current, layer, positions, query_offsets, True, normalized,
+                    )
+                    current = _feed_forward(current, layer.norm2, layer.linear1, layer.linear2, normalized)
                     state = current[query_offsets[:groups]]
                     items = current[item_positions]
                     return state, items
-                current = attend_layer(current, layer, sequence, offsets, False)
-                current = feed_forward(current, layer)
+                current, normalized = attend_layer(current, layer, sequence, offsets, False, normalized)
+                following = transformer.layers[layer_index + 1].norm1 \
+                    if layer_index + 1 < len(transformer.layers) else None
+                current = _feed_forward(current, layer.norm2, layer.linear1, layer.linear2, normalized,
+                                        following)
+                current, normalized = current if following is not None else (current, None)
             items = current[destination] if count else parts[0]
             return current[offsets[:groups]], items
         values = torch.cat(parts)[order]
