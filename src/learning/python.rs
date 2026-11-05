@@ -262,35 +262,6 @@ fn compress_words(values: &[u32]) -> Vec<u8> {
 }
 
 #[cfg(target_os = "macos")]
-fn compress_bytes(input: &[u8]) -> Vec<u8> {
-    #[link(name = "compression")]
-    unsafe extern "C" {
-        fn compression_encode_buffer(
-            output: *mut u8,
-            output_size: usize,
-            input: *const u8,
-            input_size: usize,
-            scratch: *mut std::ffi::c_void,
-            algorithm: u32,
-        ) -> usize;
-    }
-    let mut output = vec![0; input.len() + input.len() / 255 + 16];
-    let size = unsafe {
-        compression_encode_buffer(
-            output.as_mut_ptr(),
-            output.len(),
-            input.as_ptr(),
-            input.len(),
-            std::ptr::null_mut(),
-            0x100,
-        )
-    };
-    assert!(size > 0);
-    output.truncate(size);
-    output
-}
-
-#[cfg(target_os = "macos")]
 fn decompress_bytes(input: &[u8], size: usize) -> PyResult<Vec<u8>> {
     #[link(name = "compression")]
     unsafe extern "C" {
@@ -358,14 +329,8 @@ fn compact_packed_observation_and_digest(row: &Observation, digest: Option<u64>)
     actions
         .iter()
         .for_each(|value| payload.extend(value.to_le_bytes()));
-    #[cfg(target_os = "macos")]
-    let payload = compress_bytes(&payload);
     let mut output = Vec::with_capacity(32 + 4 * (globals.len() + counts.len()) + payload.len());
-    output.extend(if cfg!(target_os = "macos") {
-        b"SP68"
-    } else {
-        b"SP67"
-    });
+    output.extend(b"SP67");
     output.push(row.character);
     output.extend([0; 3]);
     output.extend(digest.to_le_bytes());
