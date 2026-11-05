@@ -402,9 +402,27 @@ pub(crate) fn listens(trigger: Trigger, id: &str, hooks: &[Hook]) -> bool {
 }
 
 fn in_code(trigger: Trigger, id: &str) -> bool {
-    LISTENERS
-        .iter()
-        .any(|&(at, ids)| hears(at, trigger) && ids.contains(&id))
+    static BY_PASS: std::sync::LazyLock<Vec<Vec<&str>>> = std::sync::LazyLock::new(|| {
+        let mut by_pass: Vec<Vec<&str>> = Vec::new();
+        for &(at, ids) in LISTENERS {
+            let typed = [
+                Trigger::AttackPlayed,
+                Trigger::SkillPlayed,
+                Trigger::PowerPlayed,
+            ];
+            for pass in std::iter::once(at)
+                .chain(typed)
+                .filter(|&pass| hears(at, pass))
+            {
+                by_pass.resize((pass as usize + 1).max(by_pass.len()), Vec::new());
+                by_pass[pass as usize].extend(ids);
+            }
+        }
+        by_pass
+    });
+    BY_PASS
+        .get(trigger as usize)
+        .is_some_and(|ids| ids.contains(&id))
 }
 
 /// A pass runs the listeners' hooks for it; a played card's pass (an attack's AttackPlayed) also

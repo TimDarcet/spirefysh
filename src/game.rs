@@ -409,9 +409,26 @@ fn with_price(mut item: ShopItem, price: i32) -> ShopItem {
 }
 
 pub(crate) fn relic_group(id: Id) -> Option<usize> {
-    [COMMON_RELICS, UNCOMMON_RELICS, RARE_RELICS, SHOP_RELICS]
-        .iter()
-        .position(|relics| relics.contains(&id))
+    const GROUPS: [u8; 512] = {
+        let (mut groups, lists) = (
+            [4; 512],
+            [COMMON_RELICS, UNCOMMON_RELICS, RARE_RELICS, SHOP_RELICS],
+        );
+        let mut group = lists.len();
+        while group > 0 {
+            group -= 1;
+            let mut index = 0;
+            while index < lists[group].len() {
+                groups[lists[group][index] as usize] = group as u8;
+                index += 1;
+            }
+        }
+        groups
+    };
+    GROUPS
+        .get(id as usize)
+        .filter(|&&group| group < 4)
+        .map(|&group| group as usize)
 }
 
 /// Event and token cards drawn with the colorless frame (CardModel.VisualCardPool.IsColorless).

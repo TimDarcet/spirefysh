@@ -64,9 +64,10 @@ impl Game {
             hp_loss: Some(vec![0.0; enemies.len()]),
         };
         let mut leaves = 0;
+        static RNGS: std::sync::LazyLock<Rngs> = std::sync::LazyLock::new(|| Rngs::from_seed(0));
         while let Some((choices, probability)) = pending.pop() {
             let mut next = self.clone();
-            next.rngs = Rngs::from_seed(0);
+            next.rngs = RNGS.clone();
             next.expectation = Some(Expectation {
                 choices: choices.clone(),
                 ..Expectation::default()
@@ -1119,69 +1120,109 @@ impl Game {
             true
         }
 
-        fn paths(nodes: &[Node], id: usize, boss: usize) -> Vec<Vec<usize>> {
-            if id == boss {
-                return vec![vec![id]];
-            }
-            let mut result = Vec::new();
-            for &child in &nodes[id].children {
-                for mut path in paths(nodes, child, boss) {
-                    path.insert(0, id);
-                    result.push(path);
-                }
-            }
-            result
-        }
-
+        /// Paths between the same two nodes through the same rooms, as found walking every path
+        /// from the ancient: each group in walk order, the groups in order of their text key.
         fn duplicate_segments(nodes: &[Node], ancient: usize, boss: usize) -> Vec<Vec<Vec<usize>>> {
-            use std::collections::BTreeMap;
-            let mut groups: BTreeMap<String, Vec<Vec<usize>>> = BTreeMap::new();
-            for path in paths(nodes, ancient, boss) {
-                for start in 0..path.len() - 1 {
-                    let first = &nodes[path[start]];
-                    if first.children.len() <= 1 && first.row != 0 {
-                        continue;
-                    }
-                    for offset in 2..path.len() - start {
-                        let segment = path[start..=start + offset].to_vec();
-                        let last = &nodes[*segment.last().unwrap()];
-                        if last.parents.len() < 2 {
-                            continue;
-                        }
-                        let prefix = if first.row == 0 {
-                            format!("0-{},{}-", last.col, last.row)
-                        } else {
-                            format!("{},{}-{},{}-", first.col, first.row, last.col, last.row)
-                        };
-                        let key = prefix
-                            + &segment
-                                .iter()
-                                .map(|&id| match nodes[id].room {
-                                    Some(Room::Unknown | Room::Event) => 1,
-                                    Some(Room::Shop) => 2,
-                                    Some(Room::Treasure) => 3,
-                                    Some(Room::Rest) => 4,
-                                    Some(Room::Combat) => 5,
-                                    Some(Room::Elite) => 6,
-                                    Some(Room::Boss) => 7,
-                                    None => 8,
-                                })
-                                .map(|room| room.to_string())
-                                .collect::<Vec<_>>()
-                                .join(",");
-                        let group = groups.entry(key).or_default();
-                        if !group.iter().any(|other| {
-                            (1..other.len() - 1).any(|index| other[index] == segment[index])
-                        }) {
-                            group.push(segment);
-                        }
+            fn code(node: &Node) -> u64 {
+                match node.room {
+                    Some(Room::Unknown | Room::Event) => 1,
+                    Some(Room::Shop) => 2,
+                    Some(Room::Treasure) => 3,
+                    Some(Room::Rest) => 4,
+                    Some(Room::Combat) => 5,
+                    Some(Room::Elite) => 6,
+                    Some(Room::Boss) => 7,
+                    None => 8,
+                }
+            }
+            fn ends(nodes: &[Node], id: usize, boss: usize, memo: &mut [Option<bool>]) -> bool {
+                if let Some(known) = memo[id] {
+                    return known;
+                }
+                let reaches = id == boss
+                    || nodes[id]
+                        .children
+                        .iter()
+                        .any(|&child| ends(nodes, child, boss, memo));
+                memo[id] = Some(reaches);
+                reaches
+            }
+            type Segments = Vec<((usize, usize, u64), usize, usize)>;
+            fn walk(
+                nodes: &[Node],
+                ending: &[bool],
+                path: &mut Vec<usize>,
+                rooms: u64,
+                segments: &mut Segments,
+                arena: &mut Vec<usize>,
+            ) {
+                let last = *path.last().unwrap();
+                let rooms = rooms << 3 | (code(&nodes[last]) - 1);
+                if path.len() >= 3 && nodes[last].parents.len() >= 2 {
+                    segments.push(((path[0], last, rooms), arena.len(), path.len()));
+                    arena.extend(&*path);
+                }
+                for &child in &nodes[last].children {
+                    if ending[child] {
+                        path.push(child);
+                        walk(nodes, ending, path, rooms, segments, arena);
+                        path.pop();
                     }
                 }
             }
+            let mut memo = vec![None; nodes.len()];
+            let ending: Vec<_> = (0..nodes.len())
+                .map(|id| ends(nodes, id, boss, &mut memo))
+                .collect();
+            let mut reachable = vec![false; nodes.len()];
+            let mut stack = vec![ancient];
+            while let Some(id) = stack.pop() {
+                if !std::mem::replace(&mut reachable[id], true) {
+                    stack.extend(&nodes[id].children);
+                }
+            }
+            let (mut segments, mut arena) = (Vec::new(), Vec::new());
+            for (id, node) in nodes.iter().enumerate() {
+                if reachable[id] && ending[id] && (node.children.len() > 1 || node.row == 0) {
+                    let begin = segments.len();
+                    walk(nodes, &ending, &mut vec![id], 0, &mut segments, &mut arena);
+                    segments[begin..].sort_unstable();
+                }
+            }
+            let mut groups = Vec::new();
+            for same in segments
+                .chunk_by(|x, y| x.0 == y.0)
+                .filter(|same| same.len() > 1)
+            {
+                let mut group: Vec<Vec<usize>> = Vec::new();
+                for &(_, offset, len) in same {
+                    let segment = &arena[offset..offset + len];
+                    if !group
+                        .iter()
+                        .any(|other| (1..len - 1).any(|index| other[index] == segment[index]))
+                    {
+                        group.push(segment.to_vec());
+                    }
+                }
+                if group.len() > 1 {
+                    groups.push(group);
+                }
+            }
+            groups.sort_by_cached_key(|group| {
+                let (first, last) = (&nodes[group[0][0]], &nodes[*group[0].last().unwrap()]);
+                let prefix = if first.row == 0 {
+                    format!("0-{},{}-", last.col, last.row)
+                } else {
+                    format!("{},{}-{},{}-", first.col, first.row, last.col, last.row)
+                };
+                prefix
+                    + &group[0]
+                        .iter()
+                        .map(|&id| code(&nodes[id]).to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+            });
             groups
-                .into_values()
-                .filter(|group| group.len() > 1)
-                .collect()
         }
 
         fn remove_edge(nodes: &mut [Node], parent: usize, child: usize) {

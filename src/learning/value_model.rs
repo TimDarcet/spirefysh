@@ -128,6 +128,15 @@ struct EncodingCache {
     move_gru: GruCache,
 }
 
+impl EncodingCache {
+    fn bound(&mut self, rows: usize, width: usize) {
+        if self.rows.len() > rows || self.move_gru.states.len() > rows * width {
+            self.rows.clear();
+            self.move_gru = GruCache::default();
+        }
+    }
+}
+
 #[derive(Default)]
 struct GruCache {
     states: Vec<f32>,
@@ -667,241 +676,70 @@ impl ValueModel {
         }
     }
 
-    fn transformed(
-        &self,
-        sequence: &[Vec<f32>],
-        layer: &TransformerLayer,
-        selected: impl Iterator<Item = usize> + Clone,
-    ) -> Vec<Vec<f32>> {
-        let mut normalized_rows = sequence.iter().flatten().copied().collect::<Vec<_>>();
-        for row in normalized_rows.chunks_exact_mut(self.width) {
+    fn layer(&self, rows: &[f32], sequences: &[(usize, usize)], layer: &TransformerLayer) -> Vec<f32> {
+        let width = self.width;
+        let mut normalized = rows.to_vec();
+        for row in normalized.chunks_exact_mut(width) {
             layer_norm(row, &layer.norm1_w, &layer.norm1_b);
         }
-        let qkv = linear_batch(&normalized_rows, sequence.len(), &layer.qkv_w, &layer.qkv_b);
-        let rows = selected.clone().count();
-        let attention = self.attention_batch(&qkv, selected.clone());
-        let projected = linear_batch(&attention, rows, &layer.out_w, &layer.out_b);
-        let mut rows = selected
-            .into_iter()
-            .zip(projected.chunks_exact(self.width))
-            .map(|(index, projected)| {
-                let mut row = sequence[index].clone();
-                for (left, right) in row.iter_mut().zip(projected) {
-                    *left += *right;
-                }
-                row
-            })
-            .collect::<Vec<_>>();
-        let mut normalized_rows = rows.iter().flatten().copied().collect::<Vec<_>>();
-        for row in normalized_rows.chunks_exact_mut(self.width) {
-            layer_norm(row, &layer.norm2_w, &layer.norm2_b);
-        }
-        let mut hidden = linear_batch(
-            &normalized_rows,
-            rows.len(),
-            &layer.linear1_w,
-            &layer.linear1_b,
-        );
-        gelu_in_place(&mut hidden);
-        let projected = linear_batch(&hidden, rows.len(), &layer.linear2_w, &layer.linear2_b);
-        for (row, projected) in rows.iter_mut().zip(projected.chunks_exact(self.width)) {
-            for (left, right) in row.iter_mut().zip(projected) {
-                *left += *right;
+        let qkv = linear_batch(&normalized, rows.len() / width, &layer.qkv_w, &layer.qkv_b);
+        let (mut attention, mut kept, mut offset) = (Vec::new(), Vec::new(), 0);
+        for &(length, start) in sequences {
+            let selected = std::iter::once(0).chain(start..length);
+            attention.extend(self.attention_batch(
+                &qkv[offset * 3 * width..(offset + length) * 3 * width],
+                selected.clone(),
+            ));
+            for index in selected {
+                kept.extend_from_slice(&rows[(offset + index) * width..][..width]);
             }
+            offset += length;
         }
-        rows
-    }
-
-    fn transform(&self, sequence: &mut [Vec<f32>], layer: &TransformerLayer) {
-        let mut normalized_rows = sequence.iter().flatten().copied().collect::<Vec<_>>();
-        for row in normalized_rows.chunks_exact_mut(self.width) {
-            layer_norm(row, &layer.norm1_w, &layer.norm1_b);
-        }
-        let qkv = linear_batch(&normalized_rows, sequence.len(), &layer.qkv_w, &layer.qkv_b);
-        let attention = self.attention_batch(&qkv, 0..sequence.len());
-        let projected = linear_batch(&attention, sequence.len(), &layer.out_w, &layer.out_b);
-        for (row, projected) in sequence.iter_mut().zip(projected.chunks_exact(self.width)) {
-            row.iter_mut()
-                .zip(projected)
-                .for_each(|(left, right)| *left += right);
-        }
-        let mut normalized_rows = sequence.iter().flatten().copied().collect::<Vec<_>>();
-        for row in normalized_rows.chunks_exact_mut(self.width) {
+        let projected = linear_batch(&attention, kept.len() / width, &layer.out_w, &layer.out_b);
+        kept.iter_mut().zip(projected).for_each(|(left, right)| *left += right);
+        let mut normalized = kept.clone();
+        for row in normalized.chunks_exact_mut(width) {
             layer_norm(row, &layer.norm2_w, &layer.norm2_b);
         }
         let mut hidden = linear_batch(
-            &normalized_rows,
-            sequence.len(),
-            &layer.linear1_w,
-            &layer.linear1_b,
-        );
-        gelu_in_place(&mut hidden);
-        let projected = linear_batch(&hidden, sequence.len(), &layer.linear2_w, &layer.linear2_b);
-        for (row, projected) in sequence.iter_mut().zip(projected.chunks_exact(self.width)) {
-            row.iter_mut()
-                .zip(projected)
-                .for_each(|(left, right)| *left += right);
-        }
-    }
-
-    #[cfg(feature = "python")]
-    fn transform_group(&self, sequences: &mut [(Vec<Vec<f32>>, usize)], layer: &TransformerLayer) {
-        let mut normalized_rows = sequences
-            .iter()
-            .flat_map(|(sequence, _)| sequence)
-            .flatten()
-            .copied()
-            .collect::<Vec<_>>();
-        for row in normalized_rows.chunks_exact_mut(self.width) {
-            layer_norm(row, &layer.norm1_w, &layer.norm1_b);
-        }
-        let qkv = linear_batch(
-            &normalized_rows,
-            normalized_rows.len() / self.width,
-            &layer.qkv_w,
-            &layer.qkv_b,
-        );
-        let mut offset = 0;
-        let mut attention = Vec::new();
-        for (sequence, _) in sequences.iter() {
-            let end = offset + sequence.len();
-            attention.extend(self.attention_batch(
-                &qkv[offset * 3 * self.width..end * 3 * self.width],
-                0..sequence.len(),
-            ));
-            offset = end;
-        }
-        let projected = linear_batch(
-            &attention,
-            attention.len() / self.width,
-            &layer.out_w,
-            &layer.out_b,
-        );
-        for (row, projected) in sequences
-            .iter_mut()
-            .flat_map(|(sequence, _)| sequence)
-            .zip(projected.chunks_exact(self.width))
-        {
-            row.iter_mut()
-                .zip(projected)
-                .for_each(|(left, right)| *left += right);
-        }
-        let mut normalized_rows = sequences
-            .iter()
-            .flat_map(|(sequence, _)| sequence)
-            .flatten()
-            .copied()
-            .collect::<Vec<_>>();
-        for row in normalized_rows.chunks_exact_mut(self.width) {
-            layer_norm(row, &layer.norm2_w, &layer.norm2_b);
-        }
-        let mut hidden = linear_batch(
-            &normalized_rows,
-            normalized_rows.len() / self.width,
+            &normalized,
+            kept.len() / width,
             &layer.linear1_w,
             &layer.linear1_b,
         );
         gelu_in_place(&mut hidden);
         let projected = linear_batch(
             &hidden,
-            hidden.len() / layer.linear1_b.len(),
+            kept.len() / width,
             &layer.linear2_w,
             &layer.linear2_b,
         );
-        for (row, projected) in sequences
-            .iter_mut()
-            .flat_map(|(sequence, _)| sequence)
-            .zip(projected.chunks_exact(self.width))
-        {
-            row.iter_mut()
-                .zip(projected)
-                .for_each(|(left, right)| *left += right);
-        }
+        kept.iter_mut().zip(projected).for_each(|(left, right)| *left += right);
+        kept
     }
 
-    #[cfg(feature = "python")]
-    fn transformed_group(
-        &self,
-        sequences: Vec<(Vec<Vec<f32>>, usize)>,
-        layer: &TransformerLayer,
-    ) -> Vec<(Vec<f32>, Vec<Vec<f32>>)> {
-        let mut normalized_rows = sequences
-            .iter()
-            .flat_map(|(sequence, _)| sequence)
-            .flatten()
-            .copied()
-            .collect::<Vec<_>>();
-        for row in normalized_rows.chunks_exact_mut(self.width) {
-            layer_norm(row, &layer.norm1_w, &layer.norm1_b);
-        }
-        let qkv = linear_batch(
-            &normalized_rows,
-            normalized_rows.len() / self.width,
-            &layer.qkv_w,
-            &layer.qkv_b,
-        );
-        let mut offset = 0;
-        let mut attention = Vec::new();
-        for (sequence, action_start) in &sequences {
-            let end = offset + sequence.len();
-            attention.extend(self.attention_batch(
-                &qkv[offset * 3 * self.width..end * 3 * self.width],
-                std::iter::once(0).chain(*action_start..sequence.len()),
-            ));
-            offset = end;
-        }
-        let projected = linear_batch(
-            &attention,
-            attention.len() / self.width,
-            &layer.out_w,
-            &layer.out_b,
-        );
-        let mut projected = projected.chunks_exact(self.width);
+    fn encoder(&self, sequences: &[(Vec<Vec<f32>>, usize)]) -> Vec<f32> {
         let mut rows = sequences
-            .into_iter()
-            .map(|(sequence, action_start)| {
-                std::iter::once(&sequence[0])
-                    .chain(&sequence[action_start..])
-                    .map(|source| {
-                        let mut row = source.clone();
-                        row.iter_mut()
-                            .zip(projected.next().unwrap())
-                            .for_each(|(left, right)| *left += right);
-                        row
-                    })
-                    .collect::<Vec<_>>()
-            })
+            .iter()
+            .flat_map(|(sequence, _)| sequence.iter().flatten().copied())
             .collect::<Vec<_>>();
-        let mut normalized_rows = rows.iter().flatten().flatten().copied().collect::<Vec<_>>();
-        for row in normalized_rows.chunks_exact_mut(self.width) {
-            layer_norm(row, &layer.norm2_w, &layer.norm2_b);
+        let (last, layers) = self.global_layers.split_last().unwrap();
+        let full = sequences
+            .iter()
+            .map(|(sequence, _)| (sequence.len(), 1))
+            .collect::<Vec<_>>();
+        for layer in layers {
+            rows = self.layer(&rows, &full, layer);
         }
-        let mut hidden = linear_batch(
-            &normalized_rows,
-            normalized_rows.len() / self.width,
-            &layer.linear1_w,
-            &layer.linear1_b,
-        );
-        gelu_in_place(&mut hidden);
-        let projected = linear_batch(
-            &hidden,
-            hidden.len() / layer.linear1_b.len(),
-            &layer.linear2_w,
-            &layer.linear2_b,
-        );
-        for (row, projected) in rows
-            .iter_mut()
-            .flatten()
-            .zip(projected.chunks_exact(self.width))
-        {
-            row.iter_mut()
-                .zip(projected)
-                .for_each(|(left, right)| *left += right);
+        let selected = sequences
+            .iter()
+            .map(|(sequence, start)| (sequence.len(), *start))
+            .collect::<Vec<_>>();
+        let mut rows = self.layer(&rows, &selected, last);
+        for row in rows.chunks_exact_mut(self.width) {
             layer_norm(row, &self.global_norm_w, &self.global_norm_b);
         }
-        rows.into_iter()
-            .map(|mut sequence| (sequence.remove(0), sequence))
-            .collect()
+        rows
     }
 
     fn summarize(&self, name: usize, mode: u8, values: Vec<Vec<f32>>) -> Vec<f32> {
@@ -915,13 +753,18 @@ impl ValueModel {
                     sum
                 }),
             1 => {
-                let mut sequence = vec![self.summary_seed[name].clone()];
-                sequence.extend(values);
-                self.transform(
-                    &mut sequence,
+                let rows = self.summary_seed[name]
+                    .iter()
+                    .chain(values.iter().flatten())
+                    .copied()
+                    .collect::<Vec<_>>();
+                let mut rows = self.layer(
+                    &rows,
+                    &[(values.len() + 1, 1)],
                     self.pool_layers[name.min(12)].as_ref().unwrap(),
                 );
-                sequence.remove(0)
+                rows.truncate(self.width);
+                rows
             }
             2 if name == 10 => self
                 .continuation_gru
@@ -1438,20 +1281,9 @@ impl ValueModel {
         observation: &Observation,
         cache: &mut EncodingCache,
     ) -> (Vec<f32>, Vec<Vec<f32>>) {
-        let (mut sequence, action_start) = self.state_tokens(observation, cache);
-        let (last, layers) = self.global_layers.split_last().unwrap();
-        for layer in layers {
-            self.transform(&mut sequence, layer);
-        }
-        sequence = self.transformed(
-            &sequence,
-            last,
-            std::iter::once(0).chain(action_start..sequence.len()),
-        );
-        for value in &mut sequence {
-            layer_norm(value, &self.global_norm_w, &self.global_norm_b);
-        }
-        (sequence.remove(0), sequence)
+        let rows = self.encoder(&[self.state_tokens(observation, cache)]);
+        let mut rows = rows.chunks_exact(self.width).map(<[f32]>::to_vec);
+        (rows.next().unwrap(), rows.collect())
     }
 
     #[cfg(feature = "python")]
@@ -1461,21 +1293,32 @@ impl ValueModel {
             .flat_map_iter(|observations| {
                 let index = rayon::current_thread_index().unwrap_or(0) % self.encode_caches.len();
                 let mut cache = self.encode_caches[index].lock().unwrap();
-                if cache.rows.len() > 65_536 || cache.move_gru.states.len() > 65_536 * self.width {
-                    cache.rows.clear();
-                    cache.move_gru = GruCache::default();
-                }
-                let mut sequences = observations
-                    .iter()
-                    .map(|observation| self.state_tokens(observation, &mut cache))
-                    .collect::<Vec<_>>();
-                let (last, layers) = self.global_layers.split_last().unwrap();
-                for layer in layers {
-                    self.transform_group(&mut sequences, layer);
-                }
-                self.transformed_group(sequences, last).into_iter()
+                cache.bound(65_536, self.width);
+                self.encoded(
+                    observations
+                        .iter()
+                        .map(|observation| self.state_tokens(observation, &mut cache))
+                        .collect(),
+                )
             })
             .collect()
+    }
+
+    #[cfg(feature = "python")]
+    fn encoded(
+        &self,
+        sequences: Vec<(Vec<Vec<f32>>, usize)>,
+    ) -> std::vec::IntoIter<(Vec<f32>, Vec<Vec<f32>>)> {
+        let rows = self.encoder(&sequences);
+        let mut rows = rows.chunks_exact(self.width).map(<[f32]>::to_vec);
+        sequences
+            .iter()
+            .map(|(sequence, start)| {
+                let state = rows.next().unwrap();
+                (state, rows.by_ref().take(sequence.len() - start).collect())
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
     }
 
     fn potential(&self, observation: &Observation) -> f32 {
