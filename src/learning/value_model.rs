@@ -629,15 +629,7 @@ impl ValueModel {
                         rows as i32,
                     );
                 }
-                for score in scores.chunks_exact_mut(rows) {
-                    let peak = reduce(score, f32::NEG_INFINITY, f32::max, f32::max);
-                    score.iter_mut().for_each(|value| *value -= peak);
-                }
-                exp_in_place(&mut scores);
-                for score in scores.chunks_exact_mut(rows) {
-                    let scale = reduce(score, 0.0, |left, right| left + right, |left, right| left + right).recip();
-                    score.iter_mut().for_each(|value| *value *= scale);
-                }
+                scores.chunks_exact_mut(rows).for_each(softmax);
                 unsafe {
                     cblas_sgemm_singlecore(
                         101,
@@ -1700,25 +1692,56 @@ fn gelu_in_place(values: &mut [f32]) {
     }
 }
 
-fn exp_in_place(values: &mut [f32]) {
-    #[cfg(target_arch = "aarch64")]
-    for chunk in values.chunks_exact_mut(4) {
-        use std::arch::aarch64::*;
-        unsafe {
-            let x = vmaxq_f32(vld1q_f32(chunk.as_ptr()), vdupq_n_f32(-87.0));
-            let shifted = vfmaq_f32(vdupq_n_f32(12_582_912.0), x, vdupq_n_f32(std::f32::consts::LOG2_E));
-            let n = vsubq_f32(shifted, vdupq_n_f32(12_582_912.0));
-            let r = vfmsq_f32(vfmsq_f32(x, n, vdupq_n_f32(0.693_145_75)), n, vdupq_n_f32(1.428_606_8e-6));
-            let mut p = vdupq_n_f32(1.0 / 5040.0);
-            for c in [1.0 / 720.0, 1.0 / 120.0, 1.0 / 24.0, 1.0 / 6.0, 0.5, 1.0, 1.0] {
-                p = vfmaq_f32(vdupq_n_f32(c), p, r);
-            }
-            let scale = vshlq_n_u32::<23>(vreinterpretq_u32_f32(shifted));
-            vst1q_f32(chunk.as_mut_ptr(), vreinterpretq_f32_u32(vaddq_u32(vreinterpretq_u32_f32(p), scale)));
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn exp4(x: std::arch::aarch64::float32x4_t) -> std::arch::aarch64::float32x4_t {
+    use std::arch::aarch64::*;
+    unsafe {
+        let x = vmaxq_f32(x, vdupq_n_f32(-87.0));
+        let shifted = vfmaq_f32(vdupq_n_f32(12_582_912.0), x, vdupq_n_f32(std::f32::consts::LOG2_E));
+        let n = vsubq_f32(shifted, vdupq_n_f32(12_582_912.0));
+        let r = vfmsq_f32(vfmsq_f32(x, n, vdupq_n_f32(0.693_145_75)), n, vdupq_n_f32(1.428_606_8e-6));
+        let mut p = vdupq_n_f32(1.0 / 5040.0);
+        for c in [1.0 / 720.0, 1.0 / 120.0, 1.0 / 24.0, 1.0 / 6.0, 0.5, 1.0, 1.0] {
+            p = vfmaq_f32(vdupq_n_f32(c), p, r);
         }
+        let scale = vshlq_n_u32::<23>(vreinterpretq_u32_f32(shifted));
+        vreinterpretq_f32_u32(vaddq_u32(vreinterpretq_u32_f32(p), scale))
     }
-    let tail = if cfg!(target_arch = "aarch64") { values.len() / 4 * 4 } else { 0 };
-    values[tail..].iter_mut().for_each(|value| *value = value.exp());
+}
+
+/// Replaces `values` by exp(values - shift) and returns their sum.
+fn exp_shifted(values: &mut [f32], shift: f32) -> f32 {
+    #[cfg(not(target_arch = "aarch64"))]
+    let mut total = 0.0;
+    #[cfg(target_arch = "aarch64")]
+    let (values, mut total) = {
+        use std::arch::aarch64::*;
+        let mut chunks = values.chunks_exact_mut(4);
+        let mut sum = unsafe { vdupq_n_f32(0.0) };
+        for chunk in &mut chunks {
+            unsafe {
+                let value = exp4(vsubq_f32(vld1q_f32(chunk.as_ptr()), vdupq_n_f32(shift)));
+                vst1q_f32(chunk.as_mut_ptr(), value);
+                sum = vaddq_f32(sum, value);
+            }
+        }
+        (chunks.into_remainder(), unsafe { vaddvq_f32(sum) })
+    };
+    for value in values {
+        *value = (*value - shift).exp();
+        total += *value;
+    }
+    total
+}
+
+fn exp_in_place(values: &mut [f32]) {
+    exp_shifted(values, 0.0);
+}
+
+fn softmax(values: &mut [f32]) {
+    let scale = exp_shifted(values, reduce(values, f32::NEG_INFINITY, f32::max, f32::max)).recip();
+    values.iter_mut().for_each(|value| *value *= scale);
 }
 
 fn normalized(input: &[f32], weight: &[f32], bias: &[f32]) -> Vec<f32> {
