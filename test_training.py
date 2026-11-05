@@ -146,11 +146,8 @@ print('restored')
         _, finite = train.critic_only_step(model, optimizer)
         self.assertTrue(finite)
         optimizer.step.assert_called_once_with()
-        with mock.patch(
-            "training.nn.utils.clip_grad_norm_",
-            return_value=torch.tensor(torch.finfo(torch.float32).max),
-        ):
-            _, finite = train.clip_gradients((parameter,))
+        parameter.grad = torch.full_like(parameter, torch.finfo(torch.float32).max)
+        _, finite = train.clip_gradients((parameter,))
         self.assertFalse(finite)
 
     def test_uniform_cross_entropy(self):

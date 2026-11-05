@@ -106,9 +106,9 @@ def collate(rows, training):
 
 
 def clip_gradients(parameters):
-    norm = nn.utils.clip_grad_norm_(
-        [parameter for parameter in parameters if parameter.grad is not None], .5,
-    )
+    gradients = [parameter.grad for parameter in parameters if parameter.grad is not None]
+    norm = torch.linalg.vector_norm(torch.stack(torch._foreach_norm(gradients)))
+    torch._foreach_mul_(gradients, (.5 / (norm + 1e-6)).clamp(max=1))
     value = float(norm)
     return value, math.isfinite(value) and value < float(torch.finfo(norm.dtype).max)
 
