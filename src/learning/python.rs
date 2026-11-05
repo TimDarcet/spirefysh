@@ -250,13 +250,17 @@ fn hash_words(hash: &mut FastHasher, words: &[u32]) {
 
 fn compress_words(values: &[u32]) -> Vec<u8> {
     let bitmap = values.len().div_ceil(8);
-    let mut output = vec![0; 4 + bitmap];
-    output[..4].copy_from_slice(&(values.len() as u32).to_le_bytes());
-    for (index, &value) in values.iter().enumerate() {
-        if value != 0 {
-            output[4 + index / 8] |= 1 << (index % 8);
-            output.extend_from_slice(&value.to_le_bytes());
-        }
+    let nonzero = values.iter().filter(|&&value| value != 0).count();
+    let mut output = Vec::with_capacity(4 + bitmap + 4 * nonzero);
+    output.extend((values.len() as u32).to_le_bytes());
+    output.extend(values.chunks(8).map(|chunk| {
+        chunk
+            .iter()
+            .enumerate()
+            .fold(0u8, |bits, (index, &value)| bits | ((value != 0) as u8) << index)
+    }));
+    for &value in values.iter().filter(|&&value| value != 0) {
+        output.extend(value.to_le_bytes());
     }
     output
 }
@@ -326,6 +330,7 @@ fn compact_packed_observation_and_digest(row: &Observation, digest: Option<u64>)
         .filter(|row| row[width - 1] != 0)
         .count();
     let mut payload = exact;
+    payload.reserve(4 * actions.len());
     actions
         .iter()
         .for_each(|value| payload.extend(value.to_le_bytes()));

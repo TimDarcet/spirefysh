@@ -6599,8 +6599,16 @@ fn packed_observation_known(
     known_digest: Option<u64>,
 ) -> (Vec<f32>, Vec<u32>, Vec<u32>, Vec<u32>, u64) {
     let mut counts = Vec::with_capacity(DOMAIN_NAMES.len());
-    let mut exact = Vec::new();
-    let mut actions = Vec::new();
+    let mut exact = Vec::with_capacity(
+        (0..DOMAIN_NAMES.len())
+            .map(|domain| {
+                let (u, s, c, f) = DOMAIN_WIDTHS[domain];
+                row.domains[domain].len() * (u + s + c + f + 1)
+            })
+            .sum(),
+    );
+    let mut actions =
+        Vec::with_capacity(row.candidates.len() * (ACTION_U + ACTION_S + ACTION_C + ACTION_F + 1));
     for domain in 0..DOMAIN_NAMES.len() {
         counts.push(row.domains[domain].len() as u32);
         for record in &row.domains[domain] {
