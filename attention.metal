@@ -237,13 +237,13 @@ kernel void flash_backward_key_value(ATTENTION_ARGUMENTS, device const bfloat *q
   }
 }
 
-// Final-layer attention of sparse queries over whole packed sequences: the queries of sequence s are
-// rows positions[query_offsets[s]...query_offsets[s + 1]), its keys rows offsets[s]...offsets[s + 1].
-// A threadgroup handles one sequence and simdgroup h its head h, over 8x8 tiles of queries and keys.
-// Products with probabilities run in fp32, as the scalar kernels they replace.
+// Final-layer attention of sparse queries over whole packed sequences: sequence s has query rows
+// first...first + queries of q, query_offsets[s] = first, and key rows offsets[s]...offsets[s + 1] of kv
+// ([K | V], 256 columns). A threadgroup handles one sequence and simdgroup h its head h, over 8x8 tiles
+// of queries and keys. Products with probabilities run in fp32, as the scalar kernels they replace.
 #define SPARSE_ARGUMENTS                                                                          \
   device const int *offsets [[buffer(0)]], device const int *query_offsets [[buffer(1)]],       \
-  device const int *positions [[buffer(2)]], device const bfloat *qkv [[buffer(3)]],            \
+  device const bfloat *q [[buffer(2)]], device const bfloat *kv [[buffer(3)]],                  \
   uint sequence [[threadgroup_position_in_grid]], ushort head [[simdgroup_index_in_threadgroup]], \
   ushort lane [[thread_index_in_simdgroup]]
 
@@ -251,9 +251,9 @@ kernel void flash_backward_key_value(ATTENTION_ARGUMENTS, device const bfloat *q
   ushort2 p = lane_position(lane);                                                              \
   uint base = offsets[sequence], length = offsets[sequence + 1] - base;                         \
   uint first = query_offsets[sequence], queries = query_offsets[sequence + 1] - first;          \
-  const device bfloat *Q = qkv + head * 32, *K = qkv + 128 + head * 32, *V = qkv + 256 + head * 32;
+  const device bfloat *Q = q + head * 32, *K = kv + head * 32, *V = kv + 128 + head * 32;
 
-// 8x8 tile whose lane holds rows[x], rows[x + 1] of one column: the transpose of 8 rows of source.
+// 8x8 tile whose lane holds rows a and b of one column: the transpose of 8 rows of source.
 METAL_FUNC tile<bfloat> columns(const device bfloat *source, uint stride, uint a, uint b, ushort y) {
   tile<bfloat> value;
   value.v() = bfloat2(source[a * stride + y], source[b * stride + y]);
@@ -264,11 +264,11 @@ kernel void sparse_forward(SPARSE_ARGUMENTS, device bfloat *output [[buffer(4)]]
                            device float *lse [[buffer(5)]]) {
   SPARSE_PROLOGUE
   for (uint q0 = 0; q0 < queries; q0 += 8) {
-    uint query = first + min(q0 + p.y, queries - 1), token = positions[query];
-    tile<bfloat> q[4];
+    uint query = first + min(q0 + p.y, queries - 1);
+    tile<bfloat> query_tile[4];
     tile<float> out[4];
     for (ushort d = 0; d < 4; d++) {
-      q[d] = load_pair<bfloat>(Q + token * 384 + d * 8 + p.x);
+      query_tile[d] = load_pair<bfloat>(Q + query * 128 + d * 8 + p.x);
       out[d].v() = 0;
     }
     float maximum = MASK, total = 0;
@@ -276,7 +276,7 @@ kernel void sparse_forward(SPARSE_ARGUMENTS, device bfloat *output [[buffer(4)]]
       uint a = base + min(k0 + p.x, length - 1), b = base + min(k0 + p.x + 1, length - 1);
       tile<float> score;
       score.v() = 0;
-      for (ushort d = 0; d < 4; d++) score.mma(q[d], columns(K + d * 8, 384, a, b, p.y));
+      for (ushort d = 0; d < 4; d++) score.mma(query_tile[d], columns(K + d * 8, 256, a, b, p.y));
       for (ushort i = 0; i < 2; i++)
         if (k0 + p.x + i >= length) score.v()[i] = MASK;
       float updated = max(maximum, row_max(max(score.v()[0], score.v()[1])) * SCALE_LOG2);
@@ -287,7 +287,7 @@ kernel void sparse_forward(SPARSE_ARGUMENTS, device bfloat *output [[buffer(4)]]
       uint key = base + min(k0 + p.y, length - 1);
       for (ushort d = 0; d < 4; d++) {
         out[d].v() *= correction;
-        out[d].mma(score, load_pair<float>(V + key * 384 + d * 8 + p.x));
+        out[d].mma(score, load_pair<float>(V + key * 256 + d * 8 + p.x));
       }
     }
     if (q0 + p.y < queries) {
@@ -302,16 +302,16 @@ kernel void sparse_forward(SPARSE_ARGUMENTS, device bfloat *output [[buffer(4)]]
 kernel void sparse_backward_query(SPARSE_ARGUMENTS, device const bfloat *output [[buffer(4)]],
                                   device const float *lse [[buffer(5)]],
                                   device const bfloat *grad_output [[buffer(6)]],
-                                  device bfloat *grad_qkv [[buffer(7)]]) {
+                                  device bfloat *grad_q [[buffer(7)]]) {
   SPARSE_PROLOGUE
   for (uint q0 = 0; q0 < queries; q0 += 8) {
-    uint query = first + min(q0 + p.y, queries - 1), token = positions[query];
-    tile<bfloat> q[4], grad[4];
+    uint query = first + min(q0 + p.y, queries - 1);
+    tile<bfloat> query_tile[4], grad[4];
     tile<float> grad_query[4];
     float rowdot = 0;
     for (ushort d = 0; d < 4; d++) {
       uint column = head * 32 + d * 8 + p.x;
-      q[d] = load_pair<bfloat>(Q + token * 384 + d * 8 + p.x);
+      query_tile[d] = load_pair<bfloat>(Q + query * 128 + d * 8 + p.x);
       grad[d] = load_pair<bfloat>(grad_output + query * 128 + column);
       rowdot += dot(float2(grad[d].v()), float2(load_pair<float>(output + query * 128 + column).v()));
       grad_query[d].v() = 0;
@@ -324,29 +324,27 @@ kernel void sparse_backward_query(SPARSE_ARGUMENTS, device const bfloat *output 
       probability.v() = 0;
       grad_probability.v() = 0;
       for (ushort d = 0; d < 4; d++) {
-        probability.mma(q[d], columns(K + d * 8, 384, a, b, p.y));
-        grad_probability.mma(grad[d], columns(V + d * 8, 384, a, b, p.y));
+        probability.mma(query_tile[d], columns(K + d * 8, 256, a, b, p.y));
+        grad_probability.mma(grad[d], columns(V + d * 8, 256, a, b, p.y));
       }
       for (ushort i = 0; i < 2; i++)
         if (k0 + p.x + i >= length) probability.v()[i] = MASK;
       probability.v() = exp2(probability.v() * SCALE_LOG2 - log_sum) * (grad_probability.v() - rowdot);
       uint key = base + min(k0 + p.y, length - 1);
       for (ushort d = 0; d < 4; d++)
-        grad_query[d].mma(probability, load_pair<float>(K + key * 384 + d * 8 + p.x));
+        grad_query[d].mma(probability, load_pair<float>(K + key * 256 + d * 8 + p.x));
     }
-    if (q0 + p.y < queries) {
+    if (q0 + p.y < queries)
       for (ushort d = 0; d < 4; d++)
-        *(device packed_bfloat2 *)(grad_qkv + token * 384 + head * 32 + d * 8 + p.x) =
+        *(device packed_bfloat2 *)(grad_q + query * 128 + head * 32 + d * 8 + p.x) =
             packed_bfloat2(bfloat2(grad_query[d].v() * SCALE));
-    }
   }
 }
 
-// Writes dK and dV of every key and zeroes its query columns; sparse_backward_query runs after it.
 kernel void sparse_backward_key_value(SPARSE_ARGUMENTS, device const float *lse [[buffer(4)]],
                                       device const float *delta [[buffer(5)]],
                                       device const bfloat *grad_output [[buffer(6)]],
-                                      device bfloat *grad_qkv [[buffer(7)]]) {
+                                      device bfloat *grad_kv [[buffer(7)]]) {
   SPARSE_PROLOGUE
   const device bfloat *G = grad_output + head * 32;
   for (uint k0 = 0; k0 < length; k0 += 8) {
@@ -354,8 +352,8 @@ kernel void sparse_backward_key_value(SPARSE_ARGUMENTS, device const float *lse 
     tile<bfloat> k[4], v[4];
     tile<float> grad_key[4], grad_value[4];
     for (ushort d = 0; d < 4; d++) {
-      k[d] = load_pair<bfloat>(K + key * 384 + d * 8 + p.x);
-      v[d] = load_pair<bfloat>(V + key * 384 + d * 8 + p.x);
+      k[d] = load_pair<bfloat>(K + key * 256 + d * 8 + p.x);
+      v[d] = load_pair<bfloat>(V + key * 256 + d * 8 + p.x);
       grad_key[d].v() = 0;
       grad_value[d].v() = 0;
     }
@@ -366,7 +364,7 @@ kernel void sparse_backward_key_value(SPARSE_ARGUMENTS, device const float *lse 
       probability.v() = 0;
       grad_probability.v() = 0;
       for (ushort d = 0; d < 4; d++) {
-        probability.mma(k[d], columns(Q + d * 8, 384, positions[a], positions[b], p.y));
+        probability.mma(k[d], columns(Q + d * 8, 128, a, b, p.y));
         grad_probability.mma(v[d], columns(G + d * 8, 128, a, b, p.y));
       }
       float2 log_sum = float2(q0 + p.x < queries ? lse[a * 4 + head] : -MASK,
@@ -376,16 +374,14 @@ kernel void sparse_backward_key_value(SPARSE_ARGUMENTS, device const float *lse 
         grad_value[d].mma(probability, load_pair<float>(G + row * 128 + d * 8 + p.x));
       probability.v() *= grad_probability.v() - float2(delta[a * 4 + head], delta[b * 4 + head]);
       for (ushort d = 0; d < 4; d++)
-        grad_key[d].mma(probability, load_pair<float>(Q + positions[row] * 384 + d * 8 + p.x));
+        grad_key[d].mma(probability, load_pair<float>(Q + row * 128 + d * 8 + p.x));
     }
-    if (k0 + p.y < length) {
+    if (k0 + p.y < length)
       for (ushort d = 0; d < 4; d++) {
-        device bfloat *destination = grad_qkv + key * 384 + head * 32 + d * 8 + p.x;
-        *(device packed_bfloat2 *)destination = packed_bfloat2(bfloat2(0));
-        *(device packed_bfloat2 *)(destination + 128) = packed_bfloat2(bfloat2(grad_key[d].v() * SCALE));
-        *(device packed_bfloat2 *)(destination + 256) = packed_bfloat2(bfloat2(grad_value[d].v()));
+        device bfloat *destination = grad_kv + key * 256 + head * 32 + d * 8 + p.x;
+        *(device packed_bfloat2 *)destination = packed_bfloat2(bfloat2(grad_key[d].v() * SCALE));
+        *(device packed_bfloat2 *)(destination + 128) = packed_bfloat2(bfloat2(grad_value[d].v()));
       }
-    }
   }
 }
 

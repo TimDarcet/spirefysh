@@ -113,6 +113,7 @@ MATMUL(linear_gelu, bfloat, false, true, bfloat, GELU, bfloat)
 MATMUL(linear_residual, bfloat, false, true, float, RESIDUAL, float)
 MATMUL(linear_input_grad, bfloat, false, false, bfloat, PLAIN, float)
 MATMUL(linear_input_grad_float, float, false, false, bfloat, PLAIN, float)
+MATMUL(linear_input_grad_float_out, bfloat, false, false, float, PLAIN, float)
 MATMUL(linear_input_grad_float_gelu, float, false, false, bfloat, GELU_GRAD, bfloat)
 MATMUL(linear_weight_grad, bfloat, true, false, float, SPLIT, float)
 MATMUL(linear_weight_grad_float, float, true, false, float, SPLIT, float)
@@ -120,13 +121,15 @@ MATMUL(linear_weight_grad_float, float, true, false, float, SPLIT, float)
 // Layer-norm backward fused into the input gradient of the following linear: G = grad_output B is the
 // gradient of the normalized rows (width 128). A threadgroup of 4 simdgroups computes G for 32 full
 // rows into threadgroup memory, then each simdgroup runs the layer-norm backward of 8 rows, writing
-// their input gradient (plus residual) and the block's gamma and beta partial sums.
+// their input gradient (plus residual) and the block's gamma and beta partial sums. With has_extra, row m
+// of G also gets extra[inverse[m]] where inverse[m] >= 0.
 template <typename TA>
 METAL_FUNC void input_grad_norm(device const TA *A, device const bfloat *B, device const float *input,
                                 device const float *gamma, device const float *stats,
                                 device const float *residual, device float *grad_input,
                                 device float *partial, threadgroup float *G, uint M, uint K,
-                                bool add_residual, uint block, ushort simd, ushort lane) {
+                                bool add_residual, device const float *extra, device const int *inverse,
+                                bool has_extra, uint block, ushort simd, ushort lane) {
   ushort2 p = lane_position(lane);
   uint m0 = block * 32;
   tile<float> acc[4][4];
@@ -141,10 +144,11 @@ METAL_FUNC void input_grad_norm(device const TA *A, device const bfloat *B, devi
     uint m = m0 + r;
     if (m >= M) break;
     float mean = stats[m * 2], inverse_std = stats[m * 2 + 1];
+    int row = has_extra ? inverse[m] : -1;
     float4 normalized, grad;
     for (ushort part = 0; part < 4; part++) {
       uint column = lane + part * 32;
-      float gradient = G[r * 128 + column];
+      float gradient = G[r * 128 + column] + (row >= 0 ? extra[row * 128 + column] : 0.0f);
       normalized[part] = (input[m * 128 + column] - mean) * inverse_std;
       grad_gamma[part] += gradient * normalized[part];
       grad_beta[part] += gradient;
@@ -174,13 +178,14 @@ METAL_FUNC void input_grad_norm(device const TA *A, device const bfloat *B, devi
                    device const float *stats [[buffer(4)]], device const float *residual [[buffer(5)]], \
                    device float *grad_input [[buffer(6)]], device float *partial [[buffer(7)]],    \
                    constant uint &M [[buffer(8)]], constant uint &K [[buffer(9)]],                 \
-                   constant uint &add_residual [[buffer(10)]],                                     \
+                   constant uint &add_residual [[buffer(10)]], device const float *extra [[buffer(11)]], \
+                   device const int *inverse [[buffer(12)]], constant uint &has_extra [[buffer(13)]], \
                    uint block [[threadgroup_position_in_grid]],                                    \
                    ushort simd [[simdgroup_index_in_threadgroup]],                                 \
                    ushort lane [[thread_index_in_simdgroup]]) {                                    \
     threadgroup float G[32 * 128];                                                                 \
     input_grad_norm<TA>(A, B, input, gamma, stats, residual, grad_input, partial, G, M, K,        \
-                        add_residual, block, simd, lane);                                          \
+                        add_residual, extra, inverse, has_extra, block, simd, lane);               \
   }
 INPUT_GRAD_NORM(linear_input_grad_norm, bfloat)
 INPUT_GRAD_NORM(linear_input_grad_norm_float, float)

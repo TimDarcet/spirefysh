@@ -1291,30 +1291,30 @@ class _RaggedAttention(torch.autograd.Function):
 
 @_committed
 class _SparseAttention(torch.autograd.Function):
-    # Final-layer attention of the selected query rows over their sequences, 4 heads of width 32.
+    # Final-layer attention of sparse queries (rows of q in sequence order) over their sequences' keys
+    # and values (rows of kv), 4 heads of width 32.
     @staticmethod
-    def forward(ctx, qkv, offsets, query_offsets, positions):
+    def forward(ctx, q, kv, offsets, query_offsets):
         library = _FlashAttention.compiled()
-        output = qkv.new_empty((len(positions), 128))
-        lse = torch.empty((len(positions), 4), dtype=torch.float32, device=qkv.device)
-        library.sparse_forward(offsets, query_offsets, positions, qkv, output, lse,
+        output = q.new_empty(q.shape)
+        lse = torch.empty((len(q), 4), dtype=torch.float32, device=q.device)
+        library.sparse_forward(offsets, query_offsets, q, kv, output, lse,
                                threads=(len(offsets) - 1) * 128, group_size=128)
-        ctx.save_for_backward(qkv, offsets, query_offsets, positions, output, lse)
+        ctx.save_for_backward(q, kv, offsets, query_offsets, output, lse)
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        qkv, offsets, query_offsets, positions, output, lse = ctx.saved_tensors
-        grad_output, grad_qkv = grad_output.to(torch.bfloat16).contiguous(), torch.empty_like(qkv)
-        arguments = offsets, query_offsets, positions, qkv
-        threads = (len(offsets) - 1) * 128
-        library, delta = _FlashAttention.library, torch.empty_like(lse)
+        q, kv, offsets, query_offsets, output, lse = ctx.saved_tensors
+        grad_output = grad_output.to(torch.bfloat16).contiguous()
+        grad_q, grad_kv, delta = torch.empty_like(q), torch.empty_like(kv), torch.empty_like(lse)
+        arguments, threads, library = (offsets, query_offsets, q, kv), (len(offsets) - 1) * 128, _FlashAttention.library
         library.sparse_delta(output, grad_output, delta, threads=delta.numel(), group_size=256)
-        library.sparse_backward_key_value(*arguments, lse, delta, grad_output, grad_qkv,
+        library.sparse_backward_key_value(*arguments, lse, delta, grad_output, grad_kv,
                                           threads=threads, group_size=128)
-        library.sparse_backward_query(*arguments, output, lse, grad_output, grad_qkv,
+        library.sparse_backward_query(*arguments, output, lse, grad_output, grad_q,
                                       threads=threads, group_size=128)
-        return grad_qkv, None, None, None
+        return grad_q, grad_kv, None, None
 
 
 @_committed
@@ -1434,10 +1434,22 @@ def _linear_residual_norm(value_bfloat, weight, bias, residual, gamma, beta):
     return output, weight_bfloat, normalized, stats
 
 
-def _linear_backward(value, weight, grad_output, hidden=None, norm=None):
+def _linear_weight_backward(value, grad_output):
+    grad_weight = value.new_zeros((grad_output.shape[1], value.shape[1]), dtype=torch.float32)
+    grad_bias = value.new_zeros(grad_output.shape[1], dtype=torch.float32)
+    _linear_kernel(
+        "linear_weight_grad" + ("_float" if grad_output.dtype == torch.float32 else ""), grad_output,
+        value, grad_weight, grad_output.shape[1], value.shape[1], len(value), grad_bias,
+        splits=max(1, min(128, len(value) // 128)),
+    )
+    return grad_weight, grad_bias
+
+
+def _linear_backward(value, weight, grad_output, hidden=None, norm=None, extra=None):
     # With hidden, value is gelu(hidden) and grad_value is the gradient of hidden. With
     # norm = (input, gamma, stats, residual), value is layer_norm(input) of width 128 and grad_value is
-    # (gradient of input plus residual, gradient of gamma, gradient of beta).
+    # (gradient of input plus residual, gradient of gamma, gradient of beta); extra = (rows, inverse)
+    # then adds rows[inverse[m]] to the gradient of normalized row m where inverse[m] >= 0.
     grad_output = grad_output.contiguous() if grad_output.dtype == torch.float32 \
         else grad_output.to(torch.bfloat16).contiguous()
     suffix = "_float" if grad_output.dtype == torch.float32 else ""
@@ -1455,16 +1467,11 @@ def _linear_backward(value, weight, grad_output, hidden=None, norm=None):
         grad_input, partial = torch.empty_like(input), input.new_empty((blocks, 2, columns))
         getattr(_linear_library(), "linear_input_grad_norm" + suffix)(
             grad_output, weight, input, gamma, stats, input if residual is None else residual.contiguous(),
-            grad_input, partial, rows, depth, residual is not None, threads=blocks * 128, group_size=128,
+            grad_input, partial, rows, depth, residual is not None, *(extra or (input, stats)),
+            extra is not None, threads=blocks * 128, group_size=128,
         )
         grad_value = grad_input, *_norm_reduce(partial, gamma)
-    grad_weight = weight.new_zeros((depth, columns), dtype=torch.float32)
-    grad_bias = weight.new_zeros(depth, dtype=torch.float32)
-    _linear_kernel(
-        "linear_weight_grad" + suffix, grad_output, value, grad_weight, depth, columns, rows,
-        grad_bias, splits=max(1, min(128, rows // 128)),
-    )
-    return grad_value, grad_weight, grad_bias
+    return grad_value, *_linear_weight_backward(value, grad_output)
 
 
 @_committed
@@ -1621,6 +1628,35 @@ class _FeedForward(torch.autograd.Function):
         )
         return grad_value, grad_gamma, grad_beta, grad_weight1, grad_bias1, grad_weight2, grad_bias2, \
             None, None, None, None
+
+
+@_committed
+class _SparseQKV(torch.autograd.Function):
+    # Final-layer projection: keys and values of every row, queries only of the rows at positions
+    # (inverse maps rows to their query index or -1). Returns (q, kv, value) like _NormLinear.
+    @staticmethod
+    def forward(ctx, value, gamma, beta, weight, bias, positions, inverse, normalized=None, stats=None):
+        if normalized is None:
+            normalized, stats = _layer_norm_forward(value, gamma, beta)
+        selected = normalized[positions]
+        q, query_weight = _linear_forward(selected, weight[:128], bias[:128])
+        kv, kv_weight = _linear_forward(normalized, weight[128:], bias[128:])
+        ctx.save_for_backward(value, gamma, normalized, stats, selected, query_weight, kv_weight, inverse)
+        return q, kv, value.view_as(value)
+
+    @staticmethod
+    def backward(ctx, grad_q, grad_kv, grad_residual):
+        value, gamma, normalized, stats, selected, query_weight, kv_weight, inverse = ctx.saved_tensors
+        grad_q = grad_q.to(torch.bfloat16).contiguous()
+        grad_selected = torch.empty_like(selected, dtype=torch.float32)
+        _linear_kernel("linear_input_grad_float_out", grad_q, query_weight, grad_selected, len(selected), 128, 128)
+        grad_query_weight, grad_query_bias = _linear_weight_backward(selected, grad_q)
+        (grad_value, grad_gamma, grad_beta), grad_kv_weight, grad_kv_bias = _linear_backward(
+            normalized, kv_weight, grad_kv, norm=(value, gamma, stats, grad_residual),
+            extra=(grad_selected, inverse),
+        )
+        return grad_value, grad_gamma, grad_beta, torch.cat((grad_query_weight, grad_kv_weight)), \
+            torch.cat((grad_query_bias, grad_kv_bias)), None, None, None, None
 
 
 @_committed
@@ -2459,18 +2495,22 @@ class Agent(nn.Module):
 
             # Each residual matmul also computes the next layer norm, passed on as normalized.
             def attend_layer(current, layer, selected, query_offsets, sparse, normalized):
-                qkv, current = _norm_linear(
-                    current, layer.norm1, layer.self_attn.in_proj_weight,
-                    layer.self_attn.in_proj_bias, normalized,
-                )
+                weights = layer.self_attn.in_proj_weight, layer.self_attn.in_proj_bias
+                if flash and sparse:
+                    inverse = torch.full((len(current),), -1, dtype=torch.int32, device=device)
+                    inverse[selected] = torch.arange(len(selected), dtype=torch.int32, device=device)
+                    q, kv, current = _SparseQKV.apply(
+                        current, layer.norm1.weight, layer.norm1.bias, *weights, selected, inverse,
+                        *(normalized or ()),
+                    )
+                    attended = _SparseAttention.apply(q, kv, metal_offsets, query_offsets.to(torch.int32))
+                    return _residual_linear(attended, layer.self_attn.out_proj, current[selected],
+                                            layer.norm2)
+                qkv, current = _norm_linear(current, layer.norm1, *weights, normalized)
                 fp32_value_backward = final_attention \
                     and layer_index + 1 == len(transformer.layers) \
                     and self.precision == "bf16_with_fp32_dV"
-                if flash and sparse:
-                    attended = _SparseAttention.apply(
-                        qkv, metal_offsets, query_offsets.to(torch.int32), selected.to(torch.int32),
-                    )
-                elif fp32_value_backward:
+                if fp32_value_backward:
                     attended = _RaggedAttention.apply(
                         qkv, offsets.to(torch.int32), sequence.to(torch.int32),
                         layer.self_attn.num_heads, selected.to(torch.int32),
