@@ -6639,61 +6639,29 @@ fn packed_observation_digest(
     exact: &[u32],
     actions: &[u32],
 ) -> u64 {
-    let mut digest = 0xcbf2_9ce4_8422_2325u64;
-    let mut update = |value: u32| {
-        digest = (digest ^ value as u64).wrapping_mul(0x100_0000_01b3);
-    };
-    update(VERSION);
-    update(VALUE_MODEL_VERSION);
-    update(character as u32);
-    update(globals.len() as u32);
-    for value in globals {
-        update(value.to_bits());
-    }
+    let update = |digest: u64, value: u64| (digest ^ value).wrapping_mul(0x100_0000_01b3);
+    let mut digest = [VERSION, VALUE_MODEL_VERSION, character as u32, globals.len() as u32]
+        .into_iter()
+        .chain(globals.iter().map(|value| value.to_bits()))
+        .fold(0xcbf2_9ce4_8422_2325, |digest, value| update(digest, value as u64));
     for values in [counts, exact, actions] {
-        update(values.len() as u32);
-        values.iter().copied().for_each(&mut update);
+        let mut lanes = [digest ^ values.len() as u64, 1, 2, 3];
+        let mut chunks = values.chunks_exact(4);
+        for chunk in &mut chunks {
+            for (lane, &value) in lanes.iter_mut().zip(chunk) {
+                *lane = update(*lane, value as u64);
+            }
+        }
+        for (lane, &value) in lanes.iter_mut().zip(chunks.remainder()) {
+            *lane = update(*lane, value as u64);
+        }
+        digest = lanes.into_iter().fold(0, update);
     }
     digest
 }
 
 fn observation_digest(row: &Observation) -> u64 {
-    let mut digest = 0xcbf2_9ce4_8422_2325u64;
-    let mut update = |value: u32| {
-        digest = (digest ^ value as u64).wrapping_mul(0x100_0000_01b3);
-    };
-    update(VERSION);
-    update(VALUE_MODEL_VERSION);
-    update(row.character as u32);
-    update(row.globals.len() as u32);
-    row.globals.iter().for_each(|value| update(value.to_bits()));
-    update(row.domains.len() as u32);
-    row.domains
-        .iter()
-        .for_each(|domain| update(domain.len() as u32));
-    update(
-        row.domains
-            .iter()
-            .flatten()
-            .map(|record| record.u.len() + record.s.len() + record.c.len() + record.f.len() + 1)
-            .sum::<usize>() as u32,
-    );
-    for record in row.domains.iter().flatten() {
-        record.u.iter().copied().for_each(&mut update);
-        record.s.iter().for_each(|value| update(*value as u32));
-        record.c.iter().copied().for_each(&mut update);
-        record.f.iter().for_each(|value| update(value.to_bits()));
-        update(record.scope as u32);
-    }
-    update((row.candidates.len() * (ACTION_U + ACTION_S + ACTION_C + ACTION_F + 1)) as u32);
-    for candidate in &row.candidates {
-        candidate.u.iter().copied().for_each(&mut update);
-        candidate.s.iter().for_each(|value| update(*value as u32));
-        candidate.c.iter().copied().for_each(&mut update);
-        candidate.f.iter().for_each(|value| update(value.to_bits()));
-        update(candidate.legal as u32);
-    }
-    digest
+    packed_observation_known(row, None).4
 }
 
 fn action_row(
