@@ -128,6 +128,15 @@ struct EncodingCache {
     move_gru: GruCache,
 }
 
+impl EncodingCache {
+    fn bound(&mut self, rows: usize, width: usize) {
+        if self.rows.len() > rows || self.move_gru.states.len() > rows * width {
+            self.rows.clear();
+            self.move_gru = GruCache::default();
+        }
+    }
+}
+
 #[derive(Default)]
 struct GruCache {
     states: Vec<f32>,
@@ -1284,25 +1293,56 @@ impl ValueModel {
             .flat_map_iter(|observations| {
                 let index = rayon::current_thread_index().unwrap_or(0) % self.encode_caches.len();
                 let mut cache = self.encode_caches[index].lock().unwrap();
-                if cache.rows.len() > 65_536 || cache.move_gru.states.len() > 65_536 * self.width {
-                    cache.rows.clear();
-                    cache.move_gru = GruCache::default();
-                }
-                let sequences = observations
-                    .iter()
-                    .map(|observation| self.state_tokens(observation, &mut cache))
-                    .collect::<Vec<_>>();
-                let rows = self.encoder(&sequences);
-                let mut rows = rows.chunks_exact(self.width).map(<[f32]>::to_vec);
-                sequences
-                    .iter()
-                    .map(|(sequence, start)| {
-                        let state = rows.next().unwrap();
-                        (state, rows.by_ref().take(sequence.len() - start).collect())
-                    })
-                    .collect::<Vec<_>>()
+                cache.bound(65_536, self.width);
+                self.encoded(
+                    observations
+                        .iter()
+                        .map(|observation| self.state_tokens(observation, &mut cache))
+                        .collect(),
+                )
             })
             .collect()
+    }
+
+    #[cfg(feature = "python")]
+    fn state_actions_cached(
+        &self,
+        observations: &[&Observation],
+        caches: &mut [&mut EncodingCache],
+    ) -> Vec<(Vec<f32>, Vec<Vec<f32>>)> {
+        observations
+            .par_chunks(8)
+            .zip(caches.par_chunks_mut(8))
+            .flat_map_iter(|(observations, caches)| {
+                self.encoded(
+                    observations
+                        .iter()
+                        .zip(caches)
+                        .map(|(observation, cache)| {
+                            cache.bound(1024, self.width);
+                            self.state_tokens(observation, cache)
+                        })
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "python")]
+    fn encoded(
+        &self,
+        sequences: Vec<(Vec<Vec<f32>>, usize)>,
+    ) -> std::vec::IntoIter<(Vec<f32>, Vec<Vec<f32>>)> {
+        let rows = self.encoder(&sequences);
+        let mut rows = rows.chunks_exact(self.width).map(<[f32]>::to_vec);
+        sequences
+            .iter()
+            .map(|(sequence, start)| {
+                let state = rows.next().unwrap();
+                (state, rows.by_ref().take(sequence.len() - start).collect())
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
     }
 
     fn potential(&self, observation: &Observation) -> f32 {

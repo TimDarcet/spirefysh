@@ -1277,6 +1277,7 @@ struct Batch {
     layout: Layout,
     games: Vec<Game>,
     map_caches: Vec<Option<CanonicalMapCache>>,
+    encodings: Vec<EncodingCache>,
     actions: Vec<Vec<Action>>,
     plans: Vec<Vec<Action>>,
     starts: Vec<Game>,
@@ -5472,6 +5473,7 @@ impl Batch {
             root_ids: vec![usize::MAX; size],
             games: Vec::with_capacity(size),
             map_caches: (0..size).map(|_| None).collect(),
+            encodings: (0..size).map(|_| EncodingCache::default()).collect(),
             random: seed.max(1),
             next_seed: seed,
             seed_stride: seed_stride.max(1),
@@ -7391,7 +7393,15 @@ impl Batch {
             .iter()
             .filter(|row| !skip_forced || row.candidates.len() > 1)
             .collect::<Vec<_>>();
-        let features = py.allow_threads(|| model.state_actions_batch(&evaluated_rows));
+        self.encodings.resize_with(rows.len(), EncodingCache::default);
+        let mut caches = rows
+            .iter()
+            .zip(&mut self.encodings)
+            .filter(|(row, _)| !skip_forced || row.candidates.len() > 1)
+            .map(|(_, cache)| cache)
+            .collect::<Vec<_>>();
+        let features =
+            py.allow_threads(|| model.state_actions_cached(&evaluated_rows, &mut caches));
         stage(&mut diagnostics, 2);
         let packed = py.allow_threads(|| {
             rows.par_iter()
@@ -7887,6 +7897,9 @@ impl Batch {
             self.actions[index].clear();
             self.plans[index].clear();
             self.searched_turns[index] = None;
+            if let Some(cache) = self.encodings.get_mut(index) {
+                *cache = EncodingCache::default();
+            }
         }
         Ok(())
     }
