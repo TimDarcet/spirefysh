@@ -7498,7 +7498,7 @@ impl Batch {
             self.actions.resize_with(rows.len(), Vec::new);
         }
         let mut evaluated = features.into_iter().zip(outputs);
-        for (row, packed) in rows.into_iter().zip(packed) {
+        for (row, packed) in rows.iter().zip(packed) {
             if skip_forced && row.candidates.len() == 1 {
                 characters.push(row.character);
                 choices.push(0);
@@ -7559,6 +7559,7 @@ impl Batch {
             packed_rows.push(PyBytes::new(py, &packed));
         }
         debug_assert!(evaluated.next().is_none());
+        rayon::spawn(move || drop(rows));
         if let Some(diagnostics) = &mut diagnostics {
             let mut diagnostics = diagnostics.as_array_mut();
             for (index, (&choice, &kind)) in choices.iter().zip(&action_kinds).enumerate() {
