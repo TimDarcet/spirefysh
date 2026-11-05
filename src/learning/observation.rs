@@ -12,7 +12,7 @@ use std::{
 };
 
 const MAGIC: &[u8; 8] = b"STSVALUE";
-const VERSION: u32 = 62;
+const VERSION: u32 = 63;
 const VALUE_MODEL_VERSION: u32 = 79;
 const TERMINAL_CATEGORIES: usize = 83;
 const CARD_ZONES: usize = 5;
@@ -80,7 +80,7 @@ const DOMAIN_WIDTHS: [(usize, usize, usize, usize); 16] = [
     (8, 4, 5, 2),
     (6, 29, 1, 29),
     (3, 3, 2, 3),
-    (12, 6, 20, 1),
+    (3, 4, 1, 4),
     (6, 2, 1, 0),
     (6, 2, 4, 1),
     (4, 1, 2, 0),
@@ -166,12 +166,6 @@ enum Semantic {
     ContinuationKind,
     ContinuationVariant,
     MapModifier,
-    RelicCounter0,
-    RelicCounter1,
-    RelicCounter2,
-    RelicCounter3,
-    RelicCounter4,
-    RelicCounter5,
     RouteKind,
     Requirement,
     TinkerRider,
@@ -234,12 +228,6 @@ const SEMANTIC_NAMES: [&str; Semantic::Count as usize] = [
     "continuation_kind",
     "continuation_variant",
     "map_modifier",
-    "relic_counter_0",
-    "relic_counter_1",
-    "relic_counter_2",
-    "relic_counter_3",
-    "relic_counter_4",
-    "relic_counter_5",
     "route_kind",
     "requirement",
     "tinker_rider",
@@ -388,12 +376,6 @@ impl Layout {
             (Semantic::ContinuationKind, 10),
             (Semantic::ContinuationVariant, 128),
             (Semantic::MapModifier, 2),
-            (Semantic::RelicCounter0, content.relics.len()),
-            (Semantic::RelicCounter1, content.relics.len()),
-            (Semantic::RelicCounter2, content.relics.len()),
-            (Semantic::RelicCounter3, content.relics.len()),
-            (Semantic::RelicCounter4, content.relics.len()),
-            (Semantic::RelicCounter5, content.relics.len()),
             (Semantic::RouteKind, 4),
             (Semantic::Requirement, 4),
             (Semantic::TinkerRider, 9),
@@ -1071,40 +1053,12 @@ fn populate_domain_features(
         RELIC_DOMAIN => {
             push_semantic(row, layout, Semantic::Relic, row.u[1]);
             if row.u[0] == 0 {
-                let pumpkin = content.relics[row.u[1] as usize].id == "RELIC.PUMPKIN_CANDLE";
-                if pumpkin {
-                    row.f[0] = row.s[0] as f32;
-                }
-                let counters = row
-                    .s
-                    .iter()
-                    .skip(pumpkin as usize)
-                    .map(|&value| value.max(0) as usize)
-                    .sum::<usize>();
-                assert!(
-                    counters < row.c.len(),
-                    "semantic row overflow domain=relic seed={} relic={} counters={:?} capacity={}",
-                    game.seed,
-                    content.relics[row.u[1] as usize].id,
-                    row.s,
-                    row.c.len(),
-                );
-                for (slot, namespace) in [
-                    Semantic::RelicCounter0,
-                    Semantic::RelicCounter1,
-                    Semantic::RelicCounter2,
-                    Semantic::RelicCounter3,
-                    Semantic::RelicCounter4,
-                    Semantic::RelicCounter5,
-                ]
-                .into_iter()
-                .enumerate()
-                .skip(pumpkin as usize)
-                {
-                    for _ in 0..row.s[slot].max(0) {
-                        push_semantic(row, layout, namespace, row.u[1]);
-                    }
-                }
+                row.f.copy_from_slice(&[
+                    sf(row.s[0], 10.0),
+                    sf(row.s[1], 10.0),
+                    row.s[2] as f32,
+                    sf(row.s[3], 4.0),
+                ]);
             }
         }
         POTION_DOMAIN => {
@@ -4007,155 +3961,78 @@ fn public_encounters(game: &Game, content: &Content, elite: bool) -> Vec<Id> {
     if public.is_empty() { full } else { public }
 }
 
-fn relic_state(game: &Game, content: &Content, id: Id) -> [f32; 4] {
+fn relic_state(game: &Game, content: &Content, id: Id) -> [f32; 2] {
     let combat = game.combat();
     let flag = |value: bool| value as u8 as f32;
     match content.relics[id as usize].id {
-        "RELIC.HAPPY_FLOWER" => [game.happy_flower as f32, 0.0, 0.0, 0.0],
-        "RELIC.FAKE_HAPPY_FLOWER" => [game.fake_happy_flower as f32, 0.0, 0.0, 0.0],
-        "RELIC.VENERABLE_TEA_SET" => [(game.tea_set / 2 * 2) as f32, 0.0, 0.0, 0.0],
-        "RELIC.FAKE_VENERABLE_TEA_SET" => [(game.tea_set % 2) as f32, 0.0, 0.0, 0.0],
-        "RELIC.LASTING_CANDY" => [(game.lasting_candy % 2) as f32, 0.0, 0.0, 0.0],
-        "RELIC.PAELS_WING" => [(game.paels_wing % 2) as f32, 0.0, 0.0, 0.0],
+        "RELIC.HAPPY_FLOWER" => [game.happy_flower as f32, 0.0],
+        "RELIC.FAKE_HAPPY_FLOWER" => [game.fake_happy_flower as f32, 0.0],
+        "RELIC.VENERABLE_TEA_SET" => [(game.tea_set / 2 * 2) as f32, 0.0],
+        "RELIC.FAKE_VENERABLE_TEA_SET" => [(game.tea_set % 2) as f32, 0.0],
+        "RELIC.LASTING_CANDY" => [(game.lasting_candy % 2) as f32, 0.0],
+        "RELIC.PAELS_WING" => [(game.paels_wing % 2) as f32, 0.0],
         "RELIC.SILVER_CRUCIBLE" => [
             3u8.saturating_sub(game.silver_crucible) as f32,
             1u8.saturating_sub(game.silver_treasures) as f32,
-            0.0,
-            0.0,
         ],
-        "RELIC.WINGED_BOOTS" => [3u8.saturating_sub(game.winged_boots) as f32, 0.0, 0.0, 0.0],
-        "RELIC.GIRYA" => [game.girya as f32, 0.0, 0.0, 0.0],
-        "RELIC.PUMPKIN_CANDLE" => [game.pumpkin_candle as f32, 0.0, 0.0, 0.0],
-        "RELIC.TOY_BOX" => [(game.toy_box_combats % 3) as f32, 0.0, 0.0, 0.0],
-        "RELIC.NUNCHAKU" => [game.nunchaku as f32, 0.0, 0.0, 0.0],
-        "RELIC.PENDULUM" => [game.pendulum as f32, 0.0, 0.0, 0.0],
-        "RELIC.PEN_NIB" => [game.pen_nib as f32, 0.0, 0.0, 0.0],
-        "RELIC.IRON_CLUB" => [game.iron_club as f32, 0.0, 0.0, 0.0],
-        "RELIC.JOSS_PAPER" => [game.joss_paper as f32, 0.0, 0.0, 0.0],
-        "RELIC.TUNING_FORK" => [game.tuning_fork as f32, 0.0, 0.0, 0.0],
-        "RELIC.GALACTIC_DUST" => [game.galactic_dust as f32, 0.0, 0.0, 0.0],
-        "RELIC.BOOK_OF_FIVE_RINGS" => [game.book_of_five_rings as f32, 0.0, 0.0, 0.0],
-        "RELIC.EMBER_TEA" => [game.ember_tea as f32, 0.0, 0.0, 0.0],
-        "RELIC.SWORD_OF_STONE" => [game.sword_of_stone as f32, 0.0, 0.0, 0.0],
-        "RELIC.MAW_BANK" => [flag(game.maw_bank > 0), 0.0, 0.0, 0.0],
-        "RELIC.LIZARD_TAIL" => [flag(game.lizard_tail), 0.0, 0.0, 0.0],
-        "RELIC.SILKEN_TRESS" => [flag(game.silken_tress), 0.0, 0.0, 0.0],
-        "RELIC.BONE_TEA" => [flag(game.bone_tea), 0.0, 0.0, 0.0],
-        "RELIC.TEA_OF_DISCOURTESY" => [flag(game.tea_of_discourtesy), 0.0, 0.0, 0.0],
+        "RELIC.WINGED_BOOTS" => [3u8.saturating_sub(game.winged_boots) as f32, 0.0],
+        "RELIC.GIRYA" => [game.girya as f32, 0.0],
+        "RELIC.PUMPKIN_CANDLE" => [game.pumpkin_candle as f32, 0.0],
+        "RELIC.TOY_BOX" => [(game.toy_box_combats % 3) as f32, 0.0],
+        "RELIC.NUNCHAKU" => [game.nunchaku as f32, 0.0],
+        "RELIC.PENDULUM" => [game.pendulum as f32, 0.0],
+        "RELIC.PEN_NIB" => [game.pen_nib as f32, 0.0],
+        "RELIC.IRON_CLUB" => [game.iron_club as f32, 0.0],
+        "RELIC.JOSS_PAPER" => [game.joss_paper as f32, 0.0],
+        "RELIC.TUNING_FORK" => [game.tuning_fork as f32, 0.0],
+        "RELIC.GALACTIC_DUST" => [game.galactic_dust as f32, 0.0],
+        "RELIC.BOOK_OF_FIVE_RINGS" => [game.book_of_five_rings as f32, 0.0],
+        "RELIC.EMBER_TEA" => [game.ember_tea as f32, 0.0],
+        "RELIC.SWORD_OF_STONE" => [game.sword_of_stone as f32, 0.0],
+        "RELIC.MAW_BANK" => [flag(game.maw_bank > 0), 0.0],
+        "RELIC.LIZARD_TAIL" => [flag(game.lizard_tail), 0.0],
+        "RELIC.SILKEN_TRESS" => [flag(game.silken_tress), 0.0],
+        "RELIC.BONE_TEA" => [flag(game.bone_tea), 0.0],
+        "RELIC.TEA_OF_DISCOURTESY" => [flag(game.tea_of_discourtesy), 0.0],
         "RELIC.WONGOS_MYSTERY_TICKET" => [
             game.wongo_combats
                 .map_or(0, |combats| 5u8.saturating_sub(combats)) as f32,
             0.0,
-            0.0,
-            0.0,
         ],
-        "RELIC.GOLDEN_COMPASS" => [
-            flag(game.golden_compass == Some(game.run.act)),
-            0.0,
-            0.0,
-            0.0,
-        ],
-        "RELIC.MEAT_CLEAVER" | "RELIC.NEOWS_BONES" | "RELIC.ASTROLABE" => [0.0; 4],
-        "RELIC.FISHING_ROD" => [game.fishing_rod as f32, 0.0, 0.0, 0.0],
-        "RELIC.POLLINOUS_CORE" => [game.pollinous_core as f32, 0.0, 0.0, 0.0],
-        "RELIC.PAELS_TOOTH" => [0.0; 4],
-        "RELIC.PAELS_TEARS" => [
-            flag(combat.is_some_and(|combat| combat.paels_tears)),
-            0.0,
-            0.0,
-            0.0,
-        ],
+        "RELIC.GOLDEN_COMPASS" => [flag(game.golden_compass == Some(game.run.act)), 0.0],
+        "RELIC.MEAT_CLEAVER" | "RELIC.NEOWS_BONES" | "RELIC.ASTROLABE" => [0.0; 2],
+        "RELIC.FISHING_ROD" => [game.fishing_rod as f32, 0.0],
+        "RELIC.POLLINOUS_CORE" => [game.pollinous_core as f32, 0.0],
+        "RELIC.PAELS_TOOTH" => [0.0; 2],
+        "RELIC.PAELS_TEARS" => [flag(combat.is_some_and(|combat| combat.paels_tears)), 0.0],
         "RELIC.CENTENNIAL_PUZZLE" => [
             flag(combat.is_some_and(|combat| combat.centennial_puzzle)),
             0.0,
-            0.0,
-            0.0,
         ],
-        "RELIC.DEMON_TONGUE" => [
-            flag(combat.is_some_and(|combat| combat.demon_tongue)),
-            0.0,
-            0.0,
-            0.0,
-        ],
-        "RELIC.PERMAFROST" => [
-            flag(combat.is_some_and(|combat| combat.permafrost)),
-            0.0,
-            0.0,
-            0.0,
-        ],
-        "RELIC.RUINED_HELMET" => [
-            flag(combat.is_some_and(|combat| combat.ruined_helmet)),
-            0.0,
-            0.0,
-            0.0,
-        ],
-        "RELIC.MUSIC_BOX" => [
-            flag(combat.is_some_and(|combat| combat.music_box)),
-            0.0,
-            0.0,
-            0.0,
-        ],
-        "RELIC.MINI_REGENT" => [
-            flag(combat.is_some_and(|combat| combat.mini_regent)),
-            0.0,
-            0.0,
-            0.0,
-        ],
-        "RELIC.RAINBOW_RING" => [
-            flag(combat.is_some_and(|combat| combat.rainbow_ring)),
-            0.0,
-            0.0,
-            0.0,
-        ],
-        "RELIC.KUSARIGAMA" => [
-            combat.map_or(0, |combat| combat.attacks_mod3) as f32,
-            0.0,
-            0.0,
-            0.0,
-        ],
+        "RELIC.DEMON_TONGUE" => [flag(combat.is_some_and(|combat| combat.demon_tongue)), 0.0],
+        "RELIC.PERMAFROST" => [flag(combat.is_some_and(|combat| combat.permafrost)), 0.0],
+        "RELIC.RUINED_HELMET" => [flag(combat.is_some_and(|combat| combat.ruined_helmet)), 0.0],
+        "RELIC.MUSIC_BOX" => [flag(combat.is_some_and(|combat| combat.music_box)), 0.0],
+        "RELIC.MINI_REGENT" => [flag(combat.is_some_and(|combat| combat.mini_regent)), 0.0],
+        "RELIC.RAINBOW_RING" => [flag(combat.is_some_and(|combat| combat.rainbow_ring)), 0.0],
+        "RELIC.KUSARIGAMA" => [combat.map_or(0, |combat| combat.attacks_mod3) as f32, 0.0],
         "RELIC.UNSETTLING_LAMP" => [
             flag(combat.is_some_and(|combat| combat.unsettling_used)),
-            0.0,
-            0.0,
             0.0,
         ],
         "RELIC.DIAMOND_DIADEM" => [
             flag(combat.is_some_and(|combat| combat.player.power(power_id::DIAMOND_DIADEM) > 0)),
             0.0,
-            0.0,
-            0.0,
         ],
         "RELIC.BURNING_STICKS" => [
             flag(combat.is_some_and(|combat| combat.burning_sticks)),
             0.0,
-            0.0,
-            0.0,
         ],
-        "RELIC.THROWING_AXE" => [
-            flag(combat.is_some_and(|combat| combat.throwing_axe)),
-            0.0,
-            0.0,
-            0.0,
-        ],
-        "RELIC.PAELS_EYE" => [
-            flag(combat.is_some_and(|combat| combat.paels_eye)),
-            0.0,
-            0.0,
-            0.0,
-        ],
-        "RELIC.PAELS_LEGION" => [
-            combat.map_or(0, |combat| combat.paels_legion) as f32,
-            0.0,
-            0.0,
-            0.0,
-        ],
-        "RELIC.BELT_BUCKLE" => [
-            flag(combat.is_some_and(|combat| combat.belt_buckle)),
-            0.0,
-            0.0,
-            0.0,
-        ],
-        _ => [0.0; 4],
+        "RELIC.THROWING_AXE" => [flag(combat.is_some_and(|combat| combat.throwing_axe)), 0.0],
+        "RELIC.PAELS_EYE" => [flag(combat.is_some_and(|combat| combat.paels_eye)), 0.0],
+        "RELIC.PAELS_LEGION" => [combat.map_or(0, |combat| combat.paels_legion) as f32, 0.0],
+        "RELIC.BELT_BUCKLE" => [flag(combat.is_some_and(|combat| combat.belt_buckle)), 0.0],
+        _ => [0.0; 2],
     }
 }
 
@@ -4953,32 +4830,12 @@ fn push_collection_domains(
 ) {
     for (order, &id) in game.run.relics.iter().enumerate() {
         let mut row = DomainRow::new(RELIC_DOMAIN, STATE_SCOPE);
-        row.u[..8].copy_from_slice(&[
-            0,
-            id as u32,
-            order as u32 + 1,
-            crate::game::relic_group(id).map_or(4, |rarity| rarity as u32),
-            0,
-            game.melted_relics.contains(&order) as u32,
-            game.wax_relics
-                .iter()
-                .filter(|wax| !game.melted_relics.contains(wax))
-                .position(|&wax| wax == order)
-                .map_or(0, |position| position as u32 + 1),
-            order as u32 + 1,
-        ]);
-        if content.relics[id as usize].id == "RELIC.UNSETTLING_LAMP" {
-            row.u[8] = game
-                .combat()
-                .and_then(|combat| combat.unsettling_lamp)
-                .map_or(0, |id| id as u32 + 1);
-        }
-        row.u[9] = (content.relics[id as usize].id == "RELIC.PAELS_TOOTH") as u32;
-        row.s[..4]
+        row.u.copy_from_slice(&[0, id as u32, order as u32 + 1]);
+        row.s[..2]
             .copy_from_slice(&relic_state(game, content, id).map(|value| value.round() as i32));
         if let Some(position) = game.wax_relics.iter().position(|&wax| wax == order) {
-            row.s[4] = 1;
-            row.s[5] = (3 + game.toy_box_combats / 3)
+            row.s[2] = 1;
+            row.s[3] = (3 + game.toy_box_combats / 3)
                 .saturating_sub(position as u8)
                 .min(4) as i32;
         }
@@ -4986,12 +4843,7 @@ fn push_collection_domains(
     }
     for &id in public_relic_bag(game, layout).iter().flatten() {
         let mut row = DomainRow::new(RELIC_DOMAIN, STATE_SCOPE);
-        row.u[..4].copy_from_slice(&[
-            1,
-            id as u32,
-            0,
-            crate::game::relic_group(id).unwrap_or(4) as u32,
-        ]);
+        row.u.copy_from_slice(&[1, id as u32, 0]);
         domains[RELIC_DOMAIN].push(row);
     }
     for (slot, potion) in game.run.potions.iter().enumerate() {
@@ -5361,12 +5213,8 @@ impl ContinuationBuilder {
                 )),
                 Payload::Relic(id) => {
                     let mut row = DomainRow::new(RELIC_DOMAIN, scope);
-                    row.u[..4].copy_from_slice(&[
-                        CONTINUATION_RELIC_ZONE,
-                        id as u32,
-                        0,
-                        crate::game::relic_group(id).unwrap_or(4) as u32,
-                    ]);
+                    row.u
+                        .copy_from_slice(&[CONTINUATION_RELIC_ZONE, id as u32, 0]);
                     domains[RELIC_DOMAIN].push(row);
                 }
                 Payload::Potion(id) => {
@@ -6391,7 +6239,7 @@ fn candidate_domain_rows(
                 && let Some(&id) = rewards.relics.get(*index)
             {
                 let mut row = DomainRow::new(RELIC_DOMAIN, scope);
-                row.u[..4].copy_from_slice(&[
+                row.u.copy_from_slice(&[
                     if game.toy_box_offers.contains(&id) {
                         5
                     } else {
@@ -6399,7 +6247,6 @@ fn candidate_domain_rows(
                     },
                     id as u32,
                     *index as u32 + 1,
-                    crate::game::relic_group(id).unwrap_or(4) as u32,
                 ]);
                 domains[RELIC_DOMAIN].push(row);
             }
@@ -6420,12 +6267,7 @@ fn candidate_domain_rows(
                 match item {
                     ShopItem::Relic(id, price) => {
                         let mut row = DomainRow::new(RELIC_DOMAIN, scope);
-                        row.u[..4].copy_from_slice(&[
-                            6,
-                            *id as u32,
-                            *index as u32 + 1,
-                            crate::game::relic_group(*id).unwrap_or(4) as u32,
-                        ]);
+                        row.u.copy_from_slice(&[6, *id as u32, *index as u32 + 1]);
                         row.s[0] = *price;
                         domains[RELIC_DOMAIN].push(row);
                     }
@@ -6470,12 +6312,7 @@ fn candidate_domain_rows(
                 }
                 if let Some(id) = ancient_offer(game, content, *index) {
                     let mut row = DomainRow::new(RELIC_DOMAIN, scope);
-                    row.u[..4].copy_from_slice(&[
-                        7,
-                        id as u32,
-                        *index as u32 + 1,
-                        crate::game::relic_group(id).unwrap_or(4) as u32,
-                    ]);
+                    row.u.copy_from_slice(&[7, id as u32, *index as u32 + 1]);
                     domains[RELIC_DOMAIN].push(row);
                 }
                 if content.events[*id as usize].id == "EVENT.RANWID_THE_ELDER"
@@ -6484,12 +6321,7 @@ fn candidate_domain_rows(
                     && let Some(&id) = game.run.relics.get(owned as usize)
                 {
                     let mut row = DomainRow::new(RELIC_DOMAIN, scope);
-                    row.u[..4].copy_from_slice(&[
-                        11,
-                        id as u32,
-                        owned + 1,
-                        crate::game::relic_group(id).unwrap_or(4) as u32,
-                    ]);
+                    row.u.copy_from_slice(&[11, id as u32, owned + 1]);
                     domains[RELIC_DOMAIN].push(row);
                 }
                 if Some(*id) == layout.relic_trader {
@@ -6505,12 +6337,8 @@ fn candidate_domain_rows(
                     .filter_map(|(kind, id)| id.map(|id| (kind, id)))
                     {
                         let mut row = DomainRow::new(RELIC_DOMAIN, scope);
-                        row.u[..4].copy_from_slice(&[
-                            8 + kind as u32,
-                            id as u32,
-                            *index as u32 + 1,
-                            crate::game::relic_group(id).unwrap_or(4) as u32,
-                        ]);
+                        row.u
+                            .copy_from_slice(&[8 + kind as u32, id as u32, *index as u32 + 1]);
                         domains[RELIC_DOMAIN].push(row);
                     }
                 }
@@ -6528,12 +6356,7 @@ fn candidate_domain_rows(
         }
         Action::EventRelic(index, id) => {
             let mut row = DomainRow::new(RELIC_DOMAIN, scope);
-            row.u[..4].copy_from_slice(&[
-                10,
-                *id as u32,
-                *index as u32 + 1,
-                crate::game::relic_group(*id).unwrap_or(4) as u32,
-            ]);
+            row.u.copy_from_slice(&[10, *id as u32, *index as u32 + 1]);
             domains[RELIC_DOMAIN].push(row);
         }
         Action::RerollCards => {
@@ -6640,10 +6463,17 @@ fn packed_observation_digest(
     actions: &[u32],
 ) -> u64 {
     let update = |digest: u64, value: u64| (digest ^ value).wrapping_mul(0x100_0000_01b3);
-    let mut digest = [VERSION, VALUE_MODEL_VERSION, character as u32, globals.len() as u32]
-        .into_iter()
-        .chain(globals.iter().map(|value| value.to_bits()))
-        .fold(0xcbf2_9ce4_8422_2325, |digest, value| update(digest, value as u64));
+    let mut digest = [
+        VERSION,
+        VALUE_MODEL_VERSION,
+        character as u32,
+        globals.len() as u32,
+    ]
+    .into_iter()
+    .chain(globals.iter().map(|value| value.to_bits()))
+    .fold(0xcbf2_9ce4_8422_2325, |digest, value| {
+        update(digest, value as u64)
+    });
     for values in [counts, exact, actions] {
         let mut lanes = [digest ^ values.len() as u64, 1, 2, 3];
         let mut chunks = values.chunks_exact(4);
@@ -7253,3 +7083,13 @@ use value_model::{LinearWeights, TokenEncoderWeights, content_fingerprint, valid
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+/// Pael's Tooth's relic id: the relic row its stored cards attach to.
+pub(crate) fn paels_tooth() -> u32 {
+    static ID: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+        crate::foundation_content()
+            .relic_id("RELIC.PAELS_TOOTH")
+            .unwrap() as u32
+    });
+    *ID
+}
