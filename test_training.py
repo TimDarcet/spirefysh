@@ -1246,6 +1246,32 @@ class ModelKernelTest(unittest.TestCase):
                                            atol=1e-2 * float(right.abs().max()))
 
     @unittest.skipUnless(torch.backends.mps.is_available(), "requires MPS")
+    def test_mps_sparse_attention_matches_ragged(self):
+        torch.manual_seed(0)
+        lengths = torch.tensor([1, 5, 40, 17, 9, 70])
+        offsets = torch.cat((torch.zeros(1, dtype=torch.long), lengths.cumsum(0)))
+        sequence = torch.repeat_interleave(torch.arange(len(lengths)), lengths)
+        positions = torch.cat([torch.randperm(int(n))[:int(k)].sort().values + int(start) for n, k, start in
+                               zip(lengths, (1, 3, 12, 0, 9, 20), offsets)])
+        query_offsets = torch.cat((torch.zeros(1, dtype=torch.long),
+                                   torch.bincount(sequence[positions], minlength=len(lengths)).cumsum(0)))
+        qkv = (torch.randn(int(offsets[-1]), 384) * 2).bfloat16().to("mps")
+        grad = torch.randn(len(positions), 128).bfloat16().to("mps")
+        mps = lambda value: value.to("mps", torch.int32)
+        results = []
+        for attention in (
+            lambda value: model._RaggedAttention.apply(value, mps(offsets), mps(sequence), 4, mps(positions),
+                                                       mps(query_offsets), True, True),
+            lambda value: model._SparseAttention.apply(value, mps(offsets), mps(query_offsets), mps(positions)),
+        ):
+            value = qkv.clone().requires_grad_()
+            output = attention(value)
+            output.backward(grad)
+            results.append((output.float().cpu(), value.grad.float().cpu()))
+        for expected, actual in zip(*results):
+            torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2 * float(expected.abs().max()))
+
+    @unittest.skipUnless(torch.backends.mps.is_available(), "requires MPS")
     def test_mps_feed_forward_matches_unfused(self):
         torch.manual_seed(0)
         modules = torch.nn.LayerNorm(128), torch.nn.Linear(128, 128), torch.nn.Linear(128, 128)

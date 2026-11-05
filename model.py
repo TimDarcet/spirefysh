@@ -1290,15 +1290,48 @@ class _RaggedAttention(torch.autograd.Function):
 
 
 @_committed
+class _SparseAttention(torch.autograd.Function):
+    # Final-layer attention of the selected query rows over their sequences, 4 heads of width 32.
+    @staticmethod
+    def forward(ctx, qkv, offsets, query_offsets, positions):
+        library = _FlashAttention.compiled()
+        output = qkv.new_empty((len(positions), 128))
+        lse = torch.empty((len(positions), 4), dtype=torch.float32, device=qkv.device)
+        library.sparse_forward(offsets, query_offsets, positions, qkv, output, lse,
+                               threads=(len(offsets) - 1) * 128, group_size=128)
+        ctx.save_for_backward(qkv, offsets, query_offsets, positions, output, lse)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        qkv, offsets, query_offsets, positions, output, lse = ctx.saved_tensors
+        grad_output, grad_qkv = grad_output.to(torch.bfloat16).contiguous(), torch.empty_like(qkv)
+        arguments = offsets, query_offsets, positions, qkv
+        threads = (len(offsets) - 1) * 128
+        library, delta = _FlashAttention.library, torch.empty_like(lse)
+        library.sparse_delta(output, grad_output, delta, threads=delta.numel(), group_size=256)
+        library.sparse_backward_key_value(*arguments, lse, delta, grad_output, grad_qkv,
+                                          threads=threads, group_size=128)
+        library.sparse_backward_query(*arguments, output, lse, grad_output, grad_qkv,
+                                      threads=threads, group_size=128)
+        return grad_qkv, None, None, None
+
+
+@_committed
 class _FlashAttention(torch.autograd.Function):
     library = None
 
     @staticmethod
-    def forward(ctx, qkv, offsets, lengths, chunk_rows, chunk_starts, real_tokens):
+    def compiled():
         if _FlashAttention.library is None:
             _FlashAttention.library = torch.mps.compile_shader(
                 Path(__file__).with_name("attention.metal").read_text()
             )
+        return _FlashAttention.library
+
+    @staticmethod
+    def forward(ctx, qkv, offsets, lengths, chunk_rows, chunk_starts, real_tokens):
+        _FlashAttention.compiled()
         output = qkv.new_empty((len(qkv), qkv.shape[1] // 3))
         output[real_tokens:] = 0
         lse = torch.empty((len(qkv), 4), dtype=torch.float32, device=qkv.device)
@@ -2433,7 +2466,11 @@ class Agent(nn.Module):
                 fp32_value_backward = final_attention \
                     and layer_index + 1 == len(transformer.layers) \
                     and self.precision == "bf16_with_fp32_dV"
-                if fp32_value_backward:
+                if flash and sparse:
+                    attended = _SparseAttention.apply(
+                        qkv, metal_offsets, query_offsets.to(torch.int32), selected.to(torch.int32),
+                    )
+                elif fp32_value_backward:
                     attended = _RaggedAttention.apply(
                         qkv, offsets.to(torch.int32), sequence.to(torch.int32),
                         layer.self_attn.num_heads, selected.to(torch.int32),
