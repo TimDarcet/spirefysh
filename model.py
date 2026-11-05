@@ -1367,7 +1367,8 @@ def _linear_kernel(name, a, b, output, rows, columns, depth, bias=None, residual
     )
 
 
-def _linear_forward(value_bfloat, weight, bias, residual=None):
+def _linear_forward(value_bfloat, weight, bias, residual=None, hidden=None):
+    # With hidden, the biased output goes to hidden and its gelu is returned.
     weight_bfloat = weight.to(torch.bfloat16)
     output = value_bfloat.new_empty(
         (len(value_bfloat), len(weight)),
@@ -1375,20 +1376,24 @@ def _linear_forward(value_bfloat, weight, bias, residual=None):
     )
     bias = bias.float() if bias is not None else weight.new_zeros(len(weight), dtype=torch.float32)
     _linear_kernel(
-        "linear" if residual is None else "linear_residual", value_bfloat, weight_bfloat, output,
-        len(value_bfloat), len(weight), value_bfloat.shape[1], bias, residual,
+        "linear_gelu" if hidden is not None else "linear" if residual is None else "linear_residual",
+        value_bfloat, weight_bfloat, output, len(value_bfloat), len(weight), value_bfloat.shape[1], bias,
+        residual if hidden is None else hidden,
     )
     return output, weight_bfloat
 
 
-def _linear_backward(value, weight, grad_output):
+def _linear_backward(value, weight, grad_output, hidden=None):
+    # With hidden, value is gelu(hidden) and grad_value is the gradient of hidden.
     grad_output = grad_output.contiguous() if grad_output.dtype == torch.float32 \
         else grad_output.to(torch.bfloat16).contiguous()
     suffix = "_float" if grad_output.dtype == torch.float32 else ""
+    gelu = "_gelu" if hidden is not None else ""
     rows, columns, depth = len(value), value.shape[1], len(weight)
     grad_value = torch.empty_like(value)
     _linear_kernel(
-        "linear_input_grad" + suffix, grad_output, weight, grad_value, rows, columns, depth,
+        "linear_input_grad" + suffix + gelu, grad_output, weight, grad_value, rows, columns, depth,
+        residual=hidden,
     )
     grad_weight = weight.new_zeros((depth, columns), dtype=torch.float32)
     grad_bias = weight.new_zeros(depth, dtype=torch.float32)
@@ -1474,18 +1479,23 @@ class _LayerNorm(torch.autograd.Function):
         return _layer_norm_backward(value, gamma, stats, grad_output.float().contiguous())
 
 
+def _layer_norm_forward(value, gamma, beta):
+    if _RaggedAttention.library is None:
+        _RaggedAttention.library = torch.mps.compile_shader(_TRAINING_METAL)
+    normalized = torch.empty_like(value, dtype=torch.bfloat16)
+    stats = value.new_empty((len(value), 2))
+    _RaggedAttention.library.layer_norm_forward_bfloat(
+        value, gamma, beta, normalized, stats, len(value), value.shape[1],
+        threads=len(value) * 32, group_size=32,
+    )
+    return normalized, stats
+
+
 @_committed
 class _NormLinear(torch.autograd.Function):
     @staticmethod
     def forward(ctx, value, gamma, beta, weight, bias):
-        if _RaggedAttention.library is None:
-            _RaggedAttention.library = torch.mps.compile_shader(_TRAINING_METAL)
-        normalized = torch.empty_like(value, dtype=torch.bfloat16)
-        stats = value.new_empty((len(value), 2))
-        _RaggedAttention.library.layer_norm_forward_bfloat(
-            value, gamma, beta, normalized, stats, len(value), value.shape[1],
-            threads=len(value) * 32, group_size=32,
-        )
+        normalized, stats = _layer_norm_forward(value, gamma, beta)
         output, weight_bfloat = _linear_forward(normalized, weight, bias)
         ctx.save_for_backward(value, gamma, normalized, stats, weight_bfloat)
         return output, value.view_as(value)
@@ -1502,6 +1512,32 @@ class _NormLinear(torch.autograd.Function):
             value, gamma, stats, grad_normalized, grad_residual,
         )
         return grad_value, grad_gamma, grad_beta, grad_weight, grad_bias
+
+
+@_committed
+class _FeedForward(torch.autograd.Function):
+    # value + second(gelu(first(norm(value)))), with gelu applied in the matmul epilogues.
+    @staticmethod
+    def forward(ctx, value, gamma, beta, weight1, bias1, weight2, bias2):
+        normalized, stats = _layer_norm_forward(value, gamma, beta)
+        hidden = value.new_empty((len(value), len(weight1)), dtype=torch.bfloat16)
+        activated, weight1_bfloat = _linear_forward(normalized, weight1, bias1, hidden=hidden)
+        output, weight2_bfloat = _linear_forward(activated, weight2, bias2, value)
+        ctx.save_for_backward(value, gamma, normalized, stats, weight1_bfloat, hidden, activated,
+                              weight2_bfloat)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        value, gamma, normalized, stats, weight1, hidden, activated, weight2 = ctx.saved_tensors
+        grad_hidden, grad_weight2, grad_bias2 = _linear_backward(
+            activated, weight2, grad_output.float(), hidden,
+        )
+        grad_normalized, grad_weight1, grad_bias1 = _linear_backward(normalized, weight1, grad_hidden)
+        grad_value, grad_gamma, grad_beta = _layer_norm_backward(
+            value, gamma, stats, grad_normalized, grad_output,
+        )
+        return grad_value, grad_gamma, grad_beta, grad_weight1, grad_bias1, grad_weight2, grad_bias2
 
 
 @_committed
@@ -1548,6 +1584,15 @@ def _norm_linear(value, norm, weight, bias):
             and torch.is_autocast_enabled("mps") and value.shape[1] == 128):
         return _NormLinear.apply(value, norm.weight, norm.bias, weight, bias)
     return nn.functional.linear(norm(value), weight, bias), value
+
+
+def _feed_forward(value, norm, first, second):
+    if (value.device.type == "mps" and value.dtype == torch.float32
+            and torch.is_autocast_enabled("mps") and value.shape[1] == len(first.weight) == 128):
+        return _FeedForward.apply(value, norm.weight, norm.bias, first.weight, first.bias,
+                                  second.weight, second.bias)
+    hidden, value = _norm_linear(value, norm, first.weight, first.bias)
+    return _residual_linear(nn.functional.gelu(hidden), second, value)
 
 
 def _layer_norm(value, norm):
@@ -2106,10 +2151,7 @@ class Agent(nn.Module):
                     self.graph_key_value.bias,
                 )[0], sequence)
                 updated = _residual_linear(attended, self.graph_out, parent)
-                hidden, updated = _norm_linear(
-                    updated, self.graph_ff_norm, self.graph_ff[0].weight, self.graph_ff[0].bias,
-                )
-                updated = _residual_linear(self.graph_ff[1](hidden), self.graph_ff[2], updated)
+                updated = _feed_forward(updated, self.graph_ff_norm, self.graph_ff[0], self.graph_ff[2])
                 nodes.index_put_((parents[:count],), updated[:count])
             if cacheable:
                 offsets = offsets.tolist()
@@ -2319,10 +2361,7 @@ class Agent(nn.Module):
                 return _residual_linear(attended, layer.self_attn.out_proj, residual)
 
             def feed_forward(current, layer):
-                hidden, current = _norm_linear(
-                    current, layer.norm2, layer.linear1.weight, layer.linear1.bias,
-                )
-                return _residual_linear(layer.activation(hidden), layer.linear2, current)
+                return _feed_forward(current, layer.norm2, layer.linear1, layer.linear2)
 
             for layer_index, layer in enumerate(transformer.layers):
                 if selected_count is not None and layer_index == len(transformer.layers) - 1:

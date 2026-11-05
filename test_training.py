@@ -1245,6 +1245,25 @@ class ModelKernelTest(unittest.TestCase):
                 torch.testing.assert_close(left.float(), right.float(), rtol=1e-2,
                                            atol=1e-2 * float(right.abs().max()))
 
+    @unittest.skipUnless(torch.backends.mps.is_available(), "requires MPS")
+    def test_mps_feed_forward_matches_unfused(self):
+        torch.manual_seed(0)
+        modules = torch.nn.LayerNorm(128), torch.nn.Linear(128, 128), torch.nn.Linear(128, 128)
+        value = torch.randn(4097, 128)
+        results = []
+        for device in ("cpu", "mps"):
+            for module in modules:
+                module.to(device).zero_grad()
+            inputs = value.to(device).detach().requires_grad_()
+            with torch.autocast(device, dtype=torch.bfloat16):
+                output = model._feed_forward(inputs, *modules)
+            output.float().square().sum().backward()
+            results.append([tensor.detach().float().cpu() for tensor in (
+                output, inputs.grad, *(parameter.grad for module in modules for parameter in module.parameters())
+            )])
+        for expected, actual in zip(*results):
+            torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2 * float(expected.abs().max()))
+
 
 class TrajectoryTest(unittest.TestCase):
     @staticmethod
