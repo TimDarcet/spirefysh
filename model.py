@@ -2126,7 +2126,7 @@ class Agent(nn.Module):
         return torch.where(legal, value, torch.zeros_like(value))
 
     def encode_map(self, encoded, index):
-        node_source, edge_source, levels, offsets, current, current_inverse, keys = index
+        node_source, edge_source, levels, offsets, current, current_inverse, keys, rows, sizes, parents = index
         cacheable = not self.training and not self._trace_graph and node_source.device.type == "cpu"
         cached = [self._graph_cache.get(key) for key in keys] if cacheable else [None] * len(keys)
         if cacheable and all(x is not None for x in cached):
@@ -2142,17 +2142,21 @@ class Agent(nn.Module):
                 for graph, value in enumerate(cached):
                     if value is not None:
                         nodes[ranges[graph]:ranges[graph + 1]] = value
-            for parents, children, edge_rows, sequence, degree, count, _edge_count in levels:
+            # Parents are read before their only update, so one gather serves every level.
+            gathered, updates = nodes[rows].split(sizes), []
+            for (local, sequence, count, gap), parent_rows, leaves in zip(levels, gathered[::2], gathered[1::2]):
                 query, parent = _norm_linear(
-                    nodes[parents], self.graph_norm, self.graph_query.weight, self.graph_query.bias,
+                    parent_rows, self.graph_norm, self.graph_query.weight, self.graph_query.bias,
                 )
+                children = torch.cat((leaves, *updates[len(updates) - gap:]))[local]
                 attended = self.attend(query, _norm_linear(
-                    nodes[children], self.graph_norm, self.graph_key_value.weight,
-                    self.graph_key_value.bias,
+                    children, self.graph_norm, self.graph_key_value.weight, self.graph_key_value.bias,
                 )[0], sequence)
                 updated = _residual_linear(attended, self.graph_out, parent)
                 updated = _feed_forward(updated, self.graph_ff_norm, self.graph_ff[0], self.graph_ff[2])
-                nodes.index_put_((parents[:count],), updated[:count])
+                updates.append(updated[:count])
+            if updates:
+                nodes = nodes.index_put((parents,), torch.cat(updates))
             if cacheable:
                 offsets = offsets.tolist()
                 for graph, key in enumerate(keys):
@@ -3091,32 +3095,33 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
         selected = selected[missing[graph_for_node[parents]][group]]
         if len(selected):
             parents, group = np.unique(edge_src[selected], return_inverse=True)
-            levels.append((
-                parents, edge_dst[selected], selected, group,
-                np.zeros(len(parents), np.float32),
-            ))
-    if pad:
-        padded = []
-        for parents, children, edges, group, degree in levels:
-            count, edge_count = len(parents), len(children)
-            edge_size = bucket(edge_count)
-            parent_size = bucket(count + (edge_size > edge_count))
-            extra = edge_size - edge_count
-            padded.append((
-                tensor(np.pad(parents, (0, parent_size - count))),
-                tensor(np.pad(children, (0, extra))), tensor(np.pad(edges, (0, extra))),
-                candidate_index(np.r_[group, np.full(extra, count, np.int32)],
-                                parent_size, target, True),
-                torch.as_tensor(np.pad(degree, (0, parent_size - count)), device=target),
-                count, edge_count,
-            ))
-        levels = padded
-    else:
-        levels = [(
-            tensor(parents), tensor(children), tensor(edges),
-            candidate_index(group, len(parents), target),
-            torch.as_tensor(degree, device=target), len(parents), len(children),
-        ) for parents, children, edges, group, degree in levels]
+            levels.append((parents, edge_dst[selected], group))
+    # Children are leaves or nodes updated by recent levels: each level reads them from a small pool of
+    # its leaves followed by the outputs of the previous `gap` levels.
+    node_level, node_position = np.full(len(node_source), -1), np.zeros(len(node_source), np.int64)
+    for level, (parents, _children, _group) in enumerate(levels):
+        node_level[parents], node_position[parents] = level, np.arange(len(parents))
+    map_rows, map_sizes, padded = [], [], []
+    for level, (parents, children, group) in enumerate(levels):
+        child_level = node_level[children]
+        leaves = np.unique(children[child_level < 0])
+        gap = level - int(child_level[child_level >= 0].min(initial=level))
+        starts = np.cumsum([len(leaves)] + [len(levels[previous][0]) for previous in range(level - gap, level)])
+        local = np.where(child_level < 0, np.searchsorted(leaves, children),
+                         starts[np.clip(child_level - level + gap, 0, None)] + node_position[children])
+        count, edge_count = len(parents), len(children)
+        edge_size = bucket(edge_count) if pad else edge_count
+        parent_size = bucket(count + (edge_size > edge_count)) if pad else count
+        extra = edge_size - edge_count
+        map_rows += [np.pad(parents, (0, parent_size - count)), leaves]
+        map_sizes += [parent_size, len(leaves)]
+        padded.append((
+            tensor(np.pad(local, (0, extra))),
+            candidate_index(np.r_[group, np.full(extra, count, np.int32)], parent_size, target, bool(pad)),
+            count, gap,
+        ))
+    map_parents = np.concatenate([parents for parents, _children, _group in levels] or [np.empty(0, np.int64)])
+    levels = padded
     run_u, _run_s, _run_c, _run_f, run_row, run_scope = domains[DOMAIN["run"]]
     run_source = np.flatnonzero(run_scope == -1)
     current_id = np.full(batch, np.iinfo(np.uint32).max, np.uint32)
@@ -3135,6 +3140,8 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
         tensor(inverse_rows[DOMAIN["map_edge"]][edge_source]), tuple(levels),
         tensor(node_offsets), tensor(current), tensor(current_inverse),
         tuple(graph_keys[row] for row in representatives) if graph_keys else (),
+        tensor(np.concatenate(map_rows or [np.empty(0, np.int64)])), tuple(map_sizes),
+        tensor(map_parents),
     )
 
     action_u, _action_s, action_c, action_f = action
