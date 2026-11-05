@@ -96,6 +96,9 @@ def start_collator(model):
     global COLLATOR_MODEL
     COLLATOR_MODEL = model
     ctypes.CDLL(None).pthread_set_qos_class_self_np(0x21, 0)
+    # Wider pools spin: 4 Rust threads cost the CPU time of one, torch ops here are tiny.
+    os.environ["RAYON_NUM_THREADS"] = "4"
+    torch.set_num_threads(1)
 
 
 def collate(rows, training):
