@@ -118,6 +118,7 @@ fn model_schema() -> (
     Vec<(&'static str, usize, usize, usize, usize)>,
     Vec<&'static str>,
     Vec<(&'static str, u32)>,
+    u32,
 ) {
     (
         VERSION,
@@ -132,6 +133,7 @@ fn model_schema() -> (
             .collect(),
         SEMANTIC_NAMES.to_vec(),
         POSITION_NAMES.into_iter().zip(POSITION_CAPS).collect(),
+        paels_tooth(),
     )
 }
 

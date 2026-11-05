@@ -512,12 +512,7 @@ pub(super) fn concept_labels(content: &Content) -> Vec<String> {
                     ),
                 },
                 n if n == Semantic::Power as usize => content.powers[value].id.to_string(),
-                n if n == Semantic::Relic as usize
-                    || (Semantic::RelicCounter0 as usize..=Semantic::RelicCounter5 as usize)
-                        .contains(&n) =>
-                {
-                    content.relics[value].id.to_string()
-                }
+                n if n == Semantic::Relic as usize => content.relics[value].id.to_string(),
                 n if n == Semantic::Potion as usize => content
                     .potions
                     .get(value)

@@ -17,7 +17,7 @@ from torch import nn
 import sts2_sim
 
 FEATURE_VERSION, MODEL_VERSION, CATEGORIES, MAX_PROGRESS, ACTION_FIELDS, TOKEN_SPECS, \
-    SEMANTIC_NAMES, POSITION_CAPS = sts2_sim.model_schema()
+    SEMANTIC_NAMES, POSITION_CAPS, PAELS_TOOTH = sts2_sim.model_schema()
 ACTION_FIELDS = tuple(ACTION_FIELDS)
 TOKEN_SPECS = tuple(tuple(row) for row in TOKEN_SPECS)
 SEMANTIC_NAMES = tuple(SEMANTIC_NAMES)
@@ -2800,7 +2800,7 @@ class Agent(nn.Module):
                 if len(stored):
                     payload.index_put_((stored_rows,), stored.to(payload.dtype), accumulate=True)
                     payload = _linear(payload, self.pael_cards)
-                pael = item_u[:, 1] != 0
+                pael = item_u[:, 1] == PAELS_TOOTH
                 item = item + pael[:, None] * payload[item_rows]
             item, item_rows = self._collection(item, item_rows, active, name)
             add(item, item_rows, name)
@@ -3162,7 +3162,7 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
         size = bucket(count) if pad else count
         metadata = u[:, 3:4] if name == "phase" else \
             u[:, [0, 2, 3, 19]] if name == "card" else \
-            u[:, 1:2] if name in ("actor", "map_node") else u[:, [2, 9]] \
+            u[:, 1:2] if name in ("actor", "map_node") else u[:, [2, 1]] \
             if name == "relic" else np.empty((len(u), 0), np.uint32)
         feature_metadata = metadata[first]
         if name == "map_node" and unique is not None:

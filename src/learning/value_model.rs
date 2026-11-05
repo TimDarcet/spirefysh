@@ -1178,7 +1178,7 @@ impl ValueModel {
             });
         let stored = self.pael_cards.apply(&stored);
         for (row, value) in &mut relics {
-            if row.u[9] != 0 {
+            if row.u[1] == paels_tooth() {
                 value
                     .iter_mut()
                     .zip(&stored)

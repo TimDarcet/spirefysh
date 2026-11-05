@@ -12,7 +12,7 @@ unsigned/signed row fields, `÷ n` the scale applied.
 | card (44) | own energy cost ÷10, value ÷30, own star cost ÷10, enchantment amount ÷30, enchantment value ÷30, replays ÷5, 16 card flags, 16 turn flags, 5 cost-modifier kinds (absolute, this turn, until played, reduce-only, star), cost modifiers ÷6 |
 | actor (12) | HP ÷30, max HP ÷30, block ÷30, (player only:) max energy ÷5, draw per turn ÷10, orb slots ÷10, energy ÷5, stars ÷5, turn ÷10; HP fraction, missing HP fraction, block fraction |
 | power (2) | amount ÷30, value ÷30 |
-| relic (1) | Pumpkin Candle counter (raw, unscaled, only that relic) |
+| relic (4) | owned relics only: main state ÷10 (counter, uses left or 0/1 flag; any size), Silver Crucible treasures left ÷10, is Wax, Wax melt-queue rank ÷4 (1 = melted) |
 | orb (1) | value ÷30 |
 | history (29) | player row: cards, manual cards, manual plays, attacks, skills, powers, energy, exhausted, discarded, shivs, stars gained, generated, ethereal, extra drawn, doom applied, Osty attacks, block gains, block card, block card gains, HP lost ÷30, HP loss events, feral returns, last cards, orbit spent, lightning channeled, orbs channeled, poisoned, last damage ÷30, drawn (all others ÷10). Enemy move-history rows leave all 29 at 0: two row types, not overloaded columns |
 | action f0–f8 | expected block ÷30, expected target damage ÷30, expected total damage ÷30, player HP delta ÷30, expected draw ÷10, discard ÷10, exhaust ÷10, energy cost ÷10, star cost ÷10 |

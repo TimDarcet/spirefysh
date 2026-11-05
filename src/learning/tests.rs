@@ -2252,56 +2252,22 @@ fn v56_dynamic_event_ids_use_typed_semantics() {
 }
 
 #[test]
-fn v57_relic_counters_are_identity_specific_and_linear() {
+fn relic_counters_are_numeric_inputs_of_any_size() {
     let content = foundation_content();
     let layout = Layout::new(&content);
     let game = Game::new_character_ascension(&content, 555, 0, 10).unwrap();
-    let id = content.relic_id("RELIC.HAPPY_FLOWER").unwrap();
-    let row = |counter| {
+    for (relic, counter) in [("RELIC.POLLINOUS_CORE", 25), ("RELIC.PUMPKIN_CANDLE", 300)] {
         let mut row = DomainRow::new(RELIC_DOMAIN, STATE_SCOPE);
-        row.u[..4].copy_from_slice(&[0, id as u32, 1, 0]);
+        row.u[1] = content.relic_id(relic).unwrap() as u32;
         row.s[0] = counter;
         populate_domain_features(&game, &content, layout, RELIC_DOMAIN, &mut row);
-        row
-    };
-    let counter = layout.semantic(Semantic::RelicCounter0, id as u32);
-    assert_eq!(row(0).c.iter().filter(|&&code| code == counter).count(), 0);
-    assert_eq!(row(2).c.iter().filter(|&&code| code == counter).count(), 2);
-    let id = content.relic_id("RELIC.SILVER_CRUCIBLE").unwrap();
-    let capped = |counter| {
-        let mut row = DomainRow::new(RELIC_DOMAIN, STATE_SCOPE);
-        row.u[..4].copy_from_slice(&[0, id as u32, 1, 0]);
-        row.s[0] = counter;
-        populate_domain_features(&game, &content, layout, RELIC_DOMAIN, &mut row);
-        row
-    };
-    let counter = layout.semantic(Semantic::RelicCounter0, id as u32);
-    assert_eq!(
-        capped(2).c.iter().filter(|&&code| code == counter).count(),
-        2
-    );
-    assert_eq!(
-        capped(3).c.iter().filter(|&&code| code == counter).count(),
-        3
-    );
+        assert_eq!(row.f, [counter as f32 / 10.0, 0.0, 0.0, 0.0]);
+        assert_eq!(row.c, [layout.semantic(Semantic::Relic, row.u[1])]);
+    }
 }
 
 #[test]
-fn pumpkin_candle_counter_is_unbounded_numeric_input() {
-    let content = foundation_content();
-    let layout = Layout::new(&content);
-    let mut game = Game::new_character_ascension(&content, 555, 0, 10).unwrap();
-    game.pumpkin_candle = 300;
-    let mut row = DomainRow::new(RELIC_DOMAIN, STATE_SCOPE);
-    row.u[1] = content.relic_id("RELIC.PUMPKIN_CANDLE").unwrap() as u32;
-    row.s[0] = game.pumpkin_candle;
-    populate_domain_features(&game, &content, layout, RELIC_DOMAIN, &mut row);
-    assert_eq!(row.f[0], 300.0);
-    assert_eq!(row.c.iter().filter(|&&code| code != 0).count(), 1);
-}
-
-#[test]
-fn v57_wax_relics_encode_queue_progress_and_melted_state() {
+fn wax_relics_encode_queue_progress_and_melted_state() {
     let content = foundation_content();
     let layout = Layout::new(&content);
     let mut game = Game::new_character_ascension(&content, 555, 0, 10).unwrap();
@@ -2310,24 +2276,18 @@ fn v57_wax_relics_encode_queue_progress_and_melted_state() {
     game.run.relics.push(id);
     let index = game.run.relics.len() - 1;
     game.wax_relics.push(index);
-    game.toy_box_combats = 0;
-    let first = build_observation(&game, &content, layout, (0, 0));
-    let row = first.domains[RELIC_DOMAIN]
-        .iter()
-        .find(|row| row.u[0] == 0 && row.u[1] == id as u32)
-        .unwrap();
-    let waxed = layout.semantic(Semantic::RelicCounter4, id as u32);
-    let position = layout.semantic(Semantic::RelicCounter5, id as u32);
-    assert_eq!(row.c.iter().filter(|&&code| code == waxed).count(), 1);
-    assert_eq!(row.c.iter().filter(|&&code| code == position).count(), 3);
+    let wax = |game: &Game| {
+        let observation = build_observation(game, &content, layout, (0, 0));
+        let row = observation.domains[RELIC_DOMAIN]
+            .iter()
+            .find(|row| row.u[0] == 0 && row.u[1] == id as u32)
+            .unwrap();
+        (row.f[2], row.f[3])
+    };
+    assert_eq!(wax(&game), (1.0, 0.75));
     game.toy_box_combats = 3;
     game.melted_relics.push(index);
-    let melted = build_observation(&game, &content, layout, (0, 0));
-    let row = melted.domains[RELIC_DOMAIN]
-        .iter()
-        .find(|row| row.u[0] == 0 && row.u[1] == id as u32)
-        .unwrap();
-    assert_eq!(row.c.iter().filter(|&&code| code == position).count(), 4);
+    assert_eq!(wax(&game), (1.0, 1.0));
 }
 
 #[test]
@@ -2432,7 +2392,7 @@ fn v55_action_and_phase_discriminants_are_exhaustive() {
 #[test]
 fn v56_layout_uses_explicit_token_dimensions_and_positions() {
     let layout = Layout::new(&foundation_content());
-    assert_eq!((VERSION, VALUE_MODEL_VERSION), (62, 79));
+    assert_eq!((VERSION, VALUE_MODEL_VERSION), (63, 79));
     assert_eq!(
         (
             DEFAULT_MODEL_WIDTH,
