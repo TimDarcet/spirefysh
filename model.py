@@ -1001,43 +1001,72 @@ kernel void layer_norm_forward_bfloat(
     }
 }
 
-kernel void layer_norm_backward_input_bfloat(
+template <typename G>
+void layer_norm_backward(
     device const float *input, device const float *gamma, device const float *stats,
-    device const bfloat *grad_output, device float *grad_input, constant uint& width,
-    uint tid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
-    uint row = tid / 32, base = row * width + lane;
-    float mean = stats[row * 2], inverse_std = stats[row * 2 + 1];
-    float4 normalized, grad;
-    float local_sum = 0.0f, local_product = 0.0f;
-    for (uint part = 0; part < width / 32; ++part) {
-        uint column = lane + part * 32, index = base + part * 32;
-        normalized[part] = (input[index] - mean) * inverse_std;
-        grad[part] = float(grad_output[index]) * gamma[column];
-        local_sum += grad[part];
-        local_product += grad[part] * normalized[part];
+    device const G *grad_output, device float *grad_input, device float *partial,
+    uint rows, uint block_rows, uint width, uint block, uint lane) {
+    float4 grad_gamma = 0.0f, grad_beta = 0.0f;
+    for (uint row = block * block_rows; row < min(rows, (block + 1) * block_rows); ++row) {
+        float mean = stats[row * 2], inverse_std = stats[row * 2 + 1];
+        float4 normalized, grad;
+        float local_sum = 0.0f, local_product = 0.0f;
+        for (uint part = 0; part < width / 32; ++part) {
+            uint column = lane + part * 32, index = row * width + column;
+            float gradient = float(grad_output[index]);
+            normalized[part] = (input[index] - mean) * inverse_std;
+            grad_gamma[part] += gradient * normalized[part];
+            grad_beta[part] += gradient;
+            grad[part] = gradient * gamma[column];
+            local_sum += grad[part];
+            local_product += grad[part] * normalized[part];
+        }
+        float sum = simd_sum(local_sum), product = simd_sum(local_product);
+        for (uint part = 0; part < width / 32; ++part)
+            grad_input[row * width + lane + part * 32] = (
+                grad[part] - sum / width - normalized[part] * product / width
+            ) * inverse_std;
     }
-    float sum = simd_sum(local_sum), product = simd_sum(local_product);
-    for (uint part = 0; part < width / 32; ++part)
-        grad_input[base + part * 32] = (
-            grad[part] - sum / width - normalized[part] * product / width
-        ) * inverse_std;
+    for (uint part = 0; part < width / 32; ++part) {
+        partial[block * 2 * width + lane + part * 32] = grad_gamma[part];
+        partial[(block * 2 + 1) * width + lane + part * 32] = grad_beta[part];
+    }
 }
 
-kernel void layer_norm_backward_partial_bfloat(
-    device const float *input, device const float *stats, device const bfloat *grad_output,
-    device float *partial, constant uint& rows, constant uint& block_rows, constant uint& width,
-    uint tid [[thread_position_in_grid]]) {
-    uint block = tid / width, column = tid % width;
-    uint begin = block * block_rows, end = min(rows, begin + block_rows);
-    float dg = 0.0f, db = 0.0f;
-    for (uint row = begin; row < end; ++row) {
-        uint index = row * width + column;
-        float grad = float(grad_output[index]);
-        dg += grad * (input[index] - stats[row * 2]) * stats[row * 2 + 1];
-        db += grad;
+#define LAYER_NORM_BACKWARD(name, G) \
+kernel void name( \
+    device const float *input, device const float *gamma, device const float *stats, \
+    device const G *grad_output, device float *grad_input, device float *partial, \
+    constant uint& rows, constant uint& block_rows, constant uint& width, \
+    uint block [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) { \
+    layer_norm_backward(input, gamma, stats, grad_output, grad_input, partial, rows, block_rows, width, block, lane); \
+}
+LAYER_NORM_BACKWARD(layer_norm_backward_bfloat, bfloat)
+LAYER_NORM_BACKWARD(layer_norm_backward_float, float)
+
+kernel void layer_norm_forward_float(
+    device const float *input, device const float *gamma, device const float *beta,
+    device float *output, device float *stats, constant uint& width,
+    uint tid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+    uint row = tid / 32, base = row * width + lane;
+    float4 value;
+    float local_sum = 0.0f, local_square = 0.0f;
+    for (uint part = 0; part < width / 32; ++part) {
+        value[part] = input[base + part * 32];
+        local_sum += value[part];
     }
-    partial[block * 2 * width + column] = dg;
-    partial[(block * 2 + 1) * width + column] = db;
+    float mean = simd_sum(local_sum) / width;
+    for (uint part = 0; part < width / 32; ++part)
+        local_square += (value[part] - mean) * (value[part] - mean);
+    float inverse_std = rsqrt(simd_sum(local_square) / width + 1e-5f);
+    for (uint part = 0; part < width / 32; ++part) {
+        uint column = lane + part * 32;
+        output[base + part * 32] = (value[part] - mean) * inverse_std * gamma[column] + beta[column];
+    }
+    if (lane == 0) {
+        stats[row * 2] = mean;
+        stats[row * 2 + 1] = inverse_std;
+    }
 }
 
 kernel void norm_head_forward(
@@ -1332,19 +1361,19 @@ def _linear_forward(value_bfloat, weight, bias, residual=None):
 
 
 def _linear_backward(value, weight, grad_output):
-    grad_output = grad_output.to(torch.bfloat16).contiguous()
+    grad_output = grad_output.contiguous() if grad_output.dtype == torch.float32 \
+        else grad_output.to(torch.bfloat16).contiguous()
+    suffix = "_float" if grad_output.dtype == torch.float32 else ""
     rows, columns, depth = len(value), value.shape[1], len(weight)
     grad_value = torch.empty_like(value)
-    _linear_kernel("linear_input_grad", grad_output, weight, grad_value, rows, columns, depth)
-    grad_weight = weight.new_zeros((depth, columns), dtype=torch.float32)
-    splits = max(1, min(64, rows // 256))
     _linear_kernel(
-        "linear_weight_grad", grad_output, value, grad_weight, depth, columns, rows, splits=splits,
+        "linear_input_grad" + suffix, grad_output, weight, grad_value, rows, columns, depth,
     )
+    grad_weight = weight.new_zeros((depth, columns), dtype=torch.float32)
     grad_bias = weight.new_zeros(depth, dtype=torch.float32)
-    _FastLinear.library.column_sum(
-        grad_output, grad_bias, rows, depth, (rows + splits - 1) // splits,
-        threads=(depth, splits), group_size=(min(depth, 128), 1),
+    _linear_kernel(
+        "linear_weight_grad" + suffix, grad_output, value, grad_weight, depth, columns, rows,
+        grad_bias, splits=max(1, min(64, rows // 256)),
     )
     return grad_value, grad_weight, grad_bias
 
@@ -1386,6 +1415,43 @@ class _LinearResidual(torch.autograd.Function):
             grad_output
 
 
+def _layer_norm_backward(value, gamma, stats, grad_normalized, block_rows=32):
+    rows, width = value.shape
+    blocks = (rows + block_rows - 1) // block_rows
+    grad_value, partial = torch.empty_like(value), value.new_empty((blocks, 2, width))
+    grad_gamma, grad_beta = torch.empty_like(gamma), torch.empty_like(gamma)
+    getattr(_RaggedAttention.library, "layer_norm_backward_" + (
+        "float" if grad_normalized.dtype == torch.float32 else "bfloat"
+    ))(
+        value, gamma, stats, grad_normalized, grad_value, partial, rows, block_rows, width,
+        threads=blocks * 32, group_size=32,
+    )
+    _RaggedAttention.library.token_backward_norm_reduce(
+        partial, grad_gamma, grad_beta, blocks, width, threads=width * 128, group_size=128,
+    )
+    return grad_value, grad_gamma, grad_beta
+
+
+@_committed
+class _LayerNorm(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, value, gamma, beta):
+        if _RaggedAttention.library is None:
+            _RaggedAttention.library = torch.mps.compile_shader(_TRAINING_METAL)
+        output, stats = torch.empty_like(value), value.new_empty((len(value), 2))
+        _RaggedAttention.library.layer_norm_forward_float(
+            value, gamma, beta, output, stats, value.shape[1],
+            threads=len(value) * 32, group_size=32,
+        )
+        ctx.save_for_backward(value, gamma, stats)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        value, gamma, stats = ctx.saved_tensors
+        return _layer_norm_backward(value, gamma, stats, grad_output.float().contiguous())
+
+
 @_committed
 class _NormLinear(torch.autograd.Function):
     @staticmethod
@@ -1408,23 +1474,7 @@ class _NormLinear(torch.autograd.Function):
         grad_normalized, grad_weight, grad_bias = _linear_backward(
             normalized, weight, grad_output,
         )
-        width = value.shape[1]
-        grad_value = torch.empty_like(value)
-        _RaggedAttention.library.layer_norm_backward_input_bfloat(
-            value, gamma, stats, grad_normalized, grad_value, width,
-            threads=len(value) * 32, group_size=32,
-        )
-        blocks = (len(value) + 127) // 128
-        partial = value.new_empty((blocks, 2, width))
-        grad_gamma, grad_beta = torch.empty_like(gamma), torch.empty_like(gamma)
-        _RaggedAttention.library.layer_norm_backward_partial_bfloat(
-            value, stats, grad_normalized, partial, len(value), 128, width,
-            threads=blocks * width, group_size=128,
-        )
-        _RaggedAttention.library.token_backward_norm_reduce(
-            partial, grad_gamma, grad_beta, blocks, width,
-            threads=width * 128, group_size=128,
-        )
+        grad_value, grad_gamma, grad_beta = _layer_norm_backward(value, gamma, stats, grad_normalized)
         return grad_value, grad_gamma, grad_beta, grad_weight, grad_bias
 
 
@@ -1450,23 +1500,7 @@ class _NormHead(torch.autograd.Function):
         grad_normalized, grad_weight, grad_bias = _linear_backward(
             normalized, weight, grad_output[:, None],
         )
-        width = value.shape[1]
-        grad_value = torch.empty_like(value)
-        _RaggedAttention.library.layer_norm_backward_input_bfloat(
-            value, gamma, stats, grad_normalized, grad_value, width,
-            threads=len(value) * 32, group_size=32,
-        )
-        blocks = (len(value) + 127) // 128
-        partial = value.new_empty((blocks, 2, width))
-        grad_gamma, grad_beta = torch.empty_like(gamma), torch.empty_like(gamma)
-        _RaggedAttention.library.layer_norm_backward_partial_bfloat(
-            value, stats, grad_normalized, partial, len(value), 128, width,
-            threads=blocks * width, group_size=128,
-        )
-        _RaggedAttention.library.token_backward_norm_reduce(
-            partial, grad_gamma, grad_beta, blocks, width,
-            threads=width * 128, group_size=128,
-        )
+        grad_value, grad_gamma, grad_beta = _layer_norm_backward(value, gamma, stats, grad_normalized)
         return grad_value, grad_gamma, grad_beta, grad_weight, grad_bias
 
 

@@ -20,15 +20,17 @@ METAL_FUNC ushort2 lane_position(ushort lane) {
 enum epilogue { BIAS, RESIDUAL, PLAIN, SPLIT };
 
 // C[M, N] = op(A) op(B): op(A) is A [M, K] or, if A_T, A stored [K, M]; op(B) is B stored [N, K]
-// transposed or, if !B_T, B stored [K, N]. Each simdgroup owns a 32x32 tile of C over the K rows
-// [z * chunk, (z + 1) * chunk); SPLIT adds these partial sums atomically into a zeroed C.
-template <bool A_T, bool B_T, typename OUT, epilogue E>
-METAL_FUNC void matmul(device const bfloat *A, device const bfloat *B, device OUT *C,
-                       device const float *bias, device const float *residual, uint M, uint N,
-                       uint K, uint chunk, uint3 group, ushort lane) {
+// transposed or, if !B_T, B stored [K, N]. A is rounded to bf16 on load. Each simdgroup owns a 32x32
+// tile of C over the K rows [z * chunk, (z + 1) * chunk); SPLIT adds these partial sums atomically
+// into a zeroed C, and the row sums of op(A) into a zeroed bias.
+template <typename TA, bool A_T, bool B_T, typename OUT, epilogue E>
+METAL_FUNC void matmul(device const TA *A, device const bfloat *B, device OUT *C, device float *bias,
+                       device const float *residual, uint M, uint N, uint K, uint chunk,
+                       uint3 group, ushort lane) {
   ushort2 p = lane_position(lane);
   uint m0 = group.y * 32, n0 = group.x * 32, k0 = group.z * chunk, k1 = min(K, k0 + chunk);
   tile<float> acc[4][4];
+  float row_sums[4] = {0, 0, 0, 0};
   for (ushort i = 0; i < 4; i++)
     for (ushort j = 0; j < 4; j++) acc[i][j].v() = 0;
   for (uint k = k0; k < k1; k += 8) {
@@ -36,8 +38,9 @@ METAL_FUNC void matmul(device const bfloat *A, device const bfloat *B, device OU
     uint ka = k + p.x, kb = k + p.y;
     for (ushort i = 0; i < 4; i++) {
       uint m = min(m0 + i * 8 + p.y, M - 1);
-      a[i].v() = A_T ? bfloat2(ka < k1 ? A[ka * M + m] : 0, ka + 1 < k1 ? A[(ka + 1) * M + m] : 0)
-                     : bfloat2(ka < k1 ? A[m * K + ka] : 0, ka + 1 < k1 ? A[m * K + ka + 1] : 0);
+      a[i].v() = bfloat2(A_T ? float2(ka < k1 ? A[ka * M + m] : 0, ka + 1 < k1 ? A[(ka + 1) * M + m] : 0)
+                             : float2(ka < k1 ? A[m * K + ka] : 0, ka + 1 < k1 ? A[m * K + ka + 1] : 0));
+      if (E == SPLIT) row_sums[i] += float(a[i].v()[0]) + float(a[i].v()[1]);
     }
     for (ushort j = 0; j < 4; j++) {
       uint n = min(n0 + j * 8 + p.x, N - 1), n1 = min(n + 1, N - 1);
@@ -49,6 +52,12 @@ METAL_FUNC void matmul(device const bfloat *A, device const bfloat *B, device OU
   }
   for (ushort i = 0; i < 4; i++) {
     uint m = m0 + i * 8 + p.y;
+    if (E == SPLIT && group.x == 0) {
+      float sum = row_sums[i] + simd_shuffle_xor(row_sums[i], 1);
+      sum += simd_shuffle_xor(sum, 8);
+      if (p.x == 0 && m < M)
+        atomic_fetch_add_explicit((device atomic_float *)(bias + m), sum, memory_order_relaxed);
+    }
     for (ushort j = 0; j < 4; j++)
       for (ushort e = 0; e < 2; e++) {
         uint n = n0 + j * 8 + p.x + e, index = m * N + n;
@@ -62,27 +71,18 @@ METAL_FUNC void matmul(device const bfloat *A, device const bfloat *B, device OU
   }
 }
 
-#define MATMUL(name, A_T, B_T, OUT, E)                                                            \
-  kernel void name(device const bfloat *A [[buffer(0)]], device const bfloat *B [[buffer(1)]],    \
-                   device OUT *C [[buffer(2)]], device const float *bias [[buffer(3)]],           \
+#define MATMUL(name, TA, A_T, B_T, OUT, E)                                                        \
+  kernel void name(device const TA *A [[buffer(0)]], device const bfloat *B [[buffer(1)]],        \
+                   device OUT *C [[buffer(2)]], device float *bias [[buffer(3)]],                 \
                    device const float *residual [[buffer(4)]], constant uint &M [[buffer(5)]],    \
                    constant uint &N [[buffer(6)]], constant uint &K [[buffer(7)]],                \
                    constant uint &chunk [[buffer(8)]], uint3 group [[threadgroup_position_in_grid]], \
                    ushort lane [[thread_index_in_simdgroup]]) {                                   \
-    matmul<A_T, B_T, OUT, E>(A, B, C, bias, residual, M, N, K, chunk, group, lane);               \
+    matmul<TA, A_T, B_T, OUT, E>(A, B, C, bias, residual, M, N, K, chunk, group, lane);           \
   }
-MATMUL(linear, false, true, bfloat, BIAS)
-MATMUL(linear_residual, false, true, float, RESIDUAL)
-MATMUL(linear_input_grad, false, false, bfloat, PLAIN)
-MATMUL(linear_weight_grad, true, false, float, SPLIT)
-
-// out[c] += sum over rows [y * chunk, (y + 1) * chunk) of values[:, c].
-kernel void column_sum(device const bfloat *values [[buffer(0)]], device float *out [[buffer(1)]],
-                       constant uint &rows [[buffer(2)]], constant uint &columns [[buffer(3)]],
-                       constant uint &chunk [[buffer(4)]], uint2 index [[thread_position_in_grid]]) {
-  if (index.x >= columns) return;
-  float sum = 0;
-  for (uint row = index.y * chunk; row < min(rows, (index.y + 1) * chunk); row++)
-    sum += float(values[row * columns + index.x]);
-  atomic_fetch_add_explicit((device atomic_float *)(out + index.x), sum, memory_order_relaxed);
-}
+MATMUL(linear, bfloat, false, true, bfloat, BIAS)
+MATMUL(linear_residual, bfloat, false, true, float, RESIDUAL)
+MATMUL(linear_input_grad, bfloat, false, false, bfloat, PLAIN)
+MATMUL(linear_input_grad_float, float, false, false, bfloat, PLAIN)
+MATMUL(linear_weight_grad, bfloat, true, false, float, SPLIT)
+MATMUL(linear_weight_grad_float, float, true, false, float, SPLIT)
