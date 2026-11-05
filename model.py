@@ -2851,14 +2851,15 @@ def prefix_tree(tokens, counts):
     ))), tuple(sizes)
 
 
-def model_inputs(character, globals_, domains, action, action_row, action_position, legal, target, model):
+def model_inputs(character, globals_, domains, action, action_row, action_position, legal, target, model,
+                 pad=None):
     batch, actions = len(character), legal.shape[1]
     globals_ = np.asarray(globals_, np.float32)
     if globals_.shape != (batch, model.layout["globals"]) or not np.isfinite(globals_).all():
         raise ValueError("invalid public globals")
     unique_rows = [domain[6:] if len(domain) == 8 else None for domain in domains]
     domains = [domain[:6] for domain in domains]
-    pad = model.training and model.global_norm.weight.device.type == "mps"
+    pad = model.training and model.global_norm.weight.device.type == "mps" if pad is None else pad
     bucket = lambda count: 0 if not count else min(
         size for power in range(max(1, (count - 1).bit_length()), 64)
         for size in (3 * (1 << power) // 4, 1 << power) if size >= count
@@ -3398,7 +3399,7 @@ def pack_batch(observation, validate=True):
 
 
 
-def unpack(rows, target, model, validate=True):
+def unpack(rows, target, model, validate=True, pad=None):
     if validate:
         for row in rows:
             validate_packed(row)
@@ -3408,7 +3409,7 @@ def unpack(rows, target, model, validate=True):
         np.asarray(character), np.asarray(globals_),
         [tuple(map(np.asarray, domain)) for domain in domains],
         tuple(map(np.asarray, action)), np.asarray(action_row), np.asarray(action_position),
-        np.asarray(legal), target, model,
+        np.asarray(legal), target, model, pad,
     )
 
 

@@ -11,7 +11,7 @@ import tempfile
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from itertools import islice
 from pathlib import Path
 from queue import Empty, Full, Queue
@@ -87,6 +87,18 @@ def upload(value, target, staged=False):
         return item
 
     return rebuild(structure)
+
+
+def start_collator(model):
+    global COLLATOR_MODEL
+    COLLATOR_MODEL = model
+
+
+def collate(rows, training):
+    return stage_upload((
+        unpack(rows, torch.device("cpu"), COLLATOR_MODEL, False, True),
+        tuple(map(torch.from_numpy, training)),
+    ))
 
 
 def clip_gradients(parameters):
@@ -710,6 +722,11 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         context.RawArray("q", [-1] * (args.envs * 3)),
     )
     packer = ThreadPoolExecutor(max_workers=1)
+    collator = None
+    if target.type == "mps":
+        collator_model = copy.deepcopy(model).cpu()
+        collator_model._sequence_layouts, collator_model._graph_cache = [], {}
+        collator = ProcessPoolExecutor(1, context, start_collator, (collator_model,))
     workers = [None] * args.samplers
     watchdog_terminated = set()
     watchdog_pending = [False] * args.samplers
@@ -899,6 +916,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 break
 
     def prepare(rows, training):
+        if collator:
+            return collator.submit(collate, rows, tuple(value.numpy() for value in training)).result()
         value = (unpack(rows, torch.device("cpu"), model, False), training)
         return stage_upload(value) if target.type != "cpu" else value
 
@@ -1753,6 +1772,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 queue.cancel_join_thread()
                 queue.close()
         packer.shutdown(wait=True, cancel_futures=True)
+        if collator:
+            collator.shutdown(cancel_futures=True)
     failed = [] if threaded else [worker.exitcode for worker in started_workers
                                   if worker not in terminated
                                   and worker not in watchdog_terminated and worker.exitcode]
