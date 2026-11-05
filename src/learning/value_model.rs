@@ -1701,17 +1701,24 @@ fn gelu_in_place(values: &mut [f32]) {
 }
 
 fn exp_in_place(values: &mut [f32]) {
-    #[cfg(target_os = "macos")]
-    {
-        #[link(name = "Accelerate", kind = "framework")]
-        unsafe extern "C" {
-            fn vvexpf(output: *mut f32, input: *const f32, count: *const i32);
+    #[cfg(target_arch = "aarch64")]
+    for chunk in values.chunks_exact_mut(4) {
+        use std::arch::aarch64::*;
+        unsafe {
+            let x = vmaxq_f32(vld1q_f32(chunk.as_ptr()), vdupq_n_f32(-87.0));
+            let shifted = vfmaq_f32(vdupq_n_f32(12_582_912.0), x, vdupq_n_f32(std::f32::consts::LOG2_E));
+            let n = vsubq_f32(shifted, vdupq_n_f32(12_582_912.0));
+            let r = vfmsq_f32(vfmsq_f32(x, n, vdupq_n_f32(0.693_145_75)), n, vdupq_n_f32(1.428_606_8e-6));
+            let mut p = vdupq_n_f32(1.0 / 5040.0);
+            for c in [1.0 / 720.0, 1.0 / 120.0, 1.0 / 24.0, 1.0 / 6.0, 0.5, 1.0, 1.0] {
+                p = vfmaq_f32(vdupq_n_f32(c), p, r);
+            }
+            let scale = vshlq_n_u32::<23>(vreinterpretq_u32_f32(shifted));
+            vst1q_f32(chunk.as_mut_ptr(), vreinterpretq_f32_u32(vaddq_u32(vreinterpretq_u32_f32(p), scale)));
         }
-        let count = values.len() as i32;
-        unsafe { vvexpf(values.as_mut_ptr(), values.as_ptr(), &count) };
     }
-    #[cfg(not(target_os = "macos"))]
-    values.iter_mut().for_each(|value| *value = value.exp());
+    let tail = if cfg!(target_arch = "aarch64") { values.len() / 4 * 4 } else { 0 };
+    values[tail..].iter_mut().for_each(|value| *value = value.exp());
 }
 
 fn normalized(input: &[f32], weight: &[f32], bias: &[f32]) -> Vec<f32> {
