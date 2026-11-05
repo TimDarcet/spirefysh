@@ -2495,24 +2495,21 @@ class Agent(nn.Module):
         return items, item_rows, plan[3:-1]
 
     def _packed_gru(self, values, batch_sizes, gru, parents=None):
-        gates = _FastLinear.apply(values, gru.weight_ih_l0, gru.bias_ih_l0)
+        gates = _FastLinear.apply(values, gru.weight_ih_l0, gru.bias_ih_l0).split(batch_sizes)
         if parents is not None:
             levels = []
-            offset = 0
-            for size in batch_sizes:
-                previous = values.new_zeros((size, self.width)) if not levels \
-                    else levels[-1][parents[offset:offset + size]]
+            for level_gates, level_parents in zip(gates, parents.split(batch_sizes)):
+                previous = values.new_zeros((len(level_gates), self.width)) if not levels \
+                    else levels[-1][level_parents]
                 hidden = _FastLinear.apply(previous, gru.weight_hh_l0, gru.bias_hh_l0)
-                levels.append(_GruStep.apply(gates[offset:offset + size], hidden, previous))
-                offset += size
+                levels.append(_GruStep.apply(level_gates, hidden, previous))
             return torch.cat(levels)
-        state = torch.zeros((batch_sizes[0], self.width), device=gates.device)
-        offset = 0
-        for size in batch_sizes:
+        state = torch.zeros((batch_sizes[0], self.width), device=values.device)
+        for level_gates in gates:
+            size = len(level_gates)
             hidden = _FastLinear.apply(state[:size], gru.weight_hh_l0, gru.bias_hh_l0)
-            current = _GruStep.apply(gates[offset:offset + size], hidden, state[:size])
+            current = _GruStep.apply(level_gates, hidden, state[:size])
             state = torch.cat((current, state[size:])) if size < len(state) else current
-            offset += size
         return state
 
     def encode_state(self, domains, encoded, phase_projection, index, action_values,
