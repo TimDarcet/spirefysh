@@ -1,6 +1,7 @@
 import copy
 import contextvars
 import fcntl
+import functools
 import hashlib
 import json
 import math
@@ -1831,6 +1832,30 @@ class _EmbeddingAdd(torch.autograd.Function):
         return grad_output, None, grad_embedding
 
 
+class _Assemble(torch.autograd.Function):
+    # Padded sequence rows: seeds at offsets, parts at their destinations, zeros after the real tokens.
+    @staticmethod
+    def forward(ctx, total, offsets, destination, seed, *parts):
+        dtype = functools.reduce(torch.promote_types, (part.dtype for part in parts))
+        sizes = [len(part) for part in parts]
+        current = seed.new_empty((total, seed.shape[-1]), dtype=dtype)
+        current[sum(sizes) + len(offsets):] = 0
+        current[offsets] = seed.to(dtype)
+        for part, rows in zip(parts, destination.split(sizes)):
+            current[rows] = part.to(dtype)
+        ctx.save_for_backward(offsets, destination)
+        ctx.sizes, ctx.seed, ctx.dtypes = sizes, (seed.dim(), seed.dtype), [part.dtype for part in parts]
+        return current
+
+    @staticmethod
+    def backward(ctx, grad):
+        offsets, destination = ctx.saved_tensors
+        grad_seed = grad[offsets].to(ctx.seed[1])
+        return None, None, None, grad_seed.sum(0) if ctx.seed[0] == 1 else grad_seed, *(
+            grad[rows].to(dtype) for rows, dtype in zip(destination.split(ctx.sizes), ctx.dtypes)
+        )
+
+
 @_committed
 class _GroupSum(torch.autograd.Function):
     @staticmethod
@@ -2283,10 +2308,13 @@ class Agent(nn.Module):
         return projection[inverse[root]], rows[root], metadata[root]
 
     def _sequence(self, values, group, groups, seed, transformer, selected=None, layout=None):
+        # values may be a list of parts, in row order of group.
+        parts = values if isinstance(values, list) else [values]
+        count, device = sum(map(len, parts)), seed.device
         selected_count = selected
-        real_tokens = len(values) + groups
+        real_tokens = count + groups
         final_attention = transformer is self.global_transformer
-        flash = values.device.type == "mps" and self.width == 128 and self.heads == 4 \
+        flash = device.type == "mps" and self.width == 128 and self.heads == 4 \
             and torch.is_autocast_enabled("mps") \
             and torch.get_autocast_dtype("mps") == torch.bfloat16
         reuse = flash and getattr(self, "_reuse_sequence_layouts", False)
@@ -2304,27 +2332,27 @@ class Agent(nn.Module):
             inverse[order] = torch.arange(len(order), device=order.device)
             group = group[order]
             counts = torch.bincount(group, minlength=groups)
-        if values.device.type == "mps" and self.width // self.heads in (16, 32) \
+        if device.type == "mps" and self.width // self.heads in (16, 32) \
                 and layout is None and not reuse:
             lengths = counts + 1
             padded_groups = (groups // 256 + 1) * 256
             lengths = nn.functional.pad(lengths, (0, padded_groups - groups), value=1)
-            total = len(values) + padded_groups
+            total = count + padded_groups
             extra = (-total) % 16_384
             lengths[groups:] += extra // (padded_groups - groups)
             lengths[groups:groups + extra % (padded_groups - groups)] += 1
             offsets = torch.cat((counts.new_zeros(1), lengths.cumsum(0)))
             starts = torch.repeat_interleave(offsets[:groups], counts)
-            position = torch.arange(len(values), device=values.device) \
+            position = torch.arange(count, device=device) \
                 - torch.repeat_interleave(counts.cumsum(0) - counts, counts) + 1
             destination = (starts + position)[inverse]
             sequence = torch.repeat_interleave(
-                torch.arange(len(lengths), device=values.device), lengths,
+                torch.arange(len(lengths), device=device), lengths,
             )
             if flash:
                 blocks = (lengths[:groups] + 31) // 32
                 block_rows = torch.repeat_interleave(
-                    torch.arange(groups, device=values.device), blocks,
+                    torch.arange(groups, device=device), blocks,
                 ).to(torch.int32)
                 block_starts = torch.cat((counts.new_zeros(1), blocks.cumsum(0)[:-1])).to(
                     torch.int32
@@ -2339,18 +2367,15 @@ class Agent(nn.Module):
                 query_counts = torch.bincount(sequence[positions], minlength=len(lengths))
                 query_offsets = torch.cat((query_counts.new_zeros(1), query_counts.cumsum(0)))
                 item_positions = torch.empty_like(query_order)
-                item_positions[query_order] = torch.arange(len(query_order), device=values.device)
+                item_positions[query_order] = torch.arange(len(query_order), device=device)
                 sparse = positions, item_positions[groups:], query_offsets
             if flash and self.training and torch.is_grad_enabled():
                 self._sequence_layouts.append((
                     order, inverse, selected, counts, lengths, offsets, destination, sequence,
                     block_rows, block_starts, metal_offsets, metal_lengths, sparse,
                 ))
-        if values.device.type == "mps" and self.width // self.heads in (16, 32):
-            total = len(sequence)
-            current = values.new_zeros((total, self.width))
-            current[offsets[:groups]] = seed.to(current.dtype)
-            current[destination] = values.to(current.dtype)
+        if device.type == "mps" and self.width // self.heads in (16, 32):
+            current = _Assemble.apply(len(sequence), offsets[:groups], destination, seed, *parts)
 
             def attend_layer(current, layer, selected, query_offsets, sparse):
                 qkv, current = _norm_linear(
@@ -2392,9 +2417,9 @@ class Agent(nn.Module):
                     return state, items
                 current = attend_layer(current, layer, sequence, offsets, False)
                 current = feed_forward(current, layer)
-            items = current[destination] if len(values) else values
+            items = current[destination] if count else parts[0]
             return current[offsets[:groups]], items
-        values = values[order]
+        values = torch.cat(parts)[order]
         selected = (torch.arange(len(values), device=values.device)
                     >= len(values) - selected_count)[order] if selected_count is not None else None
         maximum = int(counts.max().item()) if len(counts) else 0
@@ -2690,8 +2715,7 @@ class Agent(nn.Module):
         add(crystal, crystal_rows, "crystal")
         add(action, action_rows, "action")
 
-        values = torch.cat(values)
-        if global_layout is not None and len(global_layout[1]) != len(values):
+        if global_layout is not None and len(global_layout[1]) != sum(map(len, values)):
             raise RuntimeError("invalid precomputed sequence layout")
         rows = None if global_layout is not None else torch.cat(rows)
         self._sequence_lengths = global_layout[6][:batch] if global_layout is not None else \
