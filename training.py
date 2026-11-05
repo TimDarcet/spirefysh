@@ -991,8 +991,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             return
         periodic = args.mps_empty_cache_updates \
             and revisions["weights_revision"] % args.mps_empty_cache_updates == 0
-        if force or periodic \
-                or torch.mps.driver_allocated_memory() > torch.mps.recommended_max_memory() * .75:
+        if force or torch.mps.driver_allocated_memory() \
+                > torch.mps.recommended_max_memory() * (.4 if periodic else .75):
             torch.mps.empty_cache()
 
     def prefetch():
