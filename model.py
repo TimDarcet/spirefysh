@@ -1276,7 +1276,8 @@ class _RaggedAttention(torch.autograd.Function):
                 *arguments, ctx.heads, ctx.dimension, ctx.sparse,
                 threads=key_threads, group_size=32,
             )
-        if ctx.fp32_value_backward and qkv.dtype == torch.bfloat16:
+        # The tiled kernels already accumulate dV in fp32 from fp32 probabilities.
+        if ctx.fp32_value_backward and qkv.dtype == torch.bfloat16 and not tiled:
             width = qkv.shape[1] // 3
             grad_value = torch.empty((len(qkv), width), dtype=torch.float32, device=qkv.device)
             _RaggedAttention.library.attention_backward_value_bfloat(
