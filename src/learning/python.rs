@@ -7325,7 +7325,7 @@ impl Batch {
                 .zip(self.encodings.par_chunks_mut(8))
                 .zip(marks.par_chunks_mut(8))
                 .map(|(((games, map_caches), encodings), marks)| {
-                    let rows = games
+                    let mut rows = games
                         .iter()
                         .zip(map_caches)
                         .zip(marks)
@@ -7385,6 +7385,11 @@ impl Batch {
                     } else {
                         model.encoded(sequences).collect()
                     };
+                    if !search_enabled {
+                        for row in &mut rows {
+                            row.domains = std::array::from_fn(|_| DomainRows::Owned(Vec::new()));
+                        }
+                    }
                     (rows, packed, features)
                 })
                 .collect::<Vec<_>>()
