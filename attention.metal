@@ -81,7 +81,8 @@ METAL_FUNC void stage(threadgroup bfloat *left, threadgroup bfloat *right, const
   uint length = lengths[sequence], base = offsets[sequence];                                    \
   ushort2 p = lane_position(lane);                                                              \
   uint row = (chunk - chunk_starts[sequence]) * 32 + simd * 8 + p.y;                           \
-  uint clamped = base + min(row, length - 1);
+  uint clamped = base + min(row, length - 1);                                                   \
+  bool active = row - p.y < length;
 
 kernel void flash_forward(ATTENTION_ARGUMENTS, device const bfloat *qkv [[buffer(4)]],
                           device bfloat *output [[buffer(5)]], device float *lse [[buffer(6)]]) {
@@ -99,11 +100,14 @@ kernel void flash_forward(ATTENTION_ARGUMENTS, device const bfloat *qkv [[buffer
     stage(keys, values, qkv + base * 384 + 128 + head * 32, 384,
           qkv + base * 384 + 256 + head * 32, 384, first, length, index);
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!active) continue;
+    ushort blocks = min(4u, (length - first + 7) / 8);
     tile<float> score[4];
     float current = MASK;
     for (ushort k = 0; k < 4; k++) {
       score[k].v() = 0;
-      for (ushort d = 0; d < 4; d++) score[k].mma(query[d], transposed(keys, d, k, p));
+      if (k < blocks)
+        for (ushort d = 0; d < 4; d++) score[k].mma(query[d], transposed(keys, d, k, p));
       for (ushort i = 0; i < 2; i++)
         if (first + k * 8 + p.x + i >= length) score[k].v()[i] = MASK;
       current = max(current, max(score[k].v()[0], score[k].v()[1]));
@@ -118,7 +122,8 @@ kernel void flash_forward(ATTENTION_ARGUMENTS, device const bfloat *qkv [[buffer
     maximum = updated;
     for (ushort d = 0; d < 4; d++) {
       out[d].v() *= correction;
-      for (ushort k = 0; k < 4; k++) out[d].mma(score[k], block(values, k, d, p));
+      for (ushort k = 0; k < 4; k++)
+        if (k < blocks) out[d].mma(score[k], block(values, k, d, p));
     }
   }
   if (row < length) {
@@ -155,6 +160,7 @@ kernel void flash_backward_query(ATTENTION_ARGUMENTS, device const bfloat *qkv [
           qkv + base * 384 + 256 + head * 32, 384, first, length, index);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (ushort k = 0; k < 4; k++) {
+      if (!active || first + k * 8 >= length) continue;
       tile<float> probability, grad_probability;
       probability.v() = 0;
       grad_probability.v() = 0;
@@ -206,6 +212,7 @@ kernel void flash_backward_key_value(ATTENTION_ARGUMENTS, device const bfloat *q
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (ushort j = 0; j < 4; j++) {
+      if (!active || first + j * 8 >= length) continue;
       tile<float> probability, grad_probability;
       probability.v() = 0;
       grad_probability.v() = 0;
