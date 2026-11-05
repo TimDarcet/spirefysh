@@ -1670,26 +1670,37 @@ fn dense_gelu(input: &[f32], weights: &[f32], bias: &[f32]) -> Vec<f32> {
 }
 
 fn gelu_in_place(values: &mut [f32]) {
-    let mut exponential = [0.0; 256];
-    for values in values.chunks_mut(256) {
-        let exponential = &mut exponential[..values.len()];
-        exponential
-            .iter_mut()
-            .zip(&*values)
-            .for_each(|(exponential, value)| *exponential = -0.5 * value * value);
-        exp_in_place(exponential);
-        for (value, exponential) in values.iter_mut().zip(&*exponential) {
-            let x = value.abs() * std::f32::consts::FRAC_1_SQRT_2;
-            let t = 1.0 / (1.0 + 0.3275911 * x);
-            let erf = (1.0
-                - (((((1.061_405_4 * t - 1.453_152_1) * t + 1.421_413_8) * t - 0.284_496_72) * t
-                    + 0.254_829_6)
-                    * t
-                    * exponential))
-                .copysign(*value);
-            *value *= 0.5 * (1.0 + erf);
+    let gelu = |value: f32| {
+        let x = value.abs() * std::f32::consts::FRAC_1_SQRT_2;
+        let t = 1.0 / (1.0 + 0.3275911 * x);
+        let poly = (((1.061_405_4 * t - 1.453_152_1) * t + 1.421_413_8) * t - 0.284_496_72) * t
+            + 0.254_829_6;
+        let erf = (1.0 - poly * t * (-0.5 * value * value).exp()).copysign(value);
+        value * 0.5 * (1.0 + erf)
+    };
+    #[cfg(target_arch = "aarch64")]
+    let values = {
+        use std::arch::aarch64::*;
+        let mut chunks = values.chunks_exact_mut(4);
+        for chunk in &mut chunks {
+            unsafe {
+                let value = vld1q_f32(chunk.as_ptr());
+                let x = vmulq_f32(vabsq_f32(value), vdupq_n_f32(std::f32::consts::FRAC_1_SQRT_2));
+                let t = vdivq_f32(vdupq_n_f32(1.0), vfmaq_f32(vdupq_n_f32(1.0), x, vdupq_n_f32(0.3275911)));
+                let mut poly = vdupq_n_f32(1.061_405_4);
+                for c in [-1.453_152_1, 1.421_413_8, -0.284_496_72, 0.254_829_6] {
+                    poly = vfmaq_f32(vdupq_n_f32(c), poly, t);
+                }
+                let exponential = exp4(vmulq_f32(vmulq_f32(value, value), vdupq_n_f32(-0.5)));
+                let erf = vfmsq_f32(vdupq_n_f32(1.0), vmulq_f32(poly, t), exponential);
+                let erf = vbslq_f32(vdupq_n_u32(0x8000_0000), value, erf);
+                let half = vmulq_f32(value, vdupq_n_f32(0.5));
+                vst1q_f32(chunk.as_mut_ptr(), vmulq_f32(half, vaddq_f32(vdupq_n_f32(1.0), erf)));
+            }
         }
-    }
+        chunks.into_remainder()
+    };
+    values.iter_mut().for_each(|value| *value = gelu(*value));
 }
 
 #[cfg(target_arch = "aarch64")]
