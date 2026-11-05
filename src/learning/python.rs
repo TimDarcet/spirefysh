@@ -250,43 +250,18 @@ fn hash_words(hash: &mut FastHasher, words: &[u32]) {
 
 fn compress_words(values: &[u32]) -> Vec<u8> {
     let bitmap = values.len().div_ceil(8);
-    let mut output = vec![0; 4 + bitmap];
-    output[..4].copy_from_slice(&(values.len() as u32).to_le_bytes());
-    for (index, &value) in values.iter().enumerate() {
-        if value != 0 {
-            output[4 + index / 8] |= 1 << (index % 8);
-            output.extend_from_slice(&value.to_le_bytes());
-        }
+    let nonzero = values.iter().filter(|&&value| value != 0).count();
+    let mut output = Vec::with_capacity(4 + bitmap + 4 * nonzero);
+    output.extend((values.len() as u32).to_le_bytes());
+    output.extend(values.chunks(8).map(|chunk| {
+        chunk
+            .iter()
+            .enumerate()
+            .fold(0u8, |bits, (index, &value)| bits | ((value != 0) as u8) << index)
+    }));
+    for &value in values.iter().filter(|&&value| value != 0) {
+        output.extend(value.to_le_bytes());
     }
-    output
-}
-
-#[cfg(target_os = "macos")]
-fn compress_bytes(input: &[u8]) -> Vec<u8> {
-    #[link(name = "compression")]
-    unsafe extern "C" {
-        fn compression_encode_buffer(
-            output: *mut u8,
-            output_size: usize,
-            input: *const u8,
-            input_size: usize,
-            scratch: *mut std::ffi::c_void,
-            algorithm: u32,
-        ) -> usize;
-    }
-    let mut output = vec![0; input.len() + input.len() / 255 + 16];
-    let size = unsafe {
-        compression_encode_buffer(
-            output.as_mut_ptr(),
-            output.len(),
-            input.as_ptr(),
-            input.len(),
-            std::ptr::null_mut(),
-            0x100,
-        )
-    };
-    assert!(size > 0);
-    output.truncate(size);
     output
 }
 
@@ -355,17 +330,12 @@ fn compact_packed_observation_and_digest(row: &Observation, digest: Option<u64>)
         .filter(|row| row[width - 1] != 0)
         .count();
     let mut payload = exact;
+    payload.reserve(4 * actions.len());
     actions
         .iter()
         .for_each(|value| payload.extend(value.to_le_bytes()));
-    #[cfg(target_os = "macos")]
-    let payload = compress_bytes(&payload);
     let mut output = Vec::with_capacity(32 + 4 * (globals.len() + counts.len()) + payload.len());
-    output.extend(if cfg!(target_os = "macos") {
-        b"SP68"
-    } else {
-        b"SP67"
-    });
+    output.extend(b"SP67");
     output.push(row.character);
     output.extend([0; 3]);
     output.extend(digest.to_le_bytes());
@@ -7355,7 +7325,7 @@ impl Batch {
                 .zip(self.encodings.par_chunks_mut(8))
                 .zip(marks.par_chunks_mut(8))
                 .map(|(((games, map_caches), encodings), marks)| {
-                    let rows = games
+                    let mut rows = games
                         .iter()
                         .zip(map_caches)
                         .zip(marks)
@@ -7413,26 +7383,32 @@ impl Batch {
                     let features = if sequences.is_empty() {
                         Vec::new()
                     } else {
-                        model.encoded(sequences).collect()
+                        model.encoded(sequences).collect::<Vec<_>>()
                     };
-                    (rows, packed, features)
+                    let evaluated = rows
+                        .iter()
+                        .filter(|row| !skip_forced || row.candidates.len() > 1)
+                        .collect::<Vec<_>>();
+                    let outputs = model.evaluate_batch(&evaluated, &features, temperature, None, true)?;
+                    let features = if cache_features { features } else { Vec::new() };
+                    if !search_enabled {
+                        for row in &mut rows {
+                            row.domains = std::array::from_fn(|_| DomainRows::Owned(Vec::new()));
+                        }
+                    }
+                    Ok((rows, packed, features, outputs))
                 })
-                .collect::<Vec<_>>()
-        });
-        let (mut rows, mut packed, mut features) = (Vec::new(), Vec::new(), Vec::new());
+                .collect::<io::Result<Vec<_>>>()
+        })
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        let (mut rows, mut packed, mut features, mut outputs) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for chunk in chunks {
             rows.extend(chunk.0);
             packed.extend(chunk.1);
             features.extend(chunk.2);
+            outputs.extend(chunk.3);
         }
-        stage(&mut diagnostics, 2);
-        let evaluated_rows = rows
-            .iter()
-            .filter(|row| !skip_forced || row.candidates.len() > 1)
-            .collect::<Vec<_>>();
-        let outputs = model
-            .evaluate_batch(&evaluated_rows, &features, temperature, None, true)
-            .map_err(|error| PyValueError::new_err(error.to_string()))?;
         stage(&mut diagnostics, 3);
         let mut random = self.random;
         let mut search_random = random ^ 0x4d43_5453_524e_4701;
@@ -7523,7 +7499,7 @@ impl Batch {
         if advance {
             self.actions.resize_with(rows.len(), Vec::new);
         }
-        let mut evaluated = features.into_iter().zip(outputs);
+        let (mut features, mut evaluated) = (features.into_iter(), outputs.iter());
         for (row, packed) in rows.iter().zip(packed) {
             if skip_forced && row.candidates.len() == 1 {
                 characters.push(row.character);
@@ -7540,9 +7516,9 @@ impl Batch {
                 packed_rows.push(PyBytes::new(py, &packed));
                 continue;
             }
-            let ((state, actions), (log_policy, _win, expected, _)) = evaluated.next().unwrap();
+            let (log_policy, _win, expected, _) = evaluated.next().unwrap();
             let choice = if sample {
-                sample_policy(&log_policy, &mut random)
+                sample_policy(log_policy, &mut random)
             } else {
                 log_policy
                     .iter()
@@ -7555,7 +7531,7 @@ impl Batch {
             characters.push(row.character);
             choices.push(choice as i64);
             log_probabilities.push(log_policy[choice]);
-            critic_values.push(expected);
+            critic_values.push(*expected);
             action_kinds.push(row.candidates[choice].u[0]);
             if advance {
                 selected_actions.push(row.candidates[choice].action.clone());
@@ -7568,6 +7544,7 @@ impl Batch {
                 );
             }
             if cache_features {
+                let (state, actions) = features.next().unwrap();
                 let mut bytes =
                     Vec::with_capacity((PUBLIC_GLOBALS + (actions.len() + 1) * state.len()) * 4);
                 for value in [&row.globals, &state].into_iter().chain(&actions) {
