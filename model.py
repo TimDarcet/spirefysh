@@ -2819,15 +2819,12 @@ def flat_domains(observation):
 
 
 def ordered(source, *keys):
-    if len(source) < 2:
-        return source
-    values = [np.asarray(key)[source] for key in keys]
-    equal = np.ones(len(source) - 1, bool)
-    for value in values:
-        if np.any(equal & (value[1:] < value[:-1])):
-            return source[np.lexsort(tuple(reversed(values)))]
-        equal &= value[1:] == value[:-1]
-    return source
+    combined = np.zeros(len(source), np.int64)
+    for key in keys:
+        value = np.asarray(key)[source].astype(np.int64)
+        combined = combined * (int(value.max(initial=0)) + 1) + value
+    return source if np.all(combined[1:] >= combined[:-1]) \
+        else source[np.argsort(combined, kind="stable")]
 
 
 def prefix_tree(tokens, counts):
@@ -2974,8 +2971,11 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
     if np.any(edge_src < 0) or np.any(edge_dst < 0):
         raise ValueError("map edge references missing node")
     topo = np.zeros(len(node_source), np.int32)
-    for parent, child in zip(edge_src, edge_dst):
-        topo[child] = max(topo[child], topo[parent] + 1)
+    for _ in range(len(node_source)):
+        previous = topo.copy()
+        np.maximum.at(topo, edge_dst, topo[edge_src] + 1)
+        if np.array_equal(topo, previous):
+            break
     if len(edge_src) and np.any(topo[edge_dst] <= topo[edge_src]):
         raise ValueError("map is not a forward DAG")
     levels = []
