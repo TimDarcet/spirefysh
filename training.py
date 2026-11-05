@@ -50,7 +50,7 @@ def terminal_floor(category, won, args):
 
 
 
-def stage_upload(value):
+def stage_upload(value, shared=False):
     tensors = []
 
     def flatten(item):
@@ -70,7 +70,10 @@ def stage_upload(value):
         for index in selected:
             places[index] = dtype, offset, tensors[index].shape
             offset += tensors[index].numel()
-        buffers[dtype] = torch.cat([tensors[index].reshape(-1) for index in selected])
+        buffers[dtype] = torch.cat(
+            [tensors[index].reshape(-1) for index in selected],
+            out=torch.empty(offset, dtype=dtype).share_memory_() if shared else None,
+        )
     return structure, places, buffers
 
 
@@ -92,13 +95,14 @@ def upload(value, target, staged=False):
 def start_collator(model):
     global COLLATOR_MODEL
     COLLATOR_MODEL = model
+    ctypes.CDLL(None).pthread_set_qos_class_self_np(0x21, 0)
 
 
 def collate(rows, training):
     return stage_upload((
         unpack(rows, torch.device("cpu"), COLLATOR_MODEL, False, True),
         tuple(map(torch.from_numpy, training)),
-    ))
+    ), True)
 
 
 def clip_gradients(parameters):
@@ -916,8 +920,6 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 break
 
     def prepare(rows, training):
-        if collator:
-            return collator.submit(collate, rows, tuple(value.numpy() for value in training)).result()
         value = (unpack(rows, torch.device("cpu"), model, False), training)
         return stage_upload(value) if target.type != "cpu" else value
 
@@ -978,7 +980,10 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             values, replay, search_groups, \
             search_children, cached, lengths, packer.submit(
             prepare_cached, [dataset.features[index] for index in selected], training,
-        ) if cached else packer.submit(
+        ) if cached else collator.submit(
+            collate, rows + expert_rows + [sample[0] for sample in replay] + search_children,
+            tuple(value.numpy() for value in training),
+        ) if collator else packer.submit(
             prepare, rows + expert_rows + [sample[0] for sample in replay] + search_children,
             training,
         )
