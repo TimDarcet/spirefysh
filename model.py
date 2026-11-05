@@ -1160,8 +1160,11 @@ def _committed(function):
     for name in ("forward", "backward"):
         def committed(ctx, *args, method=getattr(function, name)):
             output = method(ctx, *args)
-            _committed.event = getattr(_committed, "event", None) or torch.mps.Event()
-            _committed.event.record()
+            first = next(value for value in (output if isinstance(output, tuple) else (output,))
+                         if value is not None)
+            if first.numel() >= 1 << 22:
+                _committed.event = getattr(_committed, "event", None) or torch.mps.Event()
+                _committed.event.record()
             return output
         setattr(function, name, staticmethod(committed))
     return function
