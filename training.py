@@ -928,6 +928,17 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         return stage_upload(value) if target.type != "cpu" else value
 
     def reserve_batch(size):
+        expert_stale = len(expert_dataset)
+        expert_dataset.prune(revisions["policy_revision"], args.expert_max_lag)
+        expert_stale -= len(expert_dataset)
+        if expert_stale:
+            emit_event({
+                "event": "expert_pruned", "step": base_decisions + handled,
+                "stage": stage, "expert_stale_rows": expert_stale,
+                "weights_revision": revisions["weights_revision"],
+                "policy_revision": revisions["policy_revision"],
+                "training_elapsed_seconds": time.monotonic() - run_started,
+            })
         if len(refill_ids):
             ids = dataset.data["id"][:len(dataset)]
             retained = np.isin(ids, refill_ids)
@@ -1023,8 +1034,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
 
     def prefetch():
         drain_samples()
-        if not pending and len(dataset) >= args.batch \
-                and base_decisions + handled < min(next_report, next_save):
+        if not pending and len(dataset) >= args.batch:
             pending.append(reserve_batch(args.batch))
 
     def drain_results():
@@ -1243,18 +1253,6 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                         recover_workers()
                         continue
                     sampler_done = samplers_done()
-                absolute = base_decisions + handled
-                expert_stale = len(expert_dataset)
-                expert_dataset.prune(revisions["policy_revision"], args.expert_max_lag)
-                expert_stale -= len(expert_dataset)
-                if expert_stale:
-                    emit_event({
-                        "event": "expert_pruned", "step": base_decisions + handled,
-                        "stage": stage, "expert_stale_rows": expert_stale,
-                        "weights_revision": revisions["weights_revision"],
-                        "policy_revision": revisions["policy_revision"],
-                        "training_elapsed_seconds": time.monotonic() - run_started,
-                    })
                 absolute = base_decisions + handled
                 if absolute >= next_save:
                     save_step(absolute)
