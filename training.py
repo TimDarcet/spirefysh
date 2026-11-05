@@ -50,34 +50,38 @@ def terminal_floor(category, won, args):
 
 
 
-def upload(value, target):
-    marker = object()
+def stage_upload(value):
     tensors = []
 
     def flatten(item):
         if torch.is_tensor(item):
             tensors.append(item)
-            return marker, len(tensors) - 1
+            return stage_upload, len(tensors) - 1
         if isinstance(item, tuple):
             return tuple(flatten(child) for child in item)
         return item
 
     structure = flatten(value)
-    uploaded = [None] * len(tensors)
+    places = [None] * len(tensors)
+    buffers = {}
     for dtype in {tensor.dtype for tensor in tensors}:
         selected = [index for index, tensor in enumerate(tensors) if tensor.dtype == dtype]
-        sizes = [tensors[index].numel() for index in selected]
-        buffer = torch.cat([tensors[index].reshape(-1) for index in selected]).to(
-            target, non_blocking=True,
-        )
         offset = 0
-        for index, size in zip(selected, sizes):
-            uploaded[index] = buffer[offset:offset + size].view(tensors[index].shape)
-            offset += size
+        for index in selected:
+            places[index] = dtype, offset, tensors[index].shape
+            offset += tensors[index].numel()
+        buffers[dtype] = torch.cat([tensors[index].reshape(-1) for index in selected])
+    return structure, places, buffers
+
+
+def upload(value, target, staged=False):
+    structure, places, buffers = value if staged else stage_upload(value)
+    buffers = {dtype: buffer.to(target, non_blocking=True) for dtype, buffer in buffers.items()}
 
     def rebuild(item):
-        if isinstance(item, tuple) and len(item) == 2 and item[0] is marker:
-            return uploaded[item[1]]
+        if isinstance(item, tuple) and len(item) == 2 and item[0] is stage_upload:
+            dtype, offset, shape = places[item[1]]
+            return buffers[dtype][offset:offset + shape.numel()].view(shape)
         if isinstance(item, tuple):
             return tuple(rebuild(child) for child in item)
         return item
@@ -893,17 +897,12 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 break
 
     def prepare(rows, training):
-        prepared = time.monotonic()
-        value = unpack(rows, torch.device("cpu"), model, False)
-        value = (value, training)
-        value = upload(value, target) if target.type != "cpu" else value
-        return value, time.monotonic() - prepared
+        value = (unpack(rows, torch.device("cpu"), model, False), training)
+        return stage_upload(value) if target.type != "cpu" else value
 
     def prepare_cached(features, training):
-        prepared = time.monotonic()
         value = (cached_tensors(features, model.width), training)
-        value = upload(value, target) if target.type != "cpu" else value
-        return value, time.monotonic() - prepared
+        return stage_upload(value) if target.type != "cpu" else value
 
     def reserve_batch(size):
         if len(refill_ids):
@@ -1292,7 +1291,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             flat_policy = not replay
             policy_actions = int(lengths.sum())
             expert_actions = int(expert_lengths.sum())
-            (inputs, training_tensors), _ = packed.result()
+            inputs, training_tensors = upload(packed.result(), target, True) \
+                if target.type != "cpu" else packed.result()
             action, old, choice_index, batch_advantage, batch_target = training_tensors
             unpack_seconds = time.monotonic() - unpack_started
             forward_started = time.monotonic()

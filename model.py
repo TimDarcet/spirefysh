@@ -1126,6 +1126,18 @@ kernel void ragged_log_softmax_backward_bfloat(
 """
 
 
+def _committed(function):
+    # Commit the MPS command buffer after each custom op so the GPU runs while Python encodes ahead.
+    for name in ("forward", "backward"):
+        def committed(ctx, *args, method=getattr(function, name)):
+            output = method(ctx, *args)
+            torch.mps.Event().record()
+            return output
+        setattr(function, name, staticmethod(committed))
+    return function
+
+
+@_committed
 class _RaggedAttention(torch.autograd.Function):
     library = None
     half_library = None
@@ -1224,6 +1236,7 @@ class _RaggedAttention(torch.autograd.Function):
         return grad_qkv, None, None, None, None, None, None, None
 
 
+@_committed
 class _FlashAttention(torch.autograd.Function):
     library = None
 
@@ -1265,6 +1278,7 @@ class _FlashAttention(torch.autograd.Function):
         return grad_qkv, None, None, None, None, None
 
 
+@_committed
 class _GruStep(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input_gates, hidden_gates, previous):
@@ -1361,6 +1375,7 @@ def _linear_backward(value, weight, grad_output):
     return grad_value, grad_weight, grad_bias
 
 
+@_committed
 class _FastLinear(torch.autograd.Function):
     libraries = None
     backward_libraries = None
@@ -1381,6 +1396,7 @@ class _FastLinear(torch.autograd.Function):
         return grad_value.to(ctx.value_dtype), grad_weight.float(), grad_bias.float()
 
 
+@_committed
 class _LinearResidual(torch.autograd.Function):
     @staticmethod
     def forward(ctx, value, weight, bias, residual):
@@ -1397,6 +1413,7 @@ class _LinearResidual(torch.autograd.Function):
         return grad_value.to(ctx.value_dtype), grad_weight.float(), grad_bias.float(), grad_output
 
 
+@_committed
 class _NormLinear(torch.autograd.Function):
     @staticmethod
     def forward(ctx, value, gamma, beta, weight, bias):
@@ -1438,6 +1455,7 @@ class _NormLinear(torch.autograd.Function):
         return grad_value, grad_gamma, grad_beta, grad_weight.float(), grad_bias.float()
 
 
+@_committed
 class _NormHead(torch.autograd.Function):
     @staticmethod
     def forward(ctx, value, gamma, beta, weight, bias):
@@ -1509,6 +1527,7 @@ def _norm_head(value, norm, head):
     return head(norm(value)).squeeze(-1)
 
 
+@_committed
 class _RaggedSummaryAttention(torch.autograd.Function):
     @staticmethod
     def forward(ctx, query, key_value, offsets, sequence, heads):
@@ -1544,6 +1563,7 @@ class _RaggedSummaryAttention(torch.autograd.Function):
         return grad_query, grad_key_value, None, None, None
 
 
+@_committed
 class _RaggedLogSoftmax(torch.autograd.Function):
     @staticmethod
     def forward(ctx, score, offsets):
@@ -1571,6 +1591,7 @@ class _RaggedLogSoftmax(torch.autograd.Function):
         return grad_score, None
 
 
+@_committed
 class _FusedSemantic(torch.autograd.Function):
     @staticmethod
     def forward(ctx, semantic, numeric, embedding, gamma, beta):
@@ -1618,6 +1639,7 @@ class _FusedSemantic(torch.autograd.Function):
         return None, grad_input.to(torch.bfloat16), grad_embedding, grad_gamma, grad_beta
 
 
+@_committed
 class _FusedDomains(torch.autograd.Function):
     @staticmethod
     def forward(ctx, embedding, *arguments):
@@ -1687,6 +1709,7 @@ class _FusedDomains(torch.autograd.Function):
         return tuple(gradients)
 
 
+@_committed
 class _GroupSum(torch.autograd.Function):
     @staticmethod
     def forward(ctx, values, group, groups):
@@ -1711,6 +1734,7 @@ class _GroupSum(torch.autograd.Function):
         return grad_input, None, None
 
 
+@_committed
 class _IndexedGroupSum(torch.autograd.Function):
     @staticmethod
     def forward(ctx, values, source, group, groups):
@@ -1736,6 +1760,7 @@ class _IndexedGroupSum(torch.autograd.Function):
         return grad_input, None, None, None
 
 
+@_committed
 class _ActionAttachments(torch.autograd.Function):
     @staticmethod
     def forward(ctx, nodes, path, target, *arguments):
@@ -2080,16 +2105,13 @@ class Agent(nn.Module):
         zone, order_kind, order, origin = metadata[:len(values)].T
         for kind, name in ((1, "draw_top_position"), (2, "draw_bottom_position")):
             present = (zone == 2) & (order_kind == kind) & (order > 0)
-            if present.any():
-                values = values + present[:, None] * self.concepts.local(
-                    name, (order - 1).clamp(max=256),
-                ).to(values.dtype)
-        present = origin > 0
-        if present.any():
             values = values + present[:, None] * self.concepts.local(
-                "deck_origin", (origin - 1).clamp(max=256),
+                name, (order - 1).clamp(max=256),
             ).to(values.dtype)
-        return values
+        present = origin > 0
+        return values + present[:, None] * self.concepts.local(
+            "deck_origin", (origin - 1).clamp(max=256),
+        ).to(values.dtype)
 
     def _relic_context(self, values, metadata):
         if not len(values):
@@ -2415,15 +2437,11 @@ class Agent(nn.Module):
 
     def encode_state(self, domains, encoded, phase_projection, index, action_values,
                      action_index, concepts, batch):
-        synchronize = torch.mps.synchronize if concepts.device.type == "mps" \
-            and self.training and torch.is_grad_enabled() else lambda: None
         filters, actor_plan, continuation_plan, global_layout = action_index[8:]
         current, nodes = self.encode_map(encoded, index)
-        synchronize()
         action, action_rows, action_flat, actions, policy_sequence = self._actions(
             domains, encoded, action_values, action_index, nodes, concepts,
         )
-        synchronize()
         values, rows = [], []
         segments = getattr(self, "_explanation_segments", None)
         def add(value, row, name):
@@ -2446,7 +2464,6 @@ class Agent(nn.Module):
         add(self.encoders["phase"].norm(phase), phase_rows, "phase")
         add(current + self.concepts.local("token_role", 0).to(current.dtype),
             torch.arange(batch, device=current.device), "map")
-        synchronize()
 
         pool_domains = DOMAIN["relic"], DOMAIN["encounter"], DOMAIN["event"]
         for name, domain, (source, pooled) in zip(POOLS, pool_domains, filters):
@@ -2464,12 +2481,10 @@ class Agent(nn.Module):
                 )
             add(self.pool_projections[name](summary), torch.arange(batch, device=summary.device),
                 name)
-        synchronize()
 
         actors, actor_rows, actor_u, effect_values, effect_rows = self._actors(
             domains, encoded, batch, concepts, actor_plan,
         )
-        synchronize()
         combat_rows = actor_rows[actor_u[:, 0] == 0]
         for name, domain, filtered, active in (
             ("deck", DOMAIN["card"], 3, torch.arange(batch, device=run.device)),
@@ -2503,7 +2518,6 @@ class Agent(nn.Module):
         add(actors, actor_rows, "actor")
         for value, row in zip(effect_values, effect_rows):
             add(value, row, "effect")
-        synchronize()
 
         continuation, continuation_rows, continuation_gru = self._continuations(
             domains, encoded, continuation_plan,
@@ -2540,7 +2554,6 @@ class Agent(nn.Module):
         crystal, crystal_rows, _ = self._domain_rows(domains, encoded, DOMAIN["crystal"])
         add(crystal, crystal_rows, "crystal")
         add(action, action_rows, "action")
-        synchronize()
 
         values = torch.cat(values)
         if global_layout is not None and len(global_layout[1]) != len(values):
@@ -2552,22 +2565,17 @@ class Agent(nn.Module):
             values, rows, batch, seed, self.global_transformer,
             len(action), global_layout,
         )
-        synchronize()
         return state, transformed if len(action) else action, \
             action_rows, action_flat, actions, policy_sequence
 
     def forward(self, character, globals_, domains, state_index, action_values, action_index,
                 return_state=False, policy_only=False, flat_policy=False, temperature=1):
-        synchronize = torch.mps.synchronize if domains[0][0].device.type == "mps" \
-            and self.training and torch.is_grad_enabled() else lambda: None
-        synchronize()
         if self.training and torch.is_grad_enabled():
             self._sequence_layouts.clear()
         if self._reuse_sequence_layouts:
             self._sequence_layout_index = 0
         concepts = graph_name(self.concepts.flattened(), "concepts")
         encoded, phase_projection = self.encode_domains(domains, concepts)
-        synchronize()
         state, action, action_row, action_flat, actions, sequence = self.encode_state(
             domains, encoded, phase_projection, state_index, action_values, action_index, concepts,
             len(character),
@@ -2575,7 +2583,6 @@ class Agent(nn.Module):
         scores = _norm_head(action, self.global_norm, self.policy) / temperature
         legal = torch.ones_like(scores, dtype=torch.bool)
         scores = self.group_log_softmax(scores, legal, sequence)
-        synchronize()
         if flat_policy:
             policy = scores
         else:
