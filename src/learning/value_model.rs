@@ -569,11 +569,11 @@ impl ValueModel {
         &self,
         qkv: &[f32],
         selected: impl Iterator<Item = usize> + Clone,
-    ) -> Vec<f32> {
+        output: &mut [f32],
+    ) {
         let rows = qkv.len() / (3 * self.width);
         let dimension = self.width / self.heads;
         let selected_len = selected.clone().count();
-        let mut output = vec![0.0; selected_len * self.width];
         #[cfg(target_os = "macos")]
         {
             #[link(name = "Accelerate", kind = "framework")]
@@ -630,13 +630,13 @@ impl ValueModel {
                     );
                 }
                 for score in scores.chunks_exact_mut(rows) {
-                    let peak = score.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let peak = reduce(score, f32::NEG_INFINITY, f32::max, f32::max);
                     score.iter_mut().for_each(|value| *value -= peak);
                 }
                 exp_in_place(&mut scores);
                 for score in scores.chunks_exact_mut(rows) {
-                    let total = score.iter().sum::<f32>();
-                    score.iter_mut().for_each(|value| *value /= total);
+                    let scale = reduce(score, 0.0, |left, right| left + right, |left, right| left + right).recip();
+                    score.iter_mut().for_each(|value| *value *= scale);
                 }
                 unsafe {
                     cblas_sgemm_singlecore(
@@ -657,7 +657,6 @@ impl ValueModel {
                     );
                 }
             }
-            output
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -672,50 +671,50 @@ impl ValueModel {
                     self.width,
                 ));
             }
-            output
         }
     }
 
-    fn layer(&self, rows: &[f32], sequences: &[(usize, usize)], layer: &TransformerLayer) -> Vec<f32> {
-        let width = self.width;
-        let mut normalized = rows.to_vec();
-        for row in normalized.chunks_exact_mut(width) {
-            layer_norm(row, &layer.norm1_w, &layer.norm1_b);
-        }
-        let qkv = linear_batch(&normalized, rows.len() / width, &layer.qkv_w, &layer.qkv_b);
-        let (mut attention, mut kept, mut offset) = (Vec::new(), Vec::new(), 0);
-        for &(length, start) in sequences {
-            let selected = std::iter::once(0).chain(start..length);
-            attention.extend(self.attention_batch(
-                &qkv[offset * 3 * width..(offset + length) * 3 * width],
-                selected.clone(),
-            ));
-            for index in selected {
-                kept.extend_from_slice(&rows[(offset + index) * width..][..width]);
+    fn layer(&self, rows: &mut Vec<f32>, sequences: &[(usize, usize)], layer: &TransformerLayer) {
+        thread_local!(static SCRATCH: std::cell::RefCell<[Vec<f32>; 4]> = Default::default());
+        SCRATCH.with_borrow_mut(|[normal_buffer, qkv_buffer, attention_buffer, hidden_buffer]| {
+            let width = self.width;
+            let normalized = normalize_rows(rows, width, &layer.norm1_w, &layer.norm1_b, normal_buffer);
+            let qkv = matmul(normalized, rows.len() / width, &layer.qkv_w, qkv_buffer);
+            add_bias(qkv, &layer.qkv_b);
+            let kept = sequences.iter().map(|&(length, start)| length + 1 - start).sum::<usize>();
+            let attention = scratch(attention_buffer, kept * width);
+            let (mut offset, mut target) = (0, 0);
+            for &(length, start) in sequences {
+                let count = length + 1 - start;
+                self.attention_batch(
+                    &qkv[offset * 3 * width..(offset + length) * 3 * width],
+                    std::iter::once(0).chain(start..length),
+                    &mut attention[target * width..(target + count) * width],
+                );
+                offset += length;
+                target += count;
             }
-            offset += length;
-        }
-        let projected = linear_batch(&attention, kept.len() / width, &layer.out_w, &layer.out_b);
-        kept.iter_mut().zip(projected).for_each(|(left, right)| *left += right);
-        let mut normalized = kept.clone();
-        for row in normalized.chunks_exact_mut(width) {
-            layer_norm(row, &layer.norm2_w, &layer.norm2_b);
-        }
-        let mut hidden = linear_batch(
-            &normalized,
-            kept.len() / width,
-            &layer.linear1_w,
-            &layer.linear1_b,
-        );
-        gelu_in_place(&mut hidden);
-        let projected = linear_batch(
-            &hidden,
-            kept.len() / width,
-            &layer.linear2_w,
-            &layer.linear2_b,
-        );
-        kept.iter_mut().zip(projected).for_each(|(left, right)| *left += right);
-        kept
+            if kept * width != rows.len() {
+                let mut offset = 0;
+                *rows = sequences
+                    .iter()
+                    .flat_map(|&(length, start)| {
+                        let sequence = &rows[offset * width..(offset + length) * width];
+                        offset += length;
+                        std::iter::once(0)
+                            .chain(start..length)
+                            .flat_map(move |index| &sequence[index * width..(index + 1) * width])
+                    })
+                    .copied()
+                    .collect();
+            }
+            add_residual(rows, matmul(attention, kept, &layer.out_w, qkv_buffer), &layer.out_b);
+            let normalized = normalize_rows(rows, width, &layer.norm2_w, &layer.norm2_b, normal_buffer);
+            let hidden = matmul(normalized, kept, &layer.linear1_w, hidden_buffer);
+            add_bias(hidden, &layer.linear1_b);
+            gelu_in_place(hidden);
+            add_residual(rows, matmul(hidden, kept, &layer.linear2_w, qkv_buffer), &layer.linear2_b);
+        })
     }
 
     fn encoder(&self, sequences: &[(Vec<Vec<f32>>, usize)]) -> Vec<f32> {
@@ -729,13 +728,13 @@ impl ValueModel {
             .map(|(sequence, _)| (sequence.len(), 1))
             .collect::<Vec<_>>();
         for layer in layers {
-            rows = self.layer(&rows, &full, layer);
+            self.layer(&mut rows, &full, layer);
         }
         let selected = sequences
             .iter()
             .map(|(sequence, start)| (sequence.len(), *start))
             .collect::<Vec<_>>();
-        let mut rows = self.layer(&rows, &selected, last);
+        self.layer(&mut rows, &selected, last);
         for row in rows.chunks_exact_mut(self.width) {
             layer_norm(row, &self.global_norm_w, &self.global_norm_b);
         }
@@ -753,13 +752,13 @@ impl ValueModel {
                     sum
                 }),
             1 => {
-                let rows = self.summary_seed[name]
+                let mut rows = self.summary_seed[name]
                     .iter()
                     .chain(values.iter().flatten())
                     .copied()
                     .collect::<Vec<_>>();
-                let mut rows = self.layer(
-                    &rows,
+                self.layer(
+                    &mut rows,
                     &[(values.len() + 1, 1)],
                     self.pool_layers[name.min(12)].as_ref().unwrap(),
                 );
@@ -1559,6 +1558,119 @@ fn linear_batch(input: &[f32], rows: usize, weights: &[f32], bias: &[f32]) -> Ve
         .collect()
 }
 
+fn scratch(buffer: &mut Vec<f32>, len: usize) -> &mut [f32] {
+    if buffer.len() < len {
+        buffer.resize(len, 0.0);
+    }
+    &mut buffer[..len]
+}
+
+fn matmul<'a>(input: &[f32], rows: usize, weights: &[f32], output: &'a mut Vec<f32>) -> &'a mut [f32] {
+    let inner = input.len() / rows;
+    let columns = weights.len() / inner;
+    let output = scratch(output, rows * columns);
+    #[cfg(target_os = "macos")]
+    {
+        #[link(name = "Accelerate", kind = "framework")]
+        unsafe extern "C" {
+            fn cblas_sgemm_singlecore(
+                order: i32,
+                transpose_a: i32,
+                transpose_b: i32,
+                rows: i32,
+                columns: i32,
+                inner: i32,
+                alpha: f32,
+                left: *const f32,
+                left_stride: i32,
+                right: *const f32,
+                right_stride: i32,
+                beta: f32,
+                output: *mut f32,
+                output_stride: i32,
+            );
+        }
+        unsafe {
+            cblas_sgemm_singlecore(
+                101,
+                111,
+                112,
+                rows as i32,
+                columns as i32,
+                inner as i32,
+                1.0,
+                input.as_ptr(),
+                inner as i32,
+                weights.as_ptr(),
+                inner as i32,
+                0.0,
+                output.as_mut_ptr(),
+                columns as i32,
+            );
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    for (target, row) in output.chunks_exact_mut(columns).zip(input.chunks_exact(inner)) {
+        target.copy_from_slice(&linear(row, weights, &vec![0.0; columns]));
+    }
+    output
+}
+
+fn add_bias(values: &mut [f32], bias: &[f32]) {
+    for row in values.chunks_exact_mut(bias.len()) {
+        row.iter_mut().zip(bias).for_each(|(value, bias)| *value += bias);
+    }
+}
+
+fn add_residual(rows: &mut [f32], projected: &[f32], bias: &[f32]) {
+    for (row, projected) in rows.chunks_exact_mut(bias.len()).zip(projected.chunks_exact(bias.len())) {
+        for ((value, projected), bias) in row.iter_mut().zip(projected).zip(bias) {
+            *value += projected + bias;
+        }
+    }
+}
+
+fn normalize_rows<'a>(
+    rows: &[f32],
+    width: usize,
+    weight: &[f32],
+    bias: &[f32],
+    output: &'a mut Vec<f32>,
+) -> &'a mut [f32] {
+    let output = scratch(output, rows.len());
+    for (target, row) in output.chunks_exact_mut(width).zip(rows.chunks_exact(width)) {
+        let (mean, scale) = moments(row);
+        for (((target, value), weight), bias) in target.iter_mut().zip(row).zip(weight).zip(bias) {
+            *target = (value - mean) * scale * weight + bias;
+        }
+    }
+    output
+}
+
+fn reduce(
+    values: &[f32],
+    initial: f32,
+    fold: impl Fn(f32, f32) -> f32,
+    combine: impl Fn(f32, f32) -> f32,
+) -> f32 {
+    let mut lanes = [initial; 8];
+    let mut chunks = values.chunks_exact(8);
+    for chunk in &mut chunks {
+        for (lane, &value) in lanes.iter_mut().zip(chunk) {
+            *lane = fold(*lane, value);
+        }
+    }
+    let rest = chunks.remainder().iter().fold(initial, |total, &value| fold(total, value));
+    lanes.into_iter().fold(rest, combine)
+}
+
+fn moments(values: &[f32]) -> (f32, f32) {
+    let add = |left, right| left + right;
+    let mean = reduce(values, 0.0, add, add) / values.len() as f32;
+    let squares = reduce(values, 0.0, |total, value| total + value * value, add) / values.len() as f32;
+    (mean, ((squares - mean * mean).max(0.0) + 1e-5).sqrt().recip())
+}
+
 fn dense_gelu(input: &[f32], weights: &[f32], bias: &[f32]) -> Vec<f32> {
     let mut output = linear(input, weights, bias);
     gelu_in_place(&mut output);
@@ -1566,33 +1678,26 @@ fn dense_gelu(input: &[f32], weights: &[f32], bias: &[f32]) -> Vec<f32> {
 }
 
 fn gelu_in_place(values: &mut [f32]) {
-    let gelu = |value: f32, exponential: f32| {
-        let x = value.abs() * std::f32::consts::FRAC_1_SQRT_2;
-        let t = 1.0 / (1.0 + 0.3275911 * x);
-        let erf = value.signum()
-            * (1.0
+    let mut exponential = [0.0; 256];
+    for values in values.chunks_mut(256) {
+        let exponential = &mut exponential[..values.len()];
+        exponential
+            .iter_mut()
+            .zip(&*values)
+            .for_each(|(exponential, value)| *exponential = -0.5 * value * value);
+        exp_in_place(exponential);
+        for (value, exponential) in values.iter_mut().zip(&*exponential) {
+            let x = value.abs() * std::f32::consts::FRAC_1_SQRT_2;
+            let t = 1.0 / (1.0 + 0.3275911 * x);
+            let erf = (1.0
                 - (((((1.061_405_4 * t - 1.453_152_1) * t + 1.421_413_8) * t - 0.284_496_72) * t
                     + 0.254_829_6)
                     * t
-                    * exponential));
-        value * 0.5 * (1.0 + erf)
-    };
-    #[cfg(target_os = "macos")]
-    {
-        let mut exponential = values
-            .iter()
-            .map(|value| -0.5 * value * value)
-            .collect::<Vec<_>>();
-        exp_in_place(&mut exponential);
-        values
-            .iter_mut()
-            .zip(exponential)
-            .for_each(|(value, exponential)| *value = gelu(*value, exponential));
+                    * exponential))
+                .copysign(*value);
+            *value *= 0.5 * (1.0 + erf);
+        }
     }
-    #[cfg(not(target_os = "macos"))]
-    values
-        .iter_mut()
-        .for_each(|value| *value = gelu(*value, (-0.5 * *value * *value).exp()));
 }
 
 fn exp_in_place(values: &mut [f32]) {
@@ -1616,95 +1721,9 @@ fn normalized(input: &[f32], weight: &[f32], bias: &[f32]) -> Vec<f32> {
 }
 
 fn layer_norm(input: &mut [f32], weight: &[f32], bias: &[f32]) {
-    normalize_block(input);
-    #[cfg(target_os = "macos")]
-    {
-        #[link(name = "Accelerate", kind = "framework")]
-        unsafe extern "C" {
-            fn vDSP_vma(
-                left: *const f32,
-                left_stride: isize,
-                right: *const f32,
-                right_stride: isize,
-                add: *const f32,
-                add_stride: isize,
-                output: *mut f32,
-                output_stride: isize,
-                count: usize,
-            );
-        }
-        unsafe {
-            vDSP_vma(
-                input.as_ptr(),
-                1,
-                weight.as_ptr(),
-                1,
-                bias.as_ptr(),
-                1,
-                input.as_mut_ptr(),
-                1,
-                input.len(),
-            )
-        };
-    }
-    #[cfg(not(target_os = "macos"))]
+    let (mean, scale) = moments(input);
     for ((value, weight), bias) in input.iter_mut().zip(weight).zip(bias) {
-        *value = *value * weight + bias;
-    }
-}
-
-fn normalize_block(input: &mut [f32]) {
-    #[cfg(target_os = "macos")]
-    {
-        #[link(name = "Accelerate", kind = "framework")]
-        unsafe extern "C" {
-            fn vDSP_sve_svesq(
-                input: *const f32,
-                stride: isize,
-                sum: *mut f32,
-                squares: *mut f32,
-                count: usize,
-            );
-            fn vDSP_vsmsa(
-                input: *const f32,
-                input_stride: isize,
-                scale: *const f32,
-                shift: *const f32,
-                output: *mut f32,
-                output_stride: isize,
-                count: usize,
-            );
-        }
-        let (mut sum, mut squares) = (0., 0.);
-        unsafe { vDSP_sve_svesq(input.as_ptr(), 1, &mut sum, &mut squares, input.len()) };
-        let mean = sum / input.len() as f32;
-        let variance = (squares / input.len() as f32 - mean * mean).max(0.);
-        let scale = (variance + 1e-5).sqrt().recip();
-        let shift = -mean * scale;
-        unsafe {
-            vDSP_vsmsa(
-                input.as_ptr(),
-                1,
-                &scale,
-                &shift,
-                input.as_mut_ptr(),
-                1,
-                input.len(),
-            )
-        };
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let mean = input.iter().sum::<f32>() / input.len() as f32;
-        let variance = input
-            .iter()
-            .map(|value| (value - mean).powi(2))
-            .sum::<f32>()
-            / input.len() as f32;
-        let scale = (variance + 1e-5).sqrt().recip();
-        input
-            .iter_mut()
-            .for_each(|value| *value = (*value - mean) * scale);
+        *value = (*value - mean) * scale * weight + bias;
     }
 }
 
