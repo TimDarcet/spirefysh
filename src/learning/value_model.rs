@@ -1754,10 +1754,6 @@ fn exp_shifted(values: &mut [f32], shift: f32) -> f32 {
     total
 }
 
-fn exp_in_place(values: &mut [f32]) {
-    exp_shifted(values, 0.0);
-}
-
 fn softmax(values: &mut [f32]) {
     let scale = exp_shifted(values, reduce(values, f32::NEG_INFINITY, f32::max, f32::max)).recip();
     values.iter_mut().for_each(|value| *value *= scale);
