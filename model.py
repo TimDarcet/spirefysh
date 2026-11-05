@@ -897,6 +897,19 @@ kernel void semantic_backward_embedding(
     }
 }
 
+kernel void embedding_add(
+    device const float *values, device const int *semantic, device const float *embedding,
+    device float *output, constant uint& fields, constant uint& width,
+    uint index [[thread_position_in_grid]]) {
+    uint row = index / width, column = index % width;
+    float value = values[index];
+    for (uint field = 0; field < fields; ++field) {
+        int id = semantic[row * fields + field];
+        if (id) value += embedding[id * width + column];
+    }
+    output[index] = value;
+}
+
 kernel void group_sum_forward(
     device const float *input, device const long *group, device atomic_float *output,
     constant uint& width, uint index [[thread_position_in_grid]]) {
@@ -1733,6 +1746,32 @@ class _FusedDomains(torch.autograd.Function):
 
 
 @_committed
+class _EmbeddingAdd(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, values, semantic, embedding):
+        if _RaggedAttention.library is None:
+            _RaggedAttention.library = torch.mps.compile_shader(_TRAINING_METAL)
+        output = torch.empty_like(values)
+        _RaggedAttention.library.embedding_add(
+            values, semantic, embedding, output, semantic.shape[1], values.shape[1],
+            threads=values.numel(), group_size=256,
+        )
+        ctx.save_for_backward(semantic, embedding)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        semantic, embedding = ctx.saved_tensors
+        grad_output = grad_output.contiguous()
+        grad_embedding = torch.zeros_like(embedding)
+        _RaggedAttention.library.semantic_backward_embedding(
+            semantic, grad_output, grad_embedding, len(semantic), semantic.shape[1],
+            embedding.shape[1], threads=grad_output.numel(), group_size=256,
+        )
+        return grad_output, None, grad_embedding
+
+
+@_committed
 class _GroupSum(torch.autograd.Function):
     @staticmethod
     def forward(ctx, values, group, groups):
@@ -1873,6 +1912,10 @@ class ConceptEmbeddings(nn.Module):
     def flattened(self):
         return torch.cat((self.tables[0].weight[:1] * 0,
                           *(table.weight[1:] for table in self.tables)))
+
+    def code(self, name, index):
+        table = SEMANTIC_NAMES.index(name)
+        return 1 + sum(self.sizes[:table]) + index
 
     def local(self, name, index):
         return graph_name(self.tables[SEMANTIC_NAMES.index(name)].weight[index + 1], name)
@@ -2127,10 +2170,24 @@ class Agent(nn.Module):
     def _tag(self, values, collection):
         return values + self.concepts.local("collection", collection).to(values.dtype)
 
-    def _card_context(self, values, metadata):
+    def _context(self, values, concepts, *lookups):
+        # Adds concept rows for (present, name, index) lookups; index 0 of the flat table is zero.
+        semantic = torch.stack([
+            torch.where(present, self.concepts.code(name, index), 0) for present, name, index in lookups
+        ], 1).int()
+        if values.device.type == "mps" and values.dtype == torch.float32:
+            return _EmbeddingAdd.apply(values, semantic, concepts)
+        return values + concepts[semantic].sum(1)
+
+    def _card_context(self, values, metadata, concepts):
         if not len(values):
             return values
         zone, order_kind, order, origin = metadata[:len(values)].T
+        if values.device.type == "mps":
+            return self._context(values, concepts, *(
+                ((zone == 2) & (order_kind == kind) & (order > 0), name, (order - 1).clamp(max=256))
+                for kind, name in ((1, "draw_top_position"), (2, "draw_bottom_position"))
+            ), (origin > 0, "deck_origin", (origin - 1).clamp(max=256)))
         for kind, name in ((1, "draw_top_position"), (2, "draw_bottom_position")):
             present = (zone == 2) & (order_kind == kind) & (order > 0)
             values = values + present[:, None] * self.concepts.local(
@@ -2141,10 +2198,12 @@ class Agent(nn.Module):
             "deck_origin", (origin - 1).clamp(max=256),
         ).to(values.dtype)
 
-    def _relic_context(self, values, metadata):
+    def _relic_context(self, values, metadata, concepts):
         if not len(values):
             return values
         position = metadata[:len(values), 0]
+        if values.device.type == "mps":
+            return self._context(values, concepts, (position > 0, "relic_position", (position - 1).clamp(max=256)))
         return values + (position > 0)[:, None] * self.concepts.local(
             "relic_position", (position - 1).clamp(max=256),
         ).to(values.dtype)
@@ -2398,7 +2457,7 @@ class Agent(nn.Module):
                     continue
                 attached_values = encoded[domain]
                 if domain == DOMAIN["card"]:
-                    attached_values = self._card_context(attached_values, row[10])
+                    attached_values = self._card_context(attached_values, row[10], concepts)
                 arguments.extend((attached_values, row[6][row[9]]))
             attached = _ActionAttachments.apply(
                 nodes, path[:action_count], attachment_rows, *tuple(arguments),
@@ -2411,7 +2470,7 @@ class Agent(nn.Module):
                     continue
                 item = encoded[domain][row[6][row[9]]]
                 if domain == DOMAIN["card"]:
-                    item = self._card_context(item, row[3][row[9]])
+                    item = self._card_context(item, row[3][row[9]], concepts)
                 values.append(item)
             if values:
                 attached.index_add_(0, attachment_rows, torch.cat(values).to(attached.dtype))
@@ -2421,7 +2480,7 @@ class Agent(nn.Module):
         action = _layer_norm(action + attached, self.action_norm)
         return action, action_row[:action_count], action_flat[:action_count], actions, policy_sequence
 
-    def _continuations(self, domains, encoded, plan):
+    def _continuations(self, domains, encoded, plan, concepts):
         values, rows, u = self._domain_rows(domains, encoded, DOMAIN["continuation"])
         if not len(values):
             return values, rows, plan[3:-1]
@@ -2431,7 +2490,7 @@ class Agent(nn.Module):
         for domain, source, item in plan[-1]:
             linked = encoded[domain][domains[domain][6][source]]
             if domain == DOMAIN["card"]:
-                linked = self._card_context(linked, domains[domain][3][source])
+                linked = self._card_context(linked, domains[domain][3][source], concepts)
             items.index_put_((item,), linked.to(items.dtype), accumulate=True)
         return items, item_rows, plan[3:-1]
 
@@ -2522,9 +2581,9 @@ class Agent(nn.Module):
                 source=None if filtered is None else filters[filtered],
             )
             if domain == DOMAIN["card"]:
-                item = self._card_context(item, item_u)
+                item = self._card_context(item, item_u, concepts)
             if name == "relic" and len(item):
-                item = self._relic_context(item, item_u)
+                item = self._relic_context(item, item_u, concepts)
                 stored, stored_rows, _ = self._domain_rows(
                     domains, encoded, DOMAIN["card"], source=filters[10],
                 )
@@ -2541,7 +2600,7 @@ class Agent(nn.Module):
             add(value, row, "effect")
 
         continuation, continuation_rows, continuation_gru = self._continuations(
-            domains, encoded, continuation_plan,
+            domains, encoded, continuation_plan, concepts,
         )
         mode = self.pooling["continuation"]
         if mode == "global_tokens":

@@ -1159,7 +1159,11 @@ class ModelKernelTest(unittest.TestCase):
         values = torch.randn(510, 64, device=target)
         metadata = torch.zeros(512, 4, dtype=torch.long, device=target)
         metadata[:510, 3] = 1
-        self.assertEqual(agent._card_context(values, metadata).shape, values.shape)
+        metadata[:300, :3] = torch.tensor([2, 1, 5])
+        output = agent._card_context(values, metadata, agent.concepts.flattened())
+        self.assertEqual(output.shape, values.shape)
+        expected = agent.cpu()._card_context(values.cpu(), metadata.cpu(), agent.concepts.flattened())
+        torch.testing.assert_close(output.cpu(), expected)
 
     def test_native_sequence_deduplication_preserves_empty_groups(self):
         selected, groups, inverse = train.sts2_sim.deduplicate_sequences(
