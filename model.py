@@ -1004,8 +1004,9 @@ kernel void layer_norm_forward_bfloat(
 template <typename G>
 void layer_norm_backward(
     device const float *input, device const float *gamma, device const float *stats,
-    device const G *grad_output, device float *grad_input, device float *partial,
-    uint rows, uint block_rows, uint width, uint block, uint lane) {
+    device const G *grad_output, device const float *residual, device float *grad_input,
+    device float *partial, uint rows, uint block_rows, uint width, bool add_residual, uint block,
+    uint lane) {
     float4 grad_gamma = 0.0f, grad_beta = 0.0f;
     for (uint row = block * block_rows; row < min(rows, (block + 1) * block_rows); ++row) {
         float mean = stats[row * 2], inverse_std = stats[row * 2 + 1];
@@ -1022,10 +1023,12 @@ void layer_norm_backward(
             local_product += grad[part] * normalized[part];
         }
         float sum = simd_sum(local_sum), product = simd_sum(local_product);
-        for (uint part = 0; part < width / 32; ++part)
-            grad_input[row * width + lane + part * 32] = (
+        for (uint part = 0; part < width / 32; ++part) {
+            uint index = row * width + lane + part * 32;
+            grad_input[index] = (
                 grad[part] - sum / width - normalized[part] * product / width
-            ) * inverse_std;
+            ) * inverse_std + (add_residual ? residual[index] : 0.0f);
+        }
     }
     for (uint part = 0; part < width / 32; ++part) {
         partial[block * 2 * width + lane + part * 32] = grad_gamma[part];
@@ -1036,10 +1039,12 @@ void layer_norm_backward(
 #define LAYER_NORM_BACKWARD(name, G) \
 kernel void name( \
     device const float *input, device const float *gamma, device const float *stats, \
-    device const G *grad_output, device float *grad_input, device float *partial, \
-    constant uint& rows, constant uint& block_rows, constant uint& width, \
-    uint block [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) { \
-    layer_norm_backward(input, gamma, stats, grad_output, grad_input, partial, rows, block_rows, width, block, lane); \
+    device const G *grad_output, device const float *residual, device float *grad_input, \
+    device float *partial, constant uint& rows, constant uint& block_rows, constant uint& width, \
+    constant uint& add_residual, uint block [[threadgroup_position_in_grid]], \
+    uint lane [[thread_index_in_simdgroup]]) { \
+    layer_norm_backward(input, gamma, stats, grad_output, residual, grad_input, partial, rows, \
+                        block_rows, width, add_residual, block, lane); \
 }
 LAYER_NORM_BACKWARD(layer_norm_backward_bfloat, bfloat)
 LAYER_NORM_BACKWARD(layer_norm_backward_float, float)
@@ -1418,7 +1423,7 @@ class _LinearResidual(torch.autograd.Function):
             grad_output
 
 
-def _layer_norm_backward(value, gamma, stats, grad_normalized, block_rows=32):
+def _layer_norm_backward(value, gamma, stats, grad_normalized, residual=None, block_rows=32):
     rows, width = value.shape
     blocks = (rows + block_rows - 1) // block_rows
     grad_value, partial = torch.empty_like(value), value.new_empty((blocks, 2, width))
@@ -1426,7 +1431,8 @@ def _layer_norm_backward(value, gamma, stats, grad_normalized, block_rows=32):
     getattr(_RaggedAttention.library, "layer_norm_backward_" + (
         "float" if grad_normalized.dtype == torch.float32 else "bfloat"
     ))(
-        value, gamma, stats, grad_normalized, grad_value, partial, rows, block_rows, width,
+        value, gamma, stats, grad_normalized, value if residual is None else residual.contiguous(),
+        grad_value, partial, rows, block_rows, width, residual is not None,
         threads=blocks * 32, group_size=32,
     )
     _RaggedAttention.library.token_backward_norm_reduce(
@@ -1469,15 +1475,19 @@ class _NormLinear(torch.autograd.Function):
         )
         output, weight_bfloat = _linear_forward(normalized, weight, bias)
         ctx.save_for_backward(value, gamma, normalized, stats, weight_bfloat)
-        return output
+        return output, value.view_as(value)
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, grad_output, grad_residual):
+        # The second output aliases the input for residual connections; its gradient is added
+        # by the layer-norm kernel instead of a separate pass.
         value, gamma, normalized, stats, weight = ctx.saved_tensors
         grad_normalized, grad_weight, grad_bias = _linear_backward(
             normalized, weight, grad_output,
         )
-        grad_value, grad_gamma, grad_beta = _layer_norm_backward(value, gamma, stats, grad_normalized)
+        grad_value, grad_gamma, grad_beta = _layer_norm_backward(
+            value, gamma, stats, grad_normalized, grad_residual,
+        )
         return grad_value, grad_gamma, grad_beta, grad_weight, grad_bias
 
 
@@ -1524,7 +1534,7 @@ def _norm_linear(value, norm, weight, bias):
     if (value.device.type == "mps" and value.dtype == torch.float32
             and torch.is_autocast_enabled("mps") and value.shape[1] == 128):
         return _NormLinear.apply(value, norm.weight, norm.bias, weight, bias)
-    return nn.functional.linear(norm(value), weight, bias)
+    return nn.functional.linear(norm(value), weight, bias), value
 
 
 def _layer_norm(value, norm):
@@ -2045,17 +2055,18 @@ class Agent(nn.Module):
                     if value is not None:
                         nodes[ranges[graph]:ranges[graph + 1]] = value
             for parents, children, edge_rows, sequence, degree, count, _edge_count in levels:
-                parent = nodes[parents]
-                attended = self.attend(
-                    _norm_linear(parent, self.graph_norm, self.graph_query.weight,
-                                 self.graph_query.bias),
-                    _norm_linear(nodes[children], self.graph_norm, self.graph_key_value.weight,
-                                 self.graph_key_value.bias), sequence,
+                query, parent = _norm_linear(
+                    nodes[parents], self.graph_norm, self.graph_query.weight, self.graph_query.bias,
                 )
+                attended = self.attend(query, _norm_linear(
+                    nodes[children], self.graph_norm, self.graph_key_value.weight,
+                    self.graph_key_value.bias,
+                )[0], sequence)
                 updated = _residual_linear(attended, self.graph_out, parent)
-                updated = _residual_linear(self.graph_ff[1](_norm_linear(
+                hidden, updated = _norm_linear(
                     updated, self.graph_ff_norm, self.graph_ff[0].weight, self.graph_ff[0].bias,
-                )), self.graph_ff[2], updated)
+                )
+                updated = _residual_linear(self.graph_ff[1](hidden), self.graph_ff[2], updated)
                 nodes.index_put_((parents[:count],), updated[:count])
             if cacheable:
                 offsets = offsets.tolist()
@@ -2222,11 +2233,8 @@ class Agent(nn.Module):
             current[destination] = values.to(current.dtype)
 
             def attend_layer(current, layer, selected, query_offsets, sparse):
-                qkv = _norm_linear(
+                qkv, current = _norm_linear(
                     current, layer.norm1, layer.self_attn.in_proj_weight,
-                    layer.self_attn.in_proj_bias,
-                ) if flash else nn.functional.linear(
-                    layer.norm1(current), layer.self_attn.in_proj_weight,
                     layer.self_attn.in_proj_bias,
                 )
                 fp32_value_backward = final_attention \
@@ -2252,12 +2260,10 @@ class Agent(nn.Module):
                 return _residual_linear(attended, layer.self_attn.out_proj, residual)
 
             def feed_forward(current, layer):
-                return _residual_linear(
-                    layer.activation(_norm_linear(
-                        current, layer.norm2, layer.linear1.weight, layer.linear1.bias,
-                    )),
-                    layer.linear2, current,
+                hidden, current = _norm_linear(
+                    current, layer.norm2, layer.linear1.weight, layer.linear1.bias,
                 )
+                return _residual_linear(layer.activation(hidden), layer.linear2, current)
 
             for layer_index, layer in enumerate(transformer.layers):
                 if selected_count is not None and layer_index == len(transformer.layers) - 1:
