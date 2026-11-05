@@ -1131,7 +1131,8 @@ def _committed(function):
     for name in ("forward", "backward"):
         def committed(ctx, *args, method=getattr(function, name)):
             output = method(ctx, *args)
-            torch.mps.Event().record()
+            _committed.event = getattr(_committed, "event", None) or torch.mps.Event()
+            _committed.event.record()
             return output
         setattr(function, name, staticmethod(committed))
     return function
@@ -1304,94 +1305,67 @@ class _GruStep(torch.autograd.Function):
         return grad_input, grad_hidden, grad_previous
 
 
-def _linear_forward(value_bfloat, weight, bias, residual=None):
-    if _FastLinear.libraries is None:
-        sources = Path(__file__).with_name("linear.metal").read_text().split(
-            "// SPIREFYSH_KERNEL"
+def _linear_kernel(name, a, b, output, rows, columns, depth, bias=None, residual=None, splits=1):
+    if _FastLinear.library is None:
+        _FastLinear.library = torch.mps.compile_shader(
+            Path(__file__).with_name("linear.metal").read_text()
         )
-        _FastLinear.libraries = [torch.mps.compile_shader(source) for source in sources]
+    getattr(_FastLinear.library, name)(
+        a, b, output, output if bias is None else bias, output if residual is None else residual,
+        rows, columns, depth, (depth + splits - 1) // splits,
+        threads=((columns + 31) // 32 * 32, (rows + 31) // 32, splits), group_size=(32, 1, 1),
+    )
+
+
+def _linear_forward(value_bfloat, weight, bias, residual=None):
     weight_bfloat = weight.to(torch.bfloat16)
     output = value_bfloat.new_empty(
-        (len(value_bfloat), len(weight)), dtype=residual.dtype if residual is not None else None,
+        (len(value_bfloat), len(weight)),
+        dtype=torch.float32 if residual is not None else torch.bfloat16,
     )
-    name = "linear_residual_128_128" if residual is not None else \
-        f"linear_{value_bfloat.shape[1]}_{len(weight)}"
-    arguments = (value_bfloat, weight_bfloat, output, bias.to(torch.bfloat16))
-    getattr(_FastLinear.libraries[2 if residual is not None else len(weight) != 128], name)(
-        *arguments, *((residual,) if residual is not None else ()), len(value_bfloat),
-        threads=((len(weight) + 31) // 32 * 32, (len(value_bfloat) + 31) // 32),
-        group_size=(32, 1),
+    bias = bias.float() if bias is not None else weight.new_zeros(len(weight), dtype=torch.float32)
+    _linear_kernel(
+        "linear" if residual is None else "linear_residual", value_bfloat, weight_bfloat, output,
+        len(value_bfloat), len(weight), value_bfloat.shape[1], bias, residual,
     )
     return output, weight_bfloat
 
 
 def _linear_backward(value, weight, grad_output):
     grad_output = grad_output.to(torch.bfloat16).contiguous()
-    if value.device.type != "mps" or len(value) < 4096 or len(weight) not in (128, 384):
-        return torch.ops.aten.linear_backward(
-            value, grad_output, weight, [True, True, True],
-        )
-    if _FastLinear.backward_libraries is None:
-        source_128, source_384, _ = Path(__file__).with_name("linear.metal").read_text().split(
-            "// SPIREFYSH_KERNEL"
-        )
-        source_128 = source_128.replace(
-            "constant bool B_trans = true;", "constant bool B_trans = false;",
-        ).replace("linear_128_128", "linear_backward_128_128").replace(
-            "C->store_bfloat(", "C->store(",
-        )
-        source_384 = source_384.replace(
-            "constant uint N = 384;", "constant uint N = 128;",
-        ).replace(
-            "constant uint K = 128;", "constant uint K = 384;",
-        ).replace(
-            "constant uint A_leading_dimension = 128;",
-            "constant uint A_leading_dimension = 384;",
-        ).replace(
-            "constant uint C_leading_dimension = 384;",
-            "constant uint C_leading_dimension = 128;",
-        ).replace(
-            "constant bool B_trans = true;", "constant bool B_trans = false;",
-        ).replace("linear_128_384", "linear_backward_384_128").replace(
-            "C->store_bfloat(", "C->store(",
-        )
-        _FastLinear.backward_libraries = [
-            torch.mps.compile_shader(source_128), torch.mps.compile_shader(source_384),
-        ]
-        _FastLinear.zero = value.new_zeros(128)
+    rows, columns, depth = len(value), value.shape[1], len(weight)
     grad_value = torch.empty_like(value)
-    getattr(
-        _FastLinear.backward_libraries[len(weight) != 128],
-        f"linear_backward_{len(weight)}_128",
-    )(
-        grad_output, weight, grad_value, _FastLinear.zero, len(value),
-        threads=(128, (len(value) + 31) // 32), group_size=(32, 1),
+    _linear_kernel("linear_input_grad", grad_output, weight, grad_value, rows, columns, depth)
+    grad_weight = weight.new_zeros((depth, columns), dtype=torch.float32)
+    splits = max(1, min(64, rows // 256))
+    _linear_kernel(
+        "linear_weight_grad", grad_output, value, grad_weight, depth, columns, rows, splits=splits,
     )
-    _, grad_weight, grad_bias = torch.ops.aten.linear_backward(
-        value, grad_output, weight, [False, True, True],
+    grad_bias = weight.new_zeros(depth, dtype=torch.float32)
+    _FastLinear.library.column_sum(
+        grad_output, grad_bias, rows, depth, (rows + splits - 1) // splits,
+        threads=(depth, splits), group_size=(min(depth, 128), 1),
     )
     return grad_value, grad_weight, grad_bias
 
 
 @_committed
 class _FastLinear(torch.autograd.Function):
-    libraries = None
-    backward_libraries = None
-    zero = None
+    library = None
 
     @staticmethod
     def forward(ctx, value, weight, bias):
         value_bfloat = value.to(torch.bfloat16)
         output, weight_bfloat = _linear_forward(value_bfloat, weight, bias)
         ctx.save_for_backward(value_bfloat, weight_bfloat)
-        ctx.value_dtype = value.dtype
+        ctx.value_dtype, ctx.bias = value.dtype, bias is not None
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
         value, weight = ctx.saved_tensors
         grad_value, grad_weight, grad_bias = _linear_backward(value, weight, grad_output)
-        return grad_value.to(ctx.value_dtype), grad_weight.float(), grad_bias.float()
+        return grad_value.to(ctx.value_dtype), grad_weight, grad_bias if ctx.bias else None
 
 
 @_committed
@@ -1401,14 +1375,15 @@ class _LinearResidual(torch.autograd.Function):
         value_bfloat = value.to(torch.bfloat16)
         output, weight_bfloat = _linear_forward(value_bfloat, weight, bias, residual)
         ctx.save_for_backward(value_bfloat, weight_bfloat)
-        ctx.value_dtype = value.dtype
+        ctx.value_dtype, ctx.bias = value.dtype, bias is not None
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
         value, weight = ctx.saved_tensors
         grad_value, grad_weight, grad_bias = _linear_backward(value, weight, grad_output)
-        return grad_value.to(ctx.value_dtype), grad_weight.float(), grad_bias.float(), grad_output
+        return grad_value.to(ctx.value_dtype), grad_weight, grad_bias if ctx.bias else None, \
+            grad_output
 
 
 @_committed
@@ -1450,7 +1425,7 @@ class _NormLinear(torch.autograd.Function):
             partial, grad_gamma, grad_beta, blocks, width,
             threads=width * 128, group_size=128,
         )
-        return grad_value, grad_gamma, grad_beta, grad_weight.float(), grad_bias.float()
+        return grad_value, grad_gamma, grad_beta, grad_weight, grad_bias
 
 
 @_committed
@@ -1472,8 +1447,8 @@ class _NormHead(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         value, gamma, normalized, stats, weight = ctx.saved_tensors
-        grad_normalized, grad_weight, grad_bias = torch.ops.aten.linear_backward(
-            normalized, grad_output[:, None].to(torch.bfloat16), weight, [True, True, True],
+        grad_normalized, grad_weight, grad_bias = _linear_backward(
+            normalized, weight, grad_output[:, None],
         )
         width = value.shape[1]
         grad_value = torch.empty_like(value)
@@ -1492,13 +1467,11 @@ class _NormHead(torch.autograd.Function):
             partial, grad_gamma, grad_beta, blocks, width,
             threads=width * 128, group_size=128,
         )
-        return grad_value, grad_gamma, grad_beta, grad_weight.float(), grad_bias.float()
+        return grad_value, grad_gamma, grad_beta, grad_weight, grad_bias
 
 
 def _linear(value, layer, residual=None):
-    if (value.device.type == "mps" and torch.is_autocast_enabled("mps")
-            and value.shape[1] == 128 and len(layer.weight) in (128, 384)
-            and len(value) >= 4096):
+    if value.device.type == "mps" and torch.is_autocast_enabled("mps") and value.shape[1] == 128:
         return (_FastLinear if residual is None else _LinearResidual).apply(
             value, layer.weight, layer.bias, *(() if residual is None else (residual,))
         )
@@ -1512,8 +1485,7 @@ def _residual_linear(value, layer, residual):
 
 def _norm_linear(value, norm, weight, bias):
     if (value.device.type == "mps" and value.dtype == torch.float32
-            and torch.is_autocast_enabled("mps") and value.shape[1] == 128
-            and len(weight) in (128, 384) and len(value) >= 4096):
+            and torch.is_autocast_enabled("mps") and value.shape[1] == 128):
         return _NormLinear.apply(value, norm.weight, norm.bias, weight, bias)
     return nn.functional.linear(norm(value), weight, bias)
 
@@ -2030,12 +2002,17 @@ class Agent(nn.Module):
                     if value is not None:
                         nodes[ranges[graph]:ranges[graph + 1]] = value
             for parents, children, edge_rows, sequence, degree, count, _edge_count in levels:
+                parent = nodes[parents]
                 attended = self.attend(
-                    self.graph_query(self.graph_norm(nodes[parents])),
-                    self.graph_key_value(self.graph_norm(nodes[children])), sequence,
+                    _norm_linear(parent, self.graph_norm, self.graph_query.weight,
+                                 self.graph_query.bias),
+                    _norm_linear(nodes[children], self.graph_norm, self.graph_key_value.weight,
+                                 self.graph_key_value.bias), sequence,
                 )
-                updated = nodes[parents] + self.graph_out(attended)
-                updated = updated + self.graph_ff(self.graph_ff_norm(updated))
+                updated = _residual_linear(attended, self.graph_out, parent)
+                updated = _residual_linear(self.graph_ff[1](_norm_linear(
+                    updated, self.graph_ff_norm, self.graph_ff[0].weight, self.graph_ff[0].bias,
+                )), self.graph_ff[2], updated)
                 nodes.index_copy_(0, parents[:count], updated[:count])
             if cacheable:
                 offsets = offsets.tolist()
@@ -2477,8 +2454,8 @@ class Agent(nn.Module):
                 summary = self._summarize(
                     item, item_rows, batch, name, "sum",
                 )
-            add(self.pool_projections[name](summary), torch.arange(batch, device=summary.device),
-                name)
+            add(_linear(summary, self.pool_projections[name]),
+                torch.arange(batch, device=summary.device), name)
 
         actors, actor_rows, actor_u, effect_values, effect_rows = self._actors(
             domains, encoded, batch, concepts, actor_plan,
@@ -2508,7 +2485,7 @@ class Agent(nn.Module):
                 payload = item.new_zeros((batch, self.width))
                 if len(stored):
                     payload.index_add_(0, stored_rows, stored.to(payload.dtype))
-                    payload = self.pael_cards(payload)
+                    payload = _linear(payload, self.pael_cards)
                 pael = item_u[:, 1] != 0
                 item = item + pael[:, None] * payload[item_rows]
             item, item_rows = self._collection(item, item_rows, active, name)

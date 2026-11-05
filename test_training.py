@@ -1240,8 +1240,9 @@ class ModelKernelTest(unittest.TestCase):
                 value, grad, weight, [True, True, True],
             )
             actual = model._linear_backward(value, weight, grad)
-            self.assertTrue(all(torch.equal(left, right)
-                                for left, right in zip(actual, expected)))
+            for left, right in zip(actual, expected):
+                torch.testing.assert_close(left.float(), right.float(), rtol=1e-2,
+                                           atol=1e-2 * float(right.abs().max()))
 
 
 class TrajectoryTest(unittest.TestCase):
