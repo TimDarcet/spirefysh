@@ -1524,6 +1524,12 @@ def _norm_linear(value, norm, weight, bias):
     return nn.functional.linear(norm(value), weight, bias)
 
 
+def _layer_norm(value, norm):
+    if value.device.type == "mps" and torch.is_autocast_enabled("mps") and value.shape[1] == 128:
+        return _LayerNorm.apply(value.float().contiguous(), norm.weight, norm.bias)
+    return norm(value)
+
+
 def _norm_head(value, norm, head):
     if (value.device.type == "mps" and value.dtype == torch.float32
             and torch.is_autocast_enabled("mps") and value.shape[1] == 128):
@@ -2047,7 +2053,7 @@ class Agent(nn.Module):
                 updated = _residual_linear(self.graph_ff[1](_norm_linear(
                     updated, self.graph_ff_norm, self.graph_ff[0].weight, self.graph_ff[0].bias,
                 )), self.graph_ff[2], updated)
-                nodes.index_copy_(0, parents[:count], updated[:count])
+                nodes.index_put_((parents[:count],), updated[:count])
             if cacheable:
                 offsets = offsets.tolist()
                 for graph, key in enumerate(keys):
@@ -2088,18 +2094,17 @@ class Agent(nn.Module):
         for output, (index, _name, values) in zip(outputs, learned):
             encoded[index] = output[:values[2]]
         phase = domains[DOMAIN["phase"]]
-        projection = nn.functional.embedding(phase[0].long(), concepts).sum(1)
+        projection = concepts[phase[0].long()].sum(1)
         if self.encoders["phase"].numeric is not None:
             projection = projection + self.encoders["phase"].numeric(phase[1].float())
-        encoded[DOMAIN["phase"]] = self.encoders["phase"].norm(projection[:phase[2]])
+        encoded[DOMAIN["phase"]] = _layer_norm(projection[:phase[2]], self.encoders["phase"].norm)
         potion = domains[DOMAIN["potion"]]
-        encoded[DOMAIN["potion"]] = nn.functional.embedding(
-            potion[0][:potion[2], 0].long(), concepts,
-        )
+        encoded[DOMAIN["potion"]] = concepts[potion[0][:potion[2], 0].long()]
         node = domains[DOMAIN["map_node"]]
-        node_semantic = nn.functional.embedding(node[0][:node[2]].long(), concepts).sum(1)
-        encoded[DOMAIN["map_node"]] = self.encoders["map_node"].norm(
-            node_semantic + self.map_nodes(graph_name(node[10][:node[2], 0], "map_node kinds")),
+        node_semantic = concepts[node[0][:node[2]].long()].sum(1)
+        encoded[DOMAIN["map_node"]] = _layer_norm(
+            node_semantic + self.map_nodes.weight[graph_name(node[10][:node[2], 0], "map_node kinds")],
+            self.encoders["map_node"].norm,
         )
         encoded[DOMAIN["map_edge"]] = concepts.new_empty((0, self.width))
         return tuple(graph_name(value, name + " encoding")
@@ -2314,15 +2319,13 @@ class Agent(nn.Module):
         )
         if len(history):
             if len(player_source):
-                actors = actors.index_add(
-                    0, player_group, history[player_source].to(actors.dtype),
+                actors = actors.index_put(
+                    (player_group,), history[player_source].to(actors.dtype), accumulate=True,
                 )
             if len(move_raw):
                 history_semantic, _numeric, _count, _u, _row, _scope, history_inverse, *_ = \
                     domains[DOMAIN["history"]]
-                move_values = nn.functional.embedding(
-                    history_semantic[history_inverse[move_raw], :1].long(), concepts,
-                ).squeeze(1)
+                move_values = concepts[history_semantic[history_inverse[move_raw], 0].long()]
                 move_values = move_values[move_order][move_packed_order] \
                     if move_terminal is None else move_values
                 if move_values.device.type == "mps" and torch.is_autocast_enabled("mps"):
@@ -2337,8 +2340,8 @@ class Agent(nn.Module):
                         move_values, torch.tensor(move_batch_sizes),
                     )
                     _, output = self.move_gru(packed)
-                move = move_values.new_zeros((len(actors), self.width)).index_copy(
-                    0, move_present, output[0],
+                move = move_values.new_zeros((len(actors), self.width)).index_put(
+                    (move_present,), output[0],
                 )
                 actors = actors + move
 
@@ -2364,11 +2367,11 @@ class Agent(nn.Module):
             pooled_mode = "transformer" if mode.startswith("transformer") else "sum"
             summary = self._summarize(values, local_group, len(actor_index), name, pooled_mode)
             if mode.endswith("into_actor"):
-                actors = actors.index_add(0, actor_index, summary.to(actors.dtype))
+                actors = actors.index_put((actor_index,), summary.to(actors.dtype), accumulate=True)
             else:
                 extra_values.append(self._tag(summary, 8 + (name == "enemy_effect")))
                 extra_rows.append(rows[actor_index])
-        actors = self.actor_norm(actors)
+        actors = _layer_norm(actors, self.actor_norm)
         return actors, rows, u, extra_values, extra_rows
 
     def _actions(self, domains, encoded, values, index, nodes, concepts):
@@ -2406,7 +2409,7 @@ class Agent(nn.Module):
             present = path[:action_count] >= 0
             if present.any():
                 attached[present] += nodes[path[:action_count][present]]
-        action = self.action_norm(action + attached)
+        action = _layer_norm(action + attached, self.action_norm)
         return action, action_row[:action_count], action_flat[:action_count], actions, policy_sequence
 
     def _continuations(self, domains, encoded, plan):
@@ -2415,12 +2418,12 @@ class Agent(nn.Module):
             return values, rows, plan[3:-1]
         order, group, item_rows, groups, *_ = plan
         items = values.new_zeros((groups, self.width))
-        items.index_add_(0, group, values[order])
+        items.index_put_((group,), values[order], accumulate=True)
         for domain, source, item in plan[-1]:
             linked = encoded[domain][domains[domain][6][source]]
             if domain == DOMAIN["card"]:
                 linked = self._card_context(linked, domains[domain][3][source])
-            items.index_add_(0, item, linked.to(items.dtype))
+            items.index_put_((item,), linked.to(items.dtype), accumulate=True)
         return items, item_rows, plan[3:-1]
 
     def _packed_gru(self, values, batch_sizes, gru, parents=None):
@@ -2459,7 +2462,7 @@ class Agent(nn.Module):
                 segments.append((name, len(value)))
 
         run, run_rows, _ = self._domain_rows(domains, encoded, DOMAIN["run"])
-        seed = graph_name(run.new_zeros((batch, self.width)).index_copy(0, run_rows, run), "run")
+        seed = graph_name(run.new_zeros((batch, self.width)).index_put((run_rows,), run), "run")
         phase, phase_rows, phase_u = self._phases(domains, phase_projection)
         payload = phase.new_zeros((batch, self.width))
         for domain in range(len(TOKEN_SPECS)):
@@ -2467,10 +2470,10 @@ class Agent(nn.Module):
                 domains, encoded, domain, scope_value=-2,
             )
             if len(item):
-                payload.index_add_(0, item_rows, item.to(payload.dtype))
+                payload.index_put_((item_rows,), item.to(payload.dtype), accumulate=True)
         suspended = phase_u[:, 0] != 0
         phase = phase + suspended[:, None] * payload[phase_rows].to(phase.dtype)
-        add(self.encoders["phase"].norm(phase), phase_rows, "phase")
+        add(_layer_norm(phase, self.encoders["phase"].norm), phase_rows, "phase")
         add(current + self.concepts.local("token_role", 0).to(current.dtype),
             torch.arange(batch, device=current.device), "map")
 
@@ -2518,7 +2521,7 @@ class Agent(nn.Module):
                 )
                 payload = item.new_zeros((batch, self.width))
                 if len(stored):
-                    payload.index_add_(0, stored_rows, stored.to(payload.dtype))
+                    payload.index_put_((stored_rows,), stored.to(payload.dtype), accumulate=True)
                     payload = _linear(payload, self.pael_cards)
                 pael = item_u[:, 1] != 0
                 item = item + pael[:, None] * payload[item_rows]
@@ -2542,15 +2545,15 @@ class Agent(nn.Module):
                     state = self._packed_gru(
                         continuation[packed_order], batch_sizes, self.continuation_gru,
                     )
-                    summary = continuation.new_zeros((batch, self.width)).index_copy(
-                        0, packed_present, state,
+                    summary = continuation.new_zeros((batch, self.width)).index_put(
+                        (packed_present,), state,
                     )
                 else:
                     padded = continuation.new_zeros((batch, maximum, self.width))
                     padded[continuation_rows, position] = continuation
                     output, _ = self.continuation_gru(padded)
-                    summary = continuation.new_zeros((batch, self.width)).index_copy(
-                        0, present, output[present, last],
+                    summary = continuation.new_zeros((batch, self.width)).index_put(
+                        (present,), output[present, last],
                     )
             else:
                 summary = continuation.new_zeros((batch, self.width))

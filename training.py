@@ -224,10 +224,12 @@ def uniform_cross_entropy(log_probability, legal, action_row=None, row_count=Non
     terms = torch.where(legal, -log_probability, 0.)
     if action_row is None:
         return (terms.sum(1) / legal.sum(1)).mean()
-    counts = log_probability.new_zeros(row_count).index_add(
-        0, action_row, legal.to(log_probability.dtype),
+    counts = log_probability.new_zeros(row_count).index_put(
+        (action_row,), legal.to(log_probability.dtype), accumulate=True,
     )
-    return (log_probability.new_zeros(row_count).index_add(0, action_row, terms) / counts).mean()
+    return (log_probability.new_zeros(row_count).index_put(
+        (action_row,), terms, accumulate=True,
+    ) / counts).mean()
 
 
 def resume_curriculum(source, stage):
@@ -1435,9 +1437,10 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
             if flat_policy:
                 action_row = inputs[3] if cached else inputs[5][0][:len(logits)]
                 action_legal = None if cached else inputs[5][2][:len(logits)]
-                entropy_by_row = logits.new_zeros(len(rows)).index_add(
-                    0, action_row, -(logits.exp() * logits
+                entropy_by_row = logits.new_zeros(len(rows)).index_put(
+                    (action_row,), -(logits.exp() * logits
                                      * (1 if action_legal is None else action_legal)),
+                    accumulate=True,
                 )
                 uniform_loss = uniform_cross_entropy(
                     logits, action_legal, action_row, len(rows),
