@@ -64,9 +64,10 @@ impl Game {
             hp_loss: Some(vec![0.0; enemies.len()]),
         };
         let mut leaves = 0;
+        static RNGS: std::sync::LazyLock<Rngs> = std::sync::LazyLock::new(|| Rngs::from_seed(0));
         while let Some((choices, probability)) = pending.pop() {
             let mut next = self.clone();
-            next.rngs = Rngs::from_seed(0);
+            next.rngs = RNGS.clone();
             next.expectation = Some(Expectation {
                 choices: choices.clone(),
                 ..Expectation::default()
