@@ -7346,74 +7346,90 @@ impl Batch {
         let bonuses = (self.training_strength, self.training_dexterity);
         let skip_forced = (cache_features || skip_forced) && !search_enabled;
         self.map_caches.resize_with(self.games.len(), || None);
-        let marks = stage_marks(&mut diagnostics, self.games.len());
-        let rows = py.allow_threads(|| {
+        self.encodings.resize_with(self.games.len(), EncodingCache::default);
+        let mut marks = stage_marks(&mut diagnostics, self.games.len());
+        let chunks = py.allow_threads(|| {
             self.games
-                .par_iter()
-                .zip(self.map_caches.par_iter_mut())
-                .map(|(game, map_cache)| {
-                    let (mut actions, legal) = candidate_actions(game, content);
-                    if !skip_forced || actions.len() != 1 {
-                        let map = cached_canonical_map(game, content, layout, map_cache);
-                        return build_observation_with_candidates(
-                            game,
-                            content,
-                            layout,
-                            bonuses,
-                            Some(&map),
-                            actions,
-                            legal,
-                        );
-                    }
-                    Observation {
-                        character: game.run.character as u8,
-                        globals: run_features(game, content),
-                        domains: std::array::from_fn(|_| DomainRows::Owned(Vec::new())),
-                        candidates: vec![CandidateRow {
-                            action: actions.pop().unwrap(),
-                            u: [0; ACTION_U],
-                            s: [0; ACTION_S],
-                            c: [0; ACTION_C],
-                            f: [0.0; ACTION_F],
-                            legal: true,
-                        }],
-                    }
-                })
-                .zip(marks)
-                .map(|(row, mark)| {
-                    if let Some(mark) = mark {
-                        *mark = 1;
-                    }
-                    row
+                .par_chunks(8)
+                .zip(self.map_caches.par_chunks_mut(8))
+                .zip(self.encodings.par_chunks_mut(8))
+                .zip(marks.par_chunks_mut(8))
+                .map(|(((games, map_caches), encodings), marks)| {
+                    let rows = games
+                        .iter()
+                        .zip(map_caches)
+                        .zip(marks)
+                        .map(|((game, map_cache), mark)| {
+                            if let Some(mark) = mark {
+                                **mark = 1;
+                            }
+                            let (mut actions, legal) = candidate_actions(game, content);
+                            if !skip_forced || actions.len() != 1 {
+                                let map = cached_canonical_map(game, content, layout, map_cache);
+                                return build_observation_with_candidates(
+                                    game,
+                                    content,
+                                    layout,
+                                    bonuses,
+                                    Some(&map),
+                                    actions,
+                                    legal,
+                                );
+                            }
+                            Observation {
+                                character: game.run.character as u8,
+                                globals: run_features(game, content),
+                                domains: std::array::from_fn(|_| DomainRows::Owned(Vec::new())),
+                                candidates: vec![CandidateRow {
+                                    action: actions.pop().unwrap(),
+                                    u: [0; ACTION_U],
+                                    s: [0; ACTION_S],
+                                    c: [0; ACTION_C],
+                                    f: [0.0; ACTION_F],
+                                    legal: true,
+                                }],
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    let packed = rows
+                        .iter()
+                        .map(|row| {
+                            if cache_features || skip_forced && row.candidates.len() == 1 {
+                                cached_packed_metadata(row)
+                            } else {
+                                compact_packed_observation(row)
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    let sequences = rows
+                        .iter()
+                        .zip(encodings)
+                        .filter(|(row, _)| !skip_forced || row.candidates.len() > 1)
+                        .map(|(row, cache)| {
+                            cache.bound(1024, model.width);
+                            model.state_tokens(row, cache)
+                        })
+                        .collect::<Vec<_>>();
+                    let features = if sequences.is_empty() {
+                        Vec::new()
+                    } else {
+                        model.encoded(sequences).collect()
+                    };
+                    (rows, packed, features)
                 })
                 .collect::<Vec<_>>()
         });
-        stage(&mut diagnostics, 1);
+        let (mut rows, mut packed, mut features) = (Vec::new(), Vec::new(), Vec::new());
+        for chunk in chunks {
+            rows.extend(chunk.0);
+            packed.extend(chunk.1);
+            features.extend(chunk.2);
+        }
+        stage(&mut diagnostics, 2);
         let evaluated_rows = rows
             .iter()
             .filter(|row| !skip_forced || row.candidates.len() > 1)
             .collect::<Vec<_>>();
-        self.encodings.resize_with(rows.len(), EncodingCache::default);
-        let mut caches = rows
-            .iter()
-            .zip(&mut self.encodings)
-            .filter(|(row, _)| !skip_forced || row.candidates.len() > 1)
-            .map(|(_, cache)| cache)
-            .collect::<Vec<_>>();
-        let features =
-            py.allow_threads(|| model.state_actions_cached(&evaluated_rows, &mut caches));
-        stage(&mut diagnostics, 2);
-        let packed = py.allow_threads(|| {
-            rows.par_iter()
-                .map(|row| {
-                    if cache_features || skip_forced && row.candidates.len() == 1 {
-                        cached_packed_metadata(row)
-                    } else {
-                        compact_packed_observation(row)
-                    }
-                })
-                .collect::<Vec<_>>()
-        });
         let outputs = model
             .evaluate_batch(&evaluated_rows, &features, temperature, None, true)
             .map_err(|error| PyValueError::new_err(error.to_string()))?;

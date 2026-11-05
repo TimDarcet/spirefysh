@@ -1305,30 +1305,6 @@ impl ValueModel {
     }
 
     #[cfg(feature = "python")]
-    fn state_actions_cached(
-        &self,
-        observations: &[&Observation],
-        caches: &mut [&mut EncodingCache],
-    ) -> Vec<(Vec<f32>, Vec<Vec<f32>>)> {
-        observations
-            .par_chunks(8)
-            .zip(caches.par_chunks_mut(8))
-            .flat_map_iter(|(observations, caches)| {
-                self.encoded(
-                    observations
-                        .iter()
-                        .zip(caches)
-                        .map(|(observation, cache)| {
-                            cache.bound(1024, self.width);
-                            self.state_tokens(observation, cache)
-                        })
-                        .collect(),
-                )
-            })
-            .collect()
-    }
-
-    #[cfg(feature = "python")]
     fn encoded(
         &self,
         sequences: Vec<(Vec<Vec<f32>>, usize)>,
