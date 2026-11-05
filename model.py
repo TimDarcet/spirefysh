@@ -1355,12 +1355,16 @@ class _GruStep(torch.autograd.Function):
         return grad_input, grad_hidden, grad_previous
 
 
-def _linear_kernel(name, a, b, output, rows, columns, depth, bias=None, residual=None, splits=1):
+def _linear_library():
     if _FastLinear.library is None:
         _FastLinear.library = torch.mps.compile_shader(
             Path(__file__).with_name("linear.metal").read_text()
         )
-    getattr(_FastLinear.library, name)(
+    return _FastLinear.library
+
+
+def _linear_kernel(name, a, b, output, rows, columns, depth, bias=None, residual=None, splits=1):
+    getattr(_linear_library(), name)(
         a, b, output, output if bias is None else bias, output if residual is None else residual,
         rows, columns, depth, (depth + splits - 1) // splits,
         threads=((columns + 31) // 32 * 32, (rows + 31) // 32, splits), group_size=(32, 1, 1),
@@ -1383,18 +1387,30 @@ def _linear_forward(value_bfloat, weight, bias, residual=None, hidden=None):
     return output, weight_bfloat
 
 
-def _linear_backward(value, weight, grad_output, hidden=None):
-    # With hidden, value is gelu(hidden) and grad_value is the gradient of hidden.
+def _linear_backward(value, weight, grad_output, hidden=None, norm=None):
+    # With hidden, value is gelu(hidden) and grad_value is the gradient of hidden. With
+    # norm = (input, gamma, stats, residual), value is layer_norm(input) of width 128 and grad_value is
+    # (gradient of input plus residual, gradient of gamma, gradient of beta).
     grad_output = grad_output.contiguous() if grad_output.dtype == torch.float32 \
         else grad_output.to(torch.bfloat16).contiguous()
     suffix = "_float" if grad_output.dtype == torch.float32 else ""
     gelu = "_gelu" if hidden is not None else ""
     rows, columns, depth = len(value), value.shape[1], len(weight)
-    grad_value = torch.empty_like(value)
-    _linear_kernel(
-        "linear_input_grad" + suffix + gelu, grad_output, weight, grad_value, rows, columns, depth,
-        residual=hidden,
-    )
+    if norm is None:
+        grad_value = torch.empty_like(value)
+        _linear_kernel(
+            "linear_input_grad" + suffix + gelu, grad_output, weight, grad_value, rows, columns, depth,
+            residual=hidden,
+        )
+    else:
+        input, gamma, stats, residual = norm
+        blocks = (rows + 31) // 32
+        grad_input, partial = torch.empty_like(input), input.new_empty((blocks, 2, columns))
+        getattr(_linear_library(), "linear_input_grad_norm" + suffix)(
+            grad_output, weight, input, gamma, stats, input if residual is None else residual.contiguous(),
+            grad_input, partial, rows, depth, residual is not None, threads=blocks * 128, group_size=128,
+        )
+        grad_value = grad_input, *_norm_reduce(partial, gamma)
     grad_weight = weight.new_zeros((depth, columns), dtype=torch.float32)
     grad_bias = weight.new_zeros(depth, dtype=torch.float32)
     _linear_kernel(
@@ -1441,11 +1457,18 @@ class _LinearResidual(torch.autograd.Function):
             grad_output
 
 
+def _norm_reduce(partial, gamma):
+    grad_gamma, grad_beta = torch.empty_like(gamma), torch.empty_like(gamma)
+    _RaggedAttention.library.token_backward_norm_reduce(
+        partial, grad_gamma, grad_beta, len(partial), len(gamma), threads=len(gamma) * 128, group_size=128,
+    )
+    return grad_gamma, grad_beta
+
+
 def _layer_norm_backward(value, gamma, stats, grad_normalized, residual=None, block_rows=32):
     rows, width = value.shape
     blocks = (rows + block_rows - 1) // block_rows
     grad_value, partial = torch.empty_like(value), value.new_empty((blocks, 2, width))
-    grad_gamma, grad_beta = torch.empty_like(gamma), torch.empty_like(gamma)
     getattr(_RaggedAttention.library, "layer_norm_backward_" + (
         "float" if grad_normalized.dtype == torch.float32 else "bfloat"
     ))(
@@ -1453,10 +1476,7 @@ def _layer_norm_backward(value, gamma, stats, grad_normalized, residual=None, bl
         grad_value, partial, rows, block_rows, width, residual is not None,
         threads=blocks * 32, group_size=32,
     )
-    _RaggedAttention.library.token_backward_norm_reduce(
-        partial, grad_gamma, grad_beta, blocks, width, threads=width * 128, group_size=128,
-    )
-    return grad_value, grad_gamma, grad_beta
+    return grad_value, *_norm_reduce(partial, gamma)
 
 
 @_committed
@@ -1505,11 +1525,8 @@ class _NormLinear(torch.autograd.Function):
         # The second output aliases the input for residual connections; its gradient is added
         # by the layer-norm kernel instead of a separate pass.
         value, gamma, normalized, stats, weight = ctx.saved_tensors
-        grad_normalized, grad_weight, grad_bias = _linear_backward(
-            normalized, weight, grad_output,
-        )
-        grad_value, grad_gamma, grad_beta = _layer_norm_backward(
-            value, gamma, stats, grad_normalized, grad_residual,
+        (grad_value, grad_gamma, grad_beta), grad_weight, grad_bias = _linear_backward(
+            normalized, weight, grad_output, norm=(value, gamma, stats, grad_residual),
         )
         return grad_value, grad_gamma, grad_beta, grad_weight, grad_bias
 
@@ -1533,9 +1550,8 @@ class _FeedForward(torch.autograd.Function):
         grad_hidden, grad_weight2, grad_bias2 = _linear_backward(
             activated, weight2, grad_output.float(), hidden,
         )
-        grad_normalized, grad_weight1, grad_bias1 = _linear_backward(normalized, weight1, grad_hidden)
-        grad_value, grad_gamma, grad_beta = _layer_norm_backward(
-            value, gamma, stats, grad_normalized, grad_output,
+        (grad_value, grad_gamma, grad_beta), grad_weight1, grad_bias1 = _linear_backward(
+            normalized, weight1, grad_hidden, norm=(value, gamma, stats, grad_output),
         )
         return grad_value, grad_gamma, grad_beta, grad_weight1, grad_bias1, grad_weight2, grad_bias2
 
@@ -1559,10 +1575,9 @@ class _NormHead(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         value, gamma, normalized, stats, weight = ctx.saved_tensors
-        grad_normalized, grad_weight, grad_bias = _linear_backward(
-            normalized, weight, grad_output[:, None],
+        (grad_value, grad_gamma, grad_beta), grad_weight, grad_bias = _linear_backward(
+            normalized, weight, grad_output[:, None], norm=(value, gamma, stats, None),
         )
-        grad_value, grad_gamma, grad_beta = _layer_norm_backward(value, gamma, stats, grad_normalized)
         return grad_value, grad_gamma, grad_beta, grad_weight, grad_bias
 
 

@@ -37,16 +37,14 @@ METAL_FUNC float erf(float a) {
 // tile of C over the K rows [z * chunk, (z + 1) * chunk); SPLIT adds these partial sums atomically
 // into a zeroed C, and the row sums of op(A) into a zeroed bias. GELU stores the biased output h in
 // residual and gelu(h) in C; GELU_GRAD scales C by gelu'(h) with h read from residual.
-template <typename TA, bool A_T, bool B_T, typename OUT, epilogue E, typename TR>
-METAL_FUNC void matmul(device const TA *A, device const bfloat *B, device OUT *C, device float *bias,
-                       device const TR *residual, uint M, uint N, uint K, uint chunk,
-                       uint3 group, ushort lane) {
-  ushort2 p = lane_position(lane);
-  uint m0 = group.y * 32, n0 = group.x * 32, k0 = group.z * chunk, k1 = min(K, k0 + chunk);
-  tile<float> acc[4][4];
-  float row_sums[4] = {0, 0, 0, 0};
-  for (ushort i = 0; i < 4; i++)
+template <typename TA, bool A_T, bool B_T, bool SUMS>
+METAL_FUNC void accumulate(thread tile<float> (&acc)[4][4], thread float (&row_sums)[4],
+                           device const TA *A, device const bfloat *B, uint M, uint N, uint K,
+                           uint m0, uint n0, uint k0, uint k1, ushort2 p) {
+  for (ushort i = 0; i < 4; i++) {
+    row_sums[i] = 0;
     for (ushort j = 0; j < 4; j++) acc[i][j].v() = 0;
+  }
   for (uint k = k0; k < k1; k += 8) {
     tile<bfloat> a[4], b[4];
     uint ka = k + p.x, kb = k + p.y;
@@ -54,7 +52,7 @@ METAL_FUNC void matmul(device const TA *A, device const bfloat *B, device OUT *C
       uint m = min(m0 + i * 8 + p.y, M - 1);
       a[i].v() = bfloat2(A_T ? float2(ka < k1 ? A[ka * M + m] : 0, ka + 1 < k1 ? A[(ka + 1) * M + m] : 0)
                              : float2(ka < k1 ? A[m * K + ka] : 0, ka + 1 < k1 ? A[m * K + ka + 1] : 0));
-      if (E == SPLIT) row_sums[i] += float(a[i].v()[0]) + float(a[i].v()[1]);
+      if (SUMS) row_sums[i] += float(a[i].v()[0]) + float(a[i].v()[1]);
     }
     for (ushort j = 0; j < 4; j++) {
       uint n = min(n0 + j * 8 + p.x, N - 1), n1 = min(n + 1, N - 1);
@@ -64,6 +62,17 @@ METAL_FUNC void matmul(device const TA *A, device const bfloat *B, device OUT *C
     for (ushort i = 0; i < 4; i++)
       for (ushort j = 0; j < 4; j++) acc[i][j].mma(a[i], b[j]);
   }
+}
+
+template <typename TA, bool A_T, bool B_T, typename OUT, epilogue E, typename TR>
+METAL_FUNC void matmul(device const TA *A, device const bfloat *B, device OUT *C, device float *bias,
+                       device const TR *residual, uint M, uint N, uint K, uint chunk,
+                       uint3 group, ushort lane) {
+  ushort2 p = lane_position(lane);
+  uint m0 = group.y * 32, n0 = group.x * 32, k0 = group.z * chunk;
+  tile<float> acc[4][4];
+  float row_sums[4];
+  accumulate<TA, A_T, B_T, E == SPLIT>(acc, row_sums, A, B, M, N, K, m0, n0, k0, min(K, k0 + chunk), p);
   for (ushort i = 0; i < 4; i++) {
     uint m = m0 + i * 8 + p.y;
     if (E == SPLIT && group.x == 0) {
@@ -107,3 +116,71 @@ MATMUL(linear_input_grad_float, float, false, false, bfloat, PLAIN, float)
 MATMUL(linear_input_grad_float_gelu, float, false, false, bfloat, GELU_GRAD, bfloat)
 MATMUL(linear_weight_grad, bfloat, true, false, float, SPLIT, float)
 MATMUL(linear_weight_grad_float, float, true, false, float, SPLIT, float)
+
+// Layer-norm backward fused into the input gradient of the following linear: G = grad_output B is the
+// gradient of the normalized rows (width 128). A threadgroup of 4 simdgroups computes G for 32 full
+// rows into threadgroup memory, then each simdgroup runs the layer-norm backward of 8 rows, writing
+// their input gradient (plus residual) and the block's gamma and beta partial sums.
+template <typename TA>
+METAL_FUNC void input_grad_norm(device const TA *A, device const bfloat *B, device const float *input,
+                                device const float *gamma, device const float *stats,
+                                device const float *residual, device float *grad_input,
+                                device float *partial, threadgroup float *G, uint M, uint K,
+                                bool add_residual, uint block, ushort simd, ushort lane) {
+  ushort2 p = lane_position(lane);
+  uint m0 = block * 32;
+  tile<float> acc[4][4];
+  float row_sums[4];
+  accumulate<TA, false, false, false>(acc, row_sums, A, B, M, 128, K, m0, simd * 32, 0, K, p);
+  for (ushort i = 0; i < 4; i++)
+    for (ushort j = 0; j < 4; j++)
+      *(threadgroup float2 *)(G + (i * 8 + p.y) * 128 + simd * 32 + j * 8 + p.x) = acc[i][j].v();
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float4 grad_gamma = 0, grad_beta = 0;
+  for (uint r = simd * 8; r < simd * 8 + 8; r++) {
+    uint m = m0 + r;
+    if (m >= M) break;
+    float mean = stats[m * 2], inverse_std = stats[m * 2 + 1];
+    float4 normalized, grad;
+    for (ushort part = 0; part < 4; part++) {
+      uint column = lane + part * 32;
+      float gradient = G[r * 128 + column];
+      normalized[part] = (input[m * 128 + column] - mean) * inverse_std;
+      grad_gamma[part] += gradient * normalized[part];
+      grad_beta[part] += gradient;
+      grad[part] = gradient * gamma[column];
+    }
+    float sum = simd_sum(grad[0] + grad[1] + grad[2] + grad[3]);
+    float product = simd_sum(dot(grad, normalized));
+    for (ushort part = 0; part < 4; part++) {
+      uint index = m * 128 + lane + part * 32;
+      grad_input[index] = (grad[part] - sum / 128 - normalized[part] * product / 128) * inverse_std
+                          + (add_residual ? residual[index] : 0.0f);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (ushort part = 0; part < 4; part++) {
+    G[simd * 256 + lane + part * 32] = grad_gamma[part];
+    G[simd * 256 + 128 + lane + part * 32] = grad_beta[part];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (ushort column = simd * 64 + lane; column < simd * 64 + 64; column += 32)
+    partial[block * 256 + column] = G[column] + G[256 + column] + G[512 + column] + G[768 + column];
+}
+
+#define INPUT_GRAD_NORM(name, TA)                                                                  \
+  kernel void name(device const TA *A [[buffer(0)]], device const bfloat *B [[buffer(1)]],         \
+                   device const float *input [[buffer(2)]], device const float *gamma [[buffer(3)]], \
+                   device const float *stats [[buffer(4)]], device const float *residual [[buffer(5)]], \
+                   device float *grad_input [[buffer(6)]], device float *partial [[buffer(7)]],    \
+                   constant uint &M [[buffer(8)]], constant uint &K [[buffer(9)]],                 \
+                   constant uint &add_residual [[buffer(10)]],                                     \
+                   uint block [[threadgroup_position_in_grid]],                                    \
+                   ushort simd [[simdgroup_index_in_threadgroup]],                                 \
+                   ushort lane [[thread_index_in_simdgroup]]) {                                    \
+    threadgroup float G[32 * 128];                                                                 \
+    input_grad_norm<TA>(A, B, input, gamma, stats, residual, grad_input, partial, G, M, K,        \
+                        add_residual, block, simd, lane);                                          \
+  }
+INPUT_GRAD_NORM(linear_input_grad_norm, bfloat)
+INPUT_GRAD_NORM(linear_input_grad_norm_float, float)
