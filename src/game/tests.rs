@@ -4105,3 +4105,36 @@ fn a_clone_of_fetch_draws_on_its_own_first_play() {
         assert_eq!(hand.iter().filter(|x| x.id == strike.id).count(), drawn);
     }
 }
+
+#[test]
+fn replaying_a_card_from_the_draw_pile_keeps_known_counts() {
+    let content = foundation_content();
+    let mut game = first_combat(&content, 3);
+    let decisions = content.card_id("CARD.DECISIONS_DECISIONS").unwrap();
+    let skill = content.card_id("CARD.COSMIC_INDIFFERENCE").unwrap();
+    let combat = game.combat_mut().unwrap();
+    combat.choice = None;
+    combat.hand = vec![
+        Card {
+            id: decisions,
+            ..Card::default()
+        },
+        Card {
+            id: skill,
+            instance: 900,
+            flags: RETURN_TO_DRAW,
+            ..Card::default()
+        },
+    ];
+    combat.draw.clear();
+    combat.discard.clear();
+    combat.forget_draw_order();
+    (combat.energy, combat.stars) = (10, 10);
+    combat.enemies[0].creature.hp = 100;
+    play(&mut game, &content, None);
+    while game.combat().unwrap().choice.is_some() {
+        game.step(&content, Action::Choose(0)).unwrap();
+    }
+    let combat = game.combat().unwrap();
+    assert!(combat.known_draw_bottom + combat.known_draw_top <= combat.draw.len());
+}

@@ -6479,23 +6479,18 @@ impl Game {
         // left it (CardCmd.AutoPlay moves it to the play pile, then to its result pile: an exhausting
         // card exhausts again).
         if card.flags & (REPLAY | DUPE) == REPLAY {
-            let combat = self.combat_mut().unwrap();
-            let piles = [
-                &mut combat.discard,
-                &mut combat.draw,
-                &mut combat.hand,
-                &mut combat.exhaust,
-            ];
-            for pile in piles {
-                if let Some(index) = pile
-                    .iter()
-                    .rposition(|other| other.instance == card.instance && other.id == card.id)
-                {
-                    card = pile.remove(index);
-                    // Each play picks its own result pile.
-                    card.turn_flags &= !EXHAUST;
-                    break;
-                }
+            let found = [Pile::Discard, Pile::Draw, Pile::Hand, Pile::Exhaust]
+                .into_iter()
+                .find_map(|pile| {
+                    cards(self.combat().unwrap(), pile)
+                        .iter()
+                        .rposition(|other| other.instance == card.instance && other.id == card.id)
+                        .map(|index| (pile, index))
+                });
+            if let Some((pile, index)) = found {
+                card = self.remove_pile(pile, index);
+                // Each play picks its own result pile.
+                card.turn_flags &= !EXHAUST;
             }
         }
         let def = content.cards[card.id as usize];
