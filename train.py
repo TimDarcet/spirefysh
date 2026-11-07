@@ -94,6 +94,7 @@ def parser():
     run.add_argument("--winning-loss-weight", type=float, default=0.1)
     run.add_argument("--winning-capacity", type=int, default=WINNING_CAPACITY)
     run.add_argument("--priority-decay", type=float, default=3)
+    run.add_argument("--decisions-per-update", type=float, default=0)
     run.add_argument("--character-balanced", action="store_true")
     run.add_argument("--entropy-start", type=float, default=0.01)
     run.add_argument("--entropy-end", type=float, default=0.001)
