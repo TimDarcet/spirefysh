@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import os
+import pickle
 import shutil
 import sys
 import threading
@@ -1057,41 +1058,34 @@ def report_version(report, manifest):
 
 
 def _live_projector(projectors, root, run, manifest, session_id):
-    key = manifest["run_id"], session_id
+    cache = run / ".telemetry-cache.pickle"
     saved = projectors.get(run)
-    if saved and saved[0] == key and saved[1].cursor <= _event_log_size(saved[1].path):
-        saved[1].cursor = saved[1].read(saved[1].path, start=saved[1].cursor)
-    else:
-        saved = projectors[run] = key, MetricsProjector(root, run, manifest, session_id)
-    return saved[1]
-
-
-def _cached_projection(root, run, manifest, session_id, projectors):
-    if run in projectors:
-        return _live_projector(projectors, root, run, manifest, session_id).value()
-    segments = lineage_segments(root, manifest["run_id"], session_id)
-    if not segments:
-        segments = [(run / manifest["sessions"][-1]["log"], None)]
-    signature = {
-        "version": 8,
-        "window": manifest.get("telemetry_window_decisions", 32_768),
-        "manifest": [(run / "run.json").stat().st_size,
-                     (run / "run.json").stat().st_mtime_ns],
-        "logs": [
-            [str(path.resolve()), path.stat().st_size, path.stat().st_mtime_ns, end]
-            for path, end in segments
-        ],
-    }
-    cache = run / ".telemetry-cache.json"
-    try:
-        saved = json.loads(cache.read_text())
-        if saved["signature"] == signature:
-            return saved["projection"]
-    except (OSError, KeyError, json.JSONDecodeError):
-        pass
-    projection = _live_projector(projectors, root, run, manifest, session_id).value()
-    atomic_json(cache, {"signature": signature, "projection": projection})
-    return projection
+    if saved is None or saved[0].manifest != manifest or saved[0].session_id != session_id:
+        segments = lineage_segments(root, manifest["run_id"], session_id) or \
+            [(run / manifest["sessions"][-1]["log"], None)]
+        signature = 9, [(str(path.resolve()), end) for path, end in segments], \
+            [(path.stat().st_size, path.stat().st_mtime_ns) for path, _ in segments[:-1]]
+        saved = projectors[run] = [None, signature, None]
+        try:
+            stored, projector = pickle.loads(cache.read_bytes())
+            if stored == signature and projector.manifest == manifest \
+                    and projector.session_id == session_id:
+                saved[0], saved[2] = projector, projector.cursor
+        except (OSError, EOFError, AttributeError, TypeError, ValueError, pickle.PickleError):
+            pass
+    projector, signature, written = saved
+    if projector is None or projector.path.suffix != ".gz" \
+            and projector.cursor > _event_log_size(projector.path):
+        projector = saved[0] = MetricsProjector(root, run, manifest, session_id)
+        written = None
+    elif projector.path.suffix != ".gz":
+        projector.cursor = projector.read(projector.path, start=projector.cursor)
+    if written is None or projector.cursor - written > 64 << 20:
+        temporary = cache.with_suffix(".tmp")
+        temporary.write_bytes(pickle.dumps((signature, projector)))
+        temporary.replace(cache)
+        saved[2] = projector.cursor
+    return projector
 
 
 def _dashboard_runs(target, selected, projectors):
@@ -1110,7 +1104,7 @@ def _dashboard_runs(target, selected, projectors):
         if sessions and manifest.get("schema", 1) >= 2:
             session_id = sessions[-1]["id"]
             try:
-                projected = _cached_projection(target, run, manifest, session_id, projectors)
+                projected = _live_projector(projectors, target, run, manifest, session_id).value()
             except (OSError, ValueError):
                 pass
         if projected:
