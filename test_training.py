@@ -475,21 +475,22 @@ print('restored')
                         "update_attempt"):
                 self.assertNotIn(key, metrics)
 
-    def test_projection_cache_is_reused_until_the_log_changes(self):
+    def test_projection_cache_resumes_after_restart_until_the_manifest_changes(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); run = root / "run"; (run / "events").mkdir(parents=True)
             manifest = self.manifest("run", 1)
             (run / "run.json").write_text(json.dumps(manifest))
             log = run / "events/000001.jsonl"
             write_events(log, [{"event": "checkpoint", "time": 1, "step": 0, "stage": 0}])
-            expected = telemetry._cached_projection(root, run, manifest, 1, {})
-            with mock.patch.object(telemetry, "MetricsProjector",
+            telemetry._live_projector({}, root, run, manifest, 1)
+            write_events(log, [{"event": "checkpoint", "time": 2, "step": 1, "stage": 0}])
+            with mock.patch.object(telemetry.MetricsProjector, "__init__",
                                    side_effect=AssertionError("cache miss")):
-                self.assertEqual(telemetry._cached_projection(root, run, manifest, 1, {}), expected)
-                write_events(log, [{"event": "checkpoint", "time": 2,
-                                    "step": 1, "stage": 0}])
+                projector = telemetry._live_projector({}, root, run, manifest, 1)
+                self.assertEqual(projector.value()["reports"][-1]["step"], 1)
+                self.assertEqual(projector.cursor, log.stat().st_size)
                 with self.assertRaisesRegex(AssertionError, "cache miss"):
-                    telemetry._cached_projection(root, run, manifest, 1, {})
+                    telemetry._live_projector({}, root, run, manifest | {"note": 1}, 1)
 
     def test_closed_event_logs_are_compressed_and_remain_readable(self):
         with tempfile.TemporaryDirectory() as temporary:
