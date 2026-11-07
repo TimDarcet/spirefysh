@@ -610,13 +610,11 @@ mod foundation_id {
         pub const THE_HUNT: Id = 56;
         pub const SEEKING_EDGE: Id = 87;
         pub const SWORD_SAGE: Id = 89;
-        pub const THE_SEALED_THRONE: Id = 90;
         pub const TYRANNY: Id = 91;
         pub const VOID_FORM: Id = 92;
         pub const DOOM: Id = 94;
         pub const BORROWED_TIME: Id = 95;
         pub const CALCIFY: Id = 96;
-        pub const DANSE_MACABRE: Id = 99;
         pub const DEBILITATE: Id = 100;
         pub const DEMESNE: Id = 101;
         pub const ENFEEBLING_TOUCH: Id = 103;
@@ -630,7 +628,6 @@ mod foundation_id {
         pub const SHROUD: Id = 116;
         pub const SIC_EM: Id = 117;
         pub const SLEIGHT_OF_FLESH: Id = 118;
-        pub const SPIRIT_OF_ASH: Id = 119;
         pub const VEILPIERCER: Id = 120;
         pub const COLOSSUS: Id = 122;
         pub const CRIMSON_MANTLE: Id = 123;

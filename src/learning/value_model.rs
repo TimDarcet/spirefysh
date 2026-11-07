@@ -60,71 +60,28 @@ impl LinearWeights {
         })
     }
 
-    fn read_without_bias(
-        input: &mut &[u8],
-        input_width: usize,
-        output_width: usize,
-    ) -> io::Result<Self> {
-        Ok(Self {
-            w: read_f32s(input, input_width * output_width)?,
-            b: vec![0.0; output_width],
-        })
-    }
-
     fn apply(&self, input: &[f32]) -> Vec<f32> {
         linear(input, &self.w, &self.b)
     }
 }
 
-pub(super) struct TokenEncoderWeights {
-    pub(super) numeric: LinearWeights,
-    pub(super) norm_w: Vec<f32>,
-    pub(super) norm_b: Vec<f32>,
+/// LayerNorm(sum of concept embeddings + amount x amount embedding per code + Linear(fields)).
+struct TokenEncoderWeights {
+    fields: Vec<f32>,
+    norm_w: Vec<f32>,
+    norm_b: Vec<f32>,
 }
 
-impl TokenEncoderWeights {
-    fn read(input: &mut &[u8], _semantic: usize, numeric: usize, width: usize) -> io::Result<Self> {
-        Ok(Self {
-            numeric: LinearWeights::read_without_bias(input, numeric, width)?,
-            norm_w: read_f32s(input, width)?,
-            norm_b: read_f32s(input, width)?,
-        })
-    }
-
-    pub(super) fn encode(
-        &self,
-        semantic: &[u32],
-        numeric: &[f32],
-        table: &[f32],
-        width: usize,
-    ) -> Vec<f32> {
-        let mut out = self.input(semantic, numeric, table, width);
-        layer_norm(&mut out, &self.norm_w, &self.norm_b);
-        out
-    }
-
-    fn input(&self, semantic: &[u32], numeric: &[f32], table: &[f32], width: usize) -> Vec<f32> {
-        let mut out = self.numeric.apply(numeric);
-        for &code in semantic.iter().filter(|&&code| code != 0) {
-            let embedding = &table[code as usize * width..][..width];
-            out.iter_mut()
-                .zip(embedding)
-                .for_each(|(value, embedding)| *value += embedding);
-        }
-        out
-    }
-}
-
-struct MapEncoding {
-    nodes: std::collections::BTreeMap<u32, Vec<f32>>,
+/// Whether the domain has its own encoder; potions and moves are their concept's embedding and
+/// map edges are pure structure.
+pub(super) fn has_encoder(domain: usize) -> bool {
+    !matches!(domain, POTION_DOMAIN | MOVE_DOMAIN | MAP_EDGE_DOMAIN)
 }
 
 #[derive(Default)]
 struct EncodingCache {
     rows: HashMap<(u64, u64), Vec<f32>>,
-    maps: HashMap<Vec<u8>, Arc<MapEncoding>>,
-    shared_maps: HashMap<(usize, usize), (Arc<[DomainRow]>, Arc<[DomainRow]>, Arc<MapEncoding>)>,
-    summaries: HashMap<(u64, u64), Vec<f32>>,
+    maps: HashMap<Vec<u32>, Arc<Vec<Vec<f32>>>>,
     move_gru: GruCache,
 }
 
@@ -133,6 +90,9 @@ impl EncodingCache {
         if self.rows.len() > rows || self.move_gru.states.len() > rows * width {
             self.rows.clear();
             self.move_gru = GruCache::default();
+        }
+        if self.maps.len() > 1024 {
+            self.maps.clear();
         }
     }
 }
@@ -216,13 +176,11 @@ pub struct ValueModel {
     heads: usize,
     pooling: [u8; 11],
     semantic_embedding: Vec<f32>,
+    amount_embedding: Vec<f32>,
     encoders: Vec<Option<TokenEncoderWeights>>,
-    action_encoder: TokenEncoderWeights,
-    map_node_embedding: Vec<f32>,
     summary_seed: Vec<Vec<f32>>,
     pool_layers: Vec<Option<TransformerLayer>>,
     pool_projections: Vec<LinearWeights>,
-    pael_cards: LinearWeights,
     move_gru: GruWeights,
     continuation_gru: Option<GruWeights>,
     actor_norm_w: Vec<f32>,
@@ -265,30 +223,13 @@ impl ValueModel {
         {
             return Err(invalid("incompatible value model"));
         }
-        let dimensions = (0..10)
+        let dimensions = (0..8)
             .map(|_| read_u32(&mut input))
             .collect::<io::Result<Vec<_>>>()?;
-        let [
-            width,
-            layers,
-            heads,
-            feedforward,
-            domains,
-            concepts,
-            concept_vocab,
-            action_c,
-            action_f,
-            critic_outputs,
-        ] = <[u32; 10]>::try_from(dimensions).unwrap();
+        let [width, layers, heads, feedforward, domains, concepts, concept_vocab, critic_outputs] =
+            <[u32; 8]>::try_from(dimensions).unwrap();
         let widths = (0..domains)
-            .map(|_| {
-                Ok((
-                    read_u32(&mut input)? as usize,
-                    read_u32(&mut input)? as usize,
-                    read_u32(&mut input)? as usize,
-                    read_u32(&mut input)? as usize,
-                ))
-            })
+            .map(|_| Ok((read_u32(&mut input)? as usize, read_u32(&mut input)? as usize)))
             .collect::<io::Result<Vec<_>>>()?;
         let concept_sizes = (0..concepts)
             .map(|_| read_u32(&mut input))
@@ -297,8 +238,7 @@ impl ValueModel {
             .map(|_| read_u32(&mut input))
             .collect::<io::Result<Vec<_>>>()?;
         let pooling = <[u8; 11]>::try_from(take_bytes(&mut input, 11)?).unwrap();
-        let flags = take_bytes(&mut input, 1)?[0];
-        let actor = flags & 1 != 0;
+        let actor = take_bytes(&mut input, 1)?[0] & 1 != 0;
         let layout = Layout::new(content);
         let (width, layers, heads, feedforward) = (
             width as usize,
@@ -306,14 +246,13 @@ impl ValueModel {
             heads as usize,
             feedforward as usize,
         );
+        let expected = DOMAINS.map(|(_, codes, fields)| (codes, fields.len()));
         if !valid_model_shape(width, layers, heads, feedforward)
-            || domains as usize != DOMAIN_NAMES.len()
+            || domains as usize != DOMAINS.len()
             || concepts as usize != Semantic::Count as usize
             || concept_vocab as usize != layout.concept_vocab()
-            || action_c as usize != ACTION_C
-            || action_f as usize != ACTION_F
             || critic_outputs != 1
-            || widths != DOMAIN_WIDTHS
+            || widths != expected
             || concept_sizes != layout.semantic_sizes
             || position_caps != POSITION_CAPS
             || !valid_pooling(pooling)
@@ -331,26 +270,26 @@ impl ValueModel {
             return Err(invalid("invalid value calibration"));
         }
         let semantic_embedding = read_f32s(&mut input, concept_vocab as usize * width)?;
-        let map_node_embedding = read_f32s(&mut input, MAP_NODE_KINDS * width)?;
-        let encoders = DOMAIN_WIDTHS
-            .iter()
-            .enumerate()
-            .map(|(domain, &(_, _, semantic, numeric))| {
-                if matches!(domain, POTION_DOMAIN | MAP_EDGE_DOMAIN) {
-                    Ok(None)
-                } else {
-                    TokenEncoderWeights::read(&mut input, semantic, numeric, width).map(Some)
-                }
+        let amount_embedding = read_f32s(&mut input, concept_vocab as usize * width)?;
+        let encoders = (0..DOMAINS.len())
+            .map(|domain| {
+                has_encoder(domain)
+                    .then(|| {
+                        Ok(TokenEncoderWeights {
+                            fields: read_f32s(&mut input, DOMAINS[domain].2.len() * width)?,
+                            norm_w: read_f32s(&mut input, width)?,
+                            norm_b: read_f32s(&mut input, width)?,
+                        })
+                    })
+                    .transpose()
             })
             .collect::<io::Result<Vec<_>>>()?;
-        let action_encoder = TokenEncoderWeights::read(&mut input, ACTION_C, ACTION_F, width)?;
         let summary_seed = (0..11)
             .map(|_| read_f32s(&mut input, width))
             .collect::<io::Result<Vec<_>>>()?;
         let pool_projections = (0..3)
             .map(|_| LinearWeights::read(&mut input, width, width))
             .collect::<io::Result<Vec<_>>>()?;
-        let pael_cards = LinearWeights::read_without_bias(&mut input, width, width)?;
         let mut pool_layers = Vec::with_capacity(11);
         for (index, &mode) in pooling.iter().enumerate() {
             pool_layers.push(if transformer_pool(index, mode) {
@@ -392,13 +331,11 @@ impl ValueModel {
             heads,
             pooling,
             semantic_embedding,
+            amount_embedding,
             encoders,
-            action_encoder,
-            map_node_embedding,
             summary_seed,
             pool_layers,
             pool_projections,
-            pael_cards,
             move_gru,
             continuation_gru,
             actor_norm_w,
@@ -426,29 +363,25 @@ impl ValueModel {
         })
     }
 
+    fn row<'a>(&self, table: &'a [f32], code: u32) -> &'a [f32] {
+        &table[code as usize * self.width..][..self.width]
+    }
+
     fn embedding(&self, semantic: Semantic, value: u32) -> &[f32] {
-        let code = self.layout.semantic(semantic, value) as usize;
-        &self.semantic_embedding[code * self.width..][..self.width]
+        self.row(&self.semantic_embedding, self.layout.semantic(semantic, value))
     }
 
-    #[cfg(test)]
-    pub(super) fn candidate_object_key(observation: &Observation, index: usize) -> (u32, u32) {
-        let candidate = &observation.candidates[index];
-        (candidate.u[0], candidate.u[14])
-    }
-
-    fn encode_values(
-        &self,
-        cache: &mut EncodingCache,
-        domain: usize,
-        semantic: &[u32],
-        numeric: &[f32],
-        encoder: &TokenEncoderWeights,
-    ) -> Vec<f32> {
+    fn encode(&self, cache: &mut EncodingCache, token: &Token) -> Vec<f32> {
+        let domain = token.domain as usize;
+        let Some(encoder) = &self.encoders[domain] else {
+            return token.c.first().map_or_else(Vec::new, |&code| {
+                self.row(&self.semantic_embedding, code).to_vec()
+            });
+        };
         let mut key = (0xcbf2_9ce4_8422_2325, 0x9e37_79b9_7f4a_7c15);
         for value in std::iter::once(domain as u32)
-            .chain(semantic.iter().copied())
-            .chain(numeric.iter().map(|value| value.to_bits()))
+            .chain(token.c.iter().copied())
+            .chain(token.a.iter().chain(&token.f).map(|value| value.to_bits()))
         {
             key.0 = (key.0 ^ value as u64).wrapping_mul(0x100_0000_01b3);
             key.1 = (key.1 ^ value as u64).wrapping_mul(0x9e37_79b1_85eb_ca87);
@@ -456,81 +389,21 @@ impl ValueModel {
         if let Some(value) = cache.rows.get(&key) {
             return value.clone();
         }
-        let value = encoder.encode(semantic, numeric, &self.semantic_embedding, self.width);
+        let mut value = linear(&token.f, &encoder.fields, &vec![0.0; self.width]);
+        for (&code, &amount) in token.c.iter().zip(&token.a).filter(|(code, _)| **code != 0) {
+            add(&mut value, self.row(&self.semantic_embedding, code));
+            if amount != 0.0 {
+                let scaled = self.row(&self.amount_embedding, code);
+                value.iter_mut().zip(scaled).for_each(|(left, right)| *left += amount * right);
+            }
+        }
+        layer_norm(&mut value, &encoder.norm_w, &encoder.norm_b);
         cache.rows.insert(key, value.clone());
         value
     }
 
-    fn encode(&self, cache: &mut EncodingCache, domain: usize, row: &DomainRow) -> Vec<f32> {
-        if domain == POTION_DOMAIN {
-            return self.semantic_embedding[row.c[0] as usize * self.width..][..self.width]
-                .to_vec();
-        }
-        let encoder = self.encoders[domain]
-            .as_ref()
-            .expect("domain has no encoder");
-        if domain == MAP_NODE_DOMAIN {
-            let mut value = encoder.input(&row.c, &row.f, &self.semantic_embedding, self.width);
-            value
-                .iter_mut()
-                .zip(&self.map_node_embedding[row.u[1] as usize * self.width..][..self.width])
-                .for_each(|(left, right)| *left += right);
-            layer_norm(&mut value, &encoder.norm_w, &encoder.norm_b);
-            return value;
-        }
-        self.encode_values(cache, domain, &row.c, &row.f, encoder)
-    }
-
-    fn encode_phase(&self, row: &DomainRow) -> Vec<f32> {
-        self.encoders[PHASE_DOMAIN].as_ref().unwrap().input(
-            &row.c,
-            &row.f,
-            &self.semantic_embedding,
-            self.width,
-        )
-    }
-
     fn tag(&self, mut value: Vec<f32>, semantic: Semantic, index: u32) -> Vec<f32> {
-        for (sum, embedding) in value.iter_mut().zip(self.embedding(semantic, index)) {
-            *sum += embedding;
-        }
-        value
-    }
-
-    fn add_embedding(&self, value: &mut [f32], semantic: Semantic, index: u32) {
-        value
-            .iter_mut()
-            .zip(self.embedding(semantic, index))
-            .for_each(|(left, right)| *left += right);
-    }
-
-    fn card_context(&self, row: &DomainRow, mut value: Vec<f32>) -> Vec<f32> {
-        if row.u[0] == DRAW_ZONE as u32 && row.u[3] > 0 {
-            let semantic = if row.u[2] == 1 {
-                Semantic::DrawTopPosition
-            } else {
-                Semantic::DrawBottomPosition
-            };
-            self.add_embedding(&mut value, semantic, row.u[3].saturating_sub(1).min(256));
-        }
-        if row.u[19] > 0 {
-            self.add_embedding(
-                &mut value,
-                Semantic::DeckOrigin,
-                row.u[19].saturating_sub(1).min(256),
-            );
-        }
-        value
-    }
-
-    fn relic_context(&self, row: &DomainRow, mut value: Vec<f32>) -> Vec<f32> {
-        if row.u[2] > 0 {
-            self.add_embedding(
-                &mut value,
-                Semantic::RelicPosition,
-                row.u[2].saturating_sub(1).min(256),
-            );
-        }
+        add(&mut value, self.embedding(semantic, index));
         value
     }
 
@@ -768,144 +641,57 @@ impl ValueModel {
         }
     }
 
-    fn map(
-        &self,
-        observation: &Observation,
-        current: u32,
-        cache: &mut EncodingCache,
-    ) -> (Vec<f32>, Arc<MapEncoding>) {
-        let nodes = observation.domains[MAP_NODE_DOMAIN]
-            .iter()
-            .filter(|row| row.scope == STATE_SCOPE)
+    /// Map node encodings after reverse-topological attention from each node to its children.
+    fn map(&self, observation: &Observation, cache: &mut EncodingCache) -> Arc<Vec<Vec<f32>>> {
+        let tokens = &observation.tokens;
+        let nodes = tokens.iter().take_while(|token| token.place == Place::MapNode).count();
+        let edges = (tokens[nodes..].iter())
+            .take_while(|token| token.place == Place::MapEdge)
+            .map(|token| (token.parent as usize, token.link as usize))
             .collect::<Vec<_>>();
-        let shared = match (
-            &observation.domains[MAP_NODE_DOMAIN],
-            &observation.domains[MAP_EDGE_DOMAIN],
-        ) {
-            (DomainRows::Shared(nodes), DomainRows::Shared(edges)) => Some((nodes, edges)),
-            _ => None,
-        };
-        let encoded = shared
-            .and_then(|(nodes, edges)| {
-                cache
-                    .shared_maps
-                    .get(&(nodes.as_ptr() as usize, edges.as_ptr() as usize))
-                    .and_then(|(cached_nodes, cached_edges, encoded)| {
-                        (Arc::ptr_eq(nodes, cached_nodes) && Arc::ptr_eq(edges, cached_edges))
-                            .then(|| Arc::clone(encoded))
-                    })
-            })
-            .unwrap_or_else(|| {
-                let mut key = Vec::new();
-                for domain in [MAP_NODE_DOMAIN, MAP_EDGE_DOMAIN] {
-                    key.extend((domain as u32).to_le_bytes());
-                    for row in observation.domains[domain]
-                        .iter()
-                        .filter(|row| row.scope == STATE_SCOPE)
-                    {
-                        row.u
-                            .iter()
-                            .for_each(|value| key.extend(value.to_le_bytes()));
-                        row.s
-                            .iter()
-                            .for_each(|value| key.extend(value.to_le_bytes()));
-                        row.c
-                            .iter()
-                            .for_each(|value| key.extend(value.to_le_bytes()));
-                        row.f
-                            .iter()
-                            .for_each(|value| key.extend(value.to_le_bytes()));
-                    }
-                }
-                let encoded = cache.maps.get(&key).cloned().unwrap_or_else(|| {
-                    let edges = observation.domains[MAP_EDGE_DOMAIN]
-                        .iter()
-                        .filter(|row| row.scope == STATE_SCOPE)
+        let mut key = tokens[..nodes].iter().flat_map(|token| token.c.iter().copied()).collect::<Vec<_>>();
+        key.push(NONE);
+        key.extend(edges.iter().flat_map(|&(source, target)| [source as u32, target as u32]));
+        if let Some(encoded) = cache.maps.get(&key) {
+            return Arc::clone(encoded);
+        }
+        let mut encoded = (tokens[..nodes].iter())
+            .map(|token| self.encode(cache, token))
+            .collect::<Vec<_>>();
+        let mut ranks = vec![0u32; nodes];
+        for &(source, target) in &edges {
+            ranks[target] = ranks[target].max(ranks[source] + 1);
+        }
+        let mut levels = ranks.clone();
+        levels.sort_unstable();
+        levels.dedup();
+        for level in levels.into_iter().rev() {
+            let normalized_nodes = (encoded.iter())
+                .map(|value| normalized(value, &self.graph_norm_w, &self.graph_norm_b))
+                .collect::<Vec<_>>();
+            let updates = (0..nodes)
+                .filter(|&node| ranks[node] == level && edges.iter().any(|&(source, _)| source == node))
+                .map(|node| {
+                    let query = self.graph_query.apply(&normalized_nodes[node]);
+                    let children = (edges.iter())
+                        .filter(|&&(source, _)| source == node)
+                        .map(|&(_, target)| self.graph_key_value.apply(&normalized_nodes[target]))
                         .collect::<Vec<_>>();
-                    let mut encoded = nodes
-                        .iter()
-                        .map(|row| (row.u[0], self.encode(cache, MAP_NODE_DOMAIN, row)))
-                        .collect::<std::collections::BTreeMap<_, _>>();
-                    let mut ranks = nodes
-                        .iter()
-                        .map(|row| (row.u[0], 0u32))
-                        .collect::<std::collections::BTreeMap<_, _>>();
-                    for edge in &edges {
-                        ranks.insert(edge.u[1], ranks[&edge.u[1]].max(ranks[&edge.u[0]] + 1));
-                    }
-                    let mut levels = ranks.values().copied().collect::<Vec<_>>();
-                    levels.sort_unstable();
-                    levels.dedup();
-                    for level in levels.into_iter().rev() {
-                        let normalized_nodes = encoded
-                            .iter()
-                            .map(|(&id, value)| {
-                                (
-                                    id,
-                                    normalized(value, &self.graph_norm_w, &self.graph_norm_b),
-                                )
-                            })
-                            .collect::<std::collections::BTreeMap<_, _>>();
-                        let updates = nodes
-                            .iter()
-                            .filter(|row| {
-                                ranks[&row.u[0]] == level
-                                    && edges.iter().any(|edge| edge.u[0] == row.u[0])
-                            })
-                            .map(|row| {
-                                let id = row.u[0];
-                                let query = self.graph_query.apply(&normalized_nodes[&id]);
-                                let children = edges
-                                    .iter()
-                                    .filter(|edge| edge.u[0] == id)
-                                    .map(|edge| {
-                                        self.graph_key_value.apply(&normalized_nodes[&edge.u[1]])
-                                    })
-                                    .collect::<Vec<_>>();
-                                let mut value = encoded[&id].clone();
-                                let attention =
-                                    self.graph_out.apply(&self.attention(&query, &children, 0));
-                                for column in 0..self.width {
-                                    value[column] += attention[column];
-                                }
-                                let hidden = dense_gelu(
-                                    &normalized(
-                                        &value,
-                                        &self.graph_ff_norm_w,
-                                        &self.graph_ff_norm_b,
-                                    ),
-                                    &self.graph_ff1.w,
-                                    &self.graph_ff1.b,
-                                );
-                                for (left, right) in
-                                    value.iter_mut().zip(self.graph_ff2.apply(&hidden))
-                                {
-                                    *left += right;
-                                }
-                                (id, value)
-                            })
-                            .collect::<Vec<_>>();
-                        for (id, value) in updates {
-                            encoded.insert(id, value);
-                        }
-                    }
-                    if cache.maps.len() == 1024 || cache.shared_maps.len() == 1024 {
-                        cache.maps.clear();
-                        cache.shared_maps.clear();
-                    }
-                    let encoded = Arc::new(MapEncoding { nodes: encoded });
-                    cache.maps.insert(key, Arc::clone(&encoded));
-                    encoded
-                });
-                if let Some((nodes, edges)) = shared {
-                    cache.shared_maps.insert(
-                        (nodes.as_ptr() as usize, edges.as_ptr() as usize),
-                        (Arc::clone(nodes), Arc::clone(edges), Arc::clone(&encoded)),
-                    );
-                }
-                encoded
-            });
-        (encoded.nodes[&current].clone(), encoded)
+                    let mut value = encoded[node].clone();
+                    add(&mut value, &self.graph_out.apply(&self.attention(&query, &children, 0)));
+                    let normal = normalized(&value, &self.graph_ff_norm_w, &self.graph_ff_norm_b);
+                    let hidden = dense_gelu(&normal, &self.graph_ff1.w, &self.graph_ff1.b);
+                    add(&mut value, &self.graph_ff2.apply(&hidden));
+                    (node, value)
+                })
+                .collect::<Vec<_>>();
+            for (node, value) in updates {
+                encoded[node] = value;
+            }
+        }
+        let encoded = Arc::new(encoded);
+        cache.maps.insert(key, Arc::clone(&encoded));
+        encoded
     }
 
     fn collection(&self, mut values: Vec<Vec<f32>>, name: usize, collection: u32) -> Vec<Vec<f32>> {
@@ -923,174 +709,52 @@ impl ValueModel {
         )]
     }
 
-    fn bag(
-        &self,
-        observation: &Observation,
-        cache: &mut EncodingCache,
-        domain: usize,
-        zone: impl Fn(u32) -> bool,
-        pool: usize,
-    ) -> Vec<f32> {
-        let rows = observation.domains[domain]
-            .iter()
-            .filter(|row| row.scope == STATE_SCOPE && zone(row.u[0]))
-            .collect::<Vec<_>>();
-        let mut key = (0xcbf2_9ce4_8422_2325, 0x9e37_79b9_7f4a_7c15);
-        for value in std::iter::once(pool as u32).chain(rows.iter().flat_map(|row| {
-            row.u
-                .iter()
-                .copied()
-                .chain(row.s.iter().map(|&value| value as u32))
-        })) {
-            key.0 = (key.0 ^ value as u64).wrapping_mul(0x100_0000_01b3);
-            key.1 = (key.1 ^ value as u64).wrapping_mul(0x9e37_79b1_85eb_ca87);
-        }
-        if let Some(value) = cache.summaries.get(&key) {
-            return value.clone();
-        }
-        let values = rows
-            .into_iter()
-            .map(|row| self.encode(cache, domain, row))
-            .collect();
-        let summary = self.summarize(0, 0, values);
-        let value = self.pool_projections[pool].apply(&summary);
-        cache.summaries.insert(key, value.clone());
-        value
-    }
-
+    /// Actors with their history, move sequence and (pooled) effects, then the effect tokens.
     fn actors(
         &self,
         observation: &Observation,
+        values: &[Vec<f32>],
         cache: &mut EncodingCache,
     ) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
-        let mut actors = observation.domains[ACTOR_DOMAIN]
-            .iter()
-            .filter(|row| row.scope == STATE_SCOPE)
-            .collect::<Vec<_>>();
-        actors.sort_by_key(|row| row.u[0]);
-        let mut values = Vec::new();
+        let tokens = &observation.tokens;
+        let mut actors = Vec::new();
         let mut effects_out = Vec::new();
-        for actor in actors {
-            let owner = actor.u[0];
-            let mut value = self.encode(cache, ACTOR_DOMAIN, actor);
-            for history in observation.domains[HISTORY_DOMAIN]
-                .iter()
-                .filter(|row| row.scope == STATE_SCOPE && row.u[0] == owner && row.u[1] == 0)
-            {
-                let encoded = self.encode(cache, HISTORY_DOMAIN, history);
-                value
-                    .iter_mut()
-                    .zip(encoded)
-                    .for_each(|(left, right)| *left += right);
+        for (index, actor) in tokens.iter().enumerate() {
+            if !matches!(actor.place, Place::Player | Place::Ally | Place::Enemy) {
+                continue;
             }
-            let mut moves = observation.domains[HISTORY_DOMAIN]
-                .iter()
-                .filter(|row| row.scope == STATE_SCOPE && row.u[0] == owner && row.u[1] == 1)
-                .collect::<Vec<_>>();
-            moves.sort_by_key(|row| row.u[2]);
+            let owned = |place| {
+                (tokens.iter().enumerate())
+                    .filter(move |(_, token)| token.place == place && token.parent == index as u32)
+            };
+            let mut value = values[index].clone();
             let history = self.move_gru.apply_cached(
-                moves.into_iter().map(|row| row.c[0]),
+                owned(Place::Move).map(|(_, token)| token.c[0]),
                 &self.semantic_embedding,
                 self.width,
                 &mut cache.move_gru,
             );
-            value
-                .iter_mut()
-                .zip(history)
-                .for_each(|(left, right)| *left += right);
-            let mut effects = Vec::new();
-            for domain in [POWER_DOMAIN, STATUS_DOMAIN] {
-                effects.extend(
-                    observation.domains[domain]
-                        .iter()
-                        .filter(|row| row.scope == STATE_SCOPE && row.u[0] == owner)
-                        .map(|row| self.encode(cache, domain, row)),
-                );
-            }
-            if owner == 1 {
-                effects.extend(
-                    observation.domains[CARD_DOMAIN]
-                        .iter()
-                        .filter(|row| {
-                            row.scope == STATE_SCOPE
-                                && matches!(row.u[0], NIGHTMARE_ZONE | HISTORY_COURSE_ZONE)
-                        })
-                        .map(|row| self.encode(cache, CARD_DOMAIN, row)),
-                );
-            }
-            let index = if actor.u[1] == 2 { 8 } else { 9 };
-            let mode = self.pooling[index];
+            add(&mut value, &history);
+            let effects: Vec<Vec<f32>> =
+                owned(Place::Effect).map(|(effect, _)| values[effect].clone()).collect();
+            let (pool, collection) = if actor.place == Place::Enemy { (8, 9) } else { (9, 8) };
+            let mode = self.pooling[pool];
             if mode == 4 {
-                effects_out.extend(effects.into_iter().map(|effect| {
-                    self.tag(effect, Semantic::Collection, if index == 8 { 9 } else { 8 })
-                }));
+                effects_out.extend(
+                    (effects.into_iter()).map(|effect| self.tag(effect, Semantic::Collection, collection)),
+                );
             } else {
-                let pooled =
-                    self.summarize(index, if mode.is_multiple_of(2) { 0 } else { 1 }, effects);
+                let pooled = self.summarize(pool, if mode.is_multiple_of(2) { 0 } else { 1 }, effects);
                 if mode < 2 {
-                    value
-                        .iter_mut()
-                        .zip(pooled)
-                        .for_each(|(left, right)| *left += right);
+                    add(&mut value, &pooled);
                 } else {
-                    effects_out.push(self.tag(
-                        pooled,
-                        Semantic::Collection,
-                        if index == 8 { 9 } else { 8 },
-                    ));
+                    effects_out.push(self.tag(pooled, Semantic::Collection, collection));
                 }
             }
             layer_norm(&mut value, &self.actor_norm_w, &self.actor_norm_b);
-            values.push(value);
+            actors.push(value);
         }
-        (values, effects_out)
-    }
-
-    fn continuation_items(
-        &self,
-        observation: &Observation,
-        cache: &mut EncodingCache,
-    ) -> Vec<Vec<f32>> {
-        let mut rows = observation.domains[CONTINUATION_DOMAIN]
-            .iter()
-            .filter(|row| row.scope == STATE_SCOPE)
-            .collect::<Vec<_>>();
-        rows.sort_by_key(|row| (row.u[8], row.u[2]));
-        let mut items = Vec::<(u32, Vec<f32>)>::new();
-        for row in rows {
-            if items.last().is_none_or(|(id, _)| *id != row.u[2]) {
-                items.push((row.u[2], vec![0.0; self.width]));
-            }
-            let encoded = self.encode(cache, CONTINUATION_DOMAIN, row);
-            items
-                .last_mut()
-                .unwrap()
-                .1
-                .iter_mut()
-                .zip(encoded)
-                .for_each(|(left, right)| *left += right);
-        }
-        for domain in [CARD_DOMAIN, RELIC_DOMAIN, POTION_DOMAIN] {
-            for row in observation.domains[domain]
-                .iter()
-                .filter(|row| row.scope <= -3)
-            {
-                let item = (-3 - row.scope) as u32;
-                let encoded = self.encode(cache, domain, row);
-                let encoded = if domain == CARD_DOMAIN {
-                    self.card_context(row, encoded)
-                } else {
-                    encoded
-                };
-                if let Some((_, value)) = items.iter_mut().find(|(id, _)| *id == item) {
-                    value
-                        .iter_mut()
-                        .zip(encoded)
-                        .for_each(|(left, right)| *left += right);
-                }
-            }
-        }
-        items.into_iter().map(|(_, value)| value).collect()
+        (actors, effects_out)
     }
 
     fn state_tokens(
@@ -1098,174 +762,76 @@ impl ValueModel {
         observation: &Observation,
         cache: &mut EncodingCache,
     ) -> (Vec<Vec<f32>>, usize) {
-        let state_rows = |domain: usize| {
-            observation.domains[domain]
-                .iter()
-                .filter(|row| row.scope == STATE_SCOPE)
-                .collect::<Vec<_>>()
-        };
-        let run = state_rows(RUN_DOMAIN);
-        let current_id = run[0].u[22];
-        let (map, nodes) = self.map(observation, current_id, cache);
-        let mut payload = vec![0.0; self.width];
-        for domain in 0..DOMAIN_NAMES.len() {
-            for row in observation.domains[domain]
-                .iter()
-                .filter(|row| row.scope == PHASE_SCOPE)
-            {
-                payload
-                    .iter_mut()
-                    .zip(self.encode(cache, domain, row))
-                    .for_each(|(left, right)| *left += right);
-            }
-        }
-        let bags = [
-            self.bag(observation, cache, RELIC_DOMAIN, |zone| zone == 1, 0),
-            self.bag(
-                observation,
-                cache,
-                ENCOUNTER_DOMAIN,
-                |zone| matches!(zone, 1 | 2),
-                1,
-            ),
-            self.bag(observation, cache, EVENT_DOMAIN, |zone| zone == 0, 2),
-        ];
-        let run = self.encode(cache, RUN_DOMAIN, run[0]);
-        let mut tokens = Vec::new();
-        for row in state_rows(PHASE_DOMAIN) {
-            let mut phase = self.encode_phase(row);
-            if row.u[3] != 0 {
-                phase
-                    .iter_mut()
-                    .zip(&payload)
-                    .for_each(|(left, right)| *left += right);
-            }
-            layer_norm(
-                &mut phase,
-                &self.encoders[PHASE_DOMAIN].as_ref().unwrap().norm_w,
-                &self.encoders[PHASE_DOMAIN].as_ref().unwrap().norm_b,
-            );
-            tokens.push(phase);
-        }
-        tokens.push(self.tag(map, Semantic::TokenRole, 0));
-        tokens.extend(bags);
-        let cards = state_rows(CARD_DOMAIN);
-        let deck = cards
-            .iter()
-            .filter(|row| row.u[0] == 0)
-            .map(|row| self.card_context(row, self.encode(cache, CARD_DOMAIN, row)))
-            .collect();
-        tokens.append(&mut self.collection(deck, 1, 0));
-        let mut relics = state_rows(RELIC_DOMAIN)
-            .into_iter()
-            .filter(|row| row.u[0] == 0)
-            .map(|row| {
-                (
-                    row,
-                    self.relic_context(row, self.encode(cache, RELIC_DOMAIN, row)),
-                )
+        let tokens = &observation.tokens;
+        let nodes = self.map(observation, cache);
+        let mut values = (tokens.iter())
+            .map(|token| match token.place {
+                Place::MapNode | Place::MapEdge => Vec::new(),
+                _ => self.encode(cache, token),
             })
             .collect::<Vec<_>>();
-        let stored = cards
-            .iter()
-            .filter(|row| row.u[0] == PAEL_ZONE as u32)
-            .map(|row| self.encode(cache, CARD_DOMAIN, row))
-            .fold(vec![0.0; self.width], |mut sum, value| {
-                sum.iter_mut()
-                    .zip(value)
-                    .for_each(|(left, right)| *left += right);
-                sum
-            });
-        let stored = self.pael_cards.apply(&stored);
-        for (row, value) in &mut relics {
-            if row.u[1] == paels_tooth() {
-                value
-                    .iter_mut()
-                    .zip(&stored)
-                    .for_each(|(left, right)| *left += right);
+        for (index, token) in tokens.iter().enumerate() {
+            if token.place == Place::Child {
+                let child = std::mem::take(&mut values[index]);
+                add(&mut values[token.parent as usize], &child);
+                values[index] = child;
             }
         }
-        tokens.append(&mut self.collection(
-            relics.into_iter().map(|(_, value)| value).collect(),
-            0,
-            5,
-        ));
-        let potions = state_rows(POTION_DOMAIN)
-            .into_iter()
-            .filter(|row| row.u[0] == 0)
-            .map(|row| self.encode(cache, POTION_DOMAIN, row))
-            .collect();
-        tokens.append(&mut self.collection(potions, 7, 6));
-        let continuations = self.continuation_items(observation, cache);
+        let place = |place| {
+            (tokens.iter().zip(&values))
+                .filter(move |(token, _)| token.place == place)
+                .map(|(_, value)| value.clone())
+                .collect::<Vec<_>>()
+        };
+        let run = (tokens.iter().position(|token| token.place == Place::Run))
+            .expect("observation has no run token");
+        let mut sequence = vec![values[run].clone()];
+        sequence.extend(place(Place::Phase));
+        let current = nodes[tokens[run].link as usize].clone();
+        sequence.push(self.tag(current, Semantic::TokenRole, 0));
+        for (pool, kind) in [Place::RemovedRelic, Place::EncounterPool, Place::EventPool].into_iter().enumerate() {
+            sequence.push(self.pool_projections[pool].apply(&self.summarize(0, 0, place(kind))));
+        }
+        sequence.append(&mut self.collection(place(Place::Deck), 1, 0));
+        sequence.append(&mut self.collection(place(Place::Relic), 0, 5));
+        sequence.append(&mut self.collection(place(Place::Potion), 7, 6));
+        let continuations = place(Place::Continuation);
         if self.pooling[10] == 3 {
-            tokens.extend(
-                continuations
-                    .into_iter()
-                    .map(|value| self.tag(value, Semantic::Collection, 10)),
+            sequence.extend(
+                (continuations.into_iter()).map(|value| self.tag(value, Semantic::Collection, 10)),
             );
         } else {
-            tokens.push(self.tag(
-                self.summarize(10, self.pooling[10], continuations),
-                Semantic::Collection,
-                10,
-            ));
+            let summary = self.summarize(10, self.pooling[10], continuations);
+            sequence.push(self.tag(summary, Semantic::Collection, 10));
         }
-        tokens.extend(
-            state_rows(CRYSTAL_DOMAIN)
-                .into_iter()
-                .map(|row| self.encode(cache, CRYSTAL_DOMAIN, row)),
-        );
-        if !state_rows(ACTOR_DOMAIN).is_empty() {
-            let (actors, effects) = self.actors(observation, cache);
-            tokens.extend(actors);
-            for (zone, name, collection) in [(1, 5, 1), (2, 2, 2), (3, 4, 3), (4, 3, 4)] {
-                let values = cards
-                    .iter()
-                    .filter(|row| row.u[0] == zone)
-                    .map(|row| self.card_context(row, self.encode(cache, CARD_DOMAIN, row)))
-                    .collect();
-                tokens.append(&mut self.collection(values, name, collection));
+        sequence.extend(place(Place::Crystal));
+        if tokens.iter().any(|token| token.place == Place::Player) {
+            let (actors, effects) = self.actors(observation, &values, cache);
+            sequence.extend(actors);
+            for (kind, name, collection) in [
+                (Place::Hand, 5, 1),
+                (Place::Draw, 2, 2),
+                (Place::Discard, 4, 3),
+                (Place::Exhaust, 3, 4),
+                (Place::Orb, 6, 7),
+            ] {
+                sequence.append(&mut self.collection(place(kind), name, collection));
             }
-            let orbs = state_rows(ORB_DOMAIN)
-                .into_iter()
-                .map(|row| self.encode(cache, ORB_DOMAIN, row))
-                .collect();
-            tokens.append(&mut self.collection(orbs, 6, 7));
-            tokens.extend(effects);
+            sequence.extend(effects);
         }
-        let action_count = observation.candidates.len();
-        let scoped = scoped_rows(&observation.domains, action_count);
-        for (index, candidate) in observation.candidates.iter().enumerate() {
-            let mut action = self.encode_values(
-                cache,
-                DOMAIN_NAMES.len(),
-                &candidate.c,
-                &candidate.f,
-                &self.action_encoder,
-            );
-            for &(domain, row) in &scoped[index] {
-                let value = if domain == CARD_DOMAIN {
-                    self.card_context(row, self.encode(cache, domain, row))
-                } else {
-                    self.encode(cache, domain, row)
-                };
-                action
-                    .iter_mut()
-                    .zip(value)
-                    .for_each(|(left, right)| *left += right);
+        let action_start = sequence.len();
+        for candidate in &observation.candidates {
+            let mut action = self.encode(cache, &candidate.token);
+            for token in &candidate.attached {
+                add(&mut action, &self.encode(cache, token));
             }
-            if candidate.u[4] != NO_NODE {
-                action
-                    .iter_mut()
-                    .zip(&nodes.nodes[&candidate.u[4]])
-                    .for_each(|(left, right)| *left += right);
+            let link = candidate.token.link as usize;
+            if candidate.token.link != NONE {
+                add(&mut action, if link < nodes.len() { &nodes[link] } else { &values[link] });
             }
             layer_norm(&mut action, &self.action_norm_w, &self.action_norm_b);
-            tokens.push(action);
+            sequence.push(action);
         }
-        let action_start = tokens.len() - action_count + 1;
-        let mut sequence = vec![run];
-        sequence.extend(tokens);
         (sequence, action_start)
     }
 
@@ -1407,25 +973,14 @@ impl ValueModel {
             Phase::Dead => return 0.0,
             _ => {}
         }
-        let observation = build_observation(game, content, self.layout, (0, 0));
+        let observation = build_observation(game, content, self.layout);
         let value = self.critic.apply(&self.state(&observation))[0] + self.potential(&observation);
         sigmoid(value / self.temperature + self.bias)
     }
 }
 
-fn scoped_rows(
-    domains: &[DomainRows; DOMAIN_NAMES.len()],
-    action_count: usize,
-) -> Vec<Vec<(usize, &DomainRow)>> {
-    let mut scoped = vec![Vec::new(); action_count];
-    for (domain, rows) in domains.iter().enumerate() {
-        for row in rows.iter().filter(|row| row.scope >= 0) {
-            if let Some(scoped) = scoped.get_mut(row.scope as usize) {
-                scoped.push((domain, row));
-            }
-        }
-    }
-    scoped
+fn add(left: &mut [f32], right: &[f32]) {
+    left.iter_mut().zip(right).for_each(|(left, right)| *left += right);
 }
 
 fn transformer_pool(index: usize, mode: u8) -> bool {
@@ -1885,26 +1440,6 @@ mod tests {
             );
         }
         assert_eq!(cache.states.len() / width, 7);
-    }
-
-    #[test]
-    fn scoped_rows_keep_domain_and_row_order() {
-        let row = |domain, scope, marker| {
-            let mut row = DomainRow::new(domain, scope);
-            row.u[0] = marker;
-            row
-        };
-        let mut domains = std::array::from_fn(|_| DomainRows::Owned(Vec::new()));
-        domains[0] = DomainRows::Owned(vec![row(0, 1, 1), row(0, -1, 2), row(0, 0, 3)]);
-        domains[2] = DomainRows::Owned(vec![row(2, 0, 4), row(2, 3, 5), row(2, 1, 6)]);
-        let scoped = scoped_rows(&domains, 2);
-        let keys = |rows: &[(usize, &DomainRow)]| {
-            rows.iter()
-                .map(|(domain, row)| (*domain, row.u[0]))
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(keys(&scoped[0]), vec![(0, 3), (2, 4)]);
-        assert_eq!(keys(&scoped[1]), vec![(0, 1), (2, 6)]);
     }
 }
 

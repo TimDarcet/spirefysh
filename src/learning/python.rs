@@ -1,7 +1,5 @@
 use super::*;
-use numpy::{
-    IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyReadwriteArray2, ndarray,
-};
+use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadwriteArray2, ndarray};
 use pyo3::{
     exceptions::PyValueError,
     prelude::*,
@@ -114,52 +112,35 @@ fn model_schema() -> (
     u32,
     usize,
     usize,
-    Vec<usize>,
-    Vec<(&'static str, usize, usize, usize, usize)>,
+    Vec<(&'static str, usize, usize)>,
+    Vec<&'static str>,
     Vec<&'static str>,
     Vec<(&'static str, u32)>,
-    u32,
 ) {
     (
         VERSION,
         VALUE_MODEL_VERSION,
         TERMINAL_CATEGORIES,
         TERMINAL_CATEGORIES - 11,
-        vec![ACTION_U, ACTION_S, ACTION_C, ACTION_F],
-        DOMAIN_NAMES
-            .into_iter()
-            .zip(DOMAIN_WIDTHS)
-            .map(|(name, (u, s, c, f))| (name, u, s, c, f))
-            .collect(),
+        DOMAINS.iter().map(|&(name, codes, fields)| (name, codes, fields.len())).collect(),
+        PLACE_NAMES.to_vec(),
         SEMANTIC_NAMES.to_vec(),
         POSITION_NAMES.into_iter().zip(POSITION_CAPS).collect(),
-        paels_tooth(),
     )
 }
 
 #[pyfunction]
 fn feature_schema(py: Python<'_>) -> PyResult<Py<PyAny>> {
     let result = PyDict::new(py);
-    result.set_item("schema", 1)?;
+    result.set_item("schema", 2)?;
     result.set_item("feature_version", VERSION)?;
-    result.set_item(
-        "domains",
-        DOMAIN_NAMES
-            .into_iter()
-            .zip(DOMAIN_WIDTHS)
-            .map(|(name, (unsigned, signed, categorical, numeric))| {
-                (name, unsigned, signed, categorical, numeric)
-            })
-            .collect::<Vec<_>>(),
-    )?;
-    result.set_item("action", [ACTION_U, ACTION_S, ACTION_C, ACTION_F])?;
+    result.set_item("domains", DOMAINS.to_vec())?;
+    result.set_item("places", PLACE_NAMES)?;
     result.set_item("semantic_namespaces", SEMANTIC_NAMES)?;
+    result.set_item("flags", FLAG_NAMES)?;
     result.set_item(
         "position_caps",
-        POSITION_NAMES
-            .into_iter()
-            .zip(POSITION_CAPS)
-            .collect::<Vec<_>>(),
+        POSITION_NAMES.into_iter().zip(POSITION_CAPS).collect::<Vec<_>>(),
     )?;
     Ok(result.into_any().unbind())
 }
@@ -267,323 +248,337 @@ fn compress_words(values: &[u32]) -> Vec<u8> {
     output
 }
 
-#[cfg(target_os = "macos")]
-fn decompress_bytes(input: &[u8], size: usize) -> PyResult<Vec<u8>> {
-    #[link(name = "compression")]
-    unsafe extern "C" {
-        fn compression_decode_buffer(
-            output: *mut u8,
-            output_size: usize,
-            input: *const u8,
-            input_size: usize,
-            scratch: *mut std::ffi::c_void,
-            algorithm: u32,
-        ) -> usize;
-    }
-    let mut output = vec![0; size];
-    let written = unsafe {
-        compression_decode_buffer(
-            output.as_mut_ptr(),
-            output.len(),
-            input.as_ptr(),
-            input.len(),
-            std::ptr::null_mut(),
-            0x100,
-        )
-    };
-    if written != size {
-        return Err(PyValueError::new_err("invalid compressed observation"));
-    }
-    Ok(output)
-}
-
-fn compact_packed_observation(row: &Observation) -> Vec<u8> {
-    compact_packed_observation_known(row, None)
-}
-
-fn cached_packed_metadata(row: &Observation) -> Vec<u8> {
-    let mut output = vec![0; 32 + 4 * DOMAIN_WIDTHS.len()];
-    output[..4].copy_from_slice(b"SP68");
-    output[4] = row.character;
-    output[16..20].copy_from_slice(&(row.candidates.len() as u32).to_le_bytes());
-    output[20..24].copy_from_slice(
-        &(row
-            .candidates
-            .iter()
-            .filter(|candidate| candidate.legal)
-            .count() as u32)
-            .to_le_bytes(),
-    );
-    output
-}
-
-fn compact_packed_observation_known(row: &Observation, digest: Option<u64>) -> Vec<u8> {
-    compact_packed_observation_and_digest(row, digest).0
-}
-
-fn compact_packed_observation_and_digest(row: &Observation, digest: Option<u64>) -> (Vec<u8>, u64) {
-    let (globals, counts, exact, actions, digest) = packed_observation_known(row, digest);
-    let exact = compress_words(&exact);
-    let exact_len = exact.len();
-    let width = ACTION_U + ACTION_S + ACTION_C + ACTION_F + 1;
-    let action_count = actions.len() / width;
-    let legal_count = actions
-        .chunks_exact(width)
-        .filter(|row| row[width - 1] != 0)
-        .count();
-    let mut payload = exact;
-    payload.reserve(4 * actions.len());
-    actions
-        .iter()
-        .for_each(|value| payload.extend(value.to_le_bytes()));
-    let mut output = Vec::with_capacity(32 + 4 * (globals.len() + counts.len()) + payload.len());
-    output.extend(b"SP67");
-    output.push(row.character);
-    output.extend([0; 3]);
-    output.extend(digest.to_le_bytes());
-    output.extend((action_count as u32).to_le_bytes());
-    output.extend((legal_count as u32).to_le_bytes());
-    output.extend((exact_len as u32).to_le_bytes());
-    output.extend(0u32.to_le_bytes());
-    globals
-        .iter()
-        .for_each(|value| output.extend(value.to_bits().to_le_bytes()));
-    counts
-        .iter()
-        .for_each(|value| output.extend(value.to_le_bytes()));
-    output.extend(payload);
-    (output, digest)
-}
-
-fn decompress_words(input: &[u8], expected: usize) -> PyResult<Vec<u32>> {
-    if input.len() < 4 {
-        return Err(PyValueError::new_err("invalid packed word stream"));
-    }
-    let words = u32::from_le_bytes(input[..4].try_into().unwrap()) as usize;
+fn decompress_words(input: &[u8]) -> PyResult<Vec<u32>> {
+    let invalid = || PyValueError::new_err("invalid packed word stream");
+    let words = u32::from_le_bytes(input.get(..4).ok_or_else(invalid)?.try_into().unwrap()) as usize;
     let bitmap = words.div_ceil(8);
-    if words != expected || input.len() < 4 + bitmap {
-        return Err(PyValueError::new_err("invalid packed word stream"));
+    if input.len() < 4 + bitmap {
+        return Err(invalid());
     }
     let mut output = vec![0; words];
     let mut offset = 4 + bitmap;
     for (index, value) in output.iter_mut().enumerate() {
         if input[4 + index / 8] & (1 << (index % 8)) != 0 {
-            let word = input
-                .get(offset..offset + 4)
-                .ok_or_else(|| PyValueError::new_err("invalid packed word stream"))?;
+            let word = input.get(offset..offset + 4).ok_or_else(invalid)?;
             *value = u32::from_le_bytes(word.try_into().unwrap());
             offset += 4;
         }
     }
     if offset != input.len() {
-        return Err(PyValueError::new_err("invalid packed word stream"));
+        return Err(invalid());
     }
     Ok(output)
 }
 
-struct PackedData {
-    character: u8,
-    globals: Vec<f32>,
-    counts: Vec<u32>,
-    exact: Vec<u32>,
-    actions: Vec<u32>,
-    digest: u64,
+const COMPACT_HEADER: usize = 32 + 4 * PUBLIC_GLOBALS;
+
+/// "SP70" rows: character, digest, candidate and legal counts, token count, the compressed
+/// words' length, the public globals and the compressed observation words. "SM70" rows carry
+/// only the header (a forced or feature-cached decision).
+fn compact_row(row: &Observation, magic: &[u8; 4], digest: u64, words: &[u8]) -> Vec<u8> {
+    let legal = row.candidates.iter().filter(|candidate| candidate.legal).count() as u32;
+    let mut output = Vec::with_capacity(COMPACT_HEADER + words.len());
+    output.extend(magic);
+    output.extend([row.character, 0, 0, 0]);
+    output.extend(digest.to_le_bytes());
+    for value in [row.candidates.len() as u32, legal, row.tokens.len() as u32, words.len() as u32] {
+        output.extend(value.to_le_bytes());
+    }
+    row.globals.iter().for_each(|value| output.extend(value.to_le_bytes()));
+    output.extend(words);
+    output
 }
 
-fn compact_data(input: &[u8]) -> PyResult<PackedData> {
-    let width = ACTION_U + ACTION_S + ACTION_C + ACTION_F + 1;
-    let fixed = 32 + 4 * (PUBLIC_GLOBALS + DOMAIN_WIDTHS.len());
-    if input.len() < fixed || !matches!(&input[..4], b"SP67" | b"SP68") {
+pub(in super::super) fn compact_packed_observation(row: &Observation) -> Vec<u8> {
+    compact_packed_observation_known(row, None)
+}
+
+fn cached_packed_metadata(row: &Observation) -> Vec<u8> {
+    compact_row(row, b"SM70", 0, &[])
+}
+
+fn compact_packed_observation_known(row: &Observation, digest: Option<u64>) -> Vec<u8> {
+    let words = observation_words(row);
+    let digest = digest.unwrap_or_else(|| {
+        packed_observation_digest(row.character, &row.globals, observation_counts(row), &words)
+    });
+    compact_row(row, b"SP70", digest, &compress_words(&words))
+}
+
+pub(in super::super) struct PackedData {
+    pub(in super::super) character: u8,
+    pub(in super::super) globals: Vec<f32>,
+    pub(in super::super) counts: [u32; 2],
+    pub(in super::super) words: Vec<u32>,
+    pub(in super::super) digest: u64,
+}
+
+pub(in super::super) fn compact_data(input: &[u8]) -> PyResult<PackedData> {
+    if input.len() < COMPACT_HEADER || &input[..4] != b"SP70" {
         return Err(PyValueError::new_err("invalid compact observation"));
     }
-    let digest = u64::from_le_bytes(input[8..16].try_into().unwrap());
-    let actions = u32::from_le_bytes(input[16..20].try_into().unwrap()) as usize;
-    let exact_bytes = u32::from_le_bytes(input[24..28].try_into().unwrap()) as usize;
-    let mut offset = 32;
-    let globals = input[offset..offset + 4 * PUBLIC_GLOBALS]
-        .chunks_exact(4)
-        .map(|value| f32::from_bits(u32::from_le_bytes(value.try_into().unwrap())))
-        .collect::<Vec<_>>();
-    offset += 4 * PUBLIC_GLOBALS;
-    let counts = input[offset..offset + 4 * DOMAIN_WIDTHS.len()]
-        .chunks_exact(4)
-        .map(|value| u32::from_le_bytes(value.try_into().unwrap()))
-        .collect::<Vec<_>>();
-    offset += 4 * DOMAIN_WIDTHS.len();
-    let action_bytes = actions * width * 4;
-    #[cfg(target_os = "macos")]
-    let payload = if &input[..4] == b"SP68" {
-        decompress_bytes(&input[offset..], exact_bytes + action_bytes)?
-    } else {
-        input[offset..].to_vec()
-    };
-    #[cfg(not(target_os = "macos"))]
-    let payload = input[offset..].to_vec();
-    if payload.len() != exact_bytes + action_bytes {
+    let word = |offset: usize| u32::from_le_bytes(input[offset..offset + 4].try_into().unwrap());
+    if input.len() != COMPACT_HEADER + word(28) as usize {
         return Err(PyValueError::new_err("invalid compact observation length"));
     }
-    let expected = counts
-        .iter()
-        .zip(DOMAIN_WIDTHS)
-        .map(|(&count, (u, s, c, f))| count as usize * (u + s + c + f + 1))
-        .sum();
-    let exact = decompress_words(&payload[..exact_bytes], expected)?;
-    let actions = payload[exact_bytes..]
-        .chunks_exact(4)
-        .map(|value| u32::from_le_bytes(value.try_into().unwrap()))
-        .collect();
     Ok(PackedData {
         character: input[4],
-        globals,
-        counts,
-        exact,
-        actions,
-        digest,
+        globals: (0..PUBLIC_GLOBALS).map(|index| f32::from_bits(word(32 + 4 * index))).collect(),
+        counts: [word(24), word(16)],
+        words: decompress_words(&input[COMPACT_HEADER..])?,
+        digest: u64::from_le_bytes(input[8..16].try_into().unwrap()),
     })
 }
 
-fn packed_data(row: &Bound<'_, PyAny>) -> PyResult<PackedData> {
-    if let Ok(row) = row.downcast::<PyBytes>() {
-        return compact_data(row.as_bytes());
-    }
-    let row = row.downcast::<PyTuple>()?;
-    let character = row.get_item(0)?.extract()?;
-    let globals = row
-        .get_item(1)?
-        .extract::<PyReadonlyArray1<'_, f32>>()?
-        .as_slice()?
-        .to_vec();
-    let counts = row
-        .get_item(2)?
-        .extract::<PyReadonlyArray1<'_, u32>>()?
-        .as_slice()?
-        .to_vec();
-    let expected = counts
-        .iter()
-        .zip(DOMAIN_WIDTHS)
-        .map(|(&count, (u, s, c, f))| count as usize * (u + s + c + f + 1))
-        .sum();
-    let exact_item = row.get_item(3)?;
-    let exact = if let Ok(exact) = exact_item.downcast::<PyBytes>() {
-        decompress_words(exact.as_bytes(), expected)?
-    } else {
-        exact_item
-            .extract::<PyReadonlyArray1<'_, u32>>()?
-            .as_slice()?
-            .to_vec()
-    };
-    let actions = row
-        .get_item(4)?
-        .extract::<PyReadonlyArray2<'_, u32>>()?
-        .as_slice()?
-        .to_vec();
-    Ok(PackedData {
-        character,
-        globals,
-        counts,
-        exact,
-        actions,
-        digest: row.get_item(5)?.extract()?,
-    })
+/// A parsed token: header fields with parent and link as row-local indices (-1 for none) and
+/// the offset of its codes in the row's words.
+pub(in super::super) struct Parsed {
+    pub(in super::super) domain: u8,
+    pub(in super::super) place: u8,
+    pub(in super::super) parent: i64,
+    pub(in super::super) link: i64,
+    start: usize,
 }
 
-#[pyfunction]
-fn unique_rows<'py>(
-    py: Python<'py>,
-    values: PyReadonlyArray2<'py, u32>,
-) -> (
-    Bound<'py, numpy::PyArray1<i64>>,
-    Bound<'py, numpy::PyArray1<i64>>,
-) {
-    let values = values.as_array();
-    if values.nrows() == 0 {
-        return (Vec::new().into_pyarray(py), Vec::new().into_pyarray(py));
-    }
-    let columns = values.ncols();
-    let flat = values.as_slice().unwrap();
-    let mut unique =
-        FastMap::with_capacity_and_hasher(values.nrows(), BuildHasherDefault::default());
-    let mut first = Vec::new();
-    let mut inverse = Vec::with_capacity(values.nrows());
-    for (index, row) in flat.chunks(columns).enumerate() {
-        let next = unique.len();
-        let value = *unique.entry(row).or_insert_with(|| {
-            first.push(index as i64);
-            next
+/// The row's tokens (state tokens, then each candidate followed by its attachments) and its
+/// candidates' legality.
+pub(in super::super) fn parse_row(data: &PackedData) -> PyResult<(Vec<Parsed>, Vec<bool>)> {
+    let invalid = |message| PyValueError::new_err(message);
+    let (words, [count, candidates]) = (&data.words, data.counts);
+    let (count, candidates) = (count as usize, candidates as usize);
+    let mut tokens = Vec::with_capacity(count + candidates);
+    let mut legal = Vec::with_capacity(candidates);
+    let mut offset = 0;
+    let read = |tokens: &mut Vec<Parsed>, offset: &mut usize, parent: Option<i64>| -> PyResult<()> {
+        let header = words.get(*offset..*offset + 3).ok_or_else(|| invalid("truncated token"))?;
+        let (domain, place) = ((header[0] & 0xff) as usize, (header[0] >> 8) as usize);
+        if domain >= DOMAINS.len() || place >= PLACE_NAMES.len() {
+            return Err(invalid("invalid token header"));
+        }
+        let local = |value: u32| match value {
+            NONE => Ok(-1),
+            value if (value as usize) < count => Ok(value as i64),
+            _ => Err(invalid("token references a missing state token")),
+        };
+        tokens.push(Parsed {
+            domain: domain as u8,
+            place: place as u8,
+            parent: match parent {
+                Some(parent) => parent,
+                None => local(header[1])?,
+            },
+            link: local(header[2])?,
+            start: *offset + 3,
         });
-        inverse.push(value as i64);
+        let (_, codes, fields) = DOMAINS[domain];
+        *offset += 3 + 2 * codes + fields.len();
+        if *offset > words.len() {
+            return Err(invalid("truncated token"));
+        }
+        Ok(())
+    };
+    for _ in 0..count {
+        read(&mut tokens, &mut offset, None)?;
     }
-    (first.into_pyarray(py), inverse.into_pyarray(py))
+    for _ in 0..candidates {
+        let Some(&[allowed, attached]) = words.get(offset..offset + 2).map(|pair| <&[u32; 2]>::try_from(pair).unwrap())
+        else {
+            return Err(invalid("truncated candidate"));
+        };
+        if allowed > 1 {
+            return Err(invalid("invalid action legality"));
+        }
+        legal.push(allowed == 1);
+        offset += 2;
+        let candidate = tokens.len() as i64;
+        read(&mut tokens, &mut offset, Some(-1))?;
+        for _ in 0..attached {
+            read(&mut tokens, &mut offset, Some(candidate))?;
+        }
+    }
+    if offset != words.len() || tokens.iter().any(|token| token.parent >= tokens.len() as i64) {
+        return Err(invalid("invalid observation words"));
+    }
+    Ok((tokens, legal))
 }
 
 #[pyfunction]
-fn unique_feature_rows<'py>(
+fn validate_compact_observation(row: &Bound<'_, PyBytes>) -> PyResult<()> {
+    let row = compact_data(row.as_bytes())?;
+    let digest = packed_observation_digest(row.character, &row.globals, row.counts, &row.words);
+    if digest != row.digest {
+        return Err(PyValueError::new_err("observation auxiliary digest mismatch"));
+    }
+    if !row.globals.iter().all(|value| value.is_finite()) {
+        return Err(PyValueError::new_err("invalid public globals"));
+    }
+    parse_row(&row).map(|_| ())
+}
+
+type FeatureArrays<'py> = (
+    Bound<'py, PyArray2<u32>>,
+    Bound<'py, PyArray2<f32>>,
+    Bound<'py, PyArray2<f32>>,
+);
+
+type TokenArrays<'py> = (
+    Bound<'py, PyArray1<u8>>,
+    Bound<'py, PyArray1<u8>>,
+    Bound<'py, PyArray1<i64>>,
+    Bound<'py, PyArray1<i64>>,
+    Bound<'py, PyArray1<i32>>,
+    Bound<'py, PyArray1<i64>>,
+);
+
+/// Batches compact rows: per domain its unique (codes, amounts, fields) rows, and per token
+/// (all rows' tokens in order) its domain, place, parent and link (batch indices or -1), row and
+/// unique feature row.
+#[pyfunction]
+#[allow(clippy::type_complexity)]
+fn unpack_packed_observations<'py>(
     py: Python<'py>,
-    semantic: PyReadonlyArray2<'py, u32>,
-    numeric: PyReadonlyArray2<'py, u32>,
+    rows: &Bound<'py, PyList>,
 ) -> PyResult<(
-    Bound<'py, numpy::PyArray1<i64>>,
-    Bound<'py, numpy::PyArray1<i64>>,
+    Bound<'py, PyArray1<u8>>,
+    Bound<'py, PyArray2<f32>>,
+    Vec<FeatureArrays<'py>>,
+    TokenArrays<'py>,
+    Bound<'py, PyArray2<bool>>,
 )> {
-    let semantic = semantic.as_array();
-    let numeric = numeric.as_array();
-    if semantic.nrows() != numeric.nrows() {
-        return Err(PyValueError::new_err("feature row count mismatch"));
+    let rows = rows.iter().map(|row| row.extract::<PyBackedBytes>()).collect::<PyResult<Vec<_>>>()?;
+    let packed = py.allow_threads(|| {
+        rows.par_iter()
+            .map(|row| {
+                let data = compact_data(row)?;
+                let parsed = parse_row(&data)?;
+                Ok((data, parsed))
+            })
+            .collect::<PyResult<Vec<_>>>()
+    })?;
+    let batch = packed.len();
+    let total = packed.iter().map(|(_, (tokens, _))| tokens.len()).sum::<usize>();
+    let max_actions = packed.iter().map(|(_, (_, legal))| legal.len()).max().unwrap_or(0).max(1);
+    let mut characters = Vec::with_capacity(batch);
+    let mut globals = Vec::with_capacity(batch * PUBLIC_GLOBALS);
+    let mut legal = vec![false; batch * max_actions];
+    let (mut domain, mut place) = (Vec::with_capacity(total), Vec::with_capacity(total));
+    let (mut parent, mut link) = (Vec::with_capacity(total), Vec::with_capacity(total));
+    let mut row_index = Vec::with_capacity(total);
+    let mut sources = vec![Vec::new(); DOMAINS.len()];
+    for (row, (data, (tokens, allowed))) in packed.iter().enumerate() {
+        characters.push(data.character);
+        globals.extend_from_slice(&data.globals);
+        legal[row * max_actions..][..allowed.len()].copy_from_slice(allowed);
+        let base = domain.len() as i64;
+        let global = |value: i64| if value < 0 { -1 } else { base + value };
+        for token in tokens {
+            sources[token.domain as usize].push((domain.len(), row, token.start));
+            domain.push(token.domain);
+            place.push(token.place);
+            parent.push(global(token.parent));
+            link.push(global(token.link));
+            row_index.push(row as i32);
+        }
     }
-    if semantic.nrows() == 0 {
-        return Ok((Vec::new().into_pyarray(py), Vec::new().into_pyarray(py)));
-    }
-    let rows = semantic.nrows();
-    let semantic = semantic
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("semantic rows must be contiguous"))?;
-    let numeric = numeric
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("numeric rows must be contiguous"))?;
-    let semantic_width = semantic.len() / rows;
-    let numeric_width = numeric.len() / rows;
-    let hashes = py.allow_threads(|| {
-        (0..rows)
-            .into_par_iter()
-            .map(|index| {
-                let mut hash = FastHasher::default();
-                hash_words(
-                    &mut hash,
-                    &semantic[index * semantic_width..(index + 1) * semantic_width],
-                );
-                hash_words(
-                    &mut hash,
-                    &numeric[index * numeric_width..(index + 1) * numeric_width],
-                );
-                hash.finish()
+    let features = py.allow_threads(|| {
+        (sources.par_iter().enumerate())
+            .map(|(index, sources)| {
+                let (_, codes, fields) = DOMAINS[index];
+                let width = 2 * codes + fields.len();
+                let words = |&(_, row, start): &(usize, usize, usize)| {
+                    &packed[row].0.words[start..start + width]
+                };
+                let mut unique = FastMap::<u64, Vec<usize>>::default();
+                let (mut c, mut a, mut f) = (Vec::new(), Vec::new(), Vec::new());
+                let mut representatives = Vec::new();
+                let mut feature = Vec::with_capacity(sources.len());
+                for source in sources {
+                    let token = words(source);
+                    let mut hash = FastHasher::default();
+                    hash_words(&mut hash, token);
+                    let entries = unique.entry(hash.finish()).or_default();
+                    let id = entries
+                        .iter()
+                        .copied()
+                        .find(|&id| words(&representatives[id]) == token)
+                        .unwrap_or_else(|| {
+                            entries.push(representatives.len());
+                            representatives.push(*source);
+                            c.extend_from_slice(&token[..codes]);
+                            a.extend(token[codes..2 * codes].iter().map(|&value| f32::from_bits(value)));
+                            f.extend(token[2 * codes..].iter().map(|&value| f32::from_bits(value)));
+                            representatives.len() - 1
+                        });
+                    feature.push((source.0, id as i64));
+                }
+                (representatives.len(), c, a, f, feature)
             })
             .collect::<Vec<_>>()
     });
-    let mut unique = FastMap::<u64, Vec<(usize, usize)>>::with_capacity_and_hasher(
-        rows,
-        BuildHasherDefault::default(),
-    );
-    let mut first = Vec::new();
-    let mut inverse = Vec::with_capacity(rows);
-    for (index, hash) in hashes.into_iter().enumerate() {
-        let semantic_row = &semantic[index * semantic_width..(index + 1) * semantic_width];
-        let numeric_row = &numeric[index * numeric_width..(index + 1) * numeric_width];
-        let matches = |source: usize| {
-            semantic_row == &semantic[source * semantic_width..(source + 1) * semantic_width]
-                && numeric_row == &numeric[source * numeric_width..(source + 1) * numeric_width]
-        };
-        let entries = unique.entry(hash).or_default();
-        let value = entries
-            .iter()
-            .find_map(|&(source, value)| matches(source).then_some(value))
-            .unwrap_or_else(|| {
-                let value = first.len();
-                first.push(index as i64);
-                entries.push((index, value));
-                value
-            });
-        inverse.push(value as i64);
+    let mut feature = vec![0; total];
+    let arrays = (features.into_iter().enumerate())
+        .map(|(index, (rows, c, a, f, ids))| {
+            for (token, id) in ids {
+                feature[token] = id;
+            }
+            let (_, codes, fields) = DOMAINS[index];
+            (
+                ndarray::Array2::from_shape_vec((rows, codes), c).unwrap().into_pyarray(py),
+                ndarray::Array2::from_shape_vec((rows, codes), a).unwrap().into_pyarray(py),
+                ndarray::Array2::from_shape_vec((rows, fields.len()), f).unwrap().into_pyarray(py),
+            )
+        })
+        .collect();
+    Ok((
+        characters.into_pyarray(py),
+        ndarray::Array2::from_shape_vec((batch, PUBLIC_GLOBALS), globals).unwrap().into_pyarray(py),
+        arrays,
+        (
+            domain.into_pyarray(py),
+            place.into_pyarray(py),
+            parent.into_pyarray(py),
+            link.into_pyarray(py),
+            row_index.into_pyarray(py),
+            feature.into_pyarray(py),
+        ),
+        ndarray::Array2::from_shape_vec((batch, max_actions), legal).unwrap().into_pyarray(py),
+    ))
+}
+
+/// One representative per distinct map (node features in order, then local edges) and each
+/// row's representative.
+#[pyfunction]
+fn unique_graphs<'py>(
+    py: Python<'py>,
+    node_features: PyReadonlyArray1<'py, i64>,
+    node_offsets: PyReadonlyArray1<'py, i64>,
+    edges: PyReadonlyArray1<'py, i64>,
+    edge_offsets: PyReadonlyArray1<'py, i64>,
+) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)> {
+    let (node_features, node_offsets) = (node_features.as_slice()?, node_offsets.as_slice()?);
+    let (edges, edge_offsets) = (edges.as_slice()?, edge_offsets.as_slice()?);
+    if node_offsets.len() != edge_offsets.len() {
+        return Err(PyValueError::new_err("graph row count mismatch"));
     }
+    let rows = node_offsets.len().saturating_sub(1);
+    let key = |row: usize| {
+        let nodes = &node_features[node_offsets[row] as usize..node_offsets[row + 1] as usize];
+        let links = &edges[2 * edge_offsets[row] as usize..2 * edge_offsets[row + 1] as usize];
+        (std::iter::once(nodes.len() as i64).chain(nodes.iter().copied()))
+            .chain(links.iter().copied())
+            .collect::<Vec<_>>()
+    };
+    let keys = py.allow_threads(|| (0..rows).into_par_iter().map(key).collect::<Vec<_>>());
+    let mut unique = HashMap::new();
+    let mut first = Vec::new();
+    let inverse = (keys.iter().enumerate())
+        .map(|(row, key)| {
+            *unique.entry(key).or_insert_with(|| {
+                first.push(row as i64);
+                first.len() as i64 - 1
+            })
+        })
+        .collect::<Vec<_>>();
     Ok((first.into_pyarray(py), inverse.into_pyarray(py)))
 }
 
@@ -665,584 +660,6 @@ fn deduplicate_sequences<'py>(
     ))
 }
 
-#[pyfunction]
-#[allow(clippy::too_many_arguments)]
-fn unique_graphs<'py>(
-    py: Python<'py>,
-    node_u: PyReadonlyArray2<'py, u32>,
-    node_c: PyReadonlyArray2<'py, u32>,
-    node_f: PyReadonlyArray2<'py, f32>,
-    node_inverse: PyReadonlyArray1<'py, i64>,
-    node_source: PyReadonlyArray1<'py, i32>,
-    node_offsets: PyReadonlyArray1<'py, i64>,
-    edge_u: PyReadonlyArray2<'py, u32>,
-    edge_c: PyReadonlyArray2<'py, u32>,
-    edge_f: PyReadonlyArray2<'py, f32>,
-    edge_inverse: PyReadonlyArray1<'py, i64>,
-    edge_source: PyReadonlyArray1<'py, i32>,
-    edge_offsets: PyReadonlyArray1<'py, i64>,
-) -> PyResult<(
-    Bound<'py, numpy::PyArray1<i64>>,
-    Bound<'py, numpy::PyArray1<i64>>,
-)> {
-    let (node_u, node_c, node_f) = (node_u.as_array(), node_c.as_array(), node_f.as_array());
-    let (edge_u, edge_c, edge_f) = (edge_u.as_array(), edge_c.as_array(), edge_f.as_array());
-    let node_inverse = node_inverse.as_slice()?;
-    let edge_inverse = edge_inverse.as_slice()?;
-    let node_source = node_source.as_slice()?;
-    let edge_source = edge_source.as_slice()?;
-    let node_offsets = node_offsets.as_slice()?;
-    let edge_offsets = edge_offsets.as_slice()?;
-    if node_offsets.len() != edge_offsets.len() {
-        return Err(PyValueError::new_err("graph row count mismatch"));
-    }
-    let rows = node_offsets.len().saturating_sub(1);
-    let keys = py.allow_threads(|| {
-        (0..rows)
-            .into_par_iter()
-            .map(|row| {
-                let node_range = node_offsets[row] as usize..node_offsets[row + 1] as usize;
-                let edge_range = edge_offsets[row] as usize..edge_offsets[row + 1] as usize;
-                let mut key = Vec::with_capacity(
-                    2 + node_range.len() * (node_u.ncols() + node_c.ncols() + node_f.ncols())
-                        + edge_range.len() * (edge_u.ncols() + edge_c.ncols() + edge_f.ncols()),
-                );
-                key.push(node_range.len() as u32);
-                for &source in &node_source[node_range] {
-                    let source = source as usize;
-                    key.extend(node_u.row(source));
-                    key.extend(node_c.row(node_inverse[source] as usize));
-                    key.extend(
-                        node_f
-                            .row(node_inverse[source] as usize)
-                            .iter()
-                            .map(|value| value.to_bits()),
-                    );
-                }
-                key.push(edge_range.len() as u32);
-                for &source in &edge_source[edge_range] {
-                    let source = source as usize;
-                    key.extend(edge_u.row(source));
-                    key.extend(edge_c.row(edge_inverse[source] as usize));
-                    key.extend(
-                        edge_f
-                            .row(edge_inverse[source] as usize)
-                            .iter()
-                            .map(|value| value.to_bits()),
-                    );
-                }
-                let mut hash = FastHasher::default();
-                hash_words(&mut hash, &key);
-                (hash.finish(), key)
-            })
-            .collect::<Vec<_>>()
-    });
-    let mut unique = FastMap::<u64, Vec<(usize, usize)>>::with_capacity_and_hasher(
-        rows,
-        BuildHasherDefault::default(),
-    );
-    let mut first = Vec::new();
-    let mut inverse = Vec::with_capacity(rows);
-    for (row, (hash, key)) in keys.iter().enumerate() {
-        let entries = unique.entry(*hash).or_default();
-        let value = entries
-            .iter()
-            .find_map(|&(source, value)| (key == &keys[source].1).then_some(value))
-            .unwrap_or_else(|| {
-                let value = first.len();
-                first.push(row as i64);
-                entries.push((row, value));
-                value
-            });
-        inverse.push(value as i64);
-    }
-    Ok((first.into_pyarray(py), inverse.into_pyarray(py)))
-}
-
-fn check_action_features(unsigned: &[u32], signed: &[i32], numeric: &[f32]) -> PyResult<()> {
-    let unsigned: &[u32; ACTION_U] = unsigned
-        .try_into()
-        .map_err(|_| PyValueError::new_err("invalid action unsigned width"))?;
-    let signed: &[i32; ACTION_S] = signed
-        .try_into()
-        .map_err(|_| PyValueError::new_err("invalid action signed width"))?;
-    let expected = action_features(unsigned, signed);
-    if numeric.len() != ACTION_F
-        || numeric
-            .iter()
-            .zip(expected)
-            .any(|(actual, expected)| actual.to_bits() != expected.to_bits())
-    {
-        return Err(PyValueError::new_err("action auxiliary mismatch"));
-    }
-    Ok(())
-}
-
-#[pyfunction]
-fn validate_action_features(
-    unsigned: PyReadonlyArray2<'_, u32>,
-    signed: PyReadonlyArray2<'_, i32>,
-    numeric: PyReadonlyArray2<'_, f32>,
-) -> PyResult<()> {
-    let (unsigned, signed, numeric) = (unsigned.as_array(), signed.as_array(), numeric.as_array());
-    if unsigned.nrows() != signed.nrows() || unsigned.nrows() != numeric.nrows() {
-        return Err(PyValueError::new_err("action row count mismatch"));
-    }
-    for row in 0..unsigned.nrows() {
-        check_action_features(
-            unsigned.row(row).as_slice().unwrap(),
-            signed.row(row).as_slice().unwrap(),
-            numeric.row(row).as_slice().unwrap(),
-        )?;
-    }
-    Ok(())
-}
-
-#[pyfunction]
-fn compress_packed_observations<'py>(
-    py: Python<'py>,
-    rows: &Bound<'py, PyTuple>,
-) -> PyResult<Bound<'py, PyTuple>> {
-    let mut output = Vec::with_capacity(rows.len());
-    for item in rows.iter() {
-        let row = item.downcast::<PyTuple>()?;
-        let exact = row.get_item(3)?.extract::<PyReadonlyArray1<'_, u32>>()?;
-        let compressed = compress_words(exact.as_slice()?);
-        output.push(PyTuple::new(
-            py,
-            [
-                row.get_item(0)?,
-                row.get_item(1)?,
-                row.get_item(2)?,
-                PyBytes::new(py, &compressed).into_any(),
-                row.get_item(4)?,
-                row.get_item(5)?,
-            ],
-        )?);
-    }
-    PyTuple::new(py, output)
-}
-
-#[pyfunction]
-fn validate_packed_observation(
-    character: u8,
-    globals: PyReadonlyArray1<'_, f32>,
-    counts: PyReadonlyArray1<'_, u32>,
-    exact: &Bound<'_, PyAny>,
-    actions: PyReadonlyArray2<'_, u32>,
-    digest: u64,
-) -> PyResult<()> {
-    let globals = globals
-        .as_slice()
-        .map_err(|_| PyValueError::new_err("noncontiguous public globals"))?;
-    let counts = counts
-        .as_slice()
-        .map_err(|_| PyValueError::new_err("noncontiguous domain counts"))?;
-    let expected = counts
-        .iter()
-        .zip(DOMAIN_WIDTHS)
-        .map(|(&count, (u, s, c, f))| count as usize * (u + s + c + f + 1))
-        .sum::<usize>();
-    let exact_array: PyReadonlyArray1<'_, u32>;
-    let exact_owned: Vec<u32>;
-    let exact = if let Ok(bytes) = exact.downcast::<PyBytes>() {
-        exact_owned = decompress_words(bytes.as_bytes(), expected)?;
-        exact_owned.as_slice()
-    } else {
-        exact_array = exact.extract()?;
-        exact_array
-            .as_slice()
-            .map_err(|_| PyValueError::new_err("noncontiguous domain rows"))?
-    };
-    let actions = actions.as_array();
-    let action_width = ACTION_U + ACTION_S + ACTION_C + ACTION_F + 1;
-    if globals.len() != PUBLIC_GLOBALS
-        || !globals.iter().all(|value| value.is_finite())
-        || counts.len() != DOMAIN_WIDTHS.len()
-        || exact.len() != expected
-        || actions.ncols() != action_width
-    {
-        return Err(PyValueError::new_err("invalid packed observation schema"));
-    }
-    let action_words = actions
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("noncontiguous action rows"))?;
-    if packed_observation_digest(character, globals, counts, exact, action_words) != digest {
-        return Err(PyValueError::new_err(
-            "observation auxiliary digest mismatch",
-        ));
-    }
-    for row in actions.rows() {
-        let row = row.as_slice().unwrap();
-        let signed = row[ACTION_U..ACTION_U + ACTION_S]
-            .iter()
-            .map(|&value| value as i32)
-            .collect::<Vec<_>>();
-        let numeric = row
-            [ACTION_U + ACTION_S + ACTION_C..ACTION_U + ACTION_S + ACTION_C + ACTION_F]
-            .iter()
-            .map(|&value| f32::from_bits(value))
-            .collect::<Vec<_>>();
-        check_action_features(&row[..ACTION_U], &signed, &numeric)?;
-        if row[action_width - 1] > 1 {
-            return Err(PyValueError::new_err("invalid action legality"));
-        }
-    }
-    Ok(())
-}
-
-#[pyfunction]
-fn validate_compact_observation(row: &Bound<'_, PyBytes>) -> PyResult<()> {
-    let row = compact_data(row.as_bytes())?;
-    let width = ACTION_U + ACTION_S + ACTION_C + ACTION_F + 1;
-    if packed_observation_digest(
-        row.character,
-        &row.globals,
-        &row.counts,
-        &row.exact,
-        &row.actions,
-    ) != row.digest
-    {
-        return Err(PyValueError::new_err(
-            "observation auxiliary digest mismatch",
-        ));
-    }
-    for action in row.actions.chunks_exact(width) {
-        let signed = action[ACTION_U..ACTION_U + ACTION_S]
-            .iter()
-            .map(|&value| value as i32)
-            .collect::<Vec<_>>();
-        let numeric = action
-            [ACTION_U + ACTION_S + ACTION_C..ACTION_U + ACTION_S + ACTION_C + ACTION_F]
-            .iter()
-            .map(|&value| f32::from_bits(value))
-            .collect::<Vec<_>>();
-        check_action_features(&action[..ACTION_U], &signed, &numeric)?;
-        if action[width - 1] > 1 {
-            return Err(PyValueError::new_err("invalid action legality"));
-        }
-    }
-    Ok(())
-}
-
-type DomainArrays<'py> = (
-    Bound<'py, PyArray2<u32>>,
-    Bound<'py, PyArray2<i32>>,
-    Bound<'py, PyArray2<u32>>,
-    Bound<'py, PyArray2<f32>>,
-    Bound<'py, PyArray1<i32>>,
-    Bound<'py, PyArray1<i32>>,
-    Bound<'py, PyArray1<i64>>,
-    Bound<'py, PyArray1<i64>>,
-);
-
-type DomainVectors = (
-    Vec<u32>,
-    Vec<i32>,
-    Vec<u32>,
-    Vec<f32>,
-    Vec<i32>,
-    Vec<i32>,
-    Vec<i64>,
-    Vec<i64>,
-);
-
-fn unpack_domain(
-    packed: &[PackedData],
-    action_offsets: &[usize],
-    domain: usize,
-    rows: usize,
-    compact_features: bool,
-) -> DomainVectors {
-    let (u, s, c, f) = DOMAIN_WIDTHS[domain];
-    let width = u + s + c + f + 1;
-    let mut unsigned = Vec::with_capacity(rows * u);
-    let mut signed = Vec::with_capacity(if compact_features { 0 } else { rows * s });
-    let mut semantic = Vec::with_capacity(if compact_features { 0 } else { rows * c });
-    let mut numeric = Vec::<f32>::with_capacity(if compact_features { 0 } else { rows * f });
-    let mut row_index = Vec::with_capacity(rows);
-    let mut scope = Vec::with_capacity(rows);
-    let mut first = Vec::new();
-    let mut inverse = Vec::with_capacity(rows);
-    let mut map_kinds = Vec::new();
-    let mut unique = FastMap::<u64, Vec<(usize, usize)>>::with_capacity_and_hasher(
-        rows,
-        BuildHasherDefault::default(),
-    );
-    let offsets = packed
-        .iter()
-        .map(|row| {
-            row.counts
-                .iter()
-                .zip(DOMAIN_WIDTHS)
-                .take(domain)
-                .map(|(&count, (u, s, c, f))| count as usize * (u + s + c + f + 1))
-                .sum::<usize>()
-        })
-        .collect::<Vec<_>>();
-    let hashes = packed
-        .par_iter()
-        .zip(&offsets)
-        .map(|(row, &offset)| {
-            let end = offset + row.counts[domain] as usize * width;
-            row.exact[offset..end]
-                .chunks_exact(width)
-                .map(|record| {
-                    let mut hash = FastHasher::default();
-                    if domain == MAP_NODE_DOMAIN {
-                        hash.write_u32(record[1]);
-                    }
-                    hash_words(&mut hash, &record[u + s..u + s + c]);
-                    hash_words(&mut hash, &record[u + s + c..u + s + c + f]);
-                    hash.finish()
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    for (batch, (row, &offset)) in packed.iter().zip(&offsets).enumerate() {
-        let end = offset + row.counts[domain] as usize * width;
-        for (record_index, record) in row.exact[offset..end].chunks_exact(width).enumerate() {
-            let semantic_words = &record[u + s..u + s + c];
-            let numeric_words = &record[u + s + c..u + s + c + f];
-            let entries = unique.entry(hashes[batch][record_index]).or_default();
-            let value = entries
-                .iter()
-                .find_map(|&(source, value)| {
-                    ((domain != MAP_NODE_DOMAIN
-                        || record[1]
-                            == if compact_features {
-                                map_kinds[source]
-                            } else {
-                                unsigned[source * u + 1]
-                            })
-                        && semantic_words == &semantic[source * c..(source + 1) * c]
-                        && numeric_words
-                            .iter()
-                            .copied()
-                            .eq(numeric[source * f..(source + 1) * f]
-                                .iter()
-                                .map(|value| value.to_bits())))
-                    .then_some(value)
-                })
-                .unwrap_or_else(|| {
-                    let value = first.len();
-                    let source = if compact_features {
-                        semantic.len() / c.max(1)
-                    } else {
-                        row_index.len()
-                    };
-                    first.push(source as i64);
-                    entries.push((source, value));
-                    if compact_features {
-                        if domain == MAP_NODE_DOMAIN {
-                            map_kinds.push(record[1]);
-                        }
-                        semantic.extend_from_slice(semantic_words);
-                        numeric.extend(numeric_words.iter().map(|&value| f32::from_bits(value)));
-                    }
-                    value
-                });
-            inverse.push(value as i64);
-            unsigned.extend_from_slice(&record[..u]);
-            if !compact_features {
-                signed.extend(record[u..u + s].iter().map(|&value| value as i32));
-                semantic.extend_from_slice(semantic_words);
-                numeric.extend(numeric_words.iter().map(|&value| f32::from_bits(value)));
-            }
-            row_index.push(batch as i32);
-            let value = record[width - 1] as i32;
-            scope.push(if value < 0 {
-                value
-            } else {
-                value + action_offsets[batch] as i32
-            });
-        }
-    }
-    (
-        unsigned, signed, semantic, numeric, row_index, scope, first, inverse,
-    )
-}
-
-#[pyfunction]
-#[pyo3(signature = (rows, compact_features=false))]
-fn unpack_packed_observations<'py>(
-    py: Python<'py>,
-    rows: &Bound<'py, PyList>,
-    compact_features: bool,
-) -> PyResult<(
-    Bound<'py, PyArray1<u8>>,
-    Bound<'py, PyArray2<f32>>,
-    Vec<DomainArrays<'py>>,
-    (
-        Bound<'py, PyArray2<u32>>,
-        Bound<'py, PyArray2<i32>>,
-        Bound<'py, PyArray2<u32>>,
-        Bound<'py, PyArray2<f32>>,
-    ),
-    Bound<'py, PyArray1<i32>>,
-    Bound<'py, PyArray1<i32>>,
-    Bound<'py, PyArray2<bool>>,
-)> {
-    let batch = rows.len();
-    let compact = rows
-        .iter()
-        .map(|row| row.extract::<PyBackedBytes>())
-        .collect::<PyResult<Vec<_>>>();
-    let packed = match compact {
-        Ok(rows) => py.allow_threads(|| {
-            rows.par_iter()
-                .map(|row| compact_data(row))
-                .collect::<PyResult<Vec<_>>>()
-        })?,
-        Err(_) => rows
-            .iter()
-            .map(|row| packed_data(&row))
-            .collect::<PyResult<Vec<_>>>()?,
-    };
-    let mut characters = Vec::with_capacity(batch);
-    let mut globals = Vec::with_capacity(batch * PUBLIC_GLOBALS);
-    let mut lengths = Vec::with_capacity(batch);
-    let mut domain_rows = [0; DOMAIN_WIDTHS.len()];
-    for row in &packed {
-        characters.push(row.character);
-        if row.globals.len() != PUBLIC_GLOBALS {
-            return Err(PyValueError::new_err("invalid packed globals"));
-        }
-        globals.extend_from_slice(&row.globals);
-        let width = ACTION_U + ACTION_S + ACTION_C + ACTION_F + 1;
-        if row.actions.len() % width != 0 {
-            return Err(PyValueError::new_err("invalid packed action width"));
-        }
-        lengths.push(row.actions.len() / width);
-        if row.counts.len() != DOMAIN_WIDTHS.len() {
-            return Err(PyValueError::new_err("invalid packed domain count"));
-        }
-        let expected = row
-            .counts
-            .iter()
-            .zip(DOMAIN_WIDTHS)
-            .map(|(&count, (u, s, c, f))| count as usize * (u + s + c + f + 1))
-            .sum::<usize>();
-        if row.exact.len() != expected {
-            return Err(PyValueError::new_err("invalid packed domain rows"));
-        }
-        for (total, &count) in domain_rows.iter_mut().zip(&row.counts) {
-            *total += count as usize;
-        }
-    }
-    let max_actions = lengths.iter().copied().max().unwrap_or(1).max(1);
-    let total_actions: usize = lengths.iter().sum();
-    let mut offset = 0;
-    let action_offsets = lengths
-        .iter()
-        .map(|&length| {
-            let current = offset;
-            offset += length;
-            current
-        })
-        .collect::<Vec<_>>();
-    let mut domains = py.allow_threads(|| {
-        (0..DOMAIN_WIDTHS.len())
-            .into_par_iter()
-            .map(|domain| {
-                unpack_domain(
-                    &packed,
-                    &action_offsets,
-                    domain,
-                    domain_rows[domain],
-                    compact_features,
-                )
-            })
-            .collect::<Vec<_>>()
-    });
-    let mut action_u = Vec::with_capacity(total_actions * ACTION_U);
-    let mut action_s = Vec::with_capacity(total_actions * ACTION_S);
-    let mut action_c = Vec::with_capacity(total_actions * ACTION_C);
-    let mut action_f = Vec::with_capacity(total_actions * ACTION_F);
-    let mut action_row = Vec::with_capacity(total_actions);
-    let mut action_position = Vec::with_capacity(total_actions);
-    let mut legal = vec![false; batch * max_actions];
-    for (batch_index, row) in packed.iter().enumerate() {
-        let action_width = ACTION_U + ACTION_S + ACTION_C + ACTION_F + 1;
-        for (position, action) in row.actions.chunks_exact(action_width).enumerate() {
-            action_u.extend_from_slice(&action[..ACTION_U]);
-            action_s.extend(
-                action[ACTION_U..ACTION_U + ACTION_S]
-                    .iter()
-                    .map(|&value| value as i32),
-            );
-            action_c
-                .extend_from_slice(&action[ACTION_U + ACTION_S..ACTION_U + ACTION_S + ACTION_C]);
-            action_f.extend(
-                action[ACTION_U + ACTION_S + ACTION_C..ACTION_U + ACTION_S + ACTION_C + ACTION_F]
-                    .iter()
-                    .map(|&value| f32::from_bits(value)),
-            );
-            action_row.push(batch_index as i32);
-            action_position.push(position as i32);
-            legal[batch_index * max_actions + position] =
-                action[ACTION_U + ACTION_S + ACTION_C + ACTION_F] != 0;
-        }
-    }
-    let domains = DOMAIN_WIDTHS
-        .iter()
-        .enumerate()
-        .map(|(domain, &(u, s, c, f))| {
-            let (unsigned, signed, semantic, numeric, row_index, scope, first, inverse) =
-                std::mem::take(&mut domains[domain]);
-            let rows = row_index.len();
-            let feature_rows = if compact_features { first.len() } else { rows };
-            (
-                ndarray::Array2::from_shape_vec((rows, u), unsigned)
-                    .unwrap()
-                    .into_pyarray(py),
-                ndarray::Array2::from_shape_vec(
-                    (rows, if compact_features { 0 } else { s }),
-                    signed,
-                )
-                .unwrap()
-                .into_pyarray(py),
-                ndarray::Array2::from_shape_vec((feature_rows, c), semantic)
-                    .unwrap()
-                    .into_pyarray(py),
-                ndarray::Array2::from_shape_vec((feature_rows, f), numeric)
-                    .unwrap()
-                    .into_pyarray(py),
-                row_index.into_pyarray(py),
-                scope.into_pyarray(py),
-                first.into_pyarray(py),
-                inverse.into_pyarray(py),
-            )
-        })
-        .collect();
-    Ok((
-        characters.into_pyarray(py),
-        ndarray::Array2::from_shape_vec((batch, PUBLIC_GLOBALS), globals)
-            .unwrap()
-            .into_pyarray(py),
-        domains,
-        (
-            ndarray::Array2::from_shape_vec((total_actions, ACTION_U), action_u)
-                .unwrap()
-                .into_pyarray(py),
-            ndarray::Array2::from_shape_vec((total_actions, ACTION_S), action_s)
-                .unwrap()
-                .into_pyarray(py),
-            ndarray::Array2::from_shape_vec((total_actions, ACTION_C), action_c)
-                .unwrap()
-                .into_pyarray(py),
-            ndarray::Array2::from_shape_vec((total_actions, ACTION_F), action_f)
-                .unwrap()
-                .into_pyarray(py),
-        ),
-        action_row.into_pyarray(py),
-        action_position.into_pyarray(py),
-        ndarray::Array2::from_shape_vec((batch, max_actions), legal)
-            .unwrap()
-            .into_pyarray(py),
-    ))
-}
-
 #[pyclass]
 struct Batch {
     content: Content,
@@ -1318,7 +735,7 @@ impl SearchNode {
             candidates.len(),
             BuildHasherDefault::default(),
         );
-        let mut kind_counts = [0; ACTION_KINDS];
+        let mut kind_counts = [0; labels::ACTIONS.len()];
         let mut edges = Vec::with_capacity(action_count);
         for (candidate, (row, probability)) in candidates
             .into_iter()
@@ -1679,7 +1096,7 @@ impl SearchTree {
                 return Ok(SearchResult::Value(path, value));
             }
             let next_observation =
-                build_observation_with_map(&game, content, layout, bonuses, Some(&self.map));
+                build_observation_with_map(&game, content, layout, Some(&self.map));
             let digest = observation_digest(&next_observation);
             let next = self.lookup.get(&(digest, depth)).copied();
             let child_packed = (pack_children
@@ -2008,28 +1425,28 @@ impl SearchTree {
     }
 }
 
+/// The candidate token without its target link: the target's token index shifts with the state, and
+/// the enemy's identity is already among its codes.
+fn public_token(row: &CandidateRow) -> Token {
+    let mut token = row.token.clone();
+    if !matches!(row.action, Action::Path(_)) {
+        token.link = NONE;
+    }
+    token
+}
+
 fn same_public_candidate(left: &CandidateRow, right: &CandidateRow) -> bool {
-    left.u == right.u
-        && left.s == right.s
-        && left.c == right.c
-        && left.f == right.f
-        && left.legal == right.legal
+    left.legal == right.legal && public_token(left) == public_token(right) && left.attached == right.attached
 }
 
 fn public_candidate_digest(row: &CandidateRow) -> u64 {
-    let mut digest = 0xcbf2_9ce4_8422_2325u64;
-    for value in row
-        .u
-        .iter()
-        .copied()
-        .chain(row.s.iter().map(|&value| value as u32))
-        .chain(row.c.iter().copied())
-        .chain(row.f.iter().map(|value| value.to_bits()))
-        .chain(std::iter::once(row.legal as u32))
-    {
-        digest = (digest ^ value as u64).wrapping_mul(0x100_0000_01b3);
+    let mut words = vec![row.legal as u32];
+    token_words(&public_token(row), NONE, &mut words);
+    for token in &row.attached {
+        token_words(token, NONE, &mut words);
     }
-    digest
+    (words.into_iter())
+        .fold(0xcbf2_9ce4_8422_2325, |digest, value| (digest ^ value as u64).wrapping_mul(0x100_0000_01b3))
 }
 
 #[derive(Default)]
@@ -2114,7 +1531,6 @@ fn rollout_combat(
     initial: &[(Vec<f32>, f32, f32, Option<Vec<f32>>)],
     content: &Content,
     layout: Layout,
-    bonuses: (i16, i16),
     random: &mut u64,
     temperature: f32,
     prior_temperature: f32,
@@ -2221,12 +1637,7 @@ fn rollout_combat(
             let observations = indices
                 .par_iter()
                 .map(|&index| {
-                    build_observation_with_map(
-                        &games[index],
-                        content,
-                        layout,
-                        bonuses,
-                        Some(&trees[leaves[index].tree].map),
+                    build_observation_with_map(&games[index], content, layout, Some(&trees[leaves[index].tree].map),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -2458,7 +1869,6 @@ fn run_mcts(
                 &evaluated,
                 content,
                 layout,
-                bonuses,
                 random,
                 policy_temperature,
                 prior_temperature,
@@ -2863,7 +2273,6 @@ struct ExactSearch<'a> {
     model: &'a ValueModel,
     content: &'a Content,
     layout: Layout,
-    bonuses: (i16, i16),
     map: CanonicalMap,
     root_turn: u16,
     turns: usize,
@@ -3048,12 +2457,7 @@ impl ExactSearch<'_> {
             .collect::<Vec<_>>();
         for (particle, game) in particles.iter().enumerate() {
             let observation = (particle > 0).then(|| {
-                build_observation_with_map(
-                    game,
-                    self.content,
-                    self.layout,
-                    self.bonuses,
-                    Some(&self.map),
+                build_observation_with_map(game, self.content, self.layout, Some(&self.map),
                 )
             });
             let observation = observation.as_ref().unwrap_or(&row);
@@ -3075,7 +2479,6 @@ impl ExactSearch<'_> {
             let mut action_rng = false;
             let content = self.content;
             let layout = self.layout;
-            let bonuses = self.bonuses;
             let map = &self.map;
             let successors = particles
                 .par_iter()
@@ -3089,12 +2492,7 @@ impl ExactSearch<'_> {
                         Phase::Won => (u64::MAX, None),
                         Phase::Dead => (u64::MAX - 1, None),
                         _ => {
-                            let observation = build_observation_with_map(
-                                &next,
-                                content,
-                                layout,
-                                bonuses,
-                                Some(map),
+                            let observation = build_observation_with_map(&next, content, layout, Some(map),
                             );
                             (observation_digest(&observation), Some(observation))
                         }
@@ -3162,7 +2560,6 @@ fn exact_search<'a>(
     game: &Game,
     content: &'a Content,
     layout: Layout,
-    bonuses: (i16, i16),
     root_turn: u16,
     turns: usize,
     max_depth: usize,
@@ -3182,12 +2579,11 @@ fn exact_search<'a>(
         })
         .collect::<Vec<_>>();
     let map = canonical_map(&particles[0], content, layout);
-    let row = build_observation_with_map(&particles[0], content, layout, bonuses, Some(&map));
+    let row = build_observation_with_map(&particles[0], content, layout, Some(&map));
     let mut search = ExactSearch {
         model,
         content,
         layout,
-        bonuses,
         map,
         root_turn,
         turns,
@@ -3228,7 +2624,7 @@ fn search_diagnostic(
     progress: bool,
     q_temperature: f32,
 ) -> Result<serde_json::Value, String> {
-    let observation = build_observation(game, content, layout, bonuses);
+    let observation = build_observation(game, content, layout);
     let (log_policy, win, progress_value) = model
         .evaluate(
             &observation,
@@ -3295,7 +2691,6 @@ fn search_diagnostic(
         game,
         content,
         layout,
-        bonuses,
         root_turn,
         turns,
         max_depth,
@@ -3329,7 +2724,6 @@ fn search_diagnostic(
                 game,
                 content,
                 layout,
-                bonuses,
                 root_turn,
                 turns,
                 max_depth.saturating_sub(node.depth).max(1),
@@ -5493,70 +4887,17 @@ impl Batch {
             ("model_layers".into(), layers),
             ("model_heads".into(), heads),
             ("model_feedforward".into(), feedforward),
-            ("entity_summaries".into(), 0),
-            ("base_state_width".into(), width),
-            ("state_width".into(), width),
-            ("action_width".into(), width),
-            ("head_width".into(), width),
-            ("domain_count".into(), DOMAIN_NAMES.len()),
-            ("action_u".into(), ACTION_U),
-            ("action_s".into(), ACTION_S),
-            ("action_f".into(), ACTION_F),
-            ("state_scope".into(), u32::MAX as usize),
-            ("absent_node".into(), u32::MAX as usize),
-            ("run_current_node".into(), 23),
-            ("action_path_node".into(), 4),
-            ("action_object".into(), 14),
-            ("actor_owner".into(), 0),
-            ("child_owner".into(), 0),
-            ("child_kind".into(), 1),
-            ("card_zone".into(), 0),
-            ("card_order_kind".into(), 2),
-            ("card_order".into(), 3),
-            ("continuation_frame".into(), 2),
-            ("continuation_parent".into(), 3),
-            ("continuation_branch".into(), 4),
-            ("continuation_path".into(), 5),
-            ("continuation_list".into(), 7),
-            ("continuation_order".into(), 8),
-            ("map_node_id".into(), 0),
-            ("map_node_floor".into(), 2),
-            ("map_node_lane".into(), 3),
-            ("map_node_topo".into(), 8),
-            ("map_node_outdegree".into(), 9),
-            ("map_edge_src".into(), 0),
-            ("map_edge_dst".into(), 1),
-            ("map_entry".into(), 0),
-            ("player_owner".into(), 1),
-            ("osty_owner".into(), 2),
-            ("enemy_owner_start".into(), 3),
-            ("card_zones".into(), CARD_ZONES),
-            ("card_candidate_zone".into(), ATTACHED_CARD_ZONE),
-            ("normal_encounters".into(), 58),
-            ("elite_encounters".into(), 14),
-            ("boss_encounters".into(), 14),
-            (
-                "pumpkin_candle_relic".into(),
-                self.content.relic_id("RELIC.PUMPKIN_CANDLE").unwrap() as usize,
-            ),
+            ("domain_count".into(), DOMAINS.len()),
+            ("place_count".into(), PLACE_NAMES.len()),
+            ("concept_vocab".into(), self.layout.concept_vocab()),
         ]);
-        for (name, (u, s, c, f)) in DOMAIN_NAMES.into_iter().zip(DOMAIN_WIDTHS) {
-            out.insert(format!("{name}_u"), u);
-            out.insert(format!("{name}_s"), s);
-            out.insert(format!("{name}_c"), c);
-            out.insert(format!("{name}_f"), f);
+        for (name, codes, fields) in DOMAINS {
+            out.insert(format!("{name}_c"), codes);
+            out.insert(format!("{name}_f"), fields.len());
         }
-        out.insert("action_c".into(), ACTION_C);
-        out.insert("concept_vocab".into(), self.layout.concept_vocab());
         for (index, name) in SEMANTIC_NAMES.into_iter().enumerate() {
-            out.insert(
-                format!("{name}_semantic_start"),
-                self.layout.semantic_offsets[index] as usize,
-            );
-            out.insert(
-                format!("{name}_semantic_count"),
-                self.layout.semantic_sizes[index] as usize,
-            );
+            out.insert(format!("{name}_semantic_start"), self.layout.semantic_offsets[index] as usize);
+            out.insert(format!("{name}_semantic_count"), self.layout.semantic_sizes[index] as usize);
         }
         Ok(out)
     }
@@ -6526,405 +5867,75 @@ impl Batch {
         ))
     }
 
-    #[pyo3(signature = (active=None, flat=false))]
+    /// Characters, public globals, legal masks, digests and compact rows (empty when inactive).
+    #[pyo3(signature = (active=None))]
+    #[allow(clippy::type_complexity)]
     fn observe_tokens<'py>(
         &mut self,
         py: Python<'py>,
         active: Option<Vec<bool>>,
-        flat: bool,
-    ) -> PyResult<Bound<'py, PyTuple>> {
-        let layout = self.layout;
-        let content = &self.content;
-        let bonuses = (self.training_strength, self.training_dexterity);
+    ) -> PyResult<(
+        Bound<'py, PyArray1<u8>>,
+        Bound<'py, PyArray2<f32>>,
+        Bound<'py, PyArray2<bool>>,
+        Bound<'py, PyArray1<u64>>,
+        Vec<Bound<'py, PyBytes>>,
+    )> {
+        let (layout, content) = (self.layout, &self.content);
         let active = active.unwrap_or_else(|| vec![true; self.games.len()]);
         if active.len() != self.games.len() {
             return Err(PyValueError::new_err("invalid active mask"));
         }
         self.map_caches.resize_with(self.games.len(), || None);
         let rows = py.allow_threads(|| {
-            self.games
-                .par_iter()
-                .zip(self.map_caches.par_iter_mut())
-                .zip(&active)
+            (self.games.par_iter().zip(self.map_caches.par_iter_mut()).zip(&active))
                 .map(|((game, map_cache), &active)| {
-                    if !active {
-                        return None;
-                    }
-                    debug_assert!(game.combat().is_none_or(|combat| {
-                        combat.queue.is_empty() || combat.choice.is_some()
-                    }));
-                    Some(build_observation_cached(
-                        game, content, layout, bonuses, map_cache,
-                    ))
+                    active.then(|| {
+                        let row = build_observation_cached(game, content, layout, map_cache);
+                        let packed = compact_packed_observation(&row);
+                        (row, packed)
+                    })
                 })
                 .collect::<Vec<_>>()
         });
-        let batches = rows.len();
-        let mut characters = vec![u8::MAX; batches];
-        let mut globals = vec![0.0; batches * PUBLIC_GLOBALS];
-        let mut digests = vec![0u64; batches];
-        let max_actions = rows
-            .iter()
-            .filter_map(Option::as_ref)
-            .map(|row| row.candidates.len())
+        let batch = rows.len();
+        let max_actions = (rows.iter().flatten())
+            .map(|(row, _)| row.candidates.len())
             .max()
             .unwrap_or(0)
             .max(1);
-        let padded_actions = if flat { 0 } else { batches * max_actions };
-        let mut action_u = vec![0; padded_actions * ACTION_U];
-        let mut action_s = vec![0; padded_actions * ACTION_S];
-        let mut action_c = vec![0; padded_actions * ACTION_C];
-        let mut action_f = vec![0.0; padded_actions * ACTION_F];
-        let mut represented = vec![0; padded_actions];
-        let mut legal = vec![0; batches * max_actions];
-        for (batch, row) in rows.iter().enumerate() {
-            let Some(row) = row else {
+        let mut characters = vec![u8::MAX; batch];
+        let mut globals = vec![0.0; batch * PUBLIC_GLOBALS];
+        let mut legal = vec![false; batch * max_actions];
+        let mut digests = vec![0u64; batch];
+        let mut packed = Vec::with_capacity(batch);
+        for (index, item) in rows.iter().enumerate() {
+            let Some((row, bytes)) = item else {
+                packed.push(PyBytes::new(py, &[]));
                 continue;
             };
-            characters[batch] = row.character;
-            globals[batch * PUBLIC_GLOBALS..(batch + 1) * PUBLIC_GLOBALS]
-                .copy_from_slice(&row.globals);
+            characters[index] = row.character;
+            globals[index * PUBLIC_GLOBALS..][..PUBLIC_GLOBALS].copy_from_slice(&row.globals);
             for (position, candidate) in row.candidates.iter().enumerate() {
-                let base = batch * max_actions + position;
-                if !flat {
-                    action_u[base * ACTION_U..(base + 1) * ACTION_U].copy_from_slice(&candidate.u);
-                    action_s[base * ACTION_S..(base + 1) * ACTION_S].copy_from_slice(&candidate.s);
-                    action_c[base * ACTION_C..(base + 1) * ACTION_C].copy_from_slice(&candidate.c);
-                    action_f[base * ACTION_F..(base + 1) * ACTION_F].copy_from_slice(&candidate.f);
-                    represented[base] = 1;
-                }
-                legal[base] = candidate.legal as u8;
+                legal[index * max_actions + position] = candidate.legal;
             }
+            digests[index] = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+            packed.push(PyBytes::new(py, bytes));
         }
-        if flat {
-            let packed_data = py.allow_threads(|| {
-                rows.par_iter()
-                    .map(|row| {
-                        row.as_ref().map(|row| {
-                            let (globals, counts, exact, actions, digest) = packed_observation(row);
-                            (
-                                row.character,
-                                globals,
-                                counts,
-                                compress_words(&exact),
-                                actions,
-                                digest,
-                            )
-                        })
-                    })
-                    .collect::<Vec<_>>()
-            });
-            let mut packed_domains = Vec::with_capacity(DOMAIN_NAMES.len());
-            let action_offsets = rows
-                .iter()
-                .scan(0usize, |offset, row| {
-                    let start = *offset;
-                    *offset += row.as_ref().map_or(0, |row| row.candidates.len());
-                    Some(start)
-                })
-                .collect::<Vec<_>>();
-            for (domain, &(u_width, s_width, c_width, f_width)) in DOMAIN_WIDTHS.iter().enumerate()
-            {
-                let total = rows
-                    .iter()
-                    .filter_map(Option::as_ref)
-                    .map(|row| row.domains[domain].len())
-                    .sum();
-                let mut exact_u: Vec<u32> = Vec::with_capacity(total * u_width);
-                let mut exact_s: Vec<i32> = Vec::with_capacity(total * s_width);
-                let mut semantic: Vec<u32> = Vec::with_capacity(total * c_width);
-                let mut numeric: Vec<f32> = Vec::with_capacity(total * f_width);
-                let mut scope: Vec<i32> = Vec::with_capacity(total);
-                let mut row_index: Vec<i32> = Vec::with_capacity(total);
-                for (batch, row) in rows.iter().enumerate() {
-                    let Some(row) = row else { continue };
-                    for record in &row.domains[domain] {
-                        exact_u.extend(&record.u);
-                        exact_s.extend(&record.s);
-                        semantic.extend(&record.c);
-                        numeric.extend(&record.f);
-                        scope.push(if record.scope < 0 {
-                            record.scope
-                        } else {
-                            record.scope + action_offsets[batch] as i32
-                        });
-                        row_index.push(batch as i32);
-                    }
-                }
-                packed_domains.push(
-                    PyTuple::new(
-                        py,
-                        [
-                            ndarray::Array2::from_shape_vec((total, u_width), exact_u)
-                                .unwrap()
-                                .into_pyarray(py)
-                                .into_any(),
-                            ndarray::Array2::from_shape_vec((total, s_width), exact_s)
-                                .unwrap()
-                                .into_pyarray(py)
-                                .into_any(),
-                            ndarray::Array2::from_shape_vec((total, c_width), semantic)
-                                .unwrap()
-                                .into_pyarray(py)
-                                .into_any(),
-                            ndarray::Array2::from_shape_vec((total, f_width), numeric)
-                                .unwrap()
-                                .into_pyarray(py)
-                                .into_any(),
-                            ndarray::Array1::from_vec(row_index)
-                                .into_pyarray(py)
-                                .into_any(),
-                            ndarray::Array1::from_vec(scope).into_pyarray(py).into_any(),
-                        ],
-                    )?
-                    .into_any(),
-                );
-            }
-            let total_actions = action_offsets.last().copied().unwrap_or(0)
-                + rows
-                    .last()
-                    .and_then(Option::as_ref)
-                    .map_or(0, |row| row.candidates.len());
-            let mut flat_u: Vec<u32> = Vec::with_capacity(total_actions * ACTION_U);
-            let mut flat_s: Vec<i32> = Vec::with_capacity(total_actions * ACTION_S);
-            let mut flat_c: Vec<u32> = Vec::with_capacity(total_actions * ACTION_C);
-            let mut flat_f: Vec<f32> = Vec::with_capacity(total_actions * ACTION_F);
-            let mut action_row: Vec<i32> = Vec::with_capacity(total_actions);
-            let mut action_position: Vec<i32> = Vec::with_capacity(total_actions);
-            for (batch, row) in rows.iter().enumerate() {
-                let Some(row) = row else { continue };
-                for (position, candidate) in row.candidates.iter().enumerate() {
-                    flat_u.extend(candidate.u);
-                    flat_s.extend(candidate.s);
-                    flat_c.extend(candidate.c);
-                    flat_f.extend(candidate.f);
-                    action_row.push(batch as i32);
-                    action_position.push(position as i32);
-                }
-            }
-            let actions = PyTuple::new(
-                py,
-                [
-                    ndarray::Array2::from_shape_vec((total_actions, ACTION_U), flat_u)
-                        .unwrap()
-                        .into_pyarray(py)
-                        .into_any(),
-                    ndarray::Array2::from_shape_vec((total_actions, ACTION_S), flat_s)
-                        .unwrap()
-                        .into_pyarray(py)
-                        .into_any(),
-                    ndarray::Array2::from_shape_vec((total_actions, ACTION_C), flat_c)
-                        .unwrap()
-                        .into_pyarray(py)
-                        .into_any(),
-                    ndarray::Array2::from_shape_vec((total_actions, ACTION_F), flat_f)
-                        .unwrap()
-                        .into_pyarray(py)
-                        .into_any(),
-                    ndarray::Array1::from_vec(action_row)
-                        .into_pyarray(py)
-                        .into_any(),
-                    ndarray::Array1::from_vec(action_position)
-                        .into_pyarray(py)
-                        .into_any(),
-                    ndarray::Array2::from_shape_vec((batches, max_actions), legal)
-                        .unwrap()
-                        .into_pyarray(py)
-                        .into_any(),
-                ],
-            )?;
-            let mut packed_rows = Vec::with_capacity(batches);
-            for (batch, row) in packed_data.into_iter().enumerate() {
-                let (character, globals, counts, exact, actions, digest) =
-                    row.unwrap_or_else(|| {
-                        (
-                            u8::MAX,
-                            vec![0.0; PUBLIC_GLOBALS],
-                            vec![0; DOMAIN_NAMES.len()],
-                            Vec::new(),
-                            Vec::new(),
-                            0,
-                        )
-                    });
-                digests[batch] = digest;
-                packed_rows.push(PyTuple::new(
-                    py,
-                    [
-                        character.into_pyobject(py)?.into_any(),
-                        ndarray::Array1::from_vec(globals)
-                            .into_pyarray(py)
-                            .into_any(),
-                        ndarray::Array1::from_vec(counts)
-                            .into_pyarray(py)
-                            .into_any(),
-                        PyBytes::new(py, &exact).into_any(),
-                        ndarray::Array2::from_shape_vec(
-                            (
-                                actions.len() / (ACTION_U + ACTION_S + ACTION_C + ACTION_F + 1),
-                                ACTION_U + ACTION_S + ACTION_C + ACTION_F + 1,
-                            ),
-                            actions,
-                        )
-                        .unwrap()
-                        .into_pyarray(py)
-                        .into_any(),
-                        digest.into_pyobject(py)?.into_any(),
-                    ],
-                )?);
-            }
-            self.actions = rows
-                .iter()
-                .map(|row| {
-                    row.as_ref().map_or_else(Vec::new, |row| {
-                        row.candidates
-                            .iter()
-                            .map(|candidate| candidate.action.clone())
-                            .collect()
-                    })
-                })
-                .collect();
-            return PyTuple::new(
-                py,
-                [
-                    ndarray::Array1::from_vec(characters)
-                        .into_pyarray(py)
-                        .into_any(),
-                    ndarray::Array2::from_shape_vec((batches, PUBLIC_GLOBALS), globals)
-                        .unwrap()
-                        .into_pyarray(py)
-                        .into_any(),
-                    PyTuple::new(py, packed_domains)?.into_any(),
-                    actions.into_any(),
-                    ndarray::Array1::from_vec(digests)
-                        .into_pyarray(py)
-                        .into_any(),
-                    PyTuple::new(py, packed_rows)?.into_any(),
-                ],
-            );
-        }
-        let mut packed_domains = Vec::with_capacity(DOMAIN_NAMES.len());
-        for (domain, &(u_width, s_width, c_width, f_width)) in DOMAIN_WIDTHS.iter().enumerate() {
-            let max_rows = rows
-                .iter()
-                .filter_map(Option::as_ref)
-                .map(|row| row.domains[domain].len())
-                .max()
-                .unwrap_or(0)
-                .max(1);
-            let mut exact_u = vec![0; batches * max_rows * u_width];
-            let mut exact_s = vec![0; batches * max_rows * s_width];
-            let mut semantic = vec![0; batches * max_rows * c_width];
-            let mut numeric = vec![0.0; batches * max_rows * f_width];
-            let mut scope = vec![0; batches * max_rows];
-            let mut mask = vec![0; batches * max_rows];
-            for (batch, row) in rows.iter().enumerate() {
-                let Some(row) = row else { continue };
-                for (position, record) in row.domains[domain].iter().enumerate() {
-                    let base = batch * max_rows + position;
-                    exact_u[base * u_width..(base + 1) * u_width].copy_from_slice(&record.u);
-                    exact_s[base * s_width..(base + 1) * s_width].copy_from_slice(&record.s);
-                    semantic[base * c_width..(base + 1) * c_width].copy_from_slice(&record.c);
-                    numeric[base * f_width..(base + 1) * f_width].copy_from_slice(&record.f);
-                    scope[base] = record.scope;
-                    mask[base] = 1;
-                }
-            }
-            packed_domains.push(
-                PyTuple::new(
-                    py,
-                    [
-                        ndarray::Array3::from_shape_vec((batches, max_rows, u_width), exact_u)
-                            .unwrap()
-                            .into_pyarray(py)
-                            .into_any(),
-                        ndarray::Array3::from_shape_vec((batches, max_rows, s_width), exact_s)
-                            .unwrap()
-                            .into_pyarray(py)
-                            .into_any(),
-                        ndarray::Array3::from_shape_vec((batches, max_rows, c_width), semantic)
-                            .unwrap()
-                            .into_pyarray(py)
-                            .into_any(),
-                        ndarray::Array3::from_shape_vec((batches, max_rows, f_width), numeric)
-                            .unwrap()
-                            .into_pyarray(py)
-                            .into_any(),
-                        ndarray::Array2::from_shape_vec((batches, max_rows), scope)
-                            .unwrap()
-                            .into_pyarray(py)
-                            .into_any(),
-                        ndarray::Array2::from_shape_vec((batches, max_rows), mask)
-                            .unwrap()
-                            .into_pyarray(py)
-                            .into_any(),
-                    ],
-                )?
-                .into_any(),
-            );
-        }
-        let domains = PyTuple::new(py, packed_domains)?;
-        let actions = PyTuple::new(
-            py,
-            [
-                ndarray::Array3::from_shape_vec((batches, max_actions, ACTION_U), action_u)
-                    .unwrap()
-                    .into_pyarray(py)
-                    .into_any(),
-                ndarray::Array3::from_shape_vec((batches, max_actions, ACTION_S), action_s)
-                    .unwrap()
-                    .into_pyarray(py)
-                    .into_any(),
-                ndarray::Array3::from_shape_vec((batches, max_actions, ACTION_C), action_c)
-                    .unwrap()
-                    .into_pyarray(py)
-                    .into_any(),
-                ndarray::Array3::from_shape_vec((batches, max_actions, ACTION_F), action_f)
-                    .unwrap()
-                    .into_pyarray(py)
-                    .into_any(),
-                ndarray::Array2::from_shape_vec((batches, max_actions), represented)
-                    .unwrap()
-                    .into_pyarray(py)
-                    .into_any(),
-                ndarray::Array2::from_shape_vec((batches, max_actions), legal)
-                    .unwrap()
-                    .into_pyarray(py)
-                    .into_any(),
-            ],
-        )?;
-        for (batch, row) in rows.iter().enumerate() {
-            if let Some(row) = row {
-                digests[batch] = packed_observation(row).4;
-            }
-        }
-        self.actions = rows
-            .iter()
-            .map(|row| {
-                row.as_ref().map_or_else(Vec::new, |row| {
-                    row.candidates
-                        .iter()
-                        .map(|candidate| candidate.action.clone())
-                        .collect()
+        self.actions = (rows.iter())
+            .map(|item| {
+                item.as_ref().map_or_else(Vec::new, |(row, _)| {
+                    row.candidates.iter().map(|candidate| candidate.action.clone()).collect()
                 })
             })
             .collect();
-        PyTuple::new(
-            py,
-            [
-                ndarray::Array1::from_vec(characters)
-                    .into_pyarray(py)
-                    .into_any(),
-                ndarray::Array2::from_shape_vec((batches, PUBLIC_GLOBALS), globals)
-                    .unwrap()
-                    .into_pyarray(py)
-                    .into_any(),
-                domains.into_any(),
-                actions.into_any(),
-                ndarray::Array1::from_vec(digests)
-                    .into_pyarray(py)
-                    .into_any(),
-            ],
-        )
+        Ok((
+            characters.into_pyarray(py),
+            ndarray::Array2::from_shape_vec((batch, PUBLIC_GLOBALS), globals).unwrap().into_pyarray(py),
+            ndarray::Array2::from_shape_vec((batch, max_actions), legal).unwrap().into_pyarray(py),
+            digests.into_pyarray(py),
+            packed,
+        ))
     }
 
     fn load_policy(&mut self, data: &[u8]) -> PyResult<()> {
@@ -6953,12 +5964,7 @@ impl Batch {
             .iter()
             .map(|&index| {
                 self.games.get(index).map(|game| {
-                    build_observation(
-                        game,
-                        &self.content,
-                        self.layout,
-                        (self.training_strength, self.training_dexterity),
-                    )
+                    build_observation(game, &self.content, self.layout)
                 })
             })
             .collect::<Option<Vec<_>>>()
@@ -7101,7 +6107,6 @@ impl Batch {
             .ok_or_else(|| PyValueError::new_err("policy is not loaded"))?;
         let content = &self.content;
         let layout = self.layout;
-        let bonuses = (self.training_strength, self.training_dexterity);
         Ok(py.allow_threads(|| {
             indices
                 .par_iter()
@@ -7115,7 +6120,7 @@ impl Batch {
                             .combat()
                             .ok_or_else(|| "exact-search root is not in combat".to_owned())?
                             .turn;
-                        let observation = build_observation(game, content, layout, bonuses);
+                        let observation = build_observation(game, content, layout);
                         let search_seed = seed
                             ^ game.seed as u64
                             ^ observation_digest(&observation).rotate_left(17);
@@ -7124,7 +6129,6 @@ impl Batch {
                             game,
                             content,
                             layout,
-                            bonuses,
                             root_turn,
                             turns,
                             max_depth,
@@ -7342,25 +6346,12 @@ impl Batch {
                                     game,
                                     content,
                                     layout,
-                                    bonuses,
                                     Some(&map),
                                     actions,
                                     legal,
                                 );
                             }
-                            Observation {
-                                character: game.run.character as u8,
-                                globals: run_features(game, content),
-                                domains: std::array::from_fn(|_| DomainRows::Owned(Vec::new())),
-                                candidates: vec![CandidateRow {
-                                    action: actions.pop().unwrap(),
-                                    u: [0; ACTION_U],
-                                    s: [0; ACTION_S],
-                                    c: [0; ACTION_C],
-                                    f: [0.0; ACTION_F],
-                                    legal: true,
-                                }],
-                            }
+                            forced_observation(game, content, actions.pop().unwrap())
                         })
                         .collect::<Vec<_>>();
                     let packed = rows
@@ -7395,7 +6386,7 @@ impl Batch {
                     let features = if cache_features { features } else { Vec::new() };
                     if !search_enabled {
                         for row in &mut rows {
-                            row.domains = std::array::from_fn(|_| DomainRows::Owned(Vec::new()));
+                            row.tokens = Vec::new();
                         }
                     }
                     Ok((rows, packed, features, outputs))
@@ -7513,7 +6504,7 @@ impl Batch {
                 } else {
                     self.actions.push(vec![row.candidates[0].action.clone()]);
                 }
-                action_kinds.push(row.candidates[0].u[0]);
+                action_kinds.push(action_kind(&row.candidates[0].action) as u32);
                 cached_features.push(PyBytes::new(py, &[]));
                 packed_rows.push(PyBytes::new(py, &packed));
                 continue;
@@ -7534,7 +6525,7 @@ impl Batch {
             choices.push(choice as i64);
             log_probabilities.push(log_policy[choice]);
             critic_values.push(*expected);
-            action_kinds.push(row.candidates[choice].u[0]);
+            action_kinds.push(action_kind(&row.candidates[choice].action) as u32);
             if advance {
                 selected_actions.push(row.candidates[choice].action.clone());
             } else {
@@ -8014,13 +7005,8 @@ fn sts2_sim(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(model_schema, module)?)?;
     module.add_function(wrap_pyfunction!(feature_schema, module)?)?;
     module.add_function(wrap_pyfunction!(configure_logging, module)?)?;
-    module.add_function(wrap_pyfunction!(unique_rows, module)?)?;
-    module.add_function(wrap_pyfunction!(unique_feature_rows, module)?)?;
     module.add_function(wrap_pyfunction!(deduplicate_sequences, module)?)?;
     module.add_function(wrap_pyfunction!(unique_graphs, module)?)?;
-    module.add_function(wrap_pyfunction!(validate_action_features, module)?)?;
-    module.add_function(wrap_pyfunction!(compress_packed_observations, module)?)?;
-    module.add_function(wrap_pyfunction!(validate_packed_observation, module)?)?;
     module.add_function(wrap_pyfunction!(validate_compact_observation, module)?)?;
     module.add_function(wrap_pyfunction!(unpack_packed_observations, module)?)
 }
@@ -8124,10 +7110,13 @@ fn repaired_path_replays_with_aligned_choices() {
     let mut batch = Batch::new(1, 1, Some(0), 32, 1, 10, 1).unwrap();
     batch.set_training_bonuses(7, 4);
     let mut source = batch.games[0].clone();
-    let opening = source
-        .actions(&batch.content)
-        .iter()
-        .position(|action| matches!(action, Action::Event(_)))
+    // A Neow option that leads straight to the map (Small Capsule opens a relic reward first).
+    let opening = (0..source.actions(&batch.content).len())
+        .find(|&choice| {
+            let mut next = source.clone();
+            next.step(&batch.content, next.actions(&batch.content)[choice].clone()).unwrap();
+            next.actions(&batch.content).iter().any(|action| matches!(action, Action::Path(_)))
+        })
         .unwrap();
     source
         .step(

@@ -5144,7 +5144,7 @@ impl Game {
     }
 
     /// Identifies the current card play: each replay of a series is its own play (CardPlay).
-    fn play_key(&self) -> i32 {
+    pub(crate) fn play_key(&self) -> i32 {
         let combat = self.combat().unwrap();
         let index = 256 * combat.plays.len() as i32
             + combat.plays.last().map_or(0, |play| play.done as i32);

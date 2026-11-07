@@ -2,7 +2,7 @@ use super::*;
 
 // Tables mirror effect_index, event_effect_index, action_kind, *_payload, room_index,
 // target_index, pile_index and phase_index; the model tags token roles and collections.
-const EFFECTS: [&str; 125] = [
+pub(super) const EFFECTS: [&str; 125] = [
     "Attack",
     "AttackMany",
     "OstyAttack",
@@ -130,7 +130,7 @@ const EFFECTS: [&str; 125] = [
     "AfterPlay",
 ];
 
-const TRIGGERS: [&str; 35] = [
+pub(super) const TRIGGERS: [&str; 35] = [
     "AfterRoomEntered",
     "BeforeCombatStart",
     "BeforeCombatStartLate",
@@ -168,7 +168,7 @@ const TRIGGERS: [&str; 35] = [
     "BeforeCardPlayed",
 ];
 
-const RUN_EFFECTS: [&str; 37] = [
+pub(super) const RUN_EFFECTS: [&str; 37] = [
     "Gold",
     "RandomGold",
     "LoseAllGold",
@@ -208,7 +208,7 @@ const RUN_EFFECTS: [&str; 37] = [
     "FinishCooking",
 ];
 
-const ACTIONS: [&str; 32] = [
+pub(super) const ACTIONS: [&str; 32] = [
     "Play",
     "Potion",
     "DiscardPotion",
@@ -243,7 +243,7 @@ const ACTIONS: [&str; 32] = [
     "Leave",
 ];
 
-const CONDITIONS: [&str; 23] = [
+pub(super) const CONDITIONS: [&str; 23] = [
     "Always",
     "Upgraded",
     "TargetAlive",
@@ -269,7 +269,7 @@ const CONDITIONS: [&str; 23] = [
     "Card",
 ];
 
-const FILTERS: [&str; 16] = [
+pub(super) const FILTERS: [&str; 16] = [
     "Any",
     "Type",
     "AttackOrPower",
@@ -288,7 +288,7 @@ const FILTERS: [&str; 16] = [
     "CostsResource",
 ];
 
-const CARD_OPS: [&str; 18] = [
+pub(super) const CARD_OPS: [&str; 18] = [
     "Move",
     "Upgrade",
     "Cost",
@@ -309,7 +309,7 @@ const CARD_OPS: [&str; 18] = [
     "FreeCombat",
 ];
 
-const SCALES: [&str; 47] = [
+pub(super) const SCALES: [&str; 47] = [
     "None",
     "X",
     "Block",
@@ -359,13 +359,13 @@ const SCALES: [&str; 47] = [
     "TurnDiv",
 ];
 
-const CARD_TYPES: [&str; 6] = ["Attack", "Skill", "Power", "Status", "Curse", "Quest"];
+pub(super) const CARD_TYPES: [&str; 6] = ["Attack", "Skill", "Power", "Status", "Curse", "Quest"];
 
-const RARITIES: [&str; 7] = [
+pub(super) const RARITIES: [&str; 7] = [
     "Basic", "Common", "Uncommon", "Rare", "Ancient", "Event", "Quest",
 ];
 
-const ENCHANTMENTS: [&str; 22] = [
+pub(super) const ENCHANTMENTS: [&str; 22] = [
     "Adroit",
     "Clone",
     "Corrupted",
@@ -390,11 +390,11 @@ const ENCHANTMENTS: [&str; 22] = [
     "Vigorous",
 ];
 
-const ROOMS: [&str; 8] = [
+pub(super) const ROOMS: [&str; 8] = [
     "Combat", "Elite", "Boss", "Unknown", "Event", "Shop", "Rest", "Treasure",
 ];
 
-const TARGETS: [&str; 9] = [
+pub(super) const TARGETS: [&str; 9] = [
     "Source",
     "Player",
     "Osty",
@@ -406,9 +406,9 @@ const TARGETS: [&str; 9] = [
     "LowestHpEnemy",
 ];
 
-const PILES: [&str; 5] = ["Draw", "Hand", "Discard", "Exhaust", "Offer"];
+pub(super) const PILES: [&str; 5] = ["Draw", "Hand", "Discard", "Exhaust", "Offer"];
 
-const PHASES: [&str; 12] = [
+pub(super) const PHASES: [&str; 12] = [
     "Map",
     "Combat",
     "Rewards",
@@ -423,7 +423,7 @@ const PHASES: [&str; 12] = [
     "ChooseBundles",
 ];
 
-const CARD_FLAGS: [&str; 16] = [
+pub(super) const CARD_FLAGS: [&str; 16] = [
     "exhaust",
     "ethereal",
     "retain",
@@ -442,30 +442,30 @@ const CARD_FLAGS: [&str; 16] = [
     "filtered draw",
 ];
 
-const TAGS: [&str; 5] = ["strike", "defend", "shiv", "Osty attack", "minion"];
+pub(super) const TAGS: [&str; 5] = ["strike", "defend", "shiv", "Osty attack", "minion"];
 
-const ORB_TIMINGS: [&str; 2] = ["turn start", "turn end"];
+pub(super) const ORB_TIMINGS: [&str; 2] = ["turn start", "turn end"];
 
-const REQUIREMENTS: [&str; 4] = ["always", "gold", "HP", "deck"];
+pub(super) const REQUIREMENTS: [&str; 4] = ["always", "gold", "HP", "deck"];
 
-const ACTOR_KINDS: [&str; 3] = ["player", "Osty", "enemy"];
+pub(super) const ACTOR_KINDS: [&str; 3] = ["player", "Osty", "enemy"];
 
-const CONTINUATION_KINDS: [&str; 10] = [
-    "run effect",
-    "effect",
-    "context",
-    "kind 3",
-    "resumed phase",
-    "card",
-    "kind 6",
-    "event option",
-    "payload item",
-    "kind 9",
+pub(super) const OFFER_KINDS: [&str; 8] = [
+    "standard card reward",
+    "fixed card reward",
+    "Kaleidoscope card reward",
+    "Crystal Sphere card reward",
+    "shop card",
+    "shop relic",
+    "shop potion",
+    "shop removal",
 ];
 
-const TOKEN_ROLES: [&str; 1] = ["current map node"];
+pub(super) const PLAY_KINDS: [&str; 4] = ["queued auto-play", "manual play", "extra turn", "random curse"];
 
-const COLLECTIONS: [&str; 11] = [
+pub(super) const TOKEN_ROLES: [&str; 1] = ["current map node"];
+
+pub(super) const COLLECTIONS: [&str; 11] = [
     "deck",
     "hand",
     "draw",
@@ -555,14 +555,20 @@ pub(super) fn concept_labels(content: &Content) -> Vec<String> {
                 n if n == Semantic::OrbTiming as usize => named(&ORB_TIMINGS, value),
                 n if n == Semantic::Requirement as usize => named(&REQUIREMENTS, value),
                 n if n == Semantic::ActorKind as usize => named(&ACTOR_KINDS, value),
-                n if n == Semantic::ContinuationKind as usize => named(&CONTINUATION_KINDS, value),
+                n if n == Semantic::OfferKind as usize => named(&OFFER_KINDS, value),
+                n if n == Semantic::PlayKind as usize => named(&PLAY_KINDS, value),
+                n if n == Semantic::Flag as usize => named(&FLAG_NAMES, value),
+                n if n == Semantic::PowerValue as usize => format!("{} value", content.powers[value].id),
+                n if n == Semantic::EventValue as usize => {
+                    format!("{} slot {}", content.events[value / 4].id, value % 4)
+                }
+                n if n == Semantic::EffectFlag as usize => {
+                    format!("{} flag {}", named(&EFFECTS, value / 2), value % 2)
+                }
                 n if n == Semantic::CrystalWidth as usize
                     || n == Semantic::CrystalHeight as usize =>
                 {
                     format!("{}", value + 1)
-                }
-                n if n == Semantic::Boolean as usize => {
-                    format!("flag {} = {}", value / 2, value % 2 == 1)
                 }
                 n if n == Semantic::TokenRole as usize => named(&TOKEN_ROLES, value),
                 n if n == Semantic::Collection as usize => named(&COLLECTIONS, value),

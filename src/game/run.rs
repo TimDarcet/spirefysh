@@ -37,33 +37,19 @@ impl Game {
         }
     }
 
+    /// The action's expected outcome over its random branches, or None when it is unknown: too
+    /// many branches, hidden information, a choice, or the turn ending.
+    /// The expected change from this combat state to the next decision after `action`, averaged
+    /// over the hidden random outcomes it enumerates; None when they are unknown or too many.
     pub(crate) fn expected_action_outcome(
         &self,
         content: &Content,
         action: &Action,
-    ) -> ActionOutcome {
-        let Some(before) = self.combat() else {
-            return ActionOutcome::default();
-        };
-        let turn = before.turn;
-        let enemy_turn = before.enemy_turn;
-        let block = before.player.block;
-        let exhausted = before.history.exhausted;
-        let enemies: Vec<_> = before
-            .enemies
-            .iter()
-            .map(|enemy| (enemy.instance, enemy.creature.hp.max(0)))
-            .collect();
+    ) -> Option<ActionOutcome> {
+        self.combat()?;
         let mut pending = vec![(Vec::new(), 1.0f32)];
-        let mut total = 0.0;
-        let mut outcome = ActionOutcome {
-            block: Some(0.0),
-            draw: Some(0.0),
-            discard: Some(0.0),
-            exhaust: Some(0.0),
-            hp_loss: Some(vec![0.0; enemies.len()]),
-        };
-        let mut leaves = 0;
+        let mut outcome = ActionOutcome::default();
+        let (mut total, mut leaves) = (0.0, 0);
         static RNGS: std::sync::LazyLock<Rngs> = std::sync::LazyLock::new(|| Rngs::from_seed(0));
         while let Some((choices, probability)) = pending.pop() {
             let mut next = self.clone();
@@ -72,13 +58,11 @@ impl Game {
                 choices: choices.clone(),
                 ..Expectation::default()
             });
-            if next.step(content, action.clone()).is_err() {
-                return ActionOutcome::default();
-            }
+            next.step(content, action.clone()).ok()?;
             let expectation = next.expectation.take().unwrap();
             if let Some(count) = expectation.next {
                 if count == 0 || pending.len() + leaves + count > MAX_EXPECTATION_BRANCHES {
-                    return ActionOutcome::default();
+                    return None;
                 }
                 for choice in 0..count {
                     let mut choices = choices.clone();
@@ -87,43 +71,59 @@ impl Game {
                 }
                 continue;
             }
-            let Some(after) = next.combat().filter(|combat| {
-                combat.turn == turn && combat.enemy_turn == enemy_turn && combat.choice.is_none()
-            }) else {
-                return ActionOutcome::default();
-            };
             if expectation.unknown || expectation.used != expectation.choices.len() {
-                return ActionOutcome::default();
+                return None;
             }
-            *outcome.block.as_mut().unwrap() +=
-                after.player.block.saturating_sub(block).max(0) as f32 * probability;
-            *outcome.draw.as_mut().unwrap() += expectation.drawn as f32 * probability;
-            *outcome.discard.as_mut().unwrap() += expectation.discarded as f32 * probability;
-            *outcome.exhaust.as_mut().unwrap() +=
-                after.history.exhausted.saturating_sub(exhausted).max(0) as f32 * probability;
-            for (index, (loss, (instance, hp))) in outcome
-                .hp_loss
-                .as_mut()
-                .unwrap()
-                .iter_mut()
-                .zip(&enemies)
-                .enumerate()
-            {
-                let after = after
-                    .enemies
-                    .get(index)
-                    .filter(|enemy| enemy.instance == *instance)
-                    .map_or(0, |enemy| enemy.creature.hp.max(0));
-                *loss += hp.saturating_sub(after).max(0) as f32 * probability;
-            }
+            let step = self.outcome_to(&next, expectation.drawn as f32, expectation.discarded as f32);
+            outcome.add(&step, probability);
             total += probability;
             leaves += 1;
         }
-        if leaves == 0 || (total - 1.0).abs() > 1e-4 {
-            ActionOutcome::default()
-        } else {
-            outcome
+        (leaves > 0 && (total - 1.0f32).abs() <= 1e-4).then_some(outcome)
+    }
+
+    /// The change from this combat state to `next`, given the cards drawn and discarded between.
+    pub(crate) fn outcome_to(&self, next: &Game, drawn: f32, discarded: f32) -> ActionOutcome {
+        let before = self.combat().unwrap();
+        let hp = before.player.hp;
+        // Capped: unkillable enemies sit at i16::MAX HP.
+        let alive = |hp: i16| hp.clamp(0, 999);
+        let enemies = (before.enemies.iter())
+            .map(|enemy| (enemy.instance, alive(enemy.creature.hp)))
+            .collect::<Vec<_>>();
+        let mut outcome = ActionOutcome {
+            draw: drawn,
+            discard: discarded,
+            hp_loss: vec![0.0; enemies.len()],
+            deaths: vec![0.0; enemies.len()],
+            ..ActionOutcome::default()
+        };
+        match next.combat() {
+            Some(after) => {
+                outcome.block = after.player.block.saturating_sub(before.player.block).max(0) as f32;
+                outcome.exhaust = after.history.exhausted.saturating_sub(before.history.exhausted).max(0) as f32;
+                outcome.player_hp = (after.player.hp - hp) as f32;
+                outcome.energy = (before.energy - after.energy) as f32;
+                outcome.stars = (before.stars - after.stars) as f32;
+                for (index, &(instance, hp)) in enemies.iter().enumerate() {
+                    let left = (after.enemies.get(index))
+                        .filter(|enemy| enemy.instance == instance)
+                        .map_or(0, |enemy| alive(enemy.creature.hp));
+                    outcome.hp_loss[index] = hp.saturating_sub(left).max(0) as f32;
+                    outcome.deaths[index] = (hp > 0 && left == 0) as u8 as f32;
+                }
+            }
+            // The combat ended: every enemy died, or the player did.
+            None if !matches!(next.phase, Phase::Dead) => {
+                outcome.player_hp = (next.run.hp - hp) as f32;
+                for (index, &(_, hp)) in enemies.iter().enumerate() {
+                    outcome.hp_loss[index] = hp as f32;
+                    outcome.deaths[index] = (hp > 0) as u8 as f32;
+                }
+            }
+            None => outcome.player_hp = -hp.max(0) as f32,
         }
+        outcome
     }
 
     pub fn run(&self) -> &Run {

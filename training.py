@@ -3148,13 +3148,11 @@ def probe():
     env = sts2_sim.Batch(2, 84, 0)
     layout = dict(env.token_layout())
     assert (layout["version"], layout["model_width"], layout["model_layers"],
-            layout["model_heads"], layout["model_feedforward"], layout["state_width"],
-            layout["action_width"], layout["entity_summaries"]) == (60, 128, 4, 8, 384, 128, 128, 0)
+            layout["model_heads"], layout["model_feedforward"]) == (FEATURE_VERSION, 128, 4, 8, 384)
     compact_layout = dict(env.token_layout(64, 2, 4, 128))
     assert tuple(compact_layout[key] for key in (
         "model_width", "model_layers", "model_heads", "model_feedforward",
-        "state_width", "action_width", "head_width",
-    )) == (64, 2, 4, 128, 64, 64, 64)
+    )) == (64, 2, 4, 128)
     for name, size in {
         "enemy_position": 33, "power_position": 65, "orb_position": 17,
         "deck_origin": 257, "draw_top_position": 257,
@@ -3166,57 +3164,42 @@ def probe():
 
     for _ in range(3):
         observation = env.observe_tokens()
-        legal = np.asarray(observation[3][4])
+        legal = observation_legal(observation)
         choices = [int(np.flatnonzero(row)[0]) for row in legal]
         env.step(choices)
     combat = env.observe_tokens()
     noncombat = sts2_sim.Batch(2, 71, 0).observe_tokens()
-    assert Agent(layout).map_nodes.weight.shape == (26, 128)
+
+    def unpacked(observation):
+        character, globals_, features, tokens, legal = sts2_sim.unpack_packed_observations(
+            list(observation[4]),
+        )
+        return character, globals_, features, tuple(map(np.asarray, tokens)), np.asarray(legal)
 
     def expected_lengths(observation, pooling):
-        domains, action_rows, _positions, _legal = flat_domains(observation)
+        _domain, place, parent, _link, row, _feature = observation[3]
         batch = len(observation[0])
-        counts = np.full(batch, 6, np.int64)
-        def rows(domain, predicate=lambda _u: True):
-            u, _s, _c, _f, row, scope = domains[DOMAIN[domain]]
-            selected = (scope == -1) & predicate(u)
-            return u[selected], row[selected]
-        def collection(name, domain, predicate, active):
-            _u, row = rows(domain, predicate)
-            item = np.bincount(row, minlength=batch)
-            counts[active] += item[active] if pooling[name] == "global_tokens" else 1
-        actor_u, actor_rows = rows("actor")
-        _phase_u, phase_rows = rows("phase")
-        counts += np.bincount(phase_rows, minlength=batch) - 1
-        combat_rows = np.unique(actor_rows)
-        all_rows = np.arange(batch)
-        collection("deck", "card", lambda u: u[:, 0] == 0, all_rows)
-        collection("relic", "relic", lambda u: u[:, 0] == 0, all_rows)
-        collection("potion", "potion", lambda u: u[:, 0] == 0, all_rows)
-        for name, zone in (("hand", 1), ("draw", 2), ("discard", 3), ("exhaust", 4)):
-            collection(name, "card", lambda u, zone=zone: u[:, 0] == zone, combat_rows)
-        collection("orb", "orb", lambda _u: True, combat_rows)
-        continuation_u, continuation_rows = rows("continuation")
-        for row in range(batch):
-            q = len(np.unique(continuation_u[continuation_rows == row, 2]))
-            counts[row] += q if pooling["continuation"] == "global_tokens" else 1
-        _crystal_u, crystal_rows = rows("crystal")
-        counts += np.bincount(crystal_rows, minlength=batch)
-        counts += np.bincount(action_rows, minlength=batch)
-        for row in combat_rows:
-            actors = actor_u[actor_rows == row]
-            counts[row] += len(actors)
-            for name, enemy in (("friendly_effect", False), ("enemy_effect", True)):
-                owners = actors[(actors[:, 1] == 2) == enemy, 0]
-                effect_count = 0
-                for domain in ("power", "status"):
-                    effect_u, effect_rows = rows(domain)
-                    effect_count += np.isin(effect_u[effect_rows == row, 0], owners).sum()
-                mode = pooling[name]
-                counts[row] += 0 if mode.endswith("into_actor") else \
-                    effect_count if mode == "global_tokens" else len(owners)
+        count = lambda *names: np.bincount(row[np.isin(place, [PLACE[name] for name in names])],
+                                           minlength=batch)
+        combat = count("player") > 0
+        counts = 5 + count("phase", "crystal", "candidate", "player", "ally", "enemy")
+        for name in COLLECTIONS:
+            active = np.ones(batch, bool) if name in ("deck", "relic", "potion") else combat
+            counts += np.where(active, count(name) if pooling[name] == "global_tokens" else 1, 0)
+        counts += count("continuation") if pooling["continuation"] == "global_tokens" else 1
+        owner = np.where(place == PLACE["effect"], parent, -1)
+        for name, family in (("friendly_effect", ("player", "ally")), ("enemy_effect", ("enemy",))):
+            actors = count(*family)
+            effects = np.bincount(row[(owner >= 0) & np.isin(place[owner], [PLACE[name] for name in family])],
+                                  minlength=batch)
+            mode = pooling[name]
+            counts += 0 if mode.endswith("into_actor") else effects if mode == "global_tokens" else actors
         return counts
 
+    def model_tensors(observation, model):
+        return model_inputs(*observation, target, model)
+
+    combat, noncombat = unpacked(combat), unpacked(noncombat)
     configs = [{}]
     for name in ("relic", "deck", "draw", "exhaust", "discard", "hand", "orb", "potion"):
         configs.extend(({name: mode} for mode in COLLECTION_POOLING))
@@ -3229,7 +3212,7 @@ def probe():
             model = Agent(layout, pooling=config).eval()
             model.critic.weight.data.normal_(std=.1); model.critic.bias.data.normal_(std=.1)
             for observation in (noncombat, combat):
-                inputs = tensors(observation, target, model)
+                inputs = model_tensors(observation, model)
                 with torch.no_grad():
                     policy, critic = predict(model, inputs, "fp32")
                 assert policy.shape[0] == critic.shape[0] == 2 and critic.shape[1] == 1
@@ -3243,17 +3226,24 @@ def probe():
             assert np.max(np.abs(python - rust)) <= 1e-5
 
     model = Agent(layout).eval()
-    empty_domains = []
-    for values in noncombat[2]:
-        values = [np.array(value, copy=True) for value in values]
-        values[5][values[4] >= 0] = 0
-        empty_domains.append(tuple(values))
-    empty_actions = [np.array(value, copy=True) for value in noncombat[3]]
-    empty_actions[4].fill(0); empty_actions[5].fill(0)
-    no_actions = (*noncombat[:2], tuple(empty_domains), tuple(empty_actions), *noncombat[4:])
+    def select(observation, keep, order=None):
+        character, globals_, features, tokens, legal = observation
+        order = np.flatnonzero(keep) if order is None else order
+        position = np.full(len(tokens[0]), -1)
+        position[order] = np.arange(len(order))
+        tokens = [value[order] for value in tokens]
+        for index in (2, 3):
+            tokens[index] = np.where(tokens[index] >= 0, position[tokens[index]], -1)
+        return character, globals_, features, tuple(tokens), legal
+
+    _domain, place, parent, _link, row, _feature = noncombat[3]
+    candidate = place == PLACE["candidate"]
+    attached = (parent >= 0) & candidate[np.maximum(parent, 0)]
+    no_actions = select(noncombat, ~candidate & ~attached)
+    no_actions = (*no_actions[:4], np.zeros_like(noncombat[4]))
     with torch.no_grad():
-        policy, critic = predict(model, tensors(no_actions, target, model), "fp32")
-    assert policy.shape == empty_actions[5].shape and not policy.any()
+        policy, critic = predict(model, model_tensors(no_actions, model), "fp32")
+    assert policy.shape == noncombat[4].shape and not policy.any()
     assert critic.shape == (len(noncombat[0]), 1)
     assert np.array_equal(model._sequence_lengths.cpu(), expected_lengths(no_actions, model.pooling))
 
@@ -3261,23 +3251,25 @@ def probe():
     forward, _ = model.move_gru(sequence)
     backward, _ = model.move_gru(sequence.flip(1))
     assert not torch.allclose(forward[:, -1], backward[:, -1])
-    inputs = tensors(combat, target, model)
     with torch.no_grad():
-        original = predict(model, inputs, "fp32")
-    permutation = np.arange(np.asarray(combat[3][4]).shape[1])[::-1]
-    inverse = np.argsort(permutation)
-    permuted_domains = []
-    for values in combat[2]:
-        values = [np.array(value, copy=True) for value in values]
-        scoped = values[4] >= 0
-        values[4][scoped] = inverse[values[4][scoped]]
-        permuted_domains.append(tuple(values))
-    permuted_actions = tuple(np.asarray(value)[:, permutation] for value in combat[3])
-    permuted_observation = (combat[0], combat[1], tuple(permuted_domains),
-                            permuted_actions, combat[4])
+        original = predict(model, model_tensors(combat, model), "fp32")
+    # Reverse each row's candidates (with their attached tokens).
+    _domain, place, parent, _link, row, _feature = combat[3]
+    candidate = place == PLACE["candidate"]
+    owner = np.where(candidate, np.arange(len(place)),
+                     np.where((parent >= 0) & candidate[np.maximum(parent, 0)], parent, -1))
+    counts = np.bincount(row[candidate], minlength=len(combat[0]))
+    position = np.zeros(len(place), np.int64)
+    position[candidate] = np.arange(candidate.sum()) - np.repeat(np.cumsum(counts) - counts, counts)
+    key = np.where(owner >= 0, counts[row] - position[np.maximum(owner, 0)], 0)
+    reversed_legal = combat[4].copy()
+    for index, count in enumerate(counts):
+        reversed_legal[index, :count] = combat[4][index, :count][::-1]
+    permuted = select(combat, None, np.lexsort((np.arange(len(place)), key, row)))
     with torch.no_grad():
-        permuted = predict(model, tensors(permuted_observation, target, model), "fp32")
-    assert torch.allclose(original[0], permuted[0][:, inverse], atol=1e-6)
+        permuted = predict(model, model_tensors((*permuted[:4], reversed_legal), model), "fp32")
+    for index, count in enumerate(counts):
+        assert torch.allclose(original[0][index, :count], permuted[0][index, :count].flip(0), atol=1e-6)
     assert torch.allclose(original[1], permuted[1], atol=1e-6)
 
     mixed = {
@@ -3299,7 +3291,7 @@ def probe():
         export_value_model(exported, model, env.fingerprint(), .83, -.17)
         rust = np.asarray(env.rust_values(str(exported)))
         invalid_binary = bytearray(exported.read_bytes())
-        cap_offset = 8 + 16 + 40 + 64 * 4 + len(SEMANTIC_NAMES) * 4
+        cap_offset = 8 + 16 + 32 + 8 * len(DOMAINS) + 4 * len(SEMANTIC_NAMES)
         struct.pack_into("<I", invalid_binary, cap_offset,
                          struct.unpack_from("<I", invalid_binary, cap_offset)[0] + 1)
         invalid_path = Path(directory) / "invalid.bin"

@@ -8,6 +8,7 @@ import sys
 from collections import OrderedDict, defaultdict
 from pathlib import Path
 
+import sts2_sim
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
@@ -35,59 +36,27 @@ PARAMETRIC = {"Attention", "Embedding", "GRU", "LayerNorm", "Linear"}
 _CALL_IMPL = torch.nn.Module._call_impl.__code__
 
 
-NUMERIC_CHANNELS = {
-    "run": ("ascension ÷ 20", "act ÷ 3", "floor ÷ 60", "bosses visited ÷ 3",
-            "weak encounters ÷ 20", "regular encounters ÷ 20", "elite encounters ÷ 20",
-            "HP ÷ 30", "maximum HP ÷ 30", "HP fraction", "missing HP fraction", "gold ÷ 1000",
-            "energy ÷ 10", "draw ÷ 10", "orb slots ÷ 10", "shop removals ÷ 10",
-            "card rarity offset ÷ 10000", "potion odds ÷ 100", "unknown combat weight ÷ 1000",
-            "unknown elite weight ÷ 1000", "unknown treasure weight ÷ 1000",
-            "unknown shop weight ÷ 1000"),
-    "card": ("own energy cost ÷ 10", "card value ÷ 30", "own star cost ÷ 10",
-             "enchantment amount ÷ 30", "enchantment value ÷ 30", "replays ÷ 5"),
-    "actor": ("HP ÷ 30", "maximum HP ÷ 30", "block ÷ 30", "maximum energy ÷ 5",
-              "draw per turn ÷ 10", "orb slots ÷ 10", "energy ÷ 5", "stars ÷ 5", "turn ÷ 10",
-              "HP fraction", "missing HP fraction", "block fraction"),
-    "power": ("amount ÷ 30", "value ÷ 30"),
-    "relic": ("Pumpkin Candle counter",),
-    "orb": ("value ÷ 30",),
-    "action": ("expected block ÷ 30", "expected target damage ÷ 30",
-               "expected total damage ÷ 30", "player HP delta ÷ 30", "expected draw ÷ 10",
-               "expected discard ÷ 10", "expected exhaust ÷ 10", "energy cost ÷ 10",
-               "star cost ÷ 10", "action-specific amount"),
-}
+NUMERIC_CHANNELS = {name: tuple(fields) for name, _codes, fields in sts2_sim.feature_schema()["domains"]}
 
 
 def feature_schema(model):
-    import sts2_sim
-    from model import ACTION_FIELDS, SEMANTIC_NAMES, TOKEN_SPECS
-    labels = NUMERIC_CHANNELS
-    result = {
-        "schema": 1,
+    from model import SEMANTIC_NAMES
+    native = sts2_sim.feature_schema()
+    return {
+        "schema": 2,
         "feature_version": model.layout["version"],
         "domains": [
-            {"name": name, "categorical_slots": categorical, "numerical_channels": [
-                {"index": index, "name": labels.get(name, ())[index]
-                 if index < len(labels.get(name, ())) else f"{name} numerical channel {index}"}
-                for index in range(numeric)
+            {"name": name, "code_slots": codes, "numerical_channels": [
+                {"index": index, "name": field} for index, field in enumerate(fields)
             ]}
-            for name, _unsigned, _signed, categorical, numeric in TOKEN_SPECS
+            for name, codes, fields in native["domains"]
         ],
-        "action": {
-            "categorical_slots": ACTION_FIELDS[2],
-            "numerical_channels": [
-                {"index": index, "name": labels["action"][index]}
-                for index in range(ACTION_FIELDS[3])
-            ],
-        },
         "semantic_namespaces": [
             {"name": name, "size": model.layout[name + "_semantic_count"]}
             for name in SEMANTIC_NAMES
         ],
+        "native": native,
     }
-    if hasattr(sts2_sim, "feature_schema"):
-        result["native"] = sts2_sim.feature_schema()
-    return result
 
 
 def _tensors(value):
@@ -216,7 +185,7 @@ class OperationRecorder(TorchDispatchMode):
 
 
 def _counts(indices, size):
-    flat = indices.reshape(len(indices), -1).long()
+    flat = (indices.flatten(1) if indices.dim() > 1 else indices[:, None]).long()
     return torch.zeros(len(flat), size, dtype=torch.float64).scatter_add_(
         1, flat, torch.ones_like(flat, dtype=torch.float64))
 
@@ -460,7 +429,8 @@ def semantic_graph(recorder, outputs):
             continue
         codes = {term[1]: set(values[term[1]].flatten().tolist()) for term in node["terms"]}
         node["terms"] = [term for term in node["terms"] if term[0] != "onehot"
-                         or any(term[3] <= code < term[4] for code in codes[term[1]])]
+                         or any(term[3] <= code < term[4] for code in codes[term[1]])] \
+            or node["terms"][:1]
         record = next(row for row in rewrites if row["node"] == node["id"])
         record["maximum_error"] = max(record["maximum_error"], _error(
             linear_input(values, node["terms"]) @ linear_weight(values, node["terms"]),
