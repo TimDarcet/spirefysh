@@ -485,12 +485,9 @@ class MetricsProjector:
                 "_sum": {}, "_weight": {}, "_floors": [0] * 53,
                 "_floor_explained_sum": [0.] * (MAX_PROGRESS + 1),
                 "_floor_explained_weight": [0.] * (MAX_PROGRESS + 1),
-                "_floor_explained_rows": [0] * (MAX_PROGRESS + 1),
                 "_policy_lag_counts": [], "_policy_lag_max": None, "_totals": {},
                 "_advantage_square_sum": 0., "_advantage_rows": 0,
                 "_characters": [[0, 0] for _ in range(5)],
-                "_character_floors": [[0] * 53 for _ in range(5)],
-                "_character_caps": [[0, 0, 0] for _ in range(5)],
                 "_caps": [0, 0, 0], "_outcomes": {}, "_commits": {},
                 "_samples": [[] for _ in range(5)], "_sampled": 0,
                 "_trained": 0, "_critic_trained": 0, "_discarded": 0, "_batches": 0,
@@ -653,7 +650,6 @@ class MetricsProjector:
             weight = rows * metric.get("target_variance", 1)
             window["_floor_explained_sum"][floor] += metric["value"] * weight
             window["_floor_explained_weight"][floor] += weight
-            window["_floor_explained_rows"][floor] += rows
 
     def fold_packet(self, event, event_end):
         window = self.window(event)
@@ -704,12 +700,9 @@ class MetricsProjector:
             window["_characters"][character][0] += 1
             window["_characters"][character][1] += int(episode["won"])
             window["_boss_entries"] += int(episode["won"] or floor >= 51)
-            window["_character_floors"][character][floor] += 1
             window["_caps"][0] += int(episode.get("step_cap", False))
             window["_caps"][1] += int(episode.get("combat_cap", False))
             window["_caps"][2] += int(episode.get("empty_actions", False))
-            for target, key in enumerate(("step_cap", "combat_cap", "empty_actions")):
-                window["_character_caps"][character][target] += int(episode.get(key, False))
             length = episode.get("length", 0)
             seconds = episode.get("completion_seconds", 0.)
             window["_episode_length"] += length
@@ -842,16 +835,6 @@ class MetricsProjector:
                 / sum(window["_floor_explained_weight"])
                 if any(window["_floor_explained_weight"])
                 else metrics.get("critic_floor_conditioned_explained_reward_variance", 0),
-            "critic_explained_reward_variance_by_floor": {
-                str(floor): {
-                    "value": window["_floor_explained_sum"][floor]
-                    / window["_floor_explained_weight"][floor]
-                    if window["_floor_explained_weight"][floor] else 0.,
-                    "target_variance": window["_floor_explained_weight"][floor] / rows,
-                    "rows": rows,
-                }
-                for floor, rows in enumerate(window["_floor_explained_rows"]) if rows
-            },
             "optimizer_steps": window["_optimizer_steps"],
             "trajectory_length_mean": window["_episode_length"] / max(1, episodes),
             "trajectory_length_max": window["_episode_length_max"],
@@ -970,17 +953,6 @@ class MetricsProjector:
                     "accelerator_driver_allocated_bytes"):
             if key in window:
                 metrics[key] = window[key]
-        metrics["characters"] = [
-            {
-                "character": character, "episodes": count, "wins": wins,
-                "win_rate": wins / max(1, count),
-                "floor_bands": floor_bands(window["_character_floors"][character]),
-                "step_caps": window["_character_caps"][character][0],
-                "combat_caps": window["_character_caps"][character][1],
-                "empty_actions": window["_character_caps"][character][2],
-            }
-            for character, (count, wins) in enumerate(window["_characters"])
-        ]
         stages = self.manifest.get("stages", ())
         stage = stages[window["stage"]] if 0 <= window["stage"] < len(stages) else {}
         return {
@@ -1084,12 +1056,24 @@ def report_version(report, manifest):
     )
 
 
-def _cached_projection(root, run, manifest, session_id):
+def _live_projector(projectors, root, run, manifest, session_id):
+    key = manifest["run_id"], session_id
+    saved = projectors.get(run)
+    if saved and saved[0] == key and saved[1].cursor <= _event_log_size(saved[1].path):
+        saved[1].cursor = saved[1].read(saved[1].path, start=saved[1].cursor)
+    else:
+        saved = projectors[run] = key, MetricsProjector(root, run, manifest, session_id)
+    return saved[1]
+
+
+def _cached_projection(root, run, manifest, session_id, projectors):
+    if run in projectors:
+        return _live_projector(projectors, root, run, manifest, session_id).value()
     segments = lineage_segments(root, manifest["run_id"], session_id)
     if not segments:
         segments = [(run / manifest["sessions"][-1]["log"], None)]
     signature = {
-        "version": 7,
+        "version": 8,
         "window": manifest.get("telemetry_window_decisions", 32_768),
         "manifest": [(run / "run.json").stat().st_size,
                      (run / "run.json").stat().st_mtime_ns],
@@ -1105,16 +1089,16 @@ def _cached_projection(root, run, manifest, session_id):
             return saved["projection"]
     except (OSError, KeyError, json.JSONDecodeError):
         pass
-    projection = MetricsProjector(root, run, manifest, session_id).value()
+    projection = _live_projector(projectors, root, run, manifest, session_id).value()
     atomic_json(cache, {"signature": signature, "projection": projection})
     return projection
 
 
-def _dashboard_runs(target, selected=None):
+def _dashboard_runs(target, selected, projectors):
     if (target / "run.json").exists():
         target = target.parent
     runs = {}
-    paths = target.rglob("run.json") if selected is None else [target / selected / "run.json"]
+    paths = [target / selected / "run.json"]
     for path in paths:
         try:
             manifest = json.loads(path.read_text())
@@ -1126,7 +1110,7 @@ def _dashboard_runs(target, selected=None):
         if sessions and manifest.get("schema", 1) >= 2:
             session_id = sessions[-1]["id"]
             try:
-                projected = _cached_projection(target, run, manifest, session_id)
+                projected = _cached_projection(target, run, manifest, session_id, projectors)
             except (OSError, ValueError):
                 pass
         if projected:
@@ -1225,7 +1209,6 @@ def _dashboard_runs(target, selected=None):
                 floor for group in floor_groups
                 for floor in group[::max(1, math.ceil(len(group) / 8))]
             ]
-            row["metrics"].pop("characters", None)
         version_groups = {}
         for row in report_rows:
             version = report_version(row, manifest)
@@ -1362,7 +1345,7 @@ class DashboardSource:
             raise ValueError("invalid run")
         with self.lock:
             matches = [value for value in _dashboard_runs(
-                self.target, str(run.relative_to(self.target))
+                self.target, str(run.relative_to(self.target)), self.projectors
             ).values() if value["version"] == version]
         if not matches:
             raise ValueError("run has no reports")
@@ -1375,17 +1358,7 @@ class DashboardSource:
                 raise ValueError("invalid run")
             manifest = json.loads((run / "run.json").read_text())
             session = manifest["sessions"][-1]["id"]
-            key = manifest["run_id"], session
-            projector = self.projectors.get(name)
-            if projector is None or projector[0] != key:
-                projector = key, MetricsProjector(self.target, run, manifest, session)
-                self.projectors[name] = projector
-            metrics = projector[1]
-            if metrics.cursor > _event_log_size(metrics.path):
-                metrics = MetricsProjector(self.target, run, manifest, session)
-                self.projectors[name] = key, metrics
-            else:
-                metrics.cursor = metrics.read(metrics.path, start=metrics.cursor)
+            metrics = _live_projector(self.projectors, self.target, run, manifest, session)
             current_report = metrics.render(metrics.current) if metrics.current else None
             reports = metrics.closed + ([current_report] if current_report
                                          and metrics.status != "running" else [])
