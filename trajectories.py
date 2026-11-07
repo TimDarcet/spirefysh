@@ -13,7 +13,7 @@ import torch
 import sts2_sim
 from explanations import explain as explain_decision
 from model import CATEGORIES, MAX_PROGRESS, MODEL_VERSION, POTENTIAL_TERMS, STAGES, \
-    TOKEN_SPECS, export_value_model, load, potential_head, predict, sha256_file, tensors
+    DOMAINS, export_value_model, load, potential_head, predict, sha256_file, tensors
 from model_graph import GraphCache, NUMERIC_CHANNELS, feature_schema, label_tensors, \
     linear_weight, tensor_detail, trace_model
 
@@ -236,11 +236,7 @@ def _readable(concept, namespace=True):
 
 def decision_labels(concepts, inputs, actions):
     """Name rows and channels of one decision from the simulator's concept vocabulary."""
-    domains = {name: values for (name, *_), values in zip(TOKEN_SPECS, inputs[2])}
-    flags = [_readable(concept, False) for concept in concepts if concept.startswith("flag_bit: ")]
-    channels = dict(NUMERIC_CHANNELS, card=NUMERIC_CHANNELS["card"] + tuple(flags) + tuple(
-        f"{flag} this turn" for flag in flags) + tuple(f"{kind} cost modifier" for kind in (
-        "absolute", "this-turn", "until-played", "reduce-only", "star")) + ("cost modifiers ÷ 6",))
+    domains = {name: values for (name, *_), values in zip(DOMAINS, inputs[2])}
     action_names = [_title(action[3] or action[0]) for action in actions]
 
     def row(codes):
@@ -252,7 +248,7 @@ def decision_labels(concepts, inputs, actions):
     def rows(name, count):
         if name == "concepts":
             return [_readable(concept) for concept in concepts]
-        if name in ("action", "action numeric features"):
+        if name == "action":
             return action_names
         domain = name.removesuffix(" numeric features").removesuffix(" encoding")
         if domain == "run":
@@ -260,7 +256,7 @@ def decision_labels(concepts, inputs, actions):
         return [row(codes) for codes in domains[domain][0][:count].tolist()] \
             if domain in domains else None
 
-    return rows, lambda name, count: channels.get(name.removesuffix(" numeric features")) \
+    return rows, lambda name, count: NUMERIC_CHANNELS.get(name.removesuffix(" numeric features")) \
         if name.endswith(" numeric features") else None
 
 
@@ -448,7 +444,7 @@ class TrajectorySource:
             for choice in trace["choices"][:step]:
                 env.observe_tokens(); env.step([int(choice)])
             observation = env.observe_tokens()
-            cache_key = digest, int(observation[4][0]), step
+            cache_key = digest, int(observation[3][0]), step
             graph_id = self.graph_keys.get(cache_key)
             if graph_id:
                 try:
@@ -465,7 +461,7 @@ class TrajectorySource:
                     or abs(float(critic.squeeze()) - float(trace["critic_values"][step])) > 1e-4:
                 raise RuntimeError("checkpoint does not reproduce this trajectory decision")
             summary, recorder = trace_model(
-                model, inputs, digest, observation[4][0], sts2_sim.sts2_sim.__file__, temperature,
+                model, inputs, digest, observation[3][0], sts2_sim.sts2_sim.__file__, temperature,
             )
             actions = env.action_descriptors()
             label_tensors(recorder, *decision_labels(env.concept_labels(), inputs, actions))
@@ -587,7 +583,7 @@ class TrajectorySource:
             for choice in trace["choices"][:step]:
                 env.observe_tokens()
                 env.step([int(choice)])
-            observation = env.observe_tokens(flat=True)
+            observation = env.observe_tokens()
             result = explain_decision(
                 model, observation, json.loads(env.state(0)), env.action_descriptors(),
                 trace, step, case,

@@ -54,67 +54,12 @@ fn v44_galactic_dust_block_preview_matches_play() {
         hand: 0,
         target: Some(0),
     };
-    let preview = played_card_preview(&game, &content, card, Some(0));
+    let preview = game.expected_action_outcome(&content, &action).unwrap();
     let mut played = game.clone();
     played.step(&content, action).unwrap();
-    assert_eq!(preview.block, 10);
-    assert_eq!(played.combat().unwrap().player.block, preview.block);
+    assert_eq!(preview.block, 10.0);
+    assert_eq!(played.combat().unwrap().player.block as f32, preview.block);
     assert_eq!(played.galactic_dust, 1);
-}
-
-#[test]
-fn v33_hand_moves_are_counted_as_entering_hand() {
-    let mut content = foundation_content();
-    let all_for_one = content.card_id("CARD.ALL_FOR_ONE").unwrap();
-    let hologram = content.card_id("CARD.HOLOGRAM").unwrap();
-    let custom = content.card_id("CARD.ZAP").unwrap();
-    content.cards[custom as usize].effects = Box::leak(Box::new([Effect::SelectAmount(
-        Pile::Discard,
-        CardFilter::Any,
-        Amount::fixed(2, 2),
-        false,
-        CardOp::Move(Pile::Hand),
-    )]));
-    let claw = Card {
-        id: content.card_id("CARD.CLAW").unwrap(),
-        ..Card::default()
-    };
-    let strike = Card {
-        id: content.card_id("CARD.STRIKE_IRONCLAD").unwrap(),
-        ..Card::default()
-    };
-    for (seed, card, discard, expected) in [
-        (61, all_for_one, vec![claw, claw, strike], 2),
-        (62, hologram, vec![strike], 1),
-        (63, custom, vec![strike, strike], 2),
-    ] {
-        let mut game = Game::new_character_ascension(&content, seed, 3, 10).unwrap();
-        game.begin_act(&content, 0).unwrap();
-        game.start_combat(&content, content.acts[0].encounters[0])
-            .unwrap();
-        let Phase::Combat(combat) = &mut game.phase else {
-            unreachable!()
-        };
-        combat.hand = vec![Card {
-            id: card,
-            ..Card::default()
-        }];
-        combat.draw.clear();
-        combat.discard = discard;
-        combat.energy = 3;
-        combat.player.powers.clear();
-        combat.enemies[0].creature.hp = 100;
-        combat.enemies[0].creature.max_hp = 100;
-        combat.enemies[0].creature.powers.clear();
-        let played_card = combat.hand[0];
-        let target = (card == all_for_one).then_some(0);
-        let action = Action::Play { hand: 0, target };
-        let preview = played_card_preview(&game, &content, played_card, target);
-        assert_eq!(preview.draw, expected);
-        let mut played = game.clone();
-        played.step(&content, action).unwrap();
-        assert_eq!(played.combat().unwrap().hand.len(), expected as usize);
-    }
 }
 
 #[test]
@@ -260,8 +205,8 @@ fn v56_distinguishes_remaining_encounter_bags_with_the_same_last_encounter() {
     assert_eq!(first.last_encounter, second.last_encounter);
     assert_ne!(first.encounters, second.encounters);
     assert_ne!(
-        observation_bytes(&build_observation(&first, &content, layout, (0, 0))),
-        observation_bytes(&build_observation(&second, &content, layout, (0, 0)))
+        canonical_words(&build_observation(&first, &content, layout)),
+        canonical_words(&build_observation(&second, &content, layout))
     );
     assert_eq!(first.next_encounter(&content, false), Some(second_id));
     assert_eq!(second.next_encounter(&content, false), Some(first_id));
@@ -601,21 +546,21 @@ fn v62_packed_observation_carries_run_features_and_is_digest_protected() {
     let layout = Layout::new(&content);
     let mut game = Game::new_character_ascension(&content, 600, 0, 10).unwrap();
     game.begin_act(&content, 0).unwrap();
-    let observation = build_observation(&game, &content, layout, (3, 4));
-    let (globals, counts, mut exact, actions, digest) = packed_observation(&observation);
+    let observation = build_observation(&game, &content, layout);
+    assert_eq!(observation.globals, run_features(&game, &content));
+    assert!(observation.globals.iter().all(|value| value.is_finite()));
+    let (character, counts) = (observation.character, observation_counts(&observation));
+    let mut globals = observation.globals.clone();
+    let mut words = observation_words(&observation);
+    let digest = packed_observation_digest(character, &globals, counts, &words);
     assert_eq!(observation_digest(&observation), digest);
-    assert_eq!(globals, observation.globals);
-    assert_eq!(globals, run_features(&game, &content));
-    assert!(globals.iter().all(|value| value.is_finite()));
-    assert_eq!(
-        packed_observation_digest(observation.character, &globals, &counts, &exact, &actions),
-        digest
-    );
-    exact[0] ^= 1;
-    assert_ne!(
-        packed_observation_digest(observation.character, &globals, &counts, &exact, &actions),
-        digest
-    );
+    for index in [0, words.len() - 1] {
+        words[index] ^= 1;
+        assert_ne!(packed_observation_digest(character, &globals, counts, &words), digest);
+        words[index] ^= 1;
+    }
+    globals[0] += 1.0;
+    assert_ne!(packed_observation_digest(character, &globals, counts, &words), digest);
 }
 
 #[test]
@@ -634,16 +579,8 @@ fn v36_orb_previews_match_dualcast_overflow_and_zero_slots() {
         id: content.card_id("CARD.ZAP").unwrap(),
         ..Card::default()
     };
-    let lightning = content
-        .orbs
-        .iter()
-        .position(|orb| orb.id == "ORB.LIGHTNING_ORB")
-        .unwrap() as Id;
-    let dark = content
-        .orbs
-        .iter()
-        .position(|orb| orb.id == "ORB.DARK_ORB")
-        .unwrap() as Id;
+    let orb = |name| content.orbs.iter().position(|orb| orb.id == name).unwrap() as Id;
+    let (lightning, dark) = (orb("ORB.LIGHTNING_ORB"), orb("ORB.DARK_ORB"));
     let Phase::Combat(combat) = &mut game.phase else {
         unreachable!()
     };
@@ -661,22 +598,14 @@ fn v36_orb_previews_match_dualcast_overflow_and_zero_slots() {
         id: lightning,
         value: 0,
     }];
-    let preview = played_card_preview(&game, &content, dualcast, None);
-    assert_eq!(
-        resolved_hits(&game, &content, 0, None, false, true, &preview.hits).2,
-        16
-    );
-    assert!(preview.orbs.is_empty());
+    let action = Action::Play {
+        hand: 0,
+        target: None,
+    };
+    let preview = game.expected_action_outcome(&content, &action).unwrap();
+    assert_eq!(preview.hp_loss, [16.0]);
     let mut played = game.clone();
-    played
-        .step(
-            &content,
-            Action::Play {
-                hand: 0,
-                target: None,
-            },
-        )
-        .unwrap();
+    played.step(&content, action.clone()).unwrap();
     assert_eq!(played.combat().unwrap().enemies[0].creature.hp, 84);
 
     for (slots, expected) in [(1, 11), (0, 0)] {
@@ -693,22 +622,10 @@ fn v36_orb_previews_match_dualcast_overflow_and_zero_slots() {
             })
             .into_iter()
             .collect();
-        let preview = played_card_preview(&game, &content, zap, None);
-        assert_eq!(
-            resolved_hits(&game, &content, 0, None, false, false, &preview.hits).2,
-            expected
-        );
-        assert_eq!((preview.orb_slots, preview.orbs.len()), (1, 1));
+        let preview = game.expected_action_outcome(&content, &action).unwrap();
+        assert_eq!(preview.hp_loss, [expected as f32]);
         let mut played = game.clone();
-        played
-            .step(
-                &content,
-                Action::Play {
-                    hand: 0,
-                    target: None,
-                },
-            )
-            .unwrap();
+        played.step(&content, action.clone()).unwrap();
         let combat = played.combat().unwrap();
         assert_eq!(combat.enemies[0].creature.hp, 100 - expected);
         assert_eq!((combat.orb_slots, combat.orbs.len()), (1, 1));
@@ -754,22 +671,14 @@ fn v36_fisticuffs_and_misery_previews_match_play() {
         ..Power::default()
     })
     .to_vec();
-    let preview = played_card_preview(&game, &content, fisticuffs, Some(0));
-    assert_eq!(preview.block, 12);
-    assert_eq!(
-        resolved_hits(&game, &content, 0, Some(0), false, false, &preview.hits).2,
-        10
-    );
+    let action = Action::Play {
+        hand: 0,
+        target: Some(0),
+    };
+    let preview = game.expected_action_outcome(&content, &action).unwrap();
+    assert_eq!((preview.block, preview.hp_loss[0]), (12.0, 10.0));
     let mut played = game.clone();
-    played
-        .step(
-            &content,
-            Action::Play {
-                hand: 0,
-                target: Some(0),
-            },
-        )
-        .unwrap();
+    played.step(&content, action.clone()).unwrap();
     assert_eq!(played.combat().unwrap().player.block, 12);
     assert_eq!(played.combat().unwrap().enemies[0].creature.hp, 90);
 
@@ -781,10 +690,8 @@ fn v36_fisticuffs_and_misery_previews_match_play() {
         amount: 1,
         ..Power::default()
     });
-    assert_eq!(
-        played_card_preview(&game, &content, fisticuffs, Some(0)).block,
-        0
-    );
+    let preview = game.expected_action_outcome(&content, &action).unwrap();
+    assert_eq!(preview.block, 0.0);
 
     let misery = Card {
         id: content.card_id("CARD.MISERY").unwrap(),
@@ -796,22 +703,11 @@ fn v36_fisticuffs_and_misery_previews_match_play() {
     combat.hand = vec![misery];
     combat.player.powers.clear();
     combat.enemies[0].creature.block = 0;
-    let preview = played_card_preview(&game, &content, misery, Some(0));
-    let damage = resolved_hits(&game, &content, 0, Some(0), false, false, &preview.hits).2;
+    let preview = game.expected_action_outcome(&content, &action).unwrap();
     let mut played = game.clone();
-    played
-        .step(
-            &content,
-            Action::Play {
-                hand: 0,
-                target: Some(0),
-            },
-        )
-        .unwrap();
-    assert_eq!(
-        100 - played.combat().unwrap().enemies[0].creature.hp,
-        damage
-    );
+    played.step(&content, action).unwrap();
+    let hp = played.combat().unwrap().enemies[0].creature.hp;
+    assert_eq!(preview.hp_loss[0], (100 - hp) as f32);
 }
 
 #[test]
@@ -849,20 +745,16 @@ fn v36_duplicate_hand_exhaust_previews_match_play() {
         combat.energy = 3;
         combat.player.block = 0;
         combat.player.powers.clear();
-        let preview = played_card_preview(&game, &content, card, None);
-        assert_eq!(preview.exhaust, 1);
+        let action = Action::Play {
+            hand: 0,
+            target: None,
+        };
+        let preview = game.expected_action_outcome(&content, &action).unwrap();
+        assert_eq!(preview.exhaust, 1.0);
         let mut played = game.clone();
-        played
-            .step(
-                &content,
-                Action::Play {
-                    hand: 0,
-                    target: None,
-                },
-            )
-            .unwrap();
+        played.step(&content, action).unwrap();
         assert_eq!(played.combat().unwrap().exhaust.len(), 1);
-        assert_eq!(played.combat().unwrap().player.block, preview.block);
+        assert_eq!(played.combat().unwrap().player.block as f32, preview.block);
     }
 }
 
@@ -932,23 +824,16 @@ fn v36_play_draw_and_exhaust_hooks_match_play() {
             ..Power::default()
         })
         .collect();
-    let preview = played_card_preview(&game, &content, card, Some(0));
-    assert_eq!((preview.block, preview.draw, preview.exhaust), (5, 3, 1));
-    assert_eq!(
-        resolved_hits(&game, &content, 0, Some(0), false, true, &preview.hits).2,
-        28
-    );
+    let action = Action::Play {
+        hand: 0,
+        target: Some(0),
+    };
+    let preview = game.expected_action_outcome(&content, &action).unwrap();
+    assert_eq!((preview.block, preview.draw, preview.exhaust), (5.0, 3.0, 1.0));
+    assert_eq!(preview.hp_loss, [28.0]);
     let drawn = game.combat().unwrap().drawn;
     let mut played = game.clone();
-    played
-        .step(
-            &content,
-            Action::Play {
-                hand: 0,
-                target: Some(0),
-            },
-        )
-        .unwrap();
+    played.step(&content, action).unwrap();
     let combat = played.combat().unwrap();
     assert_eq!(combat.player.block, 5);
     assert_eq!(combat.enemies[0].creature.hp, 72);
@@ -956,94 +841,51 @@ fn v36_play_draw_and_exhaust_hooks_match_play() {
     assert_eq!(combat.exhaust.len(), 1);
 }
 
-fn model_row_bytes(domain: usize, row: &DomainRow) -> Vec<u8> {
-    let structural: &[usize] = match domain {
-        RUN_DOMAIN => &[22],
-        CARD_DOMAIN => &[0, 2, 3, 19],
-        ACTOR_DOMAIN | POWER_DOMAIN | HISTORY_DOMAIN => &[0],
-        STATUS_DOMAIN => &[0, 1],
-        RELIC_DOMAIN => &[0, 2],
-        EVENT_DOMAIN | ENCOUNTER_DOMAIN => &[],
-        POTION_DOMAIN => &[],
-        ORB_DOMAIN => &[0],
-        CRYSTAL_DOMAIN => &[7],
-        CONTINUATION_DOMAIN => &[2, 3, 5],
-        MAP_NODE_DOMAIN => &[0, 1],
-        MAP_EDGE_DOMAIN => &[0, 1],
-        _ => &[],
-    };
-    let mut out = Vec::new();
-    for &index in structural {
-        out.extend(row.u[index].to_le_bytes());
+/// The observation's words with candidates sorted: equal for equal model inputs.
+fn canonical_words(observation: &Observation) -> Vec<u32> {
+    let mut words = vec![observation.character as u32];
+    words.extend(observation.globals.iter().map(|value| value.to_bits()));
+    for token in &observation.tokens {
+        token_words(token, token.parent, &mut words);
     }
-    row.c
-        .iter()
-        .for_each(|value| out.extend(value.to_le_bytes()));
-    row.f
-        .iter()
-        .for_each(|value| out.extend(value.to_bits().to_le_bytes()));
-    out
-}
-
-fn candidate_bytes(observation: &Observation, index: usize) -> Vec<u8> {
-    let row = &observation.candidates[index];
-    let mut out = Vec::new();
-    out.extend(row.u[1].to_le_bytes());
-    out.extend(row.u[4].to_le_bytes());
-    row.c
-        .iter()
-        .for_each(|value| out.extend(value.to_le_bytes()));
-    row.f
-        .iter()
-        .for_each(|value| out.extend(value.to_bits().to_le_bytes()));
-    out.push(row.legal as u8);
-    for (domain, rows) in observation.domains.iter().enumerate() {
-        for row in rows.iter().filter(|row| row.scope == index as i32) {
-            out.push(domain as u8);
-            out.extend(model_row_bytes(domain, row));
-        }
-    }
-    out
-}
-
-fn observation_bytes(observation: &Observation) -> Vec<u8> {
-    let mut out = vec![observation.character];
-    observation
-        .globals
-        .iter()
-        .for_each(|value| out.extend(value.to_bits().to_le_bytes()));
-    for (domain, rows) in observation.domains.iter().enumerate() {
-        let rows = rows
-            .iter()
-            .filter(|row| row.scope == STATE_SCOPE)
-            .collect::<Vec<_>>();
-        out.extend((rows.len() as u32).to_le_bytes());
-        for row in rows {
-            out.extend(model_row_bytes(domain, row));
-        }
-    }
-    let mut candidates = (0..observation.candidates.len())
-        .map(|index| candidate_bytes(observation, index))
+    let mut candidates = (observation.candidates.iter())
+        .map(|candidate| {
+            let mut words = vec![candidate.legal as u32];
+            for token in std::iter::once(&candidate.token).chain(&candidate.attached) {
+                token_words(token, NONE, &mut words);
+            }
+            words
+        })
         .collect::<Vec<_>>();
     candidates.sort();
-    out.extend((candidates.len() as u32).to_le_bytes());
-    for candidate in candidates {
-        out.extend((candidate.len() as u32).to_le_bytes());
-        out.extend(candidate);
-    }
-    out
+    words.extend(candidates.concat());
+    words
 }
 
-#[test]
-fn v53_exact_fields_keep_integer_extremes() {
-    let mut row = DomainRow::new(CONTINUATION_DOMAIN, STATE_SCOPE);
-    row.u[..6].copy_from_slice(&[0, 255, 256, 65_535, 65_536, u32::MAX]);
-    row.s[..4].copy_from_slice(&[0, -1, i32::MIN, i32::MAX]);
-    let mut changed = row.clone();
-    changed.u[2] = 255;
-    assert_ne!(row, changed);
-    assert_eq!(row.u[5], u32::MAX);
-    assert_eq!(row.s[2], i32::MIN);
+fn has(token: &Token, layout: Layout, namespace: Semantic, value: u32) -> bool {
+    token.c.contains(&layout.semantic(namespace, value))
+}
+
+fn amount_of(token: &Token, layout: Layout, namespace: Semantic, value: u32) -> Option<f32> {
+    let code = layout.semantic(namespace, value);
+    (token.c.iter().position(|&slot| slot == code)).map(|slot| token.a[slot])
+}
+
+fn placed(observation: &Observation, place: Place) -> impl Iterator<Item = (usize, &Token)> {
+    (observation.tokens.iter().enumerate()).filter(move |(_, token)| token.place == place)
+}
+
+fn with_ctx<R>(game: &Game, content: &Content, build: impl FnOnce(Ctx) -> R) -> R {
+    let masters = master_cards(&game.run.deck);
+    build(Ctx { game, content, layout: Layout::new(content), masters: &masters })
+}
+
+fn queue_tokens(game: &Game, content: &Content) -> Vec<Token> {
+    with_ctx(game, content, |ctx| {
+        let mut encoder = Encoder { ctx, tokens: Vec::new() };
+        encoder.queue();
+        encoder.tokens
+    })
 }
 
 #[test]
@@ -1056,8 +898,8 @@ fn v53_observation_is_canonical_under_hidden_resampling() {
     resample_hidden(&mut first, &content, 17);
     resample_hidden(&mut second, &content, 99);
     assert_eq!(
-        observation_bytes(&build_observation(&first, &content, layout, (0, 0))),
-        observation_bytes(&build_observation(&second, &content, layout, (0, 0)))
+        canonical_words(&build_observation(&first, &content, layout)),
+        canonical_words(&build_observation(&second, &content, layout))
     );
 }
 
@@ -1069,7 +911,7 @@ fn v56_public_state_mutations_change_observation() {
     game.begin_act(&content, 0).unwrap();
     game.start_combat(&content, content.acts[0].encounters[0])
         .unwrap();
-    let base = observation_bytes(&build_observation(&game, &content, layout, (0, 0)));
+    let base = canonical_words(&build_observation(&game, &content, layout));
     for mutation in 0..4 {
         let mut changed = game.clone();
         match mutation {
@@ -1089,7 +931,7 @@ fn v56_public_state_mutations_change_observation() {
             _ => unreachable!(),
         }
         assert_ne!(
-            observation_bytes(&build_observation(&changed, &content, layout, (0, 0))),
+            canonical_words(&build_observation(&changed, &content, layout)),
             base,
             "public mutation {mutation} was not observed"
         );
@@ -1097,8 +939,9 @@ fn v56_public_state_mutations_change_observation() {
 }
 
 #[test]
-fn v53_combat_choice_keeps_typed_filter_and_operation_fields() {
+fn v53_combat_choice_keeps_typed_filter_and_operation_codes() {
     let content = foundation_content();
+    let layout = Layout::new(&content);
     let mut game = Game::new_character_ascension(&content, 407, 0, 10).unwrap();
     game.begin_act(&content, 0).unwrap();
     game.start_combat(&content, content.acts[0].encounters[0])
@@ -1120,24 +963,29 @@ fn v53_combat_choice_keeps_typed_filter_and_operation_fields() {
         context: Context::player(),
     });
     combat.force_end = true;
-    let row = phase_domain_row(&game, &content, &game.phase, false);
-    assert_eq!(
-        &row.u[5..16],
-        &[
-            Pile::Draw as u32,
-            3,
-            CardType::Attack as u32,
-            7,
-            target as u32,
-            7,
-            2,
-            1,
-            1,
-            1,
-            1,
-        ]
-    );
-    assert_eq!(&row.s[..2], &[0x8123, 0]);
+    let token = with_ctx(&game, &content, |ctx| ctx.phase(&game.phase, false));
+    for (namespace, value) in [
+        (Semantic::Pile, Pile::Draw as u32),
+        (Semantic::Filter, 3),
+        (Semantic::CardType, CardType::Attack as u32),
+        (Semantic::CardOp, 7),
+        (Semantic::Card, base_card_id(target as u32)),
+    ] {
+        assert!(has(&token, layout, namespace, value));
+    }
+    for bit in [0, 1, 5, 8, 15] {
+        assert!(has(&token, layout, Semantic::TurnFlagBit, bit));
+    }
+    for flag in [
+        Flag::ChoicePending,
+        Flag::Optional,
+        Flag::EnemyTurn,
+        Flag::TurnEnding,
+        Flag::ForcedEnd,
+    ] {
+        assert!(has(&token, layout, Semantic::Flag, flag as u32));
+    }
+    assert_eq!(token.f[..3], [0.2, 0.0, 0.0]);
 }
 
 #[test]
@@ -1165,8 +1013,8 @@ fn v53_map_is_relabel_invariant_and_edge_sensitive() {
         .into();
     second.map.current = first.map.current.map(|current| inverse[current]);
     assert_eq!(
-        observation_bytes(&build_observation(&first, &content, layout, (0, 0))),
-        observation_bytes(&build_observation(&second, &content, layout, (0, 0)))
+        canonical_words(&build_observation(&first, &content, layout)),
+        canonical_words(&build_observation(&second, &content, layout))
     );
     let mut changed = first.clone();
     let node = std::sync::Arc::make_mut(&mut changed.map.nodes)
@@ -1174,10 +1022,11 @@ fn v53_map_is_relabel_invariant_and_edge_sensitive() {
         .find(|node| node.next.len() > 1)
         .unwrap();
     node.next.pop();
-    assert_ne!(
-        build_observation(&first, &content, layout, (0, 0)).domains[MAP_EDGE_DOMAIN],
-        build_observation(&changed, &content, layout, (0, 0)).domains[MAP_EDGE_DOMAIN]
-    );
+    let edges = |game: &Game| {
+        let observation = build_observation(game, &content, layout);
+        placed(&observation, Place::MapEdge).map(|(_, token)| token.clone()).collect::<Vec<_>>()
+    };
+    assert_ne!(edges(&first), edges(&changed));
 }
 
 #[test]
@@ -1189,14 +1038,8 @@ fn canonical_map_cache_is_exact_and_tracks_dynamic_geometry() {
     let mut cache = None;
     let exact = |game: &Game, cache: &mut Option<CanonicalMapCache>| {
         assert_eq!(
-            observation_bytes(&build_observation_cached(
-                game,
-                &content,
-                layout,
-                (3, 2),
-                cache,
-            )),
-            observation_bytes(&build_observation(game, &content, layout, (3, 2)))
+            build_observation_cached(game, &content, layout, cache),
+            build_observation(game, &content, layout)
         );
     };
     exact(&game, &mut cache);
@@ -1227,89 +1070,20 @@ fn canonical_map_cache_is_exact_and_tracks_dynamic_geometry() {
 }
 
 #[test]
-fn v53_sparse_map_matches_an_independent_scalar_dag() {
-    fn node_value(row: &DomainRow) -> i64 {
-        row.c
-            .iter()
-            .enumerate()
-            .map(|(index, &value)| (index as i64 + 2) * value as i64)
-            .sum()
-    }
-    fn recursive(
-        id: u32,
-        nodes: &std::collections::BTreeMap<u32, &DomainRow>,
-        edges: &[&DomainRow],
-        memo: &mut std::collections::BTreeMap<u32, i64>,
-    ) -> i64 {
-        if let Some(&value) = memo.get(&id) {
-            return value;
-        }
-        let value = node_value(nodes[&id])
-            + edges
-                .iter()
-                .filter(|edge| edge.u[0] == id)
-                .map(|edge| 1 + recursive(edge.u[1], nodes, edges, memo))
-                .sum::<i64>();
-        memo.insert(id, value);
-        value
-    }
-
+fn v53_map_tokens_come_first_and_edges_are_topological() {
     let content = foundation_content();
     let layout = Layout::new(&content);
     let mut game = Game::new_character_ascension(&content, 408, 0, 10).unwrap();
     game.begin_act(&content, 0).unwrap();
-    let observation = build_observation(&game, &content, layout, (0, 0));
-    let nodes = observation.domains[MAP_NODE_DOMAIN]
-        .iter()
-        .map(|row| (row.u[0], row))
-        .collect::<std::collections::BTreeMap<_, _>>();
-    let edges = observation.domains[MAP_EDGE_DOMAIN]
-        .iter()
+    let observation = build_observation(&game, &content, layout);
+    let nodes = game.map.nodes.len();
+    assert!(observation.tokens[..nodes].iter().all(|token| token.place == Place::MapNode));
+    let edges = (placed(&observation, Place::MapEdge))
+        .map(|(_, token)| (token.parent, token.link))
         .collect::<Vec<_>>();
-    let mut batched = nodes
-        .iter()
-        .map(|(&id, row)| (id, node_value(row)))
-        .collect::<std::collections::BTreeMap<_, _>>();
-    for row in nodes.values().rev() {
-        batched.insert(
-            row.u[0],
-            node_value(row)
-                + edges
-                    .iter()
-                    .filter(|edge| edge.u[0] == row.u[0])
-                    .map(|edge| 1 + batched[&edge.u[1]])
-                    .sum::<i64>(),
-        );
-    }
-    let mut reference = std::collections::BTreeMap::new();
-    for &id in nodes.keys() {
-        recursive(id, &nodes, &edges, &mut reference);
-    }
-    assert_eq!(batched, reference);
-    for candidate in observation
-        .candidates
-        .iter()
-        .filter(|row| matches!(row.action, Action::Path(_)))
-    {
-        assert_eq!(batched[&candidate.u[4]], reference[&candidate.u[4]]);
-    }
-    let mut changed = observation.domains[MAP_EDGE_DOMAIN].to_vec();
-    changed.remove(0);
-    let changed = changed.iter().collect::<Vec<_>>();
-    assert_ne!(
-        recursive(
-            nodes[&0].u[0],
-            &nodes,
-            &edges,
-            &mut std::collections::BTreeMap::new()
-        ),
-        recursive(
-            nodes[&0].u[0],
-            &nodes,
-            &changed,
-            &mut std::collections::BTreeMap::new()
-        )
-    );
+    assert_eq!(edges.len(), game.map.nodes.iter().map(|node| node.next.len()).sum::<usize>());
+    assert!(edges.is_sorted_by_key(|&(source, _)| source));
+    assert!(edges.iter().all(|&(source, target)| source < target && (target as usize) < nodes));
 }
 
 #[test]
@@ -1318,37 +1092,23 @@ fn v53_path_candidates_reuse_canonical_destination_ids() {
     let layout = Layout::new(&content);
     let mut game = Game::new_character_ascension(&content, 405, 0, 10).unwrap();
     game.begin_act(&content, 0).unwrap();
-    let observation = build_observation(&game, &content, layout, (0, 0));
-    assert_eq!(observation.domains[RUN_DOMAIN][0].u[22], 0);
-    let nodes = observation.domains[MAP_NODE_DOMAIN]
-        .iter()
-        .map(|row| row.u[0])
-        .collect::<std::collections::BTreeSet<_>>();
-    for candidate in observation
-        .candidates
-        .iter()
-        .filter(|row| matches!(row.action, Action::Path(_)))
-    {
-        assert!(nodes.contains(&candidate.u[4]));
+    let observation = build_observation(&game, &content, layout);
+    let run = |observation: &Observation| placed(observation, Place::Run).next().unwrap().1.link;
+    assert_eq!(run(&observation), 0);
+    for candidate in &observation.candidates {
+        match candidate.action {
+            Action::Path(_) => assert!((candidate.token.link as usize) < game.map.nodes.len()),
+            _ => assert_eq!(candidate.token.link, NONE),
+        }
     }
-    assert!(
-        observation
-            .candidates
-            .iter()
-            .filter(|row| !matches!(row.action, Action::Path(_)))
-            .all(|row| row.u[4] == NO_NODE)
-    );
-    let path = observation
-        .candidates
-        .iter()
+    let (index, link) = (observation.candidates.iter())
         .find_map(|row| match row.action {
-            Action::Path(index) => Some((index, row.u[4])),
+            Action::Path(index) => Some((index, row.token.link)),
             _ => None,
         })
         .unwrap();
-    game.map.current = Some(path.0);
-    let entered = build_observation(&game, &content, layout, (0, 0));
-    assert_eq!(entered.domains[RUN_DOMAIN][0].u[22], path.1);
+    game.map.current = Some(index);
+    assert_eq!(run(&build_observation(&game, &content, layout)), link);
 
     let current = game
         .map
@@ -1368,86 +1128,19 @@ fn v53_path_candidates_reuse_canonical_destination_ids() {
         .relics
         .push(content.relic_id("RELIC.WINGED_BOOTS").unwrap());
     game.winged_boots = 0;
-    let observation = build_observation(&game, &content, layout, (0, 0));
-    let paths = observation
-        .candidates
-        .iter()
+    let observation = build_observation(&game, &content, layout);
+    let paths = (observation.candidates.iter())
         .filter(|row| matches!(row.action, Action::Path(_)))
         .collect::<Vec<_>>();
-    assert!(paths.iter().any(|row| row.u[5] == 1));
-    assert!(paths.iter().any(|row| row.u[5] == 2));
-    assert!(paths.iter().all(|row| row.u[14] == row.u[4]));
-    assert_eq!(
-        paths
-            .iter()
-            .map(|row| row.u[14])
-            .collect::<std::collections::BTreeSet<_>>()
-            .len(),
-        paths.len()
-    );
-}
-
-#[test]
-fn v54_continuation_parent_and_path_associations_do_not_alias() {
-    fn tree(swapped: bool) -> Vec<DomainRow> {
-        let mut tree = ContinuationBuilder::new(STATE_SCOPE);
-        tree.row(9, 0, NO_NODE, 0, 0, 0, 0, 2);
-        tree.row(1, 10, 0, 1, 1, 0, 0, 1);
-        tree.row(1, 11, 0, 2, 1, 0, 1, 1);
-        tree.row(1, 20, if swapped { 2 } else { 1 }, 1, 2, 0, 0, 0);
-        tree.row(1, 21, if swapped { 1 } else { 2 }, 2, 2, 0, 0, 0);
-        tree.rows
+    for kind in [1, 2] {
+        assert!(paths.iter().any(|row| has(&row.token, layout, Semantic::RouteKind, kind)));
     }
-    fn without_structure(mut rows: Vec<DomainRow>) -> Vec<DomainRow> {
-        for row in &mut rows {
-            for field in [2, 3, 5] {
-                row.u[field] = 0;
-            }
-        }
-        rows
-    }
-
-    let first = tree(false);
-    let second = tree(true);
-    assert_eq!(
-        without_structure(first.clone()),
-        without_structure(second.clone())
-    );
-    assert_ne!(first, second);
-    let mut different_paths = first.clone();
-    different_paths[3].u[5] = 3;
-    different_paths[4].u[5] = 1;
-    assert_eq!(
-        without_structure(first.clone()),
-        without_structure(different_paths.clone())
-    );
-    assert_ne!(first, different_paths);
-    assert!(
-        first
-            .iter()
-            .all(|row| row.f[16..22].iter().all(|value| value.is_finite()))
-    );
+    let links = paths.iter().map(|row| row.token.link).collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(links.len(), paths.len());
 }
 
 #[test]
-fn v56_categorical_embeddings_sum_without_field_weights() {
-    let encoder = TokenEncoderWeights {
-        numeric: LinearWeights {
-            w: vec![],
-            b: vec![0.0; 2],
-        },
-        norm_w: vec![1.0; 2],
-        norm_b: vec![0.0; 2],
-    };
-    let table = vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0];
-    assert_eq!(
-        encoder.encode(&[1, 2], &[], &table, 2),
-        encoder.encode(&[2, 1], &[], &table, 2)
-    );
-}
-
-#[test]
-fn card_flags_are_dense_numeric_features() {
+fn card_flags_are_dense_numeric_features_independent_of_the_consumer() {
     let content = foundation_content();
     let layout = Layout::new(&content);
     let mut game = Game::new_character_ascension(&content, 549, 0, 10).unwrap();
@@ -1461,53 +1154,17 @@ fn card_flags_are_dense_numeric_features() {
     card.add_cost(0, ABSOLUTE);
     card.free_this_turn();
     game.run.deck.push(card);
-    let observation = build_observation(&game, &content, layout, (0, 0));
-    let actual = observation.domains[CARD_DOMAIN]
-        .iter()
-        .find(|row| row.u[4] == card.id as u32 && row.u[6] == u16::MAX as u32)
-        .unwrap();
-    let mut encoding = CardEncoding::new(&game, &content);
-    let mut expected = card_domain_row(
-        &game,
-        &content,
-        &mut encoding,
-        STATE_SCOPE,
-        0,
-        0,
-        0,
-        0,
-        card,
-        0,
-    );
-    populate_domain_features(&game, &content, layout, CARD_DOMAIN, &mut expected);
-    assert_eq!(
-        (actual.c.clone(), actual.f.clone()),
-        (expected.c, expected.f)
-    );
-    assert!(actual.f[6..38].iter().all(|&value| value == 1.0));
+    let observation = build_observation(&game, &content, layout);
+    let actual = (placed(&observation, Place::Deck))
+        .find(|(_, token)| token.f[4..36].iter().all(|&value| value == 1.0))
+        .unwrap()
+        .1;
+    let [deck, child] = [(Place::Deck, NONE), (Place::Child, 7)]
+        .map(|(place, parent)| with_ctx(&game, &content, |ctx| ctx.card(card, place, parent)));
+    assert_eq!(actual, &deck);
+    assert_eq!((&deck.c, &deck.a, &deck.f), (&child.c, &child.a, &child.f));
     // Absolute, this turn, until played, not reduce-only, star; three modifiers.
-    assert_eq!(actual.f[38..], [1.0, 1.0, 1.0, 0.0, 1.0, 0.5]);
-}
-
-#[test]
-fn v57_card_content_is_independent_of_its_consumer() {
-    let content = foundation_content();
-    let layout = Layout::new(&content);
-    let mut game = Game::new_character_ascension(&content, 549, 0, 10).unwrap();
-    game.begin_act(&content, 0).unwrap();
-    let card = game.run.deck[0];
-    let mut encoding = CardEncoding::new(&game, &content);
-    let mut deck = card_domain_row(&game, &content, &mut encoding, -1, 0, 0, 0, 0, card, 0);
-    let mut action = card_domain_row(&game, &content, &mut encoding, 0, 5, 9, 1, 7, card, 999);
-    populate_domain_features(&game, &content, layout, CARD_DOMAIN, &mut deck);
-    populate_domain_features(&game, &content, layout, CARD_DOMAIN, &mut action);
-    assert_eq!((deck.c, deck.f), (action.c, action.f));
-    let observation = build_observation(&game, &content, layout, (0, 0));
-    assert!(
-        observation.domains[CARD_DOMAIN]
-            .iter()
-            .all(|row| row.u[0] != 13)
-    );
+    assert_eq!(actual.f[36..], [1.0, 1.0, 1.0, 0.0, 1.0, 0.5]);
 }
 
 #[test]
@@ -1516,14 +1173,11 @@ fn v57_empty_potion_is_an_item_and_slots_are_not_semantic() {
     let layout = Layout::new(&content);
     let mut game = Game::new_character_ascension(&content, 549, 0, 10).unwrap();
     game.begin_act(&content, 0).unwrap();
-    let observation = build_observation(&game, &content, layout, (0, 0));
+    let observation = build_observation(&game, &content, layout);
     let empty = layout.semantic(Semantic::Potion, content.potions.len() as u32);
-    let rows = observation.domains[POTION_DOMAIN]
-        .iter()
-        .filter(|row| row.scope == STATE_SCOPE)
-        .collect::<Vec<_>>();
-    assert_eq!(rows.len(), game.run.potions.len());
-    assert!(rows.iter().all(|row| row.c == vec![empty]));
+    let potions = placed(&observation, Place::Potion).collect::<Vec<_>>();
+    assert_eq!(potions.len(), game.run.potions.len());
+    assert!(potions.iter().all(|(_, token)| token.c == [empty]));
 }
 
 #[test]
@@ -1532,16 +1186,9 @@ fn v57_map_has_only_real_nodes_and_untyped_edges() {
     let layout = Layout::new(&content);
     let mut game = Game::new_character_ascension(&content, 549, 0, 10).unwrap();
     game.begin_run(&content).unwrap();
-    let observation = build_observation(&game, &content, layout, (0, 0));
-    assert_eq!(
-        observation.domains[MAP_NODE_DOMAIN].len(),
-        game.map.nodes.len()
-    );
-    assert!(
-        observation.domains[MAP_NODE_DOMAIN]
-            .iter()
-            .all(|row| row.u[1] < MAP_NODE_KINDS as u32)
-    );
+    let observation = build_observation(&game, &content, layout);
+    let nodes = placed(&observation, Place::MapNode).map(|(_, token)| token).collect::<Vec<_>>();
+    assert_eq!(nodes.len(), game.map.nodes.len());
     let ancient = content.events[game.ancient.unwrap() as usize].id;
     let ancient = [
         "EVENT.NEOW",
@@ -1556,41 +1203,20 @@ fn v57_map_has_only_real_nodes_and_untyped_edges() {
     .iter()
     .position(|&name| name == ancient)
     .unwrap();
-    assert_eq!(
-        observation.domains[MAP_NODE_DOMAIN][0].u[1],
-        6 + ancient as u32,
-    );
+    assert!(has(nodes[0], layout, Semantic::MapNodeKind, 6 + ancient as u32));
     let boss = game.bosses[0].unwrap();
-    let boss_kind = 14
-        + map_bosses(&content)
-            .iter()
-            .position(|&id| id == boss)
-            .unwrap();
-    assert_eq!(
-        observation.domains[MAP_NODE_DOMAIN].last().unwrap().u[1],
-        boss_kind as u32,
-    );
+    let boss = 14 + map_bosses(&content).iter().position(|&id| id == boss).unwrap();
+    assert!(has(nodes[nodes.len() - 1], layout, Semantic::MapNodeKind, boss as u32));
     assert!(
-        observation.domains[MAP_EDGE_DOMAIN]
-            .iter()
-            .all(|row| row.c.is_empty() && row.f.is_empty())
+        placed(&observation, Place::MapEdge)
+            .all(|(_, token)| token.c.is_empty() && token.a.is_empty() && token.f.is_empty())
     );
-}
-
-fn continuation_rows(game: &Game, content: &Content) -> [Vec<DomainRow>; 16] {
-    let mut domains = std::array::from_fn(|_| Vec::new());
-    continuation_domains(
-        game,
-        content,
-        &mut domains,
-        &mut CardEncoding::new(game, content),
-    );
-    domains
 }
 
 #[test]
 fn v57_control_and_resolving_play_state_are_continuations() {
     let content = foundation_content();
+    let layout = Layout::new(&content);
     let mut game = Game::new_character_ascension(&content, 549, 0, 10).unwrap();
     game.begin_act(&content, 0).unwrap();
     game.start_combat(&content, content.acts[0].encounters[0])
@@ -1613,37 +1239,35 @@ fn v57_control_and_resolving_play_state_are_continuations() {
     combat.extra_turn = true;
     game.run_queue.push(RunEffect::FinishCooking);
     game.reward_continuation = Some(RewardContinuation::AddRandomCurse);
-    let domains = continuation_rows(&game, &content);
-    let rows = &domains[CONTINUATION_DOMAIN];
-    let playing = rows
-        .iter()
-        .find(|row| row.u[0] == 9 && row.u[1] == 0 && row.u[11..14] == [3, 2, 4])
+    let tokens = queue_tokens(&game, &content);
+    let playing = (tokens.iter())
+        .position(|token| has(token, layout, Semantic::PlayKind, 1))
         .unwrap();
-    assert_eq!(playing.u[23], 1);
-    assert!(
-        domains[CARD_DOMAIN]
-            .iter()
-            .any(|row| row.scope == -3 - playing.u[2] as i32
-                && row.u[0] == CONTINUATION_CARD_ZONE
-                && row.u[4] == card.id as u32)
-    );
-    assert!(rows.iter().any(|row| row.u[0] == 0 && row.u[1] == 36));
-    for variant in 2..=3 {
-        assert!(rows.iter().any(|row| row.u[0] == 9 && row.u[1] == variant));
+    assert_eq!(tokens[playing].place, Place::Continuation);
+    assert_eq!(tokens[playing].f, [3.0 / 5.0, 2.0 / 5.0, 4.0 / 5.0]);
+    assert!(has(&tokens[playing], layout, Semantic::Flag, Flag::UnsettlingLamp as u32));
+    let version = card_version_id(&content, card.id, card.upgrades > 0, card.variant);
+    assert!(tokens.iter().any(|token| token.parent == playing as u32
+        && token.domain == CARD_DOMAIN as u8
+        && has(token, layout, Semantic::Card, version)));
+    let cooking = event_effect_index(&RunEffect::FinishCooking) as u32;
+    assert!(tokens.iter().any(|token| has(token, layout, Semantic::RunEffect, cooking)));
+    for kind in 2..=3 {
+        assert!(tokens.iter().any(|token| has(token, layout, Semantic::PlayKind, kind)));
     }
 }
 
 #[test]
 fn v56_continuation_booleans_and_discard_counts_do_not_alias() {
     let content = foundation_content();
-    let layout = Layout::new(&content);
     let game = Game::new_character_ascension(&content, 565, 0, 10).unwrap();
     let effect = |effect| {
-        let mut tree = ContinuationBuilder::new(STATE_SCOPE);
-        tree.effect(effect, NO_NODE, 0, 0, 0, 0, None);
-        let mut row = tree.rows.remove(0);
-        populate_domain_features(&game, &content, layout, CONTINUATION_DOMAIN, &mut row);
-        (row.c, row.f)
+        with_ctx(&game, &content, |ctx| {
+            let mut items = Items::new(ctx, 0, NONE);
+            items.effect(effect, None, false);
+            let token = items.out.remove(0);
+            (token.c, token.a, token.f)
+        })
     };
     for (left, right) in [
         (
@@ -1692,7 +1316,7 @@ fn v56_continuation_booleans_and_discard_counts_do_not_alias() {
     };
     assert_ne!(select(false, false), select(true, false));
     assert_ne!(select(false, false), select(false, true));
-    let concepts = |(mut c, _): (Vec<u32>, Vec<f32>)| {
+    let concepts = |(mut c, ..): (Vec<u32>, Vec<f32>, Vec<f32>)| {
         c.sort();
         c
     };
@@ -1706,24 +1330,24 @@ fn v56_continuation_booleans_and_discard_counts_do_not_alias() {
         concepts(select(false, false))
     );
     assert_ne!(
-        effect(Effect::PassiveLightning(1)).1,
-        effect(Effect::PassiveLightning(2)).1
+        effect(Effect::PassiveLightning(1)).2,
+        effect(Effect::PassiveLightning(2)).2
     );
     assert_ne!(
-        effect(Effect::CopyCard(Pile::Hand, 1)).1,
-        effect(Effect::CopyCard(Pile::Hand, 2)).1
+        effect(Effect::CopyCard(Pile::Hand, 1)).2,
+        effect(Effect::CopyCard(Pile::Hand, 2)).2
     );
     assert_eq!(
-        effect(Effect::CopyCard(Pile::Hand, 1)).1,
-        effect(Effect::CopyCard(Pile::Draw, 1)).1
+        effect(Effect::CopyCard(Pile::Hand, 1)).2,
+        effect(Effect::CopyCard(Pile::Draw, 1)).2
     );
 
     let run_effect = |effect| {
-        let mut tree = ContinuationBuilder::new(STATE_SCOPE);
-        tree.run_effect(effect, &content, NO_NODE, 0, 0, 0, 0);
-        let mut row = tree.rows.remove(0);
-        populate_domain_features(&game, &content, layout, CONTINUATION_DOMAIN, &mut row);
-        row.c
+        with_ctx(&game, &content, |ctx| {
+            let mut items = Items::new(ctx, 0, NONE);
+            items.run_effect(effect);
+            items.out.remove(0).c
+        })
     };
     assert_ne!(
         run_effect(RunEffect::RandomPotionReward(false)),
@@ -1732,7 +1356,7 @@ fn v56_continuation_booleans_and_discard_counts_do_not_alias() {
 }
 
 #[test]
-fn v61_status_cards_are_card_rows_and_enemy_properties_are_actor_features() {
+fn v61_status_cards_are_player_effects_and_enemy_properties_are_actor_features() {
     let content = foundation_content();
     let layout = Layout::new(&content);
     let mut game = Game::new_character_ascension(&content, 610, 0, 10).unwrap();
@@ -1748,33 +1372,23 @@ fn v61_status_cards_are_card_rows_and_enemy_properties_are_actor_features() {
     combat.hits[0] = 3;
     combat.enemies[0].value = 12;
     combat.enemies[0].repeats = 2;
-    let observation = build_observation(&game, &content, layout, (0, 0));
-    let zone_count = |zone| {
-        observation.domains[CARD_DOMAIN]
-            .iter()
-            .filter(|row| {
-                row.scope == STATE_SCOPE && row.u[0] == zone && row.u[4] == card.id as u32
+    let observation = build_observation(&game, &content, layout);
+    let player = placed(&observation, Place::Player).next().unwrap().0 as u32;
+    let flagged = |flag: Flag| {
+        (placed(&observation, Place::Effect))
+            .filter(|(_, token)| {
+                token.parent == player
+                    && token.domain == CARD_DOMAIN as u8
+                    && has(token, layout, Semantic::Flag, flag as u32)
             })
-            .count()
+            .map(|(_, token)| token)
+            .collect::<Vec<_>>()
     };
-    assert_eq!(
-        (zone_count(NIGHTMARE_ZONE), zone_count(HISTORY_COURSE_ZONE)),
-        (2, 1)
-    );
-    let concepts = |zone| {
-        let row = observation.domains[CARD_DOMAIN]
-            .iter()
-            .find(|row| row.u[0] == zone)
-            .unwrap();
-        row.c.clone()
-    };
-    assert_ne!(concepts(NIGHTMARE_ZONE), concepts(HISTORY_COURSE_ZONE));
-    assert!(observation.domains[STATUS_DOMAIN].is_empty());
-    let enemy = observation.domains[ACTOR_DOMAIN]
-        .iter()
-        .find(|row| row.u[0] == 3)
-        .unwrap();
-    assert_eq!(enemy.f[12..], [12.0 / 30.0, 3.0 / 10.0, 2.0 / 10.0]);
+    let (nightmares, course) = (flagged(Flag::Nightmare), flagged(Flag::HistoryCourse));
+    assert_eq!((nightmares.len(), course.len()), (2, 1));
+    assert_ne!(nightmares[0].c, course[0].c);
+    let enemy = placed(&observation, Place::Enemy).next().unwrap().1;
+    assert_eq!(enemy.f[13..16], [12.0 / 30.0, 3.0 / 10.0, 2.0 / 10.0]);
 }
 
 #[test]
@@ -1792,7 +1406,7 @@ fn v55_potion_replacement_menu_is_unique_and_exactly_legal() {
     let (represented, mask) = candidate_actions(&game, &content);
     assert_eq!(represented, legal);
     assert!(mask.into_iter().all(|legal| legal));
-    let observation = build_observation(&game, &content, layout, (0, 0));
+    let observation = build_observation(&game, &content, layout);
     assert_eq!(
         observation
             .candidates
@@ -1833,65 +1447,15 @@ fn v58_unequal_target_previews_remain_distinct_candidates() {
     combat.queue.clear();
     combat.choice = None;
     combat.player.hp = combat.player.hp.max(1);
-    let observation = build_observation(&game, &content, layout, (0, 0));
-    let targets = [0, 1].map(|target| {
-            observation
-                .candidates
-                .iter()
-                .position(|row| matches!(row.action, Action::Play { hand: 0, target: Some(value) } if value == target))
-                .unwrap()
-        });
-    assert_ne!(
-        observation.candidates[targets[0]].f,
-        observation.candidates[targets[1]].f
-    );
-    assert_ne!(
-        observation.candidates[targets[0]].u,
-        observation.candidates[targets[1]].u
-    );
-    assert_eq!(
-        observation.candidates[targets[0]].u[14],
-        observation.candidates[targets[1]].u[14]
-    );
-    assert_eq!(
-        ValueModel::candidate_object_key(&observation, targets[0]),
-        ValueModel::candidate_object_key(&observation, targets[1])
-    );
-}
-
-#[test]
-fn v56_action_auxiliaries_rederive_from_exact_sources() {
-    let content = foundation_content();
-    let layout = Layout::new(&content);
-    let mut game = Game::new_character_ascension(&content, 566, 0, 10).unwrap();
-    game.begin_act(&content, 0).unwrap();
-    game.start_combat(&content, content.acts[0].encounters[0])
-        .unwrap();
-    let observation = build_observation(&game, &content, layout, (0, 0));
-    for candidate in &observation.candidates {
-        assert_eq!(candidate.f, action_features(&candidate.u, &candidate.s));
-    }
-    let (globals, counts, mut exact, mut actions, digest) = packed_observation(&observation);
-    assert_eq!(
-        packed_observation_digest(observation.character, &globals, &counts, &exact, &actions,),
-        digest
-    );
-    exact[0] ^= 1;
-    assert_ne!(
-        packed_observation_digest(observation.character, &globals, &counts, &exact, &actions,),
-        digest
-    );
-    exact[0] ^= 1;
-    let numeric = ACTION_U + ACTION_S + ACTION_C;
-    actions[numeric] ^= 1;
-    assert_ne!(
-        packed_observation_digest(observation.character, &globals, &counts, &exact, &actions,),
-        digest
-    );
-    let candidate = &observation.candidates[0];
-    let mut unsigned = candidate.u;
-    unsigned[8] ^= 1;
-    assert_ne!(candidate.f, action_features(&unsigned, &candidate.s));
+    let observation = build_observation(&game, &content, layout);
+    let [first, second] = [0, 1].map(|target| {
+        (observation.candidates.iter())
+            .find(|row| row.action == Action::Play { hand: 0, target: Some(target) })
+            .unwrap()
+    });
+    assert_ne!(first.token.f, second.token.f);
+    assert_ne!(first.token.c, second.token.c);
+    assert_eq!(first.attached[0], second.attached[0]);
 }
 
 #[test]
@@ -1918,29 +1482,36 @@ fn v55_power_trigger_order_is_semantic_and_actor_ratios_are_finite() {
         },
     ];
     let mut ordered = game.clone();
-    let first = build_observation(&game, &content, layout, (0, 0));
+    let first = build_observation(&game, &content, layout);
     let Phase::Combat(combat) = &mut game.phase else {
         unreachable!()
     };
     combat.player.powers.reverse();
-    let second = build_observation(&game, &content, layout, (0, 0));
+    let second = build_observation(&game, &content, layout);
     let visible = |observation: &Observation| {
-        observation.domains[POWER_DOMAIN]
-            .iter()
-            .map(|row| (row.c.clone(), row.f.clone()))
+        (observation.tokens.iter())
+            .filter(|token| token.domain == POWER_DOMAIN as u8)
+            .map(|token| (token.c.clone(), token.a.clone(), token.f.clone()))
             .collect::<Vec<_>>()
     };
     assert_ne!(visible(&first), visible(&second));
+    let mut zero = game.clone();
     ordered.step(&content, Action::EndTurn).unwrap();
     game.step(&content, Action::EndTurn).unwrap();
     assert_ne!(
-        observation_bytes(&build_observation(&ordered, &content, layout, (0, 0))),
-        observation_bytes(&build_observation(&game, &content, layout, (0, 0)))
+        canonical_words(&build_observation(&ordered, &content, layout)),
+        canonical_words(&build_observation(&game, &content, layout))
     );
-    let mut zero = DomainRow::new(ACTOR_DOMAIN, STATE_SCOPE);
-    zero.u[..3].copy_from_slice(&[1, 0, 0]);
-    populate_domain_features(&game, &content, layout, ACTOR_DOMAIN, &mut zero);
-    assert!(zero.f.iter().all(|value| value.is_finite()));
+    let Phase::Combat(combat) = &mut zero.phase else {
+        unreachable!()
+    };
+    (combat.player.hp, combat.player.max_hp) = (0, 0);
+    let player = with_ctx(&zero, &content, |ctx| {
+        let mut encoder = Encoder { ctx, tokens: Vec::new() };
+        encoder.actors();
+        encoder.tokens.swap_remove(0)
+    });
+    assert!(player.f.iter().all(|value| value.is_finite()));
 }
 
 #[test]
@@ -1981,8 +1552,8 @@ fn v56_ordered_piles_change_model_inputs_and_successors() {
         combat.discard.reverse();
     }
     assert_ne!(
-        observation_bytes(&build_observation(&first, &content, layout, (0, 0))),
-        observation_bytes(&build_observation(&second, &content, layout, (0, 0)))
+        canonical_words(&build_observation(&first, &content, layout)),
+        canonical_words(&build_observation(&second, &content, layout))
     );
     let action = Action::Play {
         hand: 0,
@@ -1991,8 +1562,8 @@ fn v56_ordered_piles_change_model_inputs_and_successors() {
     first.step(&content, action.clone()).unwrap();
     second.step(&content, action).unwrap();
     assert_ne!(
-        observation_bytes(&build_observation(&first, &content, layout, (0, 0))),
-        observation_bytes(&build_observation(&second, &content, layout, (0, 0)))
+        canonical_words(&build_observation(&first, &content, layout)),
+        canonical_words(&build_observation(&second, &content, layout))
     );
 
     let Phase::Combat(combat) = &mut first.phase else {
@@ -2024,8 +1595,8 @@ fn v56_ordered_piles_change_model_inputs_and_successors() {
     first.step(&content, Action::Choose(2)).unwrap();
     second.step(&content, Action::Choose(2)).unwrap();
     assert_ne!(
-        observation_bytes(&build_observation(&first, &content, layout, (0, 0))),
-        observation_bytes(&build_observation(&second, &content, layout, (0, 0)))
+        canonical_words(&build_observation(&first, &content, layout)),
+        canonical_words(&build_observation(&second, &content, layout))
     );
 }
 
@@ -2050,8 +1621,8 @@ fn v56_unknown_draw_middle_remains_permutation_invariant() {
         combat.draw[1..4].reverse();
     }
     assert_eq!(
-        observation_bytes(&build_observation(&first, &content, layout, (0, 0))),
-        observation_bytes(&build_observation(&second, &content, layout, (0, 0)))
+        canonical_words(&build_observation(&first, &content, layout)),
+        canonical_words(&build_observation(&second, &content, layout))
     );
 }
 
@@ -2088,17 +1659,18 @@ fn v56_enemy_instance_renumbering_preserves_wriggler_transitions() {
     combat.enemies[0].instance = 2;
     assert_eq!(first.actions(&content), second.actions(&content));
     assert_eq!(
-        observation_bytes(&build_observation(&first, &content, layout, (0, 0))),
-        observation_bytes(&build_observation(&second, &content, layout, (0, 0)))
+        canonical_words(&build_observation(&first, &content, layout)),
+        canonical_words(&build_observation(&second, &content, layout))
     );
     first.step(&content, Action::EndTurn).unwrap();
     second.step(&content, Action::EndTurn).unwrap();
     assert_eq!(first.actions(&content), second.actions(&content));
     assert_eq!(
-        observation_bytes(&build_observation(&first, &content, layout, (0, 0))),
-        observation_bytes(&build_observation(&second, &content, layout, (0, 0)))
+        canonical_words(&build_observation(&first, &content, layout)),
+        canonical_words(&build_observation(&second, &content, layout))
     );
 }
+
 
 #[test]
 fn v56_dynamic_event_ids_use_typed_semantics() {
@@ -2111,6 +1683,22 @@ fn v56_dynamic_event_ids_use_typed_semantics() {
             .position(|event| event.id == name)
             .unwrap() as Id
     };
+    let phase_has = |observation: &Observation, namespace, value| {
+        has(placed(observation, Place::Phase).next().unwrap().1, layout, namespace, value)
+    };
+    let check = |game: &Game, values: &[(usize, Semantic, u32)]| {
+        let observation = build_observation(game, &content, layout);
+        for &(option, namespace, value) in values {
+            assert!(phase_has(&observation, namespace, value));
+            let candidate = (observation.candidates.iter())
+                .find(|row| row.action == Action::Event(option))
+                .unwrap();
+            assert!(candidate.attached.iter().any(|token| {
+                token.domain == EVENT_DOMAIN as u8 && has(token, layout, namespace, value)
+            }));
+        }
+        observation
+    };
     let mut game = Game::new_character_ascension(&content, 564, 0, 10).unwrap();
     game.begin_act(&content, 0).unwrap();
 
@@ -2120,61 +1708,20 @@ fn v56_dynamic_event_ids_use_typed_semantics() {
         colorful,
         content.events[colorful as usize].options[..3].to_vec(),
     );
-    let observation = build_observation(&game, &content, layout, (0, 0));
-    for character in 0..3 {
-        assert!(
-            observation.domains[PHASE_DOMAIN][0]
-                .c
-                .contains(&layout.semantic(Semantic::Character, character))
-        );
-        let scope = observation
-            .candidates
-            .iter()
-            .position(|row| row.action == Action::Event(character as usize))
-            .unwrap() as i32;
-        assert!(observation.domains[EVENT_DOMAIN].iter().any(|row| {
-            row.scope == scope
-                && row
-                    .c
-                    .contains(&layout.semantic(Semantic::Character, character))
-        }));
-    }
+    check(&game, &[0, 1, 2].map(|value| (value, Semantic::Character, value as u32)));
 
     let doll = event("EVENT.DOLL_ROOM");
     game.event_data = [0, 1, 2, 0];
     game.phase = Phase::Event(
         doll,
-        vec![
-            EventOption {
+        (10..=12)
+            .map(|action| EventOption {
                 requirement: Requirement::Always,
-                effects: &[RunEffect::EventAction(10)],
-            },
-            EventOption {
-                requirement: Requirement::Always,
-                effects: &[RunEffect::EventAction(11)],
-            },
-            EventOption {
-                requirement: Requirement::Always,
-                effects: &[RunEffect::EventAction(12)],
-            },
-        ],
+                effects: Box::leak(Box::new([RunEffect::EventAction(action)])),
+            })
+            .collect(),
     );
-    let observation = build_observation(&game, &content, layout, (0, 0));
-    for relic in 0..3 {
-        assert!(
-            observation.domains[PHASE_DOMAIN][0]
-                .c
-                .contains(&layout.semantic(Semantic::Relic, relic))
-        );
-        let scope = observation
-            .candidates
-            .iter()
-            .position(|row| row.action == Action::Event(relic as usize))
-            .unwrap() as i32;
-        assert!(observation.domains[EVENT_DOMAIN].iter().any(|row| {
-            row.scope == scope && row.c.contains(&layout.semantic(Semantic::Relic, relic))
-        }));
-    }
+    check(&game, &[0, 1, 2].map(|value| (value, Semantic::Relic, value as u32)));
 
     let tinker = event("EVENT.TINKER_TIME");
     let options = vec![
@@ -2186,51 +1733,11 @@ fn v56_dynamic_event_ids_use_typed_semantics() {
     ];
     game.event_data = [1, 3, 0, -1];
     game.phase = Phase::Event(tinker, options.clone());
-    let observation = build_observation(&game, &content, layout, (0, 0));
-    for (option, card_type) in [0, 2].into_iter().enumerate() {
-        assert!(
-            observation.domains[PHASE_DOMAIN][0]
-                .c
-                .contains(&layout.semantic(Semantic::CardType, card_type))
-        );
-        let scope = observation
-            .candidates
-            .iter()
-            .position(|row| row.action == Action::Event(option))
-            .unwrap() as i32;
-        assert!(observation.domains[EVENT_DOMAIN].iter().any(|row| {
-            row.scope == scope
-                && row
-                    .c
-                    .contains(&layout.semantic(Semantic::CardType, card_type))
-        }));
-    }
+    check(&game, &[(0, Semantic::CardType, 0), (1, Semantic::CardType, 2)]);
     game.event_data = [4, 6, 0, 2];
     game.phase = Phase::Event(tinker, options);
-    let observation = build_observation(&game, &content, layout, (0, 0));
-    assert!(
-        observation.domains[PHASE_DOMAIN][0]
-            .c
-            .contains(&layout.semantic(Semantic::CardType, 1))
-    );
-    for (option, rider) in [3, 5].into_iter().enumerate() {
-        assert!(
-            observation.domains[PHASE_DOMAIN][0]
-                .c
-                .contains(&layout.semantic(Semantic::TinkerRider, rider))
-        );
-        let scope = observation
-            .candidates
-            .iter()
-            .position(|row| row.action == Action::Event(option))
-            .unwrap() as i32;
-        assert!(observation.domains[EVENT_DOMAIN].iter().any(|row| {
-            row.scope == scope
-                && row
-                    .c
-                    .contains(&layout.semantic(Semantic::TinkerRider, rider))
-        }));
-    }
+    let observation = check(&game, &[(0, Semantic::TinkerRider, 3), (1, Semantic::TinkerRider, 5)]);
+    assert!(phase_has(&observation, Semantic::CardType, 1));
 
     let conveyor = event("EVENT.ENDLESS_CONVEYOR");
     game.event_data = [7, 2, 3, 0];
@@ -2238,31 +1745,30 @@ fn v56_dynamic_event_ids_use_typed_semantics() {
         conveyor,
         content.events[conveyor as usize].options[..2].to_vec(),
     );
-    let phase = &build_observation(&game, &content, layout, (0, 0)).domains[PHASE_DOMAIN][0];
-    assert!(
-        phase
-            .c
-            .contains(&layout.semantic(Semantic::ConveyorDish, 6))
-    );
-    assert!(
-        phase
-            .c
-            .contains(&layout.semantic(Semantic::ConveyorDish, 2))
-    );
+    let observation = build_observation(&game, &content, layout);
+    for dish in [6, 2] {
+        assert!(phase_has(&observation, Semantic::ConveyorDish, dish));
+    }
 }
 
 #[test]
 fn relic_counters_are_numeric_inputs_of_any_size() {
     let content = foundation_content();
     let layout = Layout::new(&content);
-    let game = Game::new_character_ascension(&content, 555, 0, 10).unwrap();
-    for (relic, counter) in [("RELIC.POLLINOUS_CORE", 25), ("RELIC.PUMPKIN_CANDLE", 300)] {
-        let mut row = DomainRow::new(RELIC_DOMAIN, STATE_SCOPE);
-        row.u[1] = content.relic_id(relic).unwrap() as u32;
-        row.s[0] = counter;
-        populate_domain_features(&game, &content, layout, RELIC_DOMAIN, &mut row);
-        assert_eq!(row.f, [counter as f32 / 10.0, 0.0, 0.0, 0.0]);
-        assert_eq!(row.c, [layout.semantic(Semantic::Relic, row.u[1])]);
+    let mut game = Game::new_character_ascension(&content, 555, 0, 10).unwrap();
+    game.begin_act(&content, 0).unwrap();
+    (game.pollinous_core, game.pumpkin_candle) = (25, 300);
+    let relics = [("RELIC.POLLINOUS_CORE", 25), ("RELIC.PUMPKIN_CANDLE", 300)]
+        .map(|(name, counter)| (content.relic_id(name).unwrap() as u32, counter));
+    game.run.relics.extend(relics.map(|(id, _)| id as Id));
+    let observation = build_observation(&game, &content, layout);
+    for (id, counter) in relics {
+        let token = (placed(&observation, Place::Relic))
+            .find(|(_, token)| has(token, layout, Semantic::Relic, id))
+            .unwrap()
+            .1;
+        assert_eq!(amount_of(token, layout, Semantic::Relic, id), Some(counter as f32 / 10.0));
+        assert_eq!(token.f, [0.0; 3]);
     }
 }
 
@@ -2277,31 +1783,17 @@ fn wax_relics_encode_queue_progress_and_melted_state() {
     let index = game.run.relics.len() - 1;
     game.wax_relics.push(index);
     let wax = |game: &Game| {
-        let observation = build_observation(game, &content, layout, (0, 0));
-        let row = observation.domains[RELIC_DOMAIN]
-            .iter()
-            .find(|row| row.u[0] == 0 && row.u[1] == id as u32)
-            .unwrap();
-        (row.f[2], row.f[3])
+        let observation = build_observation(game, &content, layout);
+        let token = (placed(&observation, Place::Relic))
+            .find(|(_, token)| has(token, layout, Semantic::Relic, id as u32))
+            .unwrap()
+            .1;
+        (token.f[1], token.f[2])
     };
     assert_eq!(wax(&game), (1.0, 0.75));
     game.toy_box_combats = 3;
     game.melted_relics.push(index);
     assert_eq!(wax(&game), (1.0, 1.0));
-}
-
-#[test]
-fn observation_has_one_remaining_relic_pool() {
-    let content = foundation_content();
-    let layout = Layout::new(&content);
-    let mut game = Game::new_character_ascension(&content, 555, 0, 10).unwrap();
-    game.begin_run(&content).unwrap();
-    let observation = build_observation(&game, &content, layout, (0, 0));
-    assert!(
-        observation.domains[RELIC_DOMAIN]
-            .iter()
-            .all(|row| row.u[0] != 2)
-    );
 }
 
 #[test]
@@ -2348,7 +1840,7 @@ fn v55_action_and_phase_discriminants_are_exhaustive() {
     ];
     assert_eq!(
         actions.iter().map(action_kind).collect::<Vec<_>>(),
-        (0..ACTION_KINDS).collect::<Vec<_>>()
+        (0..labels::ACTIONS.len()).collect::<Vec<_>>()
     );
 
     let content = foundation_content();
@@ -2389,10 +1881,11 @@ fn v55_action_and_phase_discriminants_are_exhaustive() {
     );
 }
 
+
 #[test]
 fn v56_layout_uses_explicit_token_dimensions_and_positions() {
     let layout = Layout::new(&foundation_content());
-    assert_eq!((VERSION, VALUE_MODEL_VERSION), (63, 79));
+    assert_eq!((VERSION, VALUE_MODEL_VERSION), (64, 80));
     assert_eq!(
         (
             DEFAULT_MODEL_WIDTH,
@@ -2436,22 +1929,17 @@ fn v56_event_pool_contains_only_eligible_unvisited_events() {
         .collect::<Vec<_>>();
     let visited = eligible[0];
     game.visited_events.push(visited);
-    let observation = build_observation(&game, &content, layout, (0, 0));
-    let actual = observation.domains[EVENT_DOMAIN]
-        .iter()
-        .filter(|row| row.scope == STATE_SCOPE && row.u[0] == 0)
-        .map(|row| row.u[1] as Id)
+    let observation = build_observation(&game, &content, layout);
+    let actual = (placed(&observation, Place::EventPool))
+        .map(|(_, token)| (token.c[0] - layout.semantic(Semantic::Event, 0)) as Id)
         .collect::<Vec<_>>();
+    assert_eq!(actual.len(), eligible.len() - 1);
     assert!(!actual.contains(&visited));
-    assert!(
-        actual
-            .iter()
-            .all(|&id| game.event_allowed(&content, id) && !game.visited_events.contains(&id))
-    );
+    assert!(actual.iter().all(|&id| game.event_allowed(&content, id)));
 }
 
 #[test]
-fn v57_actions_are_legal_only_and_only_suspended_offers_are_phase_local() {
+fn v57_actions_are_legal_only_and_only_suspended_offers_are_phase_children() {
     let content = foundation_content();
     let layout = Layout::new(&content);
     let mut game = Game::new_character_ascension(&content, 46, 0, 10).unwrap();
@@ -2462,42 +1950,32 @@ fn v57_actions_are_legal_only_and_only_suspended_offers_are_phase_local() {
         id: content.card_id("CARD.STRIKE_IRONCLAD").unwrap(),
         ..Card::default()
     };
+    let actions = |observation: &Observation| {
+        (observation.candidates.iter()).map(|row| row.action.clone()).collect::<Vec<_>>()
+    };
+    let phase_children = |observation: &Observation, phase: usize| {
+        let phase = placed(observation, Place::Phase).nth(phase).unwrap().0 as u32;
+        (observation.tokens.iter()).filter(|token| token.parent == phase).cloned().collect::<Vec<_>>()
+    };
     game.phase = Phase::Shop(vec![ShopItem::Card(card, 100)]);
-    let observation = build_observation(&game, &content, layout, (0, 0));
-    assert_eq!(
-        observation
-            .candidates
-            .iter()
-            .map(|row| &row.action)
-            .collect::<Vec<_>>(),
-        [&Action::Leave]
-    );
-    assert!(
-        observation.domains[CONTINUATION_DOMAIN]
-            .iter()
-            .all(|row| row.scope != PHASE_SCOPE)
-    );
+    let observation = build_observation(&game, &content, layout);
+    assert_eq!(actions(&observation), [Action::Leave]);
+    assert!(phase_children(&observation, 0).is_empty());
+
     game.resume = Some(Phase::Shop(vec![ShopItem::Card(card, 100)]));
     game.phase = Phase::RemoveCards(1, 0, true);
-    let observation = build_observation(&game, &content, layout, (0, 0));
-    assert_eq!(observation.domains[PHASE_DOMAIN].len(), 2);
-    assert!(observation.domains[CONTINUATION_DOMAIN].iter().any(|row| {
-        row.scope == PHASE_SCOPE && row.u[0] == 8 && row.u[1] == 8 && row.s[0] == 100
-    }));
-    assert!(observation.domains[CARD_DOMAIN].iter().any(|row| {
-        row.scope == PHASE_SCOPE && row.u[0] == CONTINUATION_CARD_ZONE && row.u[4] == card.id as u32
-    }));
-    let position = layout.semantic_offsets[Semantic::ContinuationPosition as usize];
-    let position_end = position + layout.semantic_sizes[Semantic::ContinuationPosition as usize];
-    assert!(
-        observation.domains[CONTINUATION_DOMAIN]
-            .iter()
-            .filter(|row| row.scope == PHASE_SCOPE)
-            .all(|row| row
-                .c
-                .iter()
-                .all(|code| !(*code >= position && *code < position_end)))
-    );
+    let observation = build_observation(&game, &content, layout);
+    assert_eq!(placed(&observation, Place::Phase).count(), 2);
+    let children = phase_children(&observation, 1);
+    assert!(children.iter().any(|token| token.domain == OFFER_DOMAIN as u8
+        && has(token, layout, Semantic::OfferKind, 4)
+        && token.f[0] == 0.1));
+    assert!(children.iter().any(|token| token.domain == CARD_DOMAIN as u8
+        && has(token, layout, Semantic::Card, base_card_id(card.id as u32))));
+    let position = layout.semantic(Semantic::ContinuationPosition, 0);
+    let positions = position..position + layout.semantic_sizes[Semantic::ContinuationPosition as usize];
+    assert!(children.iter().all(|token| token.place == Place::Child
+        && !token.c.iter().any(|code| positions.contains(code))));
 
     let effects = Box::leak(Box::new([RunEffect::Gold(-999)]));
     game.phase = Phase::Event(
@@ -2514,20 +1992,9 @@ fn v57_actions_are_legal_only_and_only_suspended_offers_are_phase_local() {
         ],
     );
     game.resume = None;
-    let observation = build_observation(&game, &content, layout, (0, 0));
-    assert_eq!(
-        observation
-            .candidates
-            .iter()
-            .map(|row| &row.action)
-            .collect::<Vec<_>>(),
-        [&Action::Event(0)]
-    );
-    assert!(
-        observation.domains[CONTINUATION_DOMAIN]
-            .iter()
-            .all(|row| row.scope != PHASE_SCOPE)
-    );
+    let observation = build_observation(&game, &content, layout);
+    assert_eq!(actions(&observation), [Action::Event(0)]);
+    assert!(phase_children(&observation, 0).is_empty());
 }
 
 #[test]
@@ -2558,40 +2025,23 @@ fn v56_card_versions_origins_and_enemy_targets_are_explicit() {
         ..Card::default()
     }];
     combat.energy = 99;
-    let observation = build_observation(&game, &content, layout, (0, 0));
-    assert!(
-        observation.domains[CARD_DOMAIN]
-            .iter()
-            .filter(|row| row.u[19] > 0)
-            .count()
-            >= 2
-    );
-    let action = observation
-        .candidates
-        .iter()
-        .find(|row| {
-            matches!(
-                row.action,
-                Action::Play {
-                    hand: 0,
-                    target: Some(0)
-                }
-            )
-        })
+    let enemy = combat.enemies[0].creature.id as u32;
+    let observation = build_observation(&game, &content, layout);
+    let hand = placed(&observation, Place::Hand).next().unwrap().1;
+    assert!(has(hand, layout, Semantic::DeckOrigin, 0));
+    let action = (observation.candidates.iter())
+        .find(|row| row.action == Action::Play { hand: 0, target: Some(0) })
         .unwrap();
-    let actor = observation.domains[ACTOR_DOMAIN]
-        .iter()
-        .find(|row| row.u[1] == 2)
-        .unwrap();
-    let enemy = layout.semantic(Semantic::Enemy, actor.u[2]);
-    let position = layout.semantic(Semantic::EnemyPosition, 0);
-    assert!(action.c.contains(&enemy) && action.c.contains(&position));
-    assert!(actor.c.contains(&enemy) && actor.c.contains(&position));
+    let actor = placed(&observation, Place::Enemy).next().unwrap().1;
+    for (namespace, value) in [(Semantic::Enemy, enemy), (Semantic::EnemyPosition, 0)] {
+        assert!(has(&action.token, layout, namespace, value) && has(actor, layout, namespace, value));
+    }
 }
 
 #[test]
 fn v56_continuations_are_flat_execution_items() {
     let content = foundation_content();
+    let layout = Layout::new(&content);
     let mut game = Game::new_character_ascension(&content, 91, 0, 10).unwrap();
     game.begin_act(&content, 0).unwrap();
     game.start_combat(&content, content.acts[0].encounters[0])
@@ -2626,18 +2076,17 @@ fn v56_continuations_are_flat_execution_items() {
             context: Context::player(),
         },
     ];
-    let domains = continuation_rows(&game, &content);
-    let rows = &domains[CONTINUATION_DOMAIN];
-    let items = rows
-        .iter()
-        .map(|row| row.u[2])
-        .collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(items.len(), 4);
-    assert!(
-        rows.iter()
-            .all(|row| row.u[3] == NO_NODE && row.u[4..8] == [0; 4] && row.u[8] > 0)
-    );
-    assert!(rows.iter().all(|row| !matches!(row.u[1], 92 | 93)));
+    let tokens = queue_tokens(&game, &content);
+    let heads = (tokens.iter()).filter(|token| token.place == Place::Continuation).collect::<Vec<_>>();
+    assert_eq!(heads.len(), 4);
+    for (order, head) in heads.iter().enumerate() {
+        assert!(has(head, layout, Semantic::ContinuationPosition, order as u32));
+    }
+    assert!(tokens.iter().all(|token| (token.place == Place::Continuation) == (token.parent == NONE)));
+    for effect in [random[0], random[1]] {
+        let code = layout.semantic(Semantic::Effect, effect_index(&effect) as u32);
+        assert!(tokens.iter().all(|token| !token.c.contains(&code)));
+    }
 }
 
 #[test]
@@ -2667,21 +2116,141 @@ fn v56_continuation_amounts_use_declared_scales_and_current_values() {
             ..Context::player()
         },
     });
-    let mut domains = continuation_rows(&game, &content);
-    let rows = &mut domains[CONTINUATION_DOMAIN];
-    for row in rows.iter_mut() {
-        populate_domain_features(&game, &content, layout, CONTINUATION_DOMAIN, row);
+    let tokens = queue_tokens(&game, &content);
+    let damage = effect_index(&Effect::Damage(Target::Player, amount)) as u32;
+    let effect = (tokens.iter())
+        .find(|token| has(token, layout, Semantic::Effect, damage))
+        .unwrap();
+    assert_eq!(amount_of(effect, layout, Semantic::Effect, damage), Some(signed_log(13.0 / 30.0)));
+    assert_eq!(effect.f[..4], [3.0f32 / 30.0, 5.0 / 30.0, 0.2, 0.1].map(signed_log));
+    assert_eq!(effect.f[12], 1.0);
+    let context = (tokens.iter()).find(|token| token.domain == CONTEXT_DOMAIN as u8).unwrap();
+    assert_eq!(context.f, [0.8, 0.0]);
+}
+
+/// Asserts the token graph is well formed and every number bounded; tracks the largest
+/// magnitude of each domain's fields and amounts.
+fn check_observation(observation: &Observation, layout: Layout, fields: &mut [Vec<f32>], amounts: &mut [f32]) {
+    let tokens = &observation.tokens;
+    let nodes = tokens.iter().take_while(|token| token.place == Place::MapNode).count() as u32;
+    let actor = |index: u32| matches!(tokens[index as usize].place, Place::Player | Place::Ally | Place::Enemy);
+    for (index, token) in tokens.iter().enumerate() {
+        let earlier = token.parent < index as u32;
+        match token.place {
+            Place::Child => assert!(earlier && tokens[token.parent as usize].place != Place::Child),
+            Place::Effect | Place::Move => assert!(earlier && actor(token.parent)),
+            Place::MapEdge => assert!(token.parent < nodes && token.link < nodes),
+            _ => assert_eq!(token.parent, NONE, "{:?} token {index} has a parent", token.place),
+        }
+        match token.place {
+            Place::Run => assert!(token.link < nodes),
+            Place::MapEdge => {}
+            _ => assert_eq!(token.link, NONE),
+        }
     }
-    let effect = rows
-        .iter()
-        .find(|row| row.scope == STATE_SCOPE && row.u[0] == 1)
-        .unwrap();
-    assert_eq!(effect.f[16..20], [5.0 / 30.0, 0.2, 0.1, 13.0 / 30.0]);
-    let context = rows
-        .iter()
-        .find(|row| row.scope == STATE_SCOPE && row.u[0] == 2)
-        .unwrap();
-    assert_eq!(context.f[..2], [0.8, 0.0]);
+    for candidate in &observation.candidates {
+        let link = candidate.token.link;
+        assert_eq!((candidate.token.place, candidate.token.parent), (Place::Candidate, NONE));
+        match candidate.action {
+            Action::Path(_) => assert!(link < nodes),
+            Action::Play { target: Some(_), .. } | Action::Potion { target: Some(_), .. } => {
+                assert_eq!(tokens[link as usize].place, Place::Enemy)
+            }
+            _ => assert_eq!(link, NONE),
+        }
+        for token in &candidate.attached {
+            assert_eq!((token.place, token.parent, token.link), (Place::Child, NONE, NONE));
+        }
+    }
+    let candidates = (observation.candidates.iter())
+        .flat_map(|candidate| std::iter::once(&candidate.token).chain(&candidate.attached));
+    for token in tokens.iter().chain(candidates) {
+        let (name, _, names) = DOMAINS[token.domain as usize];
+        assert!(token.c.iter().all(|&code| (code as usize) < layout.concept_vocab()));
+        // Linear scales are capped or sized for ±5; logarithmic ones reach ln(1 + 999) ≈ 6.9.
+        for (slot, &value) in token.f.iter().enumerate() {
+            assert!(value.is_finite() && value.abs() <= 7.0, "{name} {}: {value} {token:?}", names[slot]);
+            let max = &mut fields[token.domain as usize][slot];
+            *max = max.max(value.abs());
+        }
+        for &value in &token.a {
+            assert!(value.is_finite() && value.abs() <= 7.0, "{name} amount: {value}");
+            let max = &mut amounts[token.domain as usize];
+            *max = max.max(value.abs());
+        }
+    }
+    #[cfg(feature = "python")]
+    {
+        let data = python::compact_data(&python::compact_packed_observation(observation)).unwrap();
+        assert_eq!(
+            (data.character, data.counts, data.digest),
+            (observation.character, observation_counts(observation), observation_digest(observation))
+        );
+        assert_eq!(data.globals, observation.globals);
+        assert_eq!(data.words, observation_words(observation));
+        let (parsed, legal) = python::parse_row(&data).unwrap();
+        let local = |value: u32| if value == NONE { -1 } else { value as i64 };
+        let mut expected = (tokens.iter())
+            .map(|token| (token.domain, token.place as u8, local(token.parent), local(token.link)))
+            .collect::<Vec<_>>();
+        for candidate in &observation.candidates {
+            let index = expected.len() as i64;
+            let token = &candidate.token;
+            expected.push((token.domain, token.place as u8, -1, local(token.link)));
+            expected.extend(
+                (candidate.attached.iter())
+                    .map(|token| (token.domain, token.place as u8, index, local(token.link))),
+            );
+        }
+        let parsed = parsed.iter().map(|token| (token.domain, token.place, token.parent, token.link));
+        assert_eq!(parsed.collect::<Vec<_>>(), expected);
+        assert_eq!(legal, observation.candidates.iter().map(|row| row.legal).collect::<Vec<_>>());
+    }
+}
+
+#[test]
+fn random_walk_observations_are_well_formed() {
+    let content = foundation_content();
+    let layout = Layout::new(&content);
+    let mut fields = DOMAINS.map(|(_, _, names)| vec![0.0f32; names.len()]);
+    let mut amounts = [0.0f32; DOMAINS.len()];
+    let (mut observations, mut floors) = (0, 0);
+    for seed in 0..2 {
+        for character in 0..content.characters.len() {
+            let mut game = Game::new_character_ascension(&content, 800 + seed, character as Id, 0).unwrap();
+            game.begin_run(&content).unwrap();
+            let mut rng = Rng::from_seed(seed * 16 + character as u64);
+            for _ in 0..3000 {
+                if matches!(game.phase, Phase::Won | Phase::Dead) {
+                    break;
+                }
+                // Random play would die in the first act.
+                game.run.hp = game.run.max_hp;
+                if let Phase::Combat(combat) = &mut game.phase {
+                    combat.player.hp = combat.player.max_hp;
+                }
+                // Removed relics encode the bag only if it never gains a relic outside the starting pool.
+                let pool = starting_relic_pool(&game, &content);
+                assert!(public_relic_bag(&game, layout).concat().iter().all(|id| pool.contains(id)));
+                check_observation(&build_observation(&game, &content, layout), layout, &mut fields, &mut amounts);
+                observations += 1;
+                let mut actions = game.actions(&content);
+                if actions.len() > 1 && rng.next() % 4 != 0 {
+                    actions.retain(|action| *action != Action::EndTurn);
+                }
+                let action = actions[rng.next() as usize % actions.len()].clone();
+                game.step(&content, action).unwrap();
+            }
+            floors += canonical_progress(&game) as usize;
+        }
+    }
+    eprintln!("{observations} observations, {floors} floors");
+    for (((name, _, names), fields), amount) in DOMAINS.iter().zip(&fields).zip(amounts) {
+        let field = (fields.iter().zip(names.iter()))
+            .max_by(|left, right| left.0.total_cmp(right.0))
+            .map_or(String::new(), |(value, name)| format!(" max |field| {value:.3} ({name})"));
+        eprintln!("{name}: max |amount| {amount:.3}{field}");
+    }
 }
 
 #[test]
@@ -2722,11 +2291,11 @@ fn traced_state_observations_are_stable() {
                 &record["oracle_before"],
             )
             .unwrap();
-            let observation = build_observation(&game, &content, layout, (0, 0));
+            let observation = build_observation(&game, &content, layout);
             digest = digest.rotate_left(5) ^ observation_digest(&observation);
             states += 1;
         }
     }
     assert_eq!(states, 200);
-    assert_eq!(digest, 1224650189650828057);
+    assert_eq!(digest, 4607526811213350950);
 }

@@ -1,6 +1,6 @@
 # Observation feature inventory
 
-Source: `src/learning/observation.rs` on main (feature version 59): `populate_domain_features`,
+Source: `src/learning/observation.rs` on main (feature version 59; see section 7 for version 64): `populate_domain_features`,
 the row constructors and `ContinuationBuilder`. Notation: `f[i]` numeric column, `u[i]`/`s[i]`
 unsigned/signed row fields, `÷ n` the scale applied.
 
@@ -155,3 +155,30 @@ suspended phase or attached to an action use those scopes as before; rows belong
 use scope = -3 - item, and the model adds their encoding into that item's sum. Prices stay on continuation
 rows (new variant 8 = shop card price), and the Unsettling Lamp marker moved onto the queued-play row.
 The continuation card layout (f0–f9, f24–f57) and the payload-item IDs above no longer exist.
+
+## 7. Status after unified tokens (feature version 64)
+
+Every row is one `Token {domain, place, parent, link, c, a, f}`: concept codes `c`, one amount per code
+`a`, and the domain's named numeric fields `f` (names and scales declared once in Rust `DOMAINS`, exported by
+`feature_schema`). The encoder is `LayerNorm(Σ E[c] + Σ a·A[c] + Linear(f))`, with one amount embedding `A`
+per concept. Place says where the token sits (deck, hand, enemy, continuation, candidate, …); tokens placed
+as `child` are summed into their parent; edges, the current map node and path candidates use `link`.
+
+- Continuations are split into run-effect, effect, context, option, offer and play domains; queue items
+  head a `continuation` token and their payload is its children.
+- Powers and statuses are one power domain: Bomb, Automation, Panache and Rolling Boulder are power rows
+  with `PowerValue` amounts; nightmare and history-course cards are effect-place cards of the player.
+- Booleans are `Flag` codes; per-effect flags are `EffectFlag(effect, slot)` codes; public event values are
+  amounts on `EventValue(event, slot)` codes (only IDs keep per-event branches).
+- Candidate previews come only from the simulator: every combat candidate carries the expected change up to
+  the next decision (`expected_action_outcome`; EndTurn follows one canonical sample of the hidden draw
+  pile). A Play candidate also carries its card's effects evaluated in the play context, a Potion candidate
+  its potion's effects.
+- Actors carry the intent preview (modified damage and hits).
+- The relic bag is encoded as the relics removed from its starting pool (shared plus character relics);
+  the run token's character tells the model which pool that is.
+- Energy and stars are ÷5 everywhere; run and actor tokens add ln(1 + HP).
+- Targeted Play and Potion candidates link to the enemy's token, whose encoding is added to the candidate.
+- Value ranges (checked by `random_walk_observations_are_well_formed`, |x| ≤ 7): effect amounts are
+  sign·ln(1 + |x|); combat-wide counters are ln(1 + n); actor HP, max HP and block ÷30 are capped at 5
+  (ln(1 + HP) carries larger values); the 255 "any number" count is the `any number` flag.

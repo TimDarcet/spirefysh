@@ -6,11 +6,35 @@ use crate::*;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct ActionOutcome {
-    pub block: Option<f32>,
-    pub draw: Option<f32>,
-    pub discard: Option<f32>,
-    pub exhaust: Option<f32>,
-    pub hp_loss: Option<Vec<f32>>,
+    pub block: f32,
+    pub draw: f32,
+    pub discard: f32,
+    pub exhaust: f32,
+    pub hp_loss: Vec<f32>,
+    pub deaths: Vec<f32>,
+    pub player_hp: f32,
+    pub energy: f32,
+    pub stars: f32,
+}
+
+impl ActionOutcome {
+    fn add(&mut self, other: &ActionOutcome, weight: f32) {
+        for (left, right) in [
+            (&mut self.block, other.block),
+            (&mut self.draw, other.draw),
+            (&mut self.discard, other.discard),
+            (&mut self.exhaust, other.exhaust),
+            (&mut self.player_hp, other.player_hp),
+            (&mut self.energy, other.energy),
+            (&mut self.stars, other.stars),
+        ] {
+            *left += right * weight;
+        }
+        for (left, right) in [(&mut self.hp_loss, &other.hp_loss), (&mut self.deaths, &other.deaths)] {
+            left.resize(right.len(), 0.0);
+            left.iter_mut().zip(right).for_each(|(left, right)| *left += right * weight);
+        }
+    }
 }
 
 const MAX_EXPECTATION_BRANCHES: usize = 64;

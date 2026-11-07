@@ -16,20 +16,22 @@ from torch import nn
 
 import sts2_sim
 
-FEATURE_VERSION, MODEL_VERSION, CATEGORIES, MAX_PROGRESS, ACTION_FIELDS, TOKEN_SPECS, \
-    SEMANTIC_NAMES, POSITION_CAPS, PAELS_TOOTH = sts2_sim.model_schema()
-ACTION_FIELDS = tuple(ACTION_FIELDS)
-TOKEN_SPECS = tuple(tuple(row) for row in TOKEN_SPECS)
+FEATURE_VERSION, MODEL_VERSION, CATEGORIES, MAX_PROGRESS, DOMAINS, PLACES, SEMANTIC_NAMES, \
+    POSITION_CAPS = sts2_sim.model_schema()
+DOMAINS = tuple(tuple(row) for row in DOMAINS)
+DOMAIN = {name: index for index, (name, *_shape) in enumerate(DOMAINS)}
+PLACES = tuple(PLACES)
+PLACE = {name: index for index, name in enumerate(PLACES)}
 SEMANTIC_NAMES = tuple(SEMANTIC_NAMES)
 POSITION_CAPS = dict(POSITION_CAPS)
+RAW_DOMAINS = ("potion", "move", "map_edge")
+COLLECTIONS = ("deck", "hand", "draw", "discard", "exhaust", "relic", "potion", "orb")
 DEFAULT_ARCHITECTURE = (128, 4, 8, 384)
-MAP_NODE_KINDS = 26
 PRECISIONS = ("fp32", "bf16")
 TRAINING_PRECISIONS = (*PRECISIONS, "bf16_with_fp32_dV")
 WINNING_CAPACITY = 0
-CHANGE = "Drop absorbed token roles; biased Linear per pool summary; continuation, nightmare and history-course cards as card rows; enemy properties as actor features; one Boolean code per flag; no IDs as numbers; unknown-elite weight ÷10 000."
-POOLS = ("relic_pool", "encounter_pool", "event_pool")
-STATUS_CARD_ZONES = (6, 7)
+CHANGE = "Unified tokens (concept codes with per-concept amount embeddings, parent/link structure); simulator action previews and intent damage; ln(1+HP); energy ÷5; powers and statuses unified."
+POOLS = ("removed_relic", "encounter_pool", "event_pool")
 COLLECTION_POOLING = ("sum", "transformer", "global_tokens")
 EFFECT_POOLING = (
     "sum_into_actor", "transformer_into_actor", "sum_token", "transformer_token",
@@ -898,19 +900,6 @@ kernel void semantic_backward_embedding(
     }
 }
 
-kernel void embedding_add(
-    device const float *values, device const int *semantic, device const float *embedding,
-    device float *output, constant uint& fields, constant uint& width,
-    uint index [[thread_position_in_grid]]) {
-    uint row = index / width, column = index % width;
-    float value = values[index];
-    for (uint field = 0; field < fields; ++field) {
-        int id = semantic[row * fields + field];
-        if (id) value += embedding[id * width + column];
-    }
-    output[index] = value;
-}
-
 kernel void group_sum_forward(
     device const float *input, device const long *group, device atomic_float *output,
     constant uint& width, uint index [[thread_position_in_grid]]) {
@@ -945,46 +934,6 @@ kernel void indexed_group_sum_backward(
     atomic_fetch_add_explicit(
         grad_input + source[item] * width + column,
         grad_output[group[item] * width + column], memory_order_relaxed
-    );
-}
-
-kernel void indexed_scatter_add(
-    device const float *input, device const long *source, device const long *target,
-    device atomic_float *output, constant uint& offset, constant uint& width,
-    uint index [[thread_position_in_grid]]) {
-    uint item = index / width, column = index % width;
-    atomic_fetch_add_explicit(
-        output + target[offset + item] * width + column,
-        input[source[item] * width + column], memory_order_relaxed
-    );
-}
-
-kernel void indexed_scatter_backward(
-    device const float *grad_output, device const long *source, device const long *target,
-    device atomic_float *grad_input, constant uint& offset, constant uint& width,
-    uint index [[thread_position_in_grid]]) {
-    uint item = index / width, column = index % width;
-    atomic_fetch_add_explicit(
-        grad_input + source[item] * width + column,
-        grad_output[target[offset + item] * width + column], memory_order_relaxed
-    );
-}
-
-kernel void action_nodes_forward(
-    device const float *nodes, device const long *path, device float *output,
-    constant uint& width, uint index [[thread_position_in_grid]]) {
-    uint action = index / width;
-    if (path[action] >= 0)
-        output[index] += nodes[path[action] * width + index % width];
-}
-
-kernel void action_nodes_backward(
-    device const float *grad_output, device const long *path, device atomic_float *grad_nodes,
-    constant uint& width, uint index [[thread_position_in_grid]]) {
-    uint action = index / width;
-    if (path[action] >= 0) atomic_fetch_add_explicit(
-        grad_nodes + path[action] * width + index % width,
-        grad_output[index], memory_order_relaxed
     );
 }
 
@@ -1859,27 +1808,28 @@ class _FusedDomains(torch.autograd.Function):
         if _RaggedAttention.library is None:
             _RaggedAttention.library = torch.mps.compile_shader(_TRAINING_METAL)
         outputs, saved = [], [embedding]
-        for categorical, numeric, weight, gamma, beta in zip(*[iter(arguments)] * 5):
+        for categorical, numeric, weight, extra, gamma, beta in zip(*[iter(arguments)] * 6):
             if not len(categorical):
                 outputs.append(gamma.new_empty((0, len(gamma))))
                 saved.extend((categorical, numeric, weight, gamma,
                               gamma.new_empty((0, len(gamma))), gamma.new_empty((0, 2))))
                 continue
             numeric_input = numeric.to(torch.bfloat16)
-            numeric = nn.functional.linear(numeric_input, weight.to(torch.bfloat16)) \
-                if weight.numel() else embedding.new_zeros((len(numeric), len(gamma)))
+            numeric = nn.functional.linear(numeric_input, weight.to(torch.bfloat16)) + extra \
+                if weight.numel() else extra.to(embedding.dtype)
             rows, fields = categorical.shape
             input = embedding.new_empty((rows, len(gamma)))
             output = torch.empty_like(input)
             stats = embedding.new_empty((rows, 2))
             _RaggedAttention.library.semantic_forward_bfloat(
-                categorical, numeric, embedding, gamma, beta, input, output, stats,
+                categorical, numeric.contiguous(), embedding, gamma, beta, input, output, stats,
                 rows, fields, len(gamma), threads=rows * 32, group_size=32,
             )
             outputs.append(output)
             saved.extend((categorical, numeric_input, weight.to(torch.bfloat16), gamma,
                           input, stats))
         ctx.save_for_backward(*saved)
+        ctx.extra_dtypes = [extra.dtype for extra in arguments[3::6]]
         return tuple(outputs)
 
     @staticmethod
@@ -1887,10 +1837,10 @@ class _FusedDomains(torch.autograd.Function):
         embedding, *saved = ctx.saved_tensors
         grad_embedding = torch.zeros_like(embedding)
         gradients = [grad_embedding]
-        for grad_output, values in zip(grad_outputs, zip(*[iter(saved)] * 6)):
+        for grad_output, values, extra_dtype in zip(grad_outputs, zip(*[iter(saved)] * 6), ctx.extra_dtypes):
             semantic, numeric_input, weight, gamma, input, stats = values
             if not len(semantic):
-                gradients.extend((None, None, torch.zeros_like(weight),
+                gradients.extend((None, None, torch.zeros_like(weight), None,
                                   torch.zeros_like(gamma), torch.zeros_like(gamma)))
                 continue
             grad_output = grad_output.contiguous()
@@ -1918,34 +1868,9 @@ class _FusedDomains(torch.autograd.Function):
             grad_weight = torch.ops.aten.linear_backward(
                 numeric_input, grad_input.to(torch.bfloat16), weight, [False, True, False],
             )[1] if weight.numel() else torch.zeros_like(weight)
-            gradients.extend((None, None, grad_weight.float(), grad_gamma, grad_beta))
+            gradients.extend((None, None, grad_weight.float(), grad_input.to(extra_dtype),
+                              grad_gamma, grad_beta))
         return tuple(gradients)
-
-
-@_committed
-class _EmbeddingAdd(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, values, semantic, embedding):
-        if _RaggedAttention.library is None:
-            _RaggedAttention.library = torch.mps.compile_shader(_TRAINING_METAL)
-        output = torch.empty_like(values)
-        _RaggedAttention.library.embedding_add(
-            values, semantic, embedding, output, semantic.shape[1], values.shape[1],
-            threads=values.numel(), group_size=256,
-        )
-        ctx.save_for_backward(semantic, embedding)
-        return output
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        semantic, embedding = ctx.saved_tensors
-        grad_output = grad_output.contiguous()
-        grad_embedding = torch.zeros_like(embedding)
-        _RaggedAttention.library.semantic_backward_embedding(
-            semantic, grad_output, grad_embedding, len(semantic), semantic.shape[1],
-            embedding.shape[1], threads=grad_output.numel(), group_size=256,
-        )
-        return grad_output, None, grad_embedding
 
 
 class _Assemble(torch.autograd.Function):
@@ -2023,50 +1948,6 @@ class _IndexedGroupSum(torch.autograd.Function):
         return grad_input, None, None, None
 
 
-@_committed
-class _ActionAttachments(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, nodes, path, target, *arguments):
-        if _RaggedAttention.library is None:
-            _RaggedAttention.library = torch.mps.compile_shader(_TRAINING_METAL)
-        output = nodes.new_zeros((len(path), nodes.shape[1]))
-        offset = 0
-        for values, source in zip(*[iter(arguments)] * 2):
-            _RaggedAttention.library.indexed_scatter_add(
-                values, source, target, output, offset, nodes.shape[1],
-                threads=len(source) * nodes.shape[1], group_size=256,
-            )
-            offset += len(source)
-        _RaggedAttention.library.action_nodes_forward(
-            nodes, path, output, nodes.shape[1], threads=output.numel(), group_size=256,
-        )
-        ctx.save_for_backward(path, target, *arguments[1::2])
-        ctx.node_shape = nodes.shape
-        ctx.value_shapes = [values.shape for values in arguments[::2]]
-        return output
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        path, target, *sources = ctx.saved_tensors
-        width = grad_output.shape[1]
-        grad_nodes = grad_output.new_zeros(ctx.node_shape)
-        _RaggedAttention.library.action_nodes_backward(
-            grad_output.contiguous(), path, grad_nodes, width,
-            threads=grad_output.numel(), group_size=256,
-        )
-        gradients, offset = [grad_nodes, None, None], 0
-        for source, shape in zip(sources, ctx.value_shapes):
-            grad_values = grad_output.new_zeros(shape)
-            _RaggedAttention.library.indexed_scatter_backward(
-                grad_output, source, target, grad_values, offset, width,
-                threads=len(source) * width, group_size=256,
-            )
-            gradients.extend((grad_values, None))
-            offset += len(source)
-        return tuple(gradients)
-
-
-
 def device():
     global _ACCELERATOR_LOCK
     if torch.backends.mps.is_available():
@@ -2095,24 +1976,25 @@ def release_accelerator():
         _ACCELERATOR_LOCK = None
 
 
-DOMAIN = {name: index for index, (name, *_shape) in enumerate(TOKEN_SPECS)}
-
-
 class ConceptEmbeddings(nn.Module):
     def __init__(self, layout, width):
         super().__init__()
-        self.starts = tuple(layout[name + "_semantic_start"] for name in SEMANTIC_NAMES)
         self.sizes = tuple(layout[name + "_semantic_count"] for name in SEMANTIC_NAMES)
         self.tables = nn.ModuleList(nn.Embedding(size + 1, width, padding_idx=0)
                                     for size in self.sizes)
+        self.amounts = nn.ModuleList(nn.Embedding(size + 1, width, padding_idx=0)
+                                     for size in self.sizes)
         self.num_embeddings = layout["concept_vocab"]
 
     def forward(self, codes):
         return nn.functional.embedding(codes, self.flattened())
 
-    def flattened(self):
-        return torch.cat((self.tables[0].weight[:1] * 0,
-                          *(table.weight[1:] for table in self.tables)))
+    def flattened(self, tables=None):
+        tables = self.tables if tables is None else tables
+        return torch.cat((tables[0].weight[:1] * 0, *(table.weight[1:] for table in tables)))
+
+    def amounts_flattened(self):
+        return self.flattened(self.amounts)
 
     def code(self, name, index):
         table = SEMANTIC_NAMES.index(name)
@@ -2122,23 +2004,29 @@ class ConceptEmbeddings(nn.Module):
         return graph_name(self.tables[SEMANTIC_NAMES.index(name)].weight[index + 1], name)
 
 
+def amount_sum(codes, amounts, table):
+    # Each code's amount times that concept's amount embedding, summed per row.
+    rows, slots = amounts.nonzero(as_tuple=True)
+    values = amounts[rows, slots, None].float() * table[codes[rows, slots].long()].float()
+    return values.new_zeros((len(codes), table.shape[1])).index_add_(0, rows, values)
+
+
 class TokenEncoder(nn.Module):
-    def __init__(self, _categorical, numeric, width):
+    def __init__(self, fields, width):
         super().__init__()
-        self.numeric = nn.Linear(numeric, width, bias=False) if numeric else None
+        self.numeric = nn.Linear(fields, width, bias=False) if fields else None
         self.norm = nn.LayerNorm(width)
 
-    def forward(self, categorical, numeric, embeddings):
-        if not len(categorical):
+    def forward(self, codes, amounts, fields, embeddings, amount_table):
+        if not len(codes):
             return self.norm.weight.new_empty((0, len(self.norm.weight)))
-        numeric = self.numeric(numeric) if self.numeric is not None else \
-            self.norm.weight.new_zeros((len(categorical), len(self.norm.weight)))
-        if (categorical.device.type == "mps" and numeric.dtype == torch.bfloat16
+        numeric = self.numeric(fields) if self.numeric is not None else \
+            self.norm.weight.new_zeros((len(codes), len(self.norm.weight)))
+        numeric = numeric + amount_sum(codes, amounts, amount_table).to(numeric.dtype)
+        if (codes.device.type == "mps" and numeric.dtype == torch.bfloat16
                 and len(self.norm.weight) % 32 == 0 and len(self.norm.weight) <= 128):
-            return _FusedSemantic.apply(
-                categorical, numeric, embeddings, self.norm.weight, self.norm.bias,
-            )
-        return self.norm(nn.functional.embedding(categorical.long(), embeddings).sum(1) + numeric)
+            return _FusedSemantic.apply(codes, numeric, embeddings, self.norm.weight, self.norm.bias)
+        return self.norm(nn.functional.embedding(codes.long(), embeddings).sum(1) + numeric)
 
 
 class Agent(nn.Module):
@@ -2149,14 +2037,11 @@ class Agent(nn.Module):
         self.layout = dict(layout)
         if self.layout["version"] != FEATURE_VERSION:
             raise ValueError("incompatible observation layout")
-        expected = {name + suffix: value for name, unsigned, signed, semantic, numeric in TOKEN_SPECS
-                    for suffix, value in (("_u", unsigned), ("_s", signed),
-                                          ("_c", semantic), ("_f", numeric))}
-        expected |= {"domain_count": len(TOKEN_SPECS), "action_u": ACTION_FIELDS[0],
-                     "action_s": ACTION_FIELDS[1], "action_c": ACTION_FIELDS[2],
-                     "action_f": ACTION_FIELDS[3], "globals": RUN_FEATURES, "model_width": width,
-                     "model_layers": layers, "model_heads": heads,
-                     "model_feedforward": feedforward, "action_width": width}
+        expected = {name + suffix: value for name, codes, fields in DOMAINS
+                    for suffix, value in (("_c", codes), ("_f", fields))}
+        expected |= {"domain_count": len(DOMAINS), "place_count": len(PLACES),
+                     "globals": RUN_FEATURES, "model_width": width, "model_layers": layers,
+                     "model_heads": heads, "model_feedforward": feedforward}
         if any(self.layout.get(key) != value for key, value in expected.items()):
             raise ValueError("incompatible observation schema")
         if min(width, layers, heads, feedforward) <= 0 or width % heads \
@@ -2168,12 +2053,10 @@ class Agent(nn.Module):
         self.head_width = width
         self.state_width = width
         head = potential_head(potential_weights or (0.,) * len(POTENTIAL_TERMS), potential_mode)
-        self.card_zones = 5
-        self.entity_collections = 0
         if pooling and set(pooling) - POOLING_DEFAULTS.keys():
             raise ValueError("invalid pooling configuration")
         self.pooling = POOLING_DEFAULTS | (pooling or {})
-        for name in ("relic", "deck", "draw", "exhaust", "discard", "hand", "orb", "potion"):
+        for name in COLLECTIONS:
             if self.pooling[name] not in COLLECTION_POOLING:
                 raise ValueError(f"invalid {name} pooling")
         for name in ("enemy_effect", "friendly_effect"):
@@ -2183,15 +2066,12 @@ class Agent(nn.Module):
             raise ValueError("invalid continuation pooling")
         self.concepts = ConceptEmbeddings(self.layout, width)
         self.encoders = nn.ModuleDict({
-            name: TokenEncoder(semantic, numeric, width)
-            for name, _unsigned, _signed, semantic, numeric in TOKEN_SPECS
-            if name not in ("potion", "map_edge")
+            name: TokenEncoder(fields, width)
+            for name, _codes, fields in DOMAINS if name not in RAW_DOMAINS
         })
-        self.action_encoder = TokenEncoder(ACTION_FIELDS[2], ACTION_FIELDS[3], width)
         summary_names = tuple(POOLING_DEFAULTS)
         self.summary_seed = nn.ParameterDict({name: nn.Parameter(torch.randn(width) * .02)
                                               for name in summary_names})
-        self.map_nodes = nn.Embedding(MAP_NODE_KINDS, width)
         self.pool_projections = nn.ModuleDict({name: nn.Linear(width, width) for name in POOLS})
 
         def transformer(layer_count=1):
@@ -2211,7 +2091,6 @@ class Agent(nn.Module):
             if self.pooling["continuation"] == "gru" else None
         self.actor_norm = nn.LayerNorm(width)
         self.action_norm = nn.LayerNorm(width)
-        self.pael_cards = nn.Linear(width, width, bias=False)
         self.global_transformer = transformer(layers)
         self.global_norm = nn.LayerNorm(width)
 
@@ -2282,7 +2161,7 @@ class Agent(nn.Module):
         return torch.where(legal, value, torch.zeros_like(value))
 
     def encode_map(self, encoded, index):
-        node_source, edge_source, levels, offsets, current, current_inverse, keys, rows, sizes, parents = index
+        node_source, levels, offsets, current, current_inverse, keys, rows, sizes, parents = index
         cacheable = not self.training and not self._trace_graph and node_source.device.type == "cpu"
         cached = [self._graph_cache.get(key) for key in keys] if cacheable else [None] * len(keys)
         if cacheable and all(x is not None for x in cached):
@@ -2292,7 +2171,7 @@ class Agent(nn.Module):
             if cacheable:
                 self.cache_stats["graph_hit"] += sum(x is not None for x in cached)
                 self.cache_stats["graph_miss"] += sum(x is None for x in cached)
-            nodes = encoded[DOMAIN["map_node"]][node_source]
+            nodes = encoded[node_source]
             if cacheable:
                 ranges = offsets.tolist()
                 for graph, value in enumerate(cached):
@@ -2322,106 +2201,51 @@ class Agent(nn.Module):
                     self._graph_cache.pop(next(iter(self._graph_cache)))
         return nodes[current][current_inverse], nodes
 
-    def encode_domains(self, domains, concepts):
-        for (name, *_), values in zip(TOKEN_SPECS, domains):
+    def encode_features(self, features, concepts, amounts):
+        # One encoding per unique feature row, all domains concatenated (token gid order).
+        for (name, *_), values in zip(DOMAINS, features):
             graph_name(values[0], name + " categorical IDs")
-            graph_name(values[1], name + " numeric features")
-        learned = [
-            (index, name, values)
-            for index, ((name, *_), values) in enumerate(zip(TOKEN_SPECS, domains))
-            if name in self.encoders and name not in ("map_node", "phase")
-        ]
+            graph_name(values[1], name + " amounts")
+            graph_name(values[2], name + " numeric features")
+        learned = [(index, name, values) for index, ((name, *_), values) in enumerate(zip(DOMAINS, features))
+                   if name in self.encoders]
         if (concepts.device.type == "mps" and torch.is_autocast_enabled("mps")
                 and self.width == 128):
             arguments = tuple(
                 value
-                for _index, name, values in learned
+                for _index, name, (codes, values, fields) in learned
                 for value in (
-                    *values[:2],
+                    codes, fields,
                     self.encoders[name].numeric.weight
                     if self.encoders[name].numeric is not None
                     else concepts.new_empty((self.width, 0)),
+                    amount_sum(codes, values, amounts).to(torch.bfloat16),
                     self.encoders[name].norm.weight,
                     self.encoders[name].norm.bias,
                 )
             )
             outputs = _FusedDomains.apply(concepts, *arguments)
         else:
-            outputs = tuple(self.encoders[name](*values[:2], concepts)[:values[2]]
+            outputs = tuple(self.encoders[name](*values, concepts, amounts)
                             for _index, name, values in learned)
-        encoded = [None] * len(domains)
-        for output, (index, _name, values) in zip(outputs, learned):
-            encoded[index] = output[:values[2]]
-        phase = domains[DOMAIN["phase"]]
-        projection = concepts[phase[0].long()].sum(1)
-        if self.encoders["phase"].numeric is not None:
-            projection = projection + self.encoders["phase"].numeric(phase[1].float())
-        encoded[DOMAIN["phase"]] = _layer_norm(projection[:phase[2]], self.encoders["phase"].norm)
-        potion = domains[DOMAIN["potion"]]
-        encoded[DOMAIN["potion"]] = concepts[potion[0][:potion[2], 0].long()]
-        node = domains[DOMAIN["map_node"]]
-        node_semantic = concepts[node[0][:node[2]].long()].sum(1)
-        encoded[DOMAIN["map_node"]] = _layer_norm(
-            node_semantic + self.map_nodes.weight[graph_name(node[10][:node[2], 0], "map_node kinds")],
-            self.encoders["map_node"].norm,
-        )
-        encoded[DOMAIN["map_edge"]] = concepts.new_empty((0, self.width))
-        return tuple(graph_name(value, name + " encoding")
-                     for (name, *_), value in zip(TOKEN_SPECS, encoded)), projection
+        encoded = [None] * len(DOMAINS)
+        for output, (index, name, _values) in zip(outputs, learned):
+            encoded[index] = graph_name(output, name + " encoding")
+        for name in RAW_DOMAINS:
+            codes = features[DOMAIN[name]][0]
+            encoded[DOMAIN[name]] = concepts.new_zeros((len(codes), self.width)) \
+                if name == "map_edge" else concepts[codes[:, 0].long()]
+        dtype = outputs[0].dtype if outputs else concepts.dtype
+        return graph_name(torch.cat([value.to(dtype) for value in encoded]), "token encodings")
 
     def _tag(self, values, collection):
         return values + self.concepts.local("collection", collection).to(values.dtype)
 
-    def _context(self, values, concepts, *lookups):
-        # Adds concept rows for (present, name, index) lookups; index 0 of the flat table is zero.
-        semantic = torch.stack([
-            torch.where(present, self.concepts.code(name, index), 0) for present, name, index in lookups
-        ], 1).int()
-        if values.device.type == "mps" and values.dtype == torch.float32:
-            return _EmbeddingAdd.apply(values, semantic, concepts)
-        return values + concepts[semantic].sum(1)
-
-    def _card_context(self, values, metadata, concepts):
-        if not len(values):
-            return values
-        zone, order_kind, order, origin = metadata[:len(values)].T
-        if values.device.type == "mps":
-            return self._context(values, concepts, *(
-                ((zone == 2) & (order_kind == kind) & (order > 0), name, (order - 1).clamp(max=256))
-                for kind, name in ((1, "draw_top_position"), (2, "draw_bottom_position"))
-            ), (origin > 0, "deck_origin", (origin - 1).clamp(max=256)))
-        for kind, name in ((1, "draw_top_position"), (2, "draw_bottom_position")):
-            present = (zone == 2) & (order_kind == kind) & (order > 0)
-            values = values + present[:, None] * self.concepts.local(
-                name, (order - 1).clamp(max=256),
-            ).to(values.dtype)
-        present = origin > 0
-        return values + present[:, None] * self.concepts.local(
-            "deck_origin", (origin - 1).clamp(max=256),
-        ).to(values.dtype)
-
-    def _relic_context(self, values, metadata, concepts):
-        if not len(values):
-            return values
-        position = metadata[:len(values), 0]
-        if values.device.type == "mps":
-            return self._context(values, concepts, (position > 0, "relic_position", (position - 1).clamp(max=256)))
-        return values + (position > 0)[:, None] * self.concepts.local(
-            "relic_position", (position - 1).clamp(max=256),
-        ).to(values.dtype)
-
     @staticmethod
-    def _domain_rows(domains, encoded, domain, predicate=None, scope_value=-1, source=None):
-        _semantic, _numeric, _count, u, row, _scope, inverse, root, phase, _action, *_ = \
-            domains[domain]
-        source = (root if scope_value == -1 else phase) if source is None else source
-        if predicate is not None:
-            source = source[predicate(u[source])]
-        return encoded[domain][inverse[source]], row[source], u[source]
-
-    def _phases(self, domains, projection):
-        *_, metadata, rows, _scope, inverse, root = domains[DOMAIN["phase"]][:8]
-        return projection[inverse[root]], rows[root], metadata[root]
+    def _values(encoded, children, group):
+        # Token encodings plus everything summed into them (slot 0: nothing).
+        gid, slot, *_ = group
+        return encoded[gid] + children[slot].to(encoded.dtype)
 
     def _sequence(self, values, group, groups, seed, transformer, selected=None, layout=None):
         # values may be a list of parts, in row order of group.
@@ -2586,52 +2410,32 @@ class Agent(nn.Module):
                                   name, mode)
         return self._tag(summary[active], collection), active
 
-    def _actors(self, domains, encoded, batch, concepts, plan):
-        order, player_source, player_group, move_raw, move_order, move_packed_order, \
-            move_present, move_batch_sizes, move_terminal, effect_plans, families = plan
-        actors, rows, u = self._domain_rows(domains, encoded, DOMAIN["actor"])
+    def _actors(self, encoded, children, concepts, plan):
+        actor_group, move_codes, move_order, move_packed_order, move_present, move_batch_sizes, \
+            move_terminal, effect_group, families = plan
+        rows = actor_group[2]
+        actors = self._values(encoded, children, actor_group)
         if not len(actors):
-            return actors, rows, u, [], []
-        actors, rows, u = actors[order], rows[order], u[order]
-
-        history, _history_rows, _history_u = self._domain_rows(
-            domains, encoded, DOMAIN["history"],
-        )
-        if len(history):
-            if len(player_source):
-                actors = actors.index_put(
-                    (player_group,), history[player_source].to(actors.dtype), accumulate=True,
-                )
-            if len(move_raw):
-                history_semantic, _numeric, _count, _u, _row, _scope, history_inverse, *_ = \
-                    domains[DOMAIN["history"]]
-                move_values = concepts[history_semantic[history_inverse[move_raw], 0].long()]
-                move_values = move_values[move_order][move_packed_order] \
-                    if move_terminal is None else move_values
-                if move_values.device.type == "mps" and torch.is_autocast_enabled("mps"):
-                    output = self._packed_gru(
-                        move_values, move_batch_sizes, self.move_gru,
-                        None if move_terminal is None else move_packed_order,
-                    )[None]
-                    if move_terminal is not None:
-                        output = output[:, move_terminal]
-                else:
-                    packed = nn.utils.rnn.PackedSequence(
-                        move_values, torch.tensor(move_batch_sizes),
-                    )
-                    _, output = self.move_gru(packed)
-                move = move_values.new_zeros((len(actors), self.width)).index_put(
-                    (move_present,), output[0],
-                )
-                actors = actors + move
-
-        effect_values = []
-        for domain, source in zip(
-            (DOMAIN["power"], DOMAIN["status"], DOMAIN["card"]), effect_plans,
-        ):
-            values, _effect_rows, _effect_u = self._domain_rows(domains, encoded, domain)
-            effect_values.append(values[source])
-        effects = torch.cat(effect_values) if effect_values else actors.new_empty((0, self.width))
+            return actors, rows, [], []
+        if len(move_codes):
+            move_values = concepts[move_codes]
+            move_values = move_values[move_order][move_packed_order] \
+                if move_terminal is None else move_values
+            if move_values.device.type == "mps" and torch.is_autocast_enabled("mps"):
+                output = self._packed_gru(
+                    move_values, move_batch_sizes, self.move_gru,
+                    None if move_terminal is None else move_packed_order,
+                )[None]
+                if move_terminal is not None:
+                    output = output[:, move_terminal]
+            else:
+                packed = nn.utils.rnn.PackedSequence(move_values, torch.tensor(move_batch_sizes))
+                _, output = self.move_gru(packed)
+            move = move_values.new_zeros((len(actors), self.width)).index_put(
+                (move_present,), output[0],
+            )
+            actors = actors + move
+        effects = self._values(encoded, children, effect_group)
         extra_values, extra_rows = [], []
         for name, (actor_index, effect_source, effect_actor, local_group) in zip(
             ("friendly_effect", "enemy_effect"), families,
@@ -2652,59 +2456,7 @@ class Agent(nn.Module):
                 extra_values.append(self._tag(summary, 8 + (name == "enemy_effect")))
                 extra_rows.append(rows[actor_index])
         actors = _layer_norm(actors, self.actor_norm)
-        return actors, rows, u, extra_values, extra_rows
-
-    def _actions(self, domains, encoded, values, index, nodes, concepts):
-        semantic, numeric = values
-        action_row, action_flat, _legal, policy_sequence, actions, path, action_count, \
-            attachment_rows, *_ = index
-        action = self.action_encoder(
-            graph_name(semantic, "action categorical IDs"),
-            graph_name(numeric, "action numeric features").float(), concepts.float(),
-        )[:action_count]
-        if action.device.type == "mps":
-            arguments = []
-            for domain, row in enumerate(domains):
-                if not len(row[9]):
-                    continue
-                attached_values = encoded[domain]
-                if domain == DOMAIN["card"]:
-                    attached_values = self._card_context(attached_values, row[10], concepts)
-                arguments.extend((attached_values, row[6][row[9]]))
-            attached = _ActionAttachments.apply(
-                nodes, path[:action_count], attachment_rows, *tuple(arguments),
-            )
-        else:
-            attached = action.new_zeros(action.shape)
-            values = []
-            for domain, row in enumerate(domains):
-                if not len(row[9]):
-                    continue
-                item = encoded[domain][row[6][row[9]]]
-                if domain == DOMAIN["card"]:
-                    item = self._card_context(item, row[3][row[9]], concepts)
-                values.append(item)
-            if values:
-                attached.index_add_(0, attachment_rows, torch.cat(values).to(attached.dtype))
-            present = path[:action_count] >= 0
-            if present.any():
-                attached[present] += nodes[path[:action_count][present]]
-        action = _layer_norm(action + attached, self.action_norm)
-        return action, action_row[:action_count], action_flat[:action_count], actions, policy_sequence
-
-    def _continuations(self, domains, encoded, plan, concepts):
-        values, rows, u = self._domain_rows(domains, encoded, DOMAIN["continuation"])
-        if not len(values):
-            return values, rows, plan[3:-1]
-        order, group, item_rows, groups, *_ = plan
-        items = values.new_zeros((groups, self.width))
-        items.index_put_((group,), values[order], accumulate=True)
-        for domain, source, item in plan[-1]:
-            linked = encoded[domain][domains[domain][6][source]]
-            if domain == DOMAIN["card"]:
-                linked = self._card_context(linked, domains[domain][3][source], concepts)
-            items.index_put_((item,), linked.to(items.dtype), accumulate=True)
-        return items, item_rows, plan[3:-1]
+        return actors, rows, extra_values, extra_rows
 
     def _packed_gru(self, values, batch_sizes, gru, parents=None):
         gates = _FastLinear.apply(values, gru.weight_ih_l0, gru.bias_ih_l0).split(batch_sizes)
@@ -2724,99 +2476,57 @@ class Agent(nn.Module):
             state = torch.cat((current, state[size:])) if size < len(state) else current
         return state
 
-    def encode_state(self, domains, encoded, phase_projection, index, action_values,
-                     action_index, concepts, batch):
-        filters, actor_plan, continuation_plan, global_layout = action_index[8:]
-        current, nodes = self.encode_map(encoded, index)
-        action, action_rows, action_flat, actions, policy_sequence = self._actions(
-            domains, encoded, action_values, action_index, nodes, concepts,
+    def encode_state(self, encoded, plan, map_index, action_index, concepts, batch):
+        children = encoded.new_zeros((plan["receivers"], self.width), dtype=torch.float32).index_add_(
+            0, plan["child_slot"], encoded[plan["child_gid"]].float(),
         )
+        current, nodes = self.encode_map(encoded, map_index)
+        action_row, action_flat, _legal, policy_sequence, actions, path_rows, path_nodes, \
+            action_group, global_layout, target_rows, target_group = action_index
+        action = self._values(encoded, children, action_group)
+        action = action.index_add(0, path_rows, nodes[path_nodes].to(action.dtype))
+        action = action.index_add(0, target_rows, self._values(encoded, children, target_group))
+        action = _layer_norm(action, self.action_norm)
         values, rows = [], []
         segments = getattr(self, "_explanation_segments", None)
+        everywhere = torch.arange(batch, device=encoded.device)
+
         def add(value, row, name):
             values.append(graph_name(value, name)); rows.append(row)
             if segments is not None:
                 segments.append((name, len(value)))
 
-        run, run_rows, _ = self._domain_rows(domains, encoded, DOMAIN["run"])
-        seed = graph_name(run.new_zeros((batch, self.width)).index_put((run_rows,), run), "run")
-        phase, phase_rows, phase_u = self._phases(domains, phase_projection)
-        payload = phase.new_zeros((batch, self.width))
-        for domain in range(len(TOKEN_SPECS)):
-            item, item_rows, _ = self._domain_rows(
-                domains, encoded, domain, scope_value=-2,
-            )
-            if len(item):
-                payload.index_put_((item_rows,), item.to(payload.dtype), accumulate=True)
-        suspended = phase_u[:, 0] != 0
-        phase = phase + suspended[:, None] * payload[phase_rows].to(phase.dtype)
-        add(_layer_norm(phase, self.encoders["phase"].norm), phase_rows, "phase")
-        add(current + self.concepts.local("token_role", 0).to(current.dtype),
-            torch.arange(batch, device=current.device), "map")
-
-        pool_domains = DOMAIN["relic"], DOMAIN["encounter"], DOMAIN["event"]
-        for name, domain, (source, pooled) in zip(POOLS, pool_domains, filters):
-            if encoded[domain].device.type == "mps":
-                pooled_source, item_rows, inverse, groups = pooled
-                summary = _IndexedGroupSum.apply(
-                    encoded[domain], domains[domain][6][pooled_source], item_rows, groups,
-                )[inverse]
+        run = self._values(encoded, children, plan["run"])
+        seed = graph_name(run.new_zeros((batch, self.width)).index_put((plan["run"][2],), run), "run")
+        add(self._values(encoded, children, plan["phase"]), plan["phase"][2], "phase")
+        add(current + self.concepts.local("token_role", 0).to(current.dtype), everywhere, "map")
+        for name, (source, pooled) in zip(POOLS, plan["pools"]):
+            if encoded.device.type == "mps":
+                pooled_gid, item_rows, inverse, groups = pooled
+                summary = _IndexedGroupSum.apply(encoded, pooled_gid, item_rows, groups)[inverse]
             else:
-                item, item_rows, _ = self._domain_rows(
-                    domains, encoded, domain, source=source,
-                )
-                summary = self._summarize(
-                    item, item_rows, batch, name, "sum",
-                )
-            add(_linear(summary, self.pool_projections[name]),
-                torch.arange(batch, device=summary.device), name)
-
-        actors, actor_rows, actor_u, effect_values, effect_rows = self._actors(
-            domains, encoded, batch, concepts, actor_plan,
+                summary = self._summarize(encoded[source[0]], source[2], batch, name, "sum")
+            add(_linear(summary, self.pool_projections[name]), everywhere, name)
+        actors, actor_rows, effect_values, effect_rows = self._actors(
+            encoded, children, concepts, plan["actors"],
         )
-        combat_rows = actor_rows[actor_u[:, 0] == 0]
-        for name, domain, filtered, active in (
-            ("deck", DOMAIN["card"], 3, torch.arange(batch, device=run.device)),
-            ("hand", DOMAIN["card"], 4, combat_rows),
-            ("draw", DOMAIN["card"], 5, combat_rows),
-            ("discard", DOMAIN["card"], 6, combat_rows),
-            ("exhaust", DOMAIN["card"], 7, combat_rows),
-            ("relic", DOMAIN["relic"], 8, torch.arange(batch, device=run.device)),
-            ("potion", DOMAIN["potion"], 9, torch.arange(batch, device=run.device)),
-            ("orb", DOMAIN["orb"], None, combat_rows),
-        ):
-            item, item_rows, item_u = self._domain_rows(
-                domains, encoded, domain,
-                source=None if filtered is None else filters[filtered],
+        for name in COLLECTIONS:
+            group = plan[name]
+            item, item_rows = self._collection(
+                self._values(encoded, children, group), group[2], group[3], name,
             )
-            if domain == DOMAIN["card"]:
-                item = self._card_context(item, item_u, concepts)
-            if name == "relic" and len(item):
-                item = self._relic_context(item, item_u, concepts)
-                stored, stored_rows, _ = self._domain_rows(
-                    domains, encoded, DOMAIN["card"], source=filters[10],
-                )
-                payload = item.new_zeros((batch, self.width))
-                if len(stored):
-                    payload.index_put_((stored_rows,), stored.to(payload.dtype), accumulate=True)
-                    payload = _linear(payload, self.pael_cards)
-                pael = item_u[:, 1] == PAELS_TOOTH
-                item = item + pael[:, None] * payload[item_rows]
-            item, item_rows = self._collection(item, item_rows, active, name)
             add(item, item_rows, name)
         add(actors, actor_rows, "actor")
         for value, row in zip(effect_values, effect_rows):
             add(value, row, "effect")
-
-        continuation, continuation_rows, continuation_gru = self._continuations(
-            domains, encoded, continuation_plan, concepts,
-        )
+        continuation_group, maximum, position, present, last, packed_order, packed_present, \
+            batch_sizes = plan["continuation"]
+        continuation = self._values(encoded, children, continuation_group)
+        continuation_rows = continuation_group[2]
         mode = self.pooling["continuation"]
         if mode == "global_tokens":
             add(self._tag(continuation, 10), continuation_rows, "continuation")
         elif mode == "gru":
-            _groups, maximum, position, present, last, packed_order, packed_present, \
-                batch_sizes = continuation_gru
             if len(continuation):
                 if continuation.device.type == "mps" and torch.is_autocast_enabled("mps"):
                     state = self._packed_gru(
@@ -2834,15 +2544,13 @@ class Agent(nn.Module):
                     )
             else:
                 summary = continuation.new_zeros((batch, self.width))
-            add(self._tag(summary, 10),
-                torch.arange(batch, device=run.device), "continuation")
+            add(self._tag(summary, 10), everywhere, "continuation")
         else:
             add(self._tag(self._summarize(
                     continuation, continuation_rows, batch, "continuation", mode), 10),
-                torch.arange(batch, device=run.device), "continuation")
-        crystal, crystal_rows, _ = self._domain_rows(domains, encoded, DOMAIN["crystal"])
-        add(crystal, crystal_rows, "crystal")
-        add(action, action_rows, "action")
+                everywhere, "continuation")
+        add(self._values(encoded, children, plan["crystal"]), plan["crystal"][2], "crystal")
+        add(action, action_row, "action")
 
         if global_layout is not None and len(global_layout[1]) != sum(map(len, values)):
             raise RuntimeError("invalid precomputed sequence layout")
@@ -2854,19 +2562,19 @@ class Agent(nn.Module):
             len(action), global_layout,
         )
         return state, transformed if len(action) else action, \
-            action_rows, action_flat, actions, policy_sequence
+            action_row, action_flat, actions, policy_sequence
 
-    def forward(self, character, globals_, domains, state_index, action_values, action_index,
+    def forward(self, character, globals_, features, plan, map_index, action_index,
                 return_state=False, policy_only=False, flat_policy=False, temperature=1):
         if self.training and torch.is_grad_enabled():
             self._sequence_layouts.clear()
         if self._reuse_sequence_layouts:
             self._sequence_layout_index = 0
         concepts = graph_name(self.concepts.flattened(), "concepts")
-        encoded, phase_projection = self.encode_domains(domains, concepts)
+        amounts = graph_name(self.concepts.amounts_flattened(), "amount embeddings")
+        encoded = self.encode_features(features, concepts, amounts)
         state, action, action_row, action_flat, actions, sequence = self.encode_state(
-            domains, encoded, phase_projection, state_index, action_values, action_index, concepts,
-            len(character),
+            encoded, plan, map_index, action_index, concepts, len(character),
         )
         scores = _norm_head(action, self.global_norm, self.policy) / temperature
         legal = torch.ones_like(scores, dtype=torch.bool)
@@ -2892,29 +2600,27 @@ def architecture(model):
     return {
         "width": model.width, "layers": model.layers, "heads": model.heads,
         "feedforward": model.feedforward, "head_width": model.head_width,
-        "domains": [name for name, *_ in TOKEN_SPECS], "card_zones": model.card_zones,
-        "globals": model.layout["globals"], "entity_collections": model.entity_collections,
+        "domains": [name for name, *_ in DOMAINS], "places": list(PLACES),
+        "globals": model.layout["globals"], "collections": list(COLLECTIONS),
         "state_width": model.state_width, "policy_input": model.width,
         "map_layers": 1, "global_layers": model.layers, "local_layers": 1,
         "attention": "fully_bidirectional",
         "activation": "gelu", "dropout": 0,
-        "token_encoder": "LayerNorm(sum(categorical)+Linear(numeric,bias=False))",
+        "token_encoder": "LayerNorm(sum(E[code])+sum(amount*A[code])+Linear(fields,bias=False))",
+        "children": "summed into their parent token",
         "sum_pooling": "unnormalized",
         "policy_factorization": "one linear logit per transformed legal action token",
         "policy_entropy": ["candidate", "normalized", "effective_actions"],
         "map": "reverse-topological sparse attention; current node is the map summary",
-        "map_node_kinds": MAP_NODE_KINDS,
         "move_history": f"one-layer {model.width}-D GRU",
         "continuations": "normalized execution queue",
-        "candidate_context": "explicit selected payload, destination, and enemy identity+position",
-        "card_zone_names": ["deck", "hand", "draw", "discard", "exhaust"],
-        "fixed_tokens": ["run_state", "current_phase", "current_map_node", "relic_pool",
+        "candidate_context": "attached tokens summed into the candidate, plus its map node",
+        "fixed_tokens": ["run_state", "current_phase", "current_map_node", "removed_relics",
                          "encounter_pool", "event_pool"],
         "concept_vocab": model.concepts.num_embeddings,
         "semantic_tables": dict(zip(SEMANTIC_NAMES, model.concepts.sizes)),
         "position_caps": POSITION_CAPS,
         "pooling": model.pooling,
-        "candidate_numeric": ACTION_FIELDS[3],
         "value_heads": ["terminal_floor_scalar"],
         "winning_reservoir": WINNING_CAPACITY,
     }
@@ -3053,54 +2759,7 @@ def sequence_layout(group, groups, selected, target):
 
 
 def observation_legal(observation):
-    return np.asarray(observation[3][-1], bool)
-
-
-def flat_domains(observation):
-    batch = len(observation[0]); legal = observation_legal(observation)
-    flat = len(observation[3]) == 7
-    represented = None if flat else np.asarray(observation[3][4], bool)
-    if flat:
-        action_row, action_position = map(lambda value: np.asarray(value, np.int32), observation[3][4:6])
-    else:
-        action_row, action_position = np.nonzero(represented)
-        lookup = np.full(represented.shape, -1, np.int32)
-        lookup[action_row, action_position] = np.arange(len(action_row), dtype=np.int32)
-    domains = []
-    for (name, unsigned, signed, semantic, numeric), values in zip(TOKEN_SPECS, observation[2]):
-        values = tuple(map(np.asarray, values))
-        if flat:
-            u, s, c, f, row, scope = values
-        else:
-            u, s, c, f, scope, mask = values
-            if any(value.shape[:2] != mask.shape for value in (u, s, c, f)) or scope.shape != mask.shape:
-                raise ValueError(f"invalid {name} shape")
-            selected = mask.astype(bool)
-            row = np.repeat(np.arange(batch, dtype=np.int32), selected.sum(1))
-            u, s, c, f, scope = (value[selected] for value in (u, s, c, f, scope))
-            scope = scope.astype(np.int32)
-            candidate = scope >= 0
-            if candidate.any():
-                scope[candidate] = lookup[row[candidate], scope[candidate]]
-                if np.any(scope[candidate] < 0):
-                    raise ValueError("domain row references absent candidate")
-        if (u.dtype != np.uint32 or s.dtype != np.int32 or c.dtype != np.uint32
-                or f.dtype != np.float32 or u.shape != (len(row), unsigned)
-                or s.shape != (len(row), signed) or c.shape != (len(row), semantic)
-                or f.shape != (len(row), numeric) or scope.shape != (len(row),)
-                or not np.isfinite(f).all()):
-            raise ValueError(f"invalid {name} schema")
-        domains.append((u, s, c, f, np.asarray(row, np.int32), np.asarray(scope, np.int32)))
-    return domains, np.asarray(action_row, np.int32), np.asarray(action_position, np.int32), legal
-
-
-def ordered(source, *keys):
-    combined = np.zeros(len(source), np.int64)
-    for key in keys:
-        value = np.asarray(key)[source].astype(np.int64)
-        combined = combined * (int(value.max(initial=0)) + 1) + value
-    return source if np.all(combined[1:] >= combined[:-1]) \
-        else source[np.argsort(combined, kind="stable")]
+    return np.asarray(observation[2], bool)
 
 
 def prefix_tree(tokens, counts):
@@ -3127,127 +2786,95 @@ def prefix_tree(tokens, counts):
     ))), tuple(sizes)
 
 
-def model_inputs(character, globals_, domains, action, action_row, action_position, legal, target, model,
-                 pad=None):
+def packed_order(counts):
+    # Rows by decreasing length, then items interleaved by position (PackedSequence order).
+    present = np.flatnonzero(counts)
+    group = np.repeat(np.arange(len(present)), counts[present])
+    position = np.arange(len(group)) - np.repeat(np.cumsum(counts[present]) - counts[present], counts[present])
+    length_order = np.argsort(-counts[present], kind="stable")
+    length_inverse = np.empty_like(length_order)
+    length_inverse[length_order] = np.arange(len(length_order))
+    order = np.lexsort((length_inverse[group], position))
+    sizes = tuple(int((counts[present] > index).sum()) for index in range(counts.max(initial=0)))
+    return present[length_order], order, sizes
+
+
+def model_inputs(character, globals_, features, tokens, legal, target, model, pad=None):
     batch, actions = len(character), legal.shape[1]
     globals_ = np.asarray(globals_, np.float32)
     if globals_.shape != (batch, model.layout["globals"]) or not np.isfinite(globals_).all():
         raise ValueError("invalid public globals")
-    unique_rows = [domain[6:] if len(domain) == 8 else None for domain in domains]
-    domains = [domain[:6] for domain in domains]
     pad = model.training and model.global_norm.weight.device.type == "mps" if pad is None else pad
     bucket = lambda count: 0 if not count else min(
         size for power in range(max(1, (count - 1).bit_length()), 64)
         for size in (3 * (1 << power) // 4, 1 << power) if size >= count
     )
-    tensor = lambda value: torch.as_tensor(value, dtype=torch.long, device=target)
-    domain_tensors = []
-    inverse_rows = []
-    for (name, *_), (u, _s, semantic, numeric, row, scope), unique in zip(
-        TOKEN_SPECS, domains, unique_rows,
-    ):
-        if semantic.max(initial=0) >= model.concepts.num_embeddings:
+    tensor = lambda value: torch.as_tensor(np.asarray(value), dtype=torch.long, device=target)
+    domain, place, parent, link, row, feature = (np.asarray(value) for value in tokens)
+    count = len(domain)
+    feature_tensors, sizes = [], []
+    for (name, codes, fields), (c, a, f) in zip(DOMAINS, features):
+        c, a, f = np.asarray(c), np.asarray(a, np.float32), np.asarray(f, np.float32)
+        if c.shape[1:] != (codes,) or f.shape[1:] != (fields,) or a.shape != c.shape:
+            raise ValueError(f"invalid {name} schema")
+        if c.max(initial=0) >= model.concepts.num_embeddings:
             raise ValueError(f"invalid {name} semantic id")
-        if unique is not None:
-            first, inverse = unique
-        elif len(semantic):
-            unique_semantic = np.column_stack((u[:, 1], semantic)) \
-                if name == "map_node" else semantic
-            first, inverse = map(np.asarray, sts2_sim.unique_feature_rows(
-                unique_semantic, numeric.view(np.uint32),
-            ))
-        else:
-            first = inverse = np.empty(0, np.intp)
-        count = len(first)
-        size = bucket(count) if pad else count
-        metadata = u[:, 3:4] if name == "phase" else \
-            u[:, [0, 2, 3, 19]] if name == "card" else \
-            u[:, 1:2] if name in ("actor", "map_node") else u[:, [2, 1]] \
-            if name == "relic" else np.empty((len(u), 0), np.uint32)
-        feature_metadata = metadata[first]
-        if name == "map_node" and unique is not None:
-            feature_metadata = np.empty((count, 1), np.uint32)
-            feature_metadata[inverse] = metadata
-        domain_tensors.append((
-            torch.as_tensor(np.pad(
-                semantic[first], ((0, size - count), (0, 0)),
-            ).astype(np.int32), device=target),
-            torch.as_tensor(np.pad(
-                numeric[first], ((0, size - count), (0, 0)),
-            ), device=target), count,
-            torch.as_tensor(metadata.astype(np.int64), device=target),
-            torch.as_tensor(row.astype(np.int64), device=target),
-            None,
-            torch.as_tensor(inverse.astype(np.int64), device=target),
-            *(torch.as_tensor(np.flatnonzero(predicate), device=target)
-              for predicate in (scope == -1, scope == -2, scope >= 0)),
-            torch.as_tensor(np.pad(
-                feature_metadata, ((0, size - count), (0, 0)),
-            ).astype(np.int64), device=target),
-        ))
-        inverse_rows.append(inverse)
-    domain_tensors = tuple(domain_tensors)
-    feature_index = [
-        inverse if len(domain[2]) != len(domain[0]) else np.arange(len(domain[0]))
-        for domain, inverse in zip(domains, inverse_rows)
-    ]
+        if not (np.isfinite(a).all() and np.isfinite(f).all()):
+            raise ValueError(f"invalid {name} numbers")
+        size = bucket(len(c)) if pad else len(c)
+        padding = ((0, size - len(c)), (0, 0))
+        feature_tensors.append(tuple(torch.as_tensor(value, device=target) for value in (
+            np.pad(c, padding).astype(np.int32), np.pad(a, padding), np.pad(f, padding),
+        )))
+        sizes.append(size)
+    gid = np.r_[0, np.cumsum(sizes)][:-1][domain] + feature
+    starts = np.searchsorted(row, np.arange(batch))
+    at = lambda name: np.flatnonzero(place == PLACE[name])
+    children = at("child")
+    receivers, receiver_slot = np.unique(parent[children], return_inverse=True)
+    slot = np.zeros(count, np.int64)
+    slot[receivers] = np.arange(1, len(receivers) + 1)
+    group = lambda index: (tensor(gid[index]), tensor(slot[index]), tensor(row[index]))
+    all_rows = np.arange(batch)
 
-    node_u, _node_s, node_c, node_f, node_row, node_scope = domains[DOMAIN["map_node"]]
-    edge_u, _edge_s, edge_c, edge_f, edge_row, edge_scope = domains[DOMAIN["map_edge"]]
-    node_feature = feature_index[DOMAIN["map_node"]]
-    edge_feature = feature_index[DOMAIN["map_edge"]]
-    node_source = ordered(np.flatnonzero(node_scope == -1).astype(np.int32), node_row, node_u[:, 0])
-    edge_source = ordered(np.flatnonzero(edge_scope == -1).astype(np.int32),
-                          edge_row, edge_u[:, 0], edge_u[:, 1])
-    node_offsets = np.r_[0, np.cumsum(np.bincount(node_row[node_source], minlength=batch))]
-    edge_offsets = np.r_[0, np.cumsum(np.bincount(edge_row[edge_source], minlength=batch))]
-    node_groups = [node_source[node_offsets[row]:node_offsets[row + 1]] for row in range(batch)]
-    edge_groups = [edge_source[edge_offsets[row]:edge_offsets[row + 1]] for row in range(batch)]
+    nodes, edges = at("map_node"), at("map_edge")
+    node_counts = np.bincount(row[nodes], minlength=batch)
+    node_offsets = np.r_[0, np.cumsum(node_counts)]
+    if np.any(nodes - starts[row[nodes]] != np.arange(len(nodes)) - node_offsets[row[nodes]]):
+        raise ValueError("map nodes must lead their row")
+    edge_offsets = np.r_[0, np.cumsum(np.bincount(row[edges], minlength=batch))]
+    local_edges = np.stack((parent[edges], link[edges]), 1) - starts[row[edges]][:, None]
+    if np.any(local_edges < 0) or np.any(local_edges >= node_counts[row[edges]][:, None]):
+        raise ValueError("map edge references missing node")
+    node_group = lambda index: nodes[node_offsets[index]:node_offsets[index + 1]]
+    edge_group = lambda index: local_edges[edge_offsets[index]:edge_offsets[index + 1]]
     if model.training:
         representatives, inverse = map(np.asarray, sts2_sim.unique_graphs(
-            node_u, node_c, node_f, node_feature,
-            node_source, node_offsets,
-            edge_u, edge_c, edge_f, edge_feature,
-            edge_source, edge_offsets,
+            feature[nodes], node_offsets, local_edges.reshape(-1), edge_offsets,
         ))
-        representatives = representatives.astype(np.int32)
-        inverse = inverse.astype(np.int32)
         graph_keys = ()
     else:
-        graph_keys = tuple((
-            node_u[nodes].tobytes(), node_c[node_feature[nodes]].tobytes(),
-            node_f[node_feature[nodes]].tobytes(), edge_u[edges].tobytes(),
-            edge_c[edge_feature[edges]].tobytes(), edge_f[edge_feature[edges]].tobytes(),
-        ) for nodes, edges in zip(node_groups, edge_groups))
-        unique, representatives, inverse = {}, [], np.empty(batch, np.int32)
-        for row, key in enumerate(graph_keys):
+        node_codes = np.asarray(features[DOMAIN["map_node"]][0])
+        graph_keys = tuple((node_codes[feature[node_group(index)]].tobytes(), edge_group(index).tobytes())
+                           for index in range(batch))
+        unique, representatives, inverse = {}, [], np.empty(batch, np.int64)
+        for index, key in enumerate(graph_keys):
             if key not in unique:
-                unique[key] = len(representatives); representatives.append(row)
-            inverse[row] = unique[key]
-    node_source = np.concatenate([node_groups[row] for row in representatives])
-    edge_source = np.concatenate([edge_groups[row] for row in representatives])
-    node_offsets = np.r_[0, np.cumsum([len(node_groups[row]) for row in representatives])]
-    graph_for_node = np.repeat(np.arange(len(representatives)), np.diff(node_offsets))
+                unique[key] = len(representatives); representatives.append(index)
+            inverse[index] = unique[key]
+        representatives = np.asarray(representatives, np.int64)
+    rep_counts = node_counts[representatives]
+    rep_starts = np.r_[0, np.cumsum(rep_counts)]
+    node_source = np.concatenate([node_group(index) for index in representatives] or [np.empty(0, np.int64)])
+    graph_for_node = np.repeat(np.arange(len(representatives)), rep_counts)
     missing = np.asarray([
-        model.training or target.type != "cpu" or graph_keys[row] not in model._graph_cache
-        for row in representatives
-    ])
-    max_node = int(node_u[node_source, 0].max(initial=0))
-    node_lookup = np.full((batch, max_node + 1), -1, np.int32)
-    offset = 0
-    for graph, row in enumerate(representatives):
-        ids = node_u[node_groups[row], 0].astype(np.intp)
-        members = np.flatnonzero(inverse == graph)
-        node_lookup[members[:, None], ids] = offset + np.arange(len(ids))
-        offset += len(ids)
-    edge_ids = edge_u[edge_source, :2].astype(np.intp)
-    if edge_ids.max(initial=0) > max_node:
-        raise ValueError("map edge references missing node")
-    edge_src = node_lookup[edge_row[edge_source], edge_ids[:, 0]]
-    edge_dst = node_lookup[edge_row[edge_source], edge_ids[:, 1]]
-    if np.any(edge_src < 0) or np.any(edge_dst < 0):
-        raise ValueError("map edge references missing node")
-    topo = np.zeros(len(node_source), np.int32)
+        model.training or target.type != "cpu" or graph_keys[index] not in model._graph_cache
+        for index in representatives
+    ], bool)
+    edge_src, edge_dst = (np.concatenate([rep_starts[graph] + edge_group(index)[:, side]
+                                          for graph, index in enumerate(representatives)]
+                                         or [np.empty(0, np.int64)]) for side in (0, 1))
+    topo = np.zeros(len(node_source), np.int64)
     for _ in range(len(node_source)):
         previous = topo.copy()
         np.maximum.at(topo, edge_dst, topo[edge_src] + 1)
@@ -3259,436 +2886,209 @@ def model_inputs(character, globals_, domains, action, action_row, action_positi
     for level in sorted(np.unique(topo[edge_src]), reverse=True):
         selected = np.flatnonzero(topo[edge_src] == level)
         selected = selected[np.argsort(edge_src[selected], kind="stable")]
-        parents, group = np.unique(edge_src[selected], return_inverse=True)
-        selected = selected[missing[graph_for_node[parents]][group]]
+        parents, local = np.unique(edge_src[selected], return_inverse=True)
+        selected = selected[missing[graph_for_node[parents]][local]]
         if len(selected):
-            parents, group = np.unique(edge_src[selected], return_inverse=True)
-            levels.append((parents, edge_dst[selected], group))
+            parents, local = np.unique(edge_src[selected], return_inverse=True)
+            levels.append((parents, edge_dst[selected], local))
     # Children are leaves or nodes updated by recent levels: each level reads them from a small pool of
     # its leaves followed by the outputs of the previous `gap` levels.
     node_level, node_position = np.full(len(node_source), -1), np.zeros(len(node_source), np.int64)
-    for level, (parents, _children, _group) in enumerate(levels):
+    for level, (parents, _children, _local) in enumerate(levels):
         node_level[parents], node_position[parents] = level, np.arange(len(parents))
     map_rows, map_sizes, padded = [], [], []
-    for level, (parents, children, group) in enumerate(levels):
-        child_level = node_level[children]
-        leaves = np.unique(children[child_level < 0])
+    for level, (parents, targets, local) in enumerate(levels):
+        child_level = node_level[targets]
+        leaves = np.unique(targets[child_level < 0])
         gap = level - int(child_level[child_level >= 0].min(initial=level))
-        starts = np.cumsum([len(leaves)] + [len(levels[previous][0]) for previous in range(level - gap, level)])
-        local = np.where(child_level < 0, np.searchsorted(leaves, children),
-                         starts[np.clip(child_level - level + gap, 0, None)] + node_position[children])
-        count, edge_count = len(parents), len(children)
+        offsets = np.cumsum([len(leaves)] + [len(levels[previous][0]) for previous in range(level - gap, level)])
+        position = np.where(child_level < 0, np.searchsorted(leaves, targets),
+                            offsets[np.clip(child_level - level + gap, 0, None)] + node_position[targets])
+        parent_count, edge_count = len(parents), len(targets)
         edge_size = bucket(edge_count) if pad else edge_count
-        parent_size = bucket(count + (edge_size > edge_count)) if pad else count
+        parent_size = bucket(parent_count + (edge_size > edge_count)) if pad else parent_count
         extra = edge_size - edge_count
-        map_rows += [np.pad(parents, (0, parent_size - count)), leaves]
+        map_rows += [np.pad(parents, (0, parent_size - parent_count)), leaves]
         map_sizes += [parent_size, len(leaves)]
         padded.append((
-            tensor(np.pad(local, (0, extra))),
-            candidate_index(np.r_[group, np.full(extra, count, np.int32)], parent_size, target, bool(pad)),
-            count, gap,
+            tensor(np.pad(position, (0, extra))),
+            candidate_index(np.r_[local, np.full(extra, parent_count, np.int32)], parent_size, target,
+                            bool(pad)),
+            parent_count, gap,
         ))
-    map_parents = np.concatenate([parents for parents, _children, _group in levels] or [np.empty(0, np.int64)])
-    levels = padded
-    run_u, _run_s, _run_c, _run_f, run_row, run_scope = domains[DOMAIN["run"]]
-    run_source = np.flatnonzero(run_scope == -1)
-    current_id = np.full(batch, np.iinfo(np.uint32).max, np.uint32)
-    current_id[run_row[run_source]] = run_u[run_source, 22]
-    current = np.full(batch, -1, np.int32)
-    present = current_id != np.iinfo(np.uint32).max
-    if current_id[present].max(initial=0) > max_node:
+    map_parents = np.concatenate([parents for parents, _targets, _local in levels] or [np.empty(0, np.int64)])
+    node_position_of = lambda index, token: rep_starts[inverse[row[index]]] + token - starts[row[index]]
+    run = at("run")
+    if not np.array_equal(row[run], all_rows):
+        raise ValueError("each observation needs one run token")
+    if np.any(link[run] < 0) or np.any(link[run] - starts[row[run]] >= node_counts[row[run]]):
         raise ValueError("current map node is missing")
-    current[present] = node_lookup[np.flatnonzero(present), current_id[present].astype(np.intp)]
-    entry = node_lookup[:, 0]
-    if np.any(current[present] < 0) or np.any(entry < 0):
-        raise ValueError("current map node is missing")
-    current, current_inverse = np.unique(np.where(current >= 0, current, entry), return_inverse=True)
+    current, current_inverse = np.unique(node_position_of(run, link[run]), return_inverse=True)
     map_index = (
-        tensor(inverse_rows[DOMAIN["map_node"]][node_source]),
-        tensor(inverse_rows[DOMAIN["map_edge"]][edge_source]), tuple(levels),
-        tensor(node_offsets), tensor(current), tensor(current_inverse),
-        tuple(graph_keys[row] for row in representatives) if graph_keys else (),
-        tensor(np.concatenate(map_rows or [np.empty(0, np.int64)])), tuple(map_sizes),
-        tensor(map_parents),
+        tensor(gid[node_source]), tuple(padded), tensor(rep_starts), tensor(current),
+        tensor(current_inverse), tuple(graph_keys[index] for index in representatives) if graph_keys else (),
+        tensor(np.concatenate(map_rows or [np.empty(0, np.int64)])), tuple(map_sizes), tensor(map_parents),
     )
 
-    action_u, _action_s, action_c, action_f = action
-    action_count = len(action_u)
-    action_size = bucket(action_count) if pad else action_count
-    if action_c.max(initial=0) >= model.concepts.num_embeddings:
-        raise ValueError("invalid action semantic id")
-    path = np.full(action_count, -1, np.int32)
-    path_id = action_u[:, 4]
-    present = path_id != np.iinfo(np.uint32).max
-    if path_id[present].max(initial=0) > max_node:
-        raise ValueError("path candidate references missing node")
-    path[present] = node_lookup[action_row[present], path_id[present].astype(np.intp)]
-    if np.any(path[present] < 0):
-        raise ValueError("path candidate references missing node")
+    candidates = at("candidate")
+    action_row = row[candidates]
+    action_counts = np.bincount(action_row, minlength=batch)
+    action_position = np.arange(len(candidates)) - np.repeat(np.cumsum(action_counts) - action_counts,
+                                                             action_counts)
     action_flat = action_row * actions + action_position
     action_legal = legal[action_row, action_position]
-    def filtered(domain, predicate, pooled=False):
-        u, *_values, scope = domains[domain]
-        source = np.flatnonzero((scope == -1) & predicate(u[:, 0]))
-        if not pooled:
-            return tensor(source)
-        row = domains[domain][4][source]
-        offsets = np.r_[0, np.cumsum(np.bincount(row, minlength=batch))]
-        pooled, item_rows, inverse = map(np.asarray, sts2_sim.deduplicate_sequences(
-            inverse_rows[domain], source, offsets,
-        ))
-        groups = int(inverse.max(initial=-1)) + 1
-        return None if pad else tensor(source), (
-            tensor(pooled), tensor(item_rows), tensor(inverse), groups,
-        )
-    filters = (
-        filtered(DOMAIN["relic"], lambda value: value == 1, True),
-        filtered(DOMAIN["encounter"], lambda value: (value == 1) | (value == 2), True),
-        filtered(DOMAIN["event"], lambda value: value == 0, True),
-        *(filtered(DOMAIN["card"], lambda value, kind=kind: value == kind)
-          for kind in range(5)),
-        filtered(DOMAIN["relic"], lambda value: value == 0),
-        filtered(DOMAIN["potion"], lambda value: value == 0),
-        filtered(DOMAIN["card"], lambda value: value == 8),
-    )
-    actor_u, _s, _c, _f, actor_row, actor_scope = domains[DOMAIN["actor"]]
-    actor_source = np.flatnonzero(actor_scope == -1)
-    actor_order = np.argsort(
-        actor_row[actor_source].astype(np.int64) * (1 << 20) + actor_u[actor_source, 0],
-        kind="stable",
-    )
-    actor_source = actor_source[actor_order]
-    actor_keys = actor_row[actor_source].astype(np.int64) * (1 << 20) + actor_u[actor_source, 0]
-    history_u, _s, history_c, _f, history_row, history_scope = domains[DOMAIN["history"]]
-    history_source = np.flatnonzero(history_scope == -1)
-    history_keys = history_row[history_source].astype(np.int64) * (1 << 20) \
-        + history_u[history_source, 0]
-    history_group = np.searchsorted(actor_keys, history_keys)
-    history_valid = history_group < len(actor_keys)
-    history_valid &= actor_keys[np.minimum(history_group, max(0, len(actor_keys) - 1))] \
-        == history_keys if len(actor_keys) else False
-    player_source = np.flatnonzero(history_valid & (history_u[history_source, 1] == 0))
-    move_source = np.flatnonzero(history_valid & (history_u[history_source, 1] == 1))
-    move_order = np.argsort(history_group[move_source], kind="stable")
-    move_raw = history_source[move_source]
-    move_group = history_group[move_source][move_order]
-    move_counts = np.bincount(move_group, minlength=len(actor_source))
+    links = link[candidates]
+    linked_place = np.where(links >= 0, place[links].astype(np.int64), -1)
+    path_rows = np.flatnonzero(linked_place == PLACE["map_node"])
+    target_rows = np.flatnonzero((links >= 0) & (linked_place != PLACE["map_node"]))
+    path_tokens = candidates[path_rows]
+
+    pools = []
+    for name in POOLS:
+        source = at(name)
+        offsets = np.r_[0, np.cumsum(np.bincount(row[source], minlength=batch))]
+        pooled, item_rows, pool_inverse = map(np.asarray, sts2_sim.deduplicate_sequences(gid, source, offsets))
+        groups = int(pool_inverse.max(initial=-1)) + 1
+        pools.append((group(source),
+                      (tensor(gid[pooled]), tensor(item_rows), tensor(pool_inverse), groups)))
+
+    actor_tokens = np.flatnonzero(np.isin(place, [PLACE["player"], PLACE["ally"], PLACE["enemy"]]))
+    actor_rows = row[actor_tokens]
+    combat_rows = row[at("player")]
+    actor_of = np.full(count, -1)
+    actor_of[actor_tokens] = np.arange(len(actor_tokens))
+    moves = at("move")
+    move_group = actor_of[parent[moves]]
+    if np.any(move_group < 0):
+        raise ValueError("move token without actor")
+    move_codes = np.asarray(features[DOMAIN["move"]][0])[feature[moves], 0].astype(np.int64)
+    move_order = np.argsort(move_group, kind="stable")
+    move_codes, move_group = move_codes[move_order], move_group[move_order]
+    move_counts = np.bincount(move_group, minlength=len(actor_tokens))
     move_present = np.flatnonzero(move_counts)
     move_terminal = None
     if pad and model.precision != "fp32" and len(move_present):
-        move_raw = move_raw[move_order]
-        tokens = history_c[feature_index[DOMAIN["history"]][move_raw], 0].astype(np.int64)
-        (sources, parents, move_terminal), move_batch_sizes = prefix_tree(tokens, move_counts)
-        move_raw = move_raw[sources]
-        move_order = None
-        move_packed_order = parents
+        (sources, move_packed_order, move_terminal), move_batch_sizes = prefix_tree(move_codes, move_counts)
+        move_codes, move_order = move_codes[sources], None
     else:
-        compact_move_group = np.repeat(np.arange(len(move_present)), move_counts[move_present])
-        move_position = np.arange(len(compact_move_group)) \
-            - np.repeat(np.cumsum(move_counts) - move_counts, move_counts)
-        length_order = np.argsort(-move_counts[move_present], kind="stable")
-        length_inverse = np.empty_like(length_order)
-        length_inverse[length_order] = np.arange(len(length_order))
-        compact_move_group = length_inverse[compact_move_group]
-        move_present = move_present[length_order]
-        move_packed_order = np.lexsort((compact_move_group, move_position))
-        move_batch_sizes = tuple(int((move_counts[move_present] > index).sum())
-                                 for index in range(move_counts.max(initial=0)))
-    effect_plans = []
-    effect_groups = []
-    for domain in (DOMAIN["power"], DOMAIN["status"], DOMAIN["card"]):
-        effect_u, _s, _c, _f, effect_row, effect_scope = domains[domain]
-        effect_source = np.flatnonzero(effect_scope == -1)
-        owner = effect_u[effect_source, 0]
-        if domain == DOMAIN["card"]:
-            owner = np.where(np.isin(owner, STATUS_CARD_ZONES), 1, -1)
-        effect_keys = effect_row[effect_source].astype(np.int64) * (1 << 20) + owner
-        group = np.searchsorted(actor_keys, effect_keys)
-        valid = group < len(actor_keys)
-        valid &= actor_keys[np.minimum(group, max(0, len(actor_keys) - 1))] == effect_keys \
-            if len(actor_keys) else False
-        source = np.flatnonzero(valid)
-        effect_plans.append(tensor(source))
-        effect_groups.append(group[source])
-    effect_groups = np.concatenate(effect_groups)
-    families = []
-    effect_output_rows = []
-    actor_rows = actor_row[actor_source]
-    for name, family in zip(
-        ("friendly_effect", "enemy_effect"),
-        (actor_u[actor_source, 1] < 2, actor_u[actor_source, 1] == 2),
-    ):
+        move_present, move_packed_order, move_batch_sizes = packed_order(move_counts)
+        move_order = np.arange(len(move_codes))
+    effects = at("effect")
+    effect_actor = actor_of[parent[effects]]
+    if np.any(effect_actor < 0):
+        raise ValueError("effect token without actor")
+    families, effect_output_rows = [], []
+    for name, family in zip(("friendly_effect", "enemy_effect"),
+                            (place[actor_tokens] != PLACE["enemy"], place[actor_tokens] == PLACE["enemy"])):
         actor_index = np.flatnonzero(family)
-        lookup = np.full(len(actor_source), -1, np.int64)
+        lookup = np.full(len(actor_tokens), -1, np.int64)
         lookup[actor_index] = np.arange(len(actor_index))
-        selected = lookup[effect_groups] >= 0
-        effect_source = np.flatnonzero(selected)
-        effect_actor = effect_groups[selected]
-        families.append((
-            tensor(actor_index), tensor(effect_source), tensor(effect_actor),
-            tensor(lookup[effect_actor]),
-        ))
+        selected = lookup[effect_actor] >= 0
+        effect_source, owners = np.flatnonzero(selected), effect_actor[selected]
+        families.append((tensor(actor_index), tensor(effect_source), tensor(owners), tensor(lookup[owners])))
         if len(actor_index) and model.pooling[name] == "global_tokens":
-            effect_output_rows.append(actor_rows[effect_actor])
+            effect_output_rows.append(actor_rows[owners])
         elif len(actor_index) and not model.pooling[name].endswith("into_actor"):
             effect_output_rows.append(actor_rows[actor_index])
     actor_plan = (
-        tensor(actor_order), tensor(player_source), tensor(history_group[player_source]),
-        tensor(move_raw), None if move_order is None else tensor(move_order),
+        group(actor_tokens), tensor(move_codes), None if move_order is None else tensor(move_order),
         tensor(move_packed_order), tensor(move_present), move_batch_sizes,
-        None if move_terminal is None else tensor(move_terminal),
-        tuple(effect_plans), tuple(families),
+        None if move_terminal is None else tensor(move_terminal), group(effects), tuple(families),
     )
-    continuation_u, _s, _c, _f, continuation_row, continuation_scope = \
-        domains[DOMAIN["continuation"]]
-    continuation_source = np.flatnonzero(continuation_scope == -1)
-    continuation_order = np.argsort(
-        continuation_row[continuation_source].astype(np.int64) * (1 << 32)
-        + continuation_u[continuation_source, 8], kind="stable",
-    )
-    ordered_rows = continuation_row[continuation_source][continuation_order]
-    ordered_u = continuation_u[continuation_source][continuation_order]
-    keys = ordered_rows.astype(np.int64) * (1 << 32) + ordered_u[:, 2]
-    first = np.r_[True, keys[1:] != keys[:-1]] if len(keys) else np.empty(0, bool)
-    group = np.cumsum(first) - 1
-    item_rows = ordered_rows[first]
-    counts = np.bincount(item_rows, minlength=batch)
-    present = np.flatnonzero(counts)
-    position = np.arange(len(item_rows)) - np.repeat(np.cumsum(counts) - counts, counts)
+
+    heads = at("continuation")
+    head_rows = row[heads]
+    head_counts = np.bincount(head_rows, minlength=batch)
+    present = np.flatnonzero(head_counts)
+    position = np.arange(len(heads)) - np.repeat(np.cumsum(head_counts) - head_counts, head_counts)
+    packed_present, continuation_order, batch_sizes = packed_order(head_counts)
     continuation_plan = (
-        tensor(continuation_order), tensor(group), tensor(item_rows), int(first.sum()),
-        int(counts.max(initial=0)), tensor(position), tensor(present),
-        tensor(counts[present] - 1),
+        group(heads), int(head_counts.max(initial=0)), tensor(position), tensor(present),
+        tensor(head_counts[present] - 1), tensor(continuation_order), tensor(packed_present), batch_sizes,
     )
-    if len(present):
-        length_order = np.argsort(-counts[present], kind="stable")
-        length_inverse = np.empty_like(length_order)
-        length_inverse[length_order] = np.arange(len(length_order))
-        packed_group = length_inverse[np.repeat(np.arange(len(present)), counts[present])]
-        packed_order = np.lexsort((packed_group, position))
-        batch_sizes = tuple(int((counts[present][length_order] > index).sum())
-                            for index in range(counts.max()))
-        continuation_plan += tensor(packed_order), tensor(present[length_order]), batch_sizes
-    else:
-        continuation_plan += tensor(np.empty(0, np.int64)), tensor(present), ()
-    item_keys = keys[first]
-    item_order = np.argsort(item_keys, kind="stable")
-    links = []
-    for name in ("card", "relic", "potion"):
-        _u, _s, _c, _f, linked_row, linked_scope = domains[DOMAIN[name]]
-        source = np.flatnonzero(linked_scope <= -3)
-        if len(source):
-            key = linked_row[source].astype(np.int64) * (1 << 32) + (-3 - linked_scope[source])
-            found = np.searchsorted(item_keys[item_order], key).clip(max=max(len(item_keys) - 1, 0))
-            position = item_order[found] if len(item_keys) else found
-            if not len(item_keys) or not np.array_equal(item_keys[position], key):
-                raise ValueError(f"{name} row references an absent continuation item")
-            links.append((DOMAIN[name], tensor(source), tensor(position)))
-    continuation_plan += (tuple(links),)
-    all_rows = np.arange(batch)
-    combat_rows = actor_rows[actor_u[actor_source, 1] == 0]
-    phase_domain = domains[DOMAIN["phase"]]
-    phase_rows = phase_domain[4][phase_domain[5] == -1]
+
+    plan = {
+        "child_gid": tensor(gid[children]), "child_slot": tensor(receiver_slot + 1),
+        "receivers": len(receivers) + 1, "run": group(run), "phase": group(at("phase")),
+        "pools": tuple(pools), "actors": actor_plan, "continuation": continuation_plan,
+        "crystal": group(at("crystal")),
+    }
+    for name in COLLECTIONS:
+        active = all_rows if name in ("deck", "relic", "potion") else combat_rows
+        plan[name] = (*group(at(name)), tensor(active))
+
+    phase_rows = row[at("phase")]
     global_rows = [phase_rows, *([all_rows] * 4)]
-    for name, domain, zone, active in (
-        ("deck", DOMAIN["card"], 0, all_rows),
-        ("hand", DOMAIN["card"], 1, combat_rows),
-        ("draw", DOMAIN["card"], 2, combat_rows),
-        ("discard", DOMAIN["card"], 3, combat_rows),
-        ("exhaust", DOMAIN["card"], 4, combat_rows),
-        ("relic", DOMAIN["relic"], 0, all_rows),
-        ("potion", DOMAIN["potion"], 0, all_rows),
-        ("orb", DOMAIN["orb"], None, combat_rows),
-    ):
-        u, _s, _c, _f, row, scope = domains[domain]
-        source = np.flatnonzero((scope == -1) & (True if zone is None else u[:, 0] == zone))
+    for name in COLLECTIONS:
+        source = at(name)
+        active = all_rows if name in ("deck", "relic", "potion") else combat_rows
         global_rows.append(row[source] if model.pooling[name] == "global_tokens" else active)
     global_rows.extend((actor_rows, *effect_output_rows))
-    global_rows.append(item_rows if model.pooling["continuation"] == "global_tokens" else all_rows)
-    crystal = domains[DOMAIN["crystal"]]
-    global_rows.append(crystal[4][crystal[5] == -1])
+    global_rows.append(head_rows if model.pooling["continuation"] == "global_tokens" else all_rows)
+    global_rows.append(row[at("crystal")])
     global_rows.append(action_row)
     global_layout = sequence_layout(
-        np.concatenate(global_rows), batch, action_count, target,
+        np.concatenate(global_rows), batch, len(candidates), target,
     ) if pad else None
     action_index = (
         tensor(action_row), tensor(action_flat), torch.as_tensor(action_legal, device=target),
-        candidate_index(action_row, batch, target, True), actions, tensor(path), action_count,
-        tensor(np.concatenate([scope[scope >= 0] for *_values, scope in domains])),
-        filters, actor_plan, continuation_plan, global_layout,
+        candidate_index(action_row, batch, target, True), actions, tensor(path_rows),
+        tensor(node_position_of(path_tokens, link[path_tokens])), group(candidates), global_layout,
+        tensor(target_rows), group(links[target_rows]),
     )
     return (
         torch.as_tensor(character, dtype=torch.long, device=target),
-        torch.as_tensor(globals_, device=target), domain_tensors, map_index,
-        (torch.as_tensor(np.pad(
-            action_c, ((0, action_size - action_count), (0, 0)),
-        ).astype(np.int32), device=target),
-         torch.as_tensor(np.pad(
-             action_f, ((0, action_size - action_count), (0, 0)),
-         ).astype(np.float32), device=target)),
+        torch.as_tensor(globals_, device=target), tuple(feature_tensors), plan, map_index,
         action_index, torch.as_tensor(legal, device=target),
     )
 
 
-def _tensors(observation, target, model):
-    domains, action_row, action_position, legal = flat_domains(observation)
-    if len(observation[3]) == 7:
-        action_u, action_s, action_c, action_f = map(np.asarray, observation[3][:4])
-        represented = np.ones(len(action_u), bool)
-    else:
-        action_u, action_s, action_c, action_f, represented, _legal = map(np.asarray, observation[3])
-        represented = represented.astype(bool)
-    if (action_u.dtype != np.uint32 or action_s.dtype != np.int32 or action_c.dtype != np.uint32
-            or action_f.dtype != np.float32
-            or action_u.shape[-1] != ACTION_FIELDS[0] or action_s.shape[-1] != ACTION_FIELDS[1]
-            or action_c.shape[-1] != ACTION_FIELDS[2] or action_f.shape[-1] != ACTION_FIELDS[3]
-            or not np.isfinite(action_f[represented]).all()):
-        raise ValueError("invalid action schema")
-    return model_inputs(
-        np.asarray(observation[0], np.uint8), np.asarray(observation[1], np.float32), domains,
-        (action_u[represented], action_s[represented], action_c[represented], action_f[represented]),
-        action_row, action_position, legal, target, model,
-    )
-
-
 def validate_packed(row):
-    if isinstance(row, bytes):
-        sts2_sim.validate_compact_observation(row)
-        return
-    if len(row) != 6:
-        raise ValueError("packed observation lacks its Rust digest")
-    character, globals_, counts, exact, actions, digest = row
-    globals_, counts, actions = map(np.asarray, (globals_, counts, actions))
-    compressed = isinstance(exact, bytes)
-    if not compressed:
-        exact = np.asarray(exact)
-    if globals_.dtype != np.float32 or globals_.shape != (RUN_FEATURES,) \
-            or not np.isfinite(globals_).all() \
-            or counts.dtype != np.uint32 or counts.ndim != 1 \
-            or not compressed and (exact.dtype != np.uint32 or exact.ndim != 1) \
-            or actions.dtype != np.uint32 or actions.ndim != 2:
-        raise ValueError("invalid packed observation arrays")
-    character, digest = int(character), int(digest)
-    if character == np.iinfo(np.uint8).max:
-        if (digest or globals_.any() or counts.shape != (len(TOKEN_SPECS),) or counts.any() or len(exact)
-                or actions.shape != (0, sum(ACTION_FIELDS) + 1)):
-            raise ValueError("invalid inactive observation")
-    elif not 0 <= character < 5:
-        raise ValueError("invalid observation character")
-    else:
-        sts2_sim.validate_packed_observation(character, globals_, counts, exact, actions, digest)
+    if not isinstance(row, bytes):
+        raise ValueError("packed observation must be compact bytes")
+    sts2_sim.validate_compact_observation(row)
 
 
 def packed_character(row):
-    return row[4] if isinstance(row, bytes) else int(row[0])
+    return row[4]
 
 
 def packed_action_count(row):
-    return struct.unpack_from("<I", row, 16)[0] if isinstance(row, bytes) else len(row[4])
+    return struct.unpack_from("<I", row, 16)[0]
 
 
 def packed_legal_count(row):
-    return struct.unpack_from("<I", row, 20)[0] if isinstance(row, bytes) \
-        else int(np.count_nonzero(row[4][:, -1]))
+    return struct.unpack_from("<I", row, 20)[0]
 
 
 def packed_state_count(row):
-    return sum(struct.unpack_from(f"<{len(TOKEN_SPECS)}I", row, 32)) \
-        if isinstance(row, bytes) else int(row[2].sum())
-
-
-def tensors(observation, target, model):
-    return _tensors(observation, target, model)
+    return struct.unpack_from("<I", row, 24)[0]
 
 
 def _pack_batch(observation):
-    if len(observation) < 5:
-        raise ValueError("observation lacks its Rust digest")
-    if len(observation) > 5:
-        return observation[5]
-    character = np.asarray(observation[0], np.uint8)
-    globals_ = np.asarray(observation[1], np.float32)
-    digests = np.asarray(observation[4])
-    represented = np.asarray(observation[3][4], bool)
-    legal = np.asarray(observation[3][5], bool)
-    batch = len(character)
-    if globals_.shape != (batch, RUN_FEATURES) or not np.isfinite(globals_).all() \
-            or digests.dtype != np.uint64 or digests.shape != (batch,):
-        raise ValueError("invalid observation digests")
-    action_row, action_position = np.nonzero(represented)
-    action_counts = np.bincount(action_row, minlength=batch)
-    action_offsets = np.cumsum(action_counts) - action_counts
-    remap = np.full(represented.shape, -1, np.int32)
-    remap[action_row, action_position] = np.arange(len(action_row)) - np.repeat(
-        action_offsets, action_counts
-    )
-    counts = np.empty((batch, len(TOKEN_SPECS)), np.uint32)
-    pieces = [[] for _ in range(batch)]
-    for domain, ((name, unsigned, signed, semantic, numeric), values) in enumerate(
-        zip(TOKEN_SPECS, observation[2])
-    ):
-        u, s, c, f, scope, mask = map(np.asarray, values)
-        row, _position = np.nonzero(mask.astype(bool))
-        selected = mask.astype(bool)
-        u, s, c, f, scope = (value[selected] for value in (u, s, c, f, scope))
-        scope = scope.astype(np.int32)
-        candidate = scope >= 0
-        keep = ~candidate
-        keep[candidate] = represented[row[candidate], scope[candidate]]
-        u, s, c, f, scope, row = u[keep], s[keep], c[keep], f[keep], scope[keep], row[keep]
-        candidate = scope >= 0
-        scope[candidate] = remap[row[candidate], scope[candidate]]
-        if (u.shape[1:] != (unsigned,) or s.shape[1:] != (signed,)
-                or c.shape[1:] != (semantic,) or f.shape[1:] != (numeric,)):
-            raise ValueError(f"invalid {name} schema")
-        packed = np.concatenate((
-            u.astype(np.uint32), s.astype(np.int32).view(np.uint32),
-            c.astype(np.uint32), f.astype(np.float32).view(np.uint32),
-            scope.view(np.uint32)[:, None],
-        ), 1)
-        sizes = np.bincount(row, minlength=batch)
-        counts[:, domain] = sizes
-        offsets = np.cumsum(sizes) - sizes
-        for index, (offset, size) in enumerate(zip(offsets, sizes)):
-            pieces[index].append(packed[offset:offset + size].reshape(-1))
-    action_u, action_s, action_c, action_f = map(np.asarray, observation[3][:4])
-    rows = []
-    for index in range(batch):
-        selected = represented[index]
-        actions = np.concatenate((
-            action_u[index, selected].astype(np.uint32),
-            action_s[index, selected].astype(np.int32).view(np.uint32),
-            action_c[index, selected].astype(np.uint32),
-            action_f[index, selected].astype(np.float32).view(np.uint32),
-            legal[index, selected].astype(np.uint32)[:, None],
-        ), 1)
-        rows.append((character[index], globals_[index], counts[index], np.concatenate(pieces[index]), actions,
-                     digests[index]))
-    return rows
+    return list(observation[4])
 
 
 def pack_batch(observation, validate=True):
     rows = _pack_batch(observation)
-    if len(rows) != len(observation[0]):
-        raise ValueError("packed observation row count mismatch")
     if validate:
-        for row in rows:
+        for row in filter(None, rows):
             validate_packed(row)
     return rows
 
+
+def tensors(observation, target, model):
+    return unpack(_pack_batch(observation), target, model)
 
 
 def unpack(rows, target, model, validate=True, pad=None):
     if validate:
         for row in rows:
             validate_packed(row)
-    character, globals_, domains, action, action_row, action_position, legal = \
-        sts2_sim.unpack_packed_observations(rows, True)
+    character, globals_, features, tokens, legal = sts2_sim.unpack_packed_observations(list(rows))
     return model_inputs(
-        np.asarray(character), np.asarray(globals_),
-        [tuple(map(np.asarray, domain)) for domain in domains],
-        tuple(map(np.asarray, action)), np.asarray(action_row), np.asarray(action_position),
-        np.asarray(legal), target, model, pad,
+        np.asarray(character), np.asarray(globals_), [tuple(map(np.asarray, value)) for value in features],
+        tuple(map(np.asarray, tokens)), np.asarray(legal), target, model, pad,
     )
 
 
@@ -3852,11 +3252,10 @@ def export_value_model(path, model, fingerprint, temperature, bias, actor=False)
         path.parent.mkdir(parents=True, exist_ok=True)
     parts = [
         b"STSVALUE", struct.pack("<IIQ", model.model_version, FEATURE_VERSION, fingerprint),
-        struct.pack("<10I", model.width, model.layers, model.heads, model.feedforward,
-                    len(TOKEN_SPECS), len(SEMANTIC_NAMES), model.concepts.num_embeddings,
-                    ACTION_FIELDS[2], ACTION_FIELDS[3], 1),
-        struct.pack("<64I", *(value for _name, unsigned, signed, semantic, numeric in TOKEN_SPECS
-                              for value in (unsigned, signed, semantic, numeric))),
+        struct.pack("<8I", model.width, model.layers, model.heads, model.feedforward,
+                    len(DOMAINS), len(SEMANTIC_NAMES), model.concepts.num_embeddings, 1),
+        struct.pack(f"<{2 * len(DOMAINS)}I", *(value for _name, codes, fields in DOMAINS
+                                               for value in (codes, fields))),
         struct.pack(f"<{len(SEMANTIC_NAMES)}I", *model.concepts.sizes),
         struct.pack(f"<{len(POSITION_CAPS)}I", *POSITION_CAPS.values()),
         bytes([
@@ -3907,16 +3306,14 @@ def export_value_model(path, model, fingerprint, temperature, bias, actor=False)
         add(gru.weight_ih_l0); add(gru.bias_ih_l0)
         add(gru.weight_hh_l0); add(gru.bias_hh_l0)
 
-    add(model.concepts.flattened()); add(model.map_nodes.weight)
-    for name, *_shape in TOKEN_SPECS:
+    add(model.concepts.flattened()); add(model.concepts.amounts_flattened())
+    for name, *_shape in DOMAINS:
         if name in model.encoders:
             add_encoder(model.encoders[name])
-    add_encoder(model.action_encoder)
     for name in POOLING_DEFAULTS:
         add(model.summary_seed[name])
     for name in POOLS:
         add_linear(model.pool_projections[name])
-    add_linear(model.pael_cards)
     for index, (name, mode) in enumerate(model.pooling.items()):
         if (index < 8 and mode == "transformer") \
                 or (index < 10 and mode.startswith("transformer")) \

@@ -282,7 +282,7 @@ class RolloutCollector:
             args.envs, seed, None, ascension=ascension, seed_stride=stride,
         )
         self.env.set_training_bonus(bonus)
-        self.observation = self.env.observe_tokens(flat=True)
+        self.observation = self.env.observe_tokens()
         self.episode_steps = np.zeros(args.envs, np.int32)
         self.combat_steps = np.zeros(args.envs, np.int32)
         self.reservoir = reservoir
@@ -456,7 +456,7 @@ class RolloutCollector:
                 self.recovery[reset] = False
                 self.episode_steps[reset] = 0
                 self.combat_steps[reset] = 0
-                self.observation = self.env.observe_tokens(flat=True)
+                self.observation = self.env.observe_tokens()
             self.mark_phase("preparing", True)
             trace_indices = self.trace_indices()
             step_started = time.monotonic()
@@ -553,7 +553,7 @@ class RolloutCollector:
             if progress is not None:
                 progress[self.worker] += args.envs
             self.episode_steps += 1
-            next_observation = None if native else self.env.observe_tokens((~done).tolist(), True)
+            next_observation = None if native else self.env.observe_tokens((~done).tolist())
             stats = stats if native else self.env.stats()
             still_combat = np.asarray([row[4] == 1 for row in stats])
             truncated, step_truncated, combat_truncated, empty_actions = cuts(
@@ -669,7 +669,7 @@ class RolloutCollector:
                 self.reset(reset)
                 self.episode_steps[reset] = 0
                 self.combat_steps[reset] = 0
-                next_observation = None if native else self.env.observe_tokens(flat=True)
+                next_observation = None if native else self.env.observe_tokens()
             if native:
                 if len(self.native_steps) > NATIVE_HISTORY_WINDOW * 2:
                     cutoff = len(self.native_steps) - NATIVE_HISTORY_WINDOW

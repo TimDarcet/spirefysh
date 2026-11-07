@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import multiprocessing
+import struct
 import subprocess
 import sys
 import tempfile
@@ -31,7 +32,9 @@ def write_events(path, rows):
 
 
 def packed_row(legal=2):
-    return (0, (), (), (), np.ones((legal, 1), np.uint32), 0)
+    row = bytearray(b"SP70" + bytes(132))
+    struct.pack_into("<II", row, 16, legal, legal)
+    return bytes(row)
 
 
 class TelemetryTest(unittest.TestCase):
@@ -332,7 +335,7 @@ print('restored')
     def test_model_schema_comes_from_simulator(self):
         schema = train.sts2_sim.model_schema()
         self.assertEqual((train.FEATURE_VERSION, train.MODEL_VERSION), schema[:2])
-        self.assertEqual(train.TOKEN_SPECS, tuple(tuple(row) for row in schema[5]))
+        self.assertEqual(train.DOMAINS, tuple(tuple(row) for row in schema[4]))
 
     def manifest(self, run_id, session, parent=None):
         return {
@@ -1021,6 +1024,37 @@ print('restored')
 
 
 class ModelKernelTest(unittest.TestCase):
+    def test_rust_inference_matches_python_for_every_pooling_mode(self):
+        collections = ("relic", "deck", "draw", "exhaust", "discard", "hand", "orb", "potion")
+        configs = [{}, {"continuation": "global_tokens"}] + [
+            dict.fromkeys(collections, mode) | {"friendly_effect": friendly, "enemy_effect": enemy,
+                                                "continuation": mode}
+            for mode, friendly, enemy in (("sum", "sum_into_actor", "sum_token"),
+                                          ("transformer", "transformer_into_actor", "transformer_token"))
+        ]
+        env = train.sts2_sim.Batch(4, 11, None, ascension=0)
+        layout = dict(env.token_layout(*train.DEFAULT_ARCHITECTURE))
+        rng = np.random.default_rng(0)
+        for step in range(48):
+            observation = env.observe_tokens()
+            legal = model.observation_legal(observation)
+            if step in (2, 11, 32, 47):  # Queued continuations, combat, combat with a queue, map.
+                for number, config in enumerate(configs):
+                    torch.manual_seed(number)
+                    network = train.Agent(layout, pooling=config).eval()
+                    network.critic.weight.data.normal_(std=.1)
+                    with torch.no_grad():
+                        policy, critic = train.predict(
+                            network, train.tensors(observation, torch.device("cpu"), network), "fp32",
+                        )
+                    env.load_policy(train.export_value_model(None, network, env.fingerprint(), 1, 0, True))
+                    for index, rust_policy, rust_critic in env.policy_details(list(range(4)), 1):
+                        with self.subTest(step=step, config=config, row=index):
+                            np.testing.assert_allclose(rust_policy, policy[index, :len(rust_policy)],
+                                                       atol=1e-4)
+                            self.assertAlmostEqual(rust_critic, float(critic[index]), places=4)
+            env.step([int(rng.choice(np.flatnonzero(row))) for row in legal])
+
     def assert_readable_graph(self, graph):
         nodes = {node["id"]: node for node in graph["nodes"]}
         children = {}
@@ -1057,7 +1091,7 @@ class ModelKernelTest(unittest.TestCase):
         network = train.Agent(dict(env.token_layout())).eval()
         inputs = train.tensors(observation, torch.device("cpu"), network)
         result, recorder = trace_model(
-            network, inputs, "checkpoint", observation[4][0], train.sts2_sim.sts2_sim.__file__,
+            network, inputs, "checkpoint", observation[3][0], train.sts2_sim.sts2_sim.__file__,
         )
         proof, graph = result["proof"], result["graph"]
         self.assertTrue(proof["verified"])
@@ -1076,7 +1110,7 @@ class ModelKernelTest(unittest.TestCase):
                              ["LayerNorm", "MultiheadAttention", "Add", "LayerNorm", "Linear",
                               "GELU", "Linear", "Add"])
         self.assertTrue(any(node["kind"] == "repeat" for node in graph["nodes"]))
-        self.assertTrue({"relic pool", "deck", "action"} <= {node["label"] for node in graph["nodes"]})
+        self.assertTrue({"removed relic", "deck", "action"} <= {node["label"] for node in graph["nodes"]})
         self.assertFalse(graph["rejected"])
         self.assertTrue(all(row["maximum_error"] <= 1e-4 for row in graph["rewrites"]))
         concepts = env.concept_labels()
@@ -1088,20 +1122,24 @@ class ModelKernelTest(unittest.TestCase):
         self.assertEqual(recorder.labels[final][-3:],
                          ["Booming Conch", "Neows Torment", "Leafy Poultice"])
         card = next(node for node in graph["nodes"] if node["label"] == "card encoding")
-        self.assertEqual(recorder.labels[card["outputs"][0]],
-                         ["Zap", "Dualcast", "Strike Defect", "Defend Defect"])
+        self.assertEqual(set(recorder.labels[card["outputs"][0]]),
+                         {"Zap", "Dualcast", "Strike Defect", "Defend Defect"})
         encoder = next(node for node in graph["nodes"] if node["code"] == "encoders.card")
-        self.assertEqual([node["label"] for node in graph["nodes"] if node["parent"] == encoder["id"]],
-                         ["card state vector", "Linear", "norm"])
+        parts = [node["label"] for node in graph["nodes"] if node["parent"] == encoder["id"]]
+        self.assertEqual((parts[0], parts[-1]), ("card numeric features", "norm"))
+        self.assertIn("amount sum", parts)
         run = next(node for node in graph["nodes"] if node["code"] == "encoders.run")
-        state = next(node["outputs"][0] for node in graph["nodes"]
-                     if node["parent"] == run["id"] and node.get("leaf"))
-        channels, values = recorder.channels[state], recorder.values[state][0].tolist()
+        leaves = {node["label"]: node["outputs"][0] for node in graph["nodes"]
+                  if node["parent"] == run["id"] and node.get("leaf")}
+        numeric = leaves["run numeric features"]
+        self.assertAlmostEqual(recorder.values[numeric][0][recorder.channels[numeric].index("act ÷ 3")],
+                               1 / 3, places=6)
+        codes = leaves["run categorical IDs one-hot"]
+        channels, values = recorder.channels[codes], recorder.values[codes][0].tolist()
         characters = [name for name in channels if name.startswith("character: ")]
         self.assertEqual(len(characters), 5)
         self.assertEqual(sum(values[:5]), 1)
         self.assertEqual(values[channels.index("character: Defect")], 1)
-        self.assertAlmostEqual(values[channels.index("act ÷ 3")], 1 / 3, places=6)
         self.assertLess(len(channels), 100)
         self.assertNotIn('"data"', json.dumps(result))
 
@@ -1142,21 +1180,8 @@ class ModelKernelTest(unittest.TestCase):
                 self.assertRaisesRegex(RuntimeError, "does not reproduce"):
             trace_model(
                 network, train.tensors(observation, torch.device("cpu"), network),
-                "checkpoint", observation[4][0], train.sts2_sim.sts2_sim.__file__,
+                "checkpoint", observation[3][0], train.sts2_sim.sts2_sim.__file__,
             )
-
-    def test_card_context_ignores_device_padding(self):
-        env = train.sts2_sim.Batch(1, 7, 0)
-        target = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
-        agent = model.Agent(dict(env.token_layout(64, 1, 4, 128)), 64, 1, 4, 128).to(target)
-        values = torch.randn(510, 64, device=target)
-        metadata = torch.zeros(512, 4, dtype=torch.long, device=target)
-        metadata[:510, 3] = 1
-        metadata[:300, :3] = torch.tensor([2, 1, 5])
-        output = agent._card_context(values, metadata, agent.concepts.flattened())
-        self.assertEqual(output.shape, values.shape)
-        expected = agent.cpu()._card_context(values.cpu(), metadata.cpu(), agent.concepts.flattened())
-        torch.testing.assert_close(output.cpu(), expected)
 
     def test_native_sequence_deduplication_preserves_empty_groups(self):
         selected, groups, inverse = train.sts2_sim.deduplicate_sequences(
@@ -1167,16 +1192,20 @@ class ModelKernelTest(unittest.TestCase):
         np.testing.assert_array_equal(groups, [0, 0, 2, 2])
         np.testing.assert_array_equal(inverse, [0, 0, 1, 2])
 
-    def test_compact_training_unpack_preserves_features(self):
+    def test_unpack_deduplicates_feature_rows(self):
         env = train.sts2_sim.Batch(4, 7, None, ascension=0)
-        rows = list(model._pack_batch(env.observe_tokens(flat=True)))
-        normal = train.sts2_sim.unpack_packed_observations(rows)
-        compact = train.sts2_sim.unpack_packed_observations(rows, True)
-        for full, reduced in zip(normal[2], compact[2]):
-            for index in (0, 4, 5, 7):
-                np.testing.assert_array_equal(full[index], reduced[index])
-            np.testing.assert_array_equal(full[2][full[6]], reduced[2])
-            np.testing.assert_array_equal(full[3][full[6]], reduced[3])
+        rows = list(model._pack_batch(env.observe_tokens()))
+        _character, _globals, features, tokens, legal = train.sts2_sim.unpack_packed_observations(rows)
+        domain, place, parent, link, row, feature = map(np.asarray, tokens)
+        self.assertEqual(legal.shape[0], 4)
+        np.testing.assert_array_equal(np.unique(row), np.arange(4))
+        self.assertTrue(np.all(parent < len(domain)) and np.all(link < len(domain)))
+        for index, (codes, amounts, fields) in enumerate(features):
+            selected = feature[domain == index]
+            self.assertEqual(len(np.unique(selected)), len(codes))
+            self.assertEqual(len(np.unique(np.column_stack((
+                codes, amounts.view(np.uint32), fields.view(np.uint32),
+            )), axis=0)), len(codes))
 
     def test_precomputed_sequence_layout(self):
         groups = np.array([2, 0, 2, 1, 0, 2, 1])
@@ -1225,6 +1254,36 @@ class ModelKernelTest(unittest.TestCase):
         torch.testing.assert_close(tree_embedding.weight.grad, embedding.weight.grad)
         for name, parameter in cell.named_parameters():
             torch.testing.assert_close(parameter.grad, getattr(gru, name + "_l0").grad)
+
+    @unittest.skipUnless(torch.backends.mps.is_available(), "MPS unavailable")
+    def test_mps_training_model_matches_cpu(self):
+        env = train.sts2_sim.Batch(8, 11, None, ascension=0)
+        rng = np.random.default_rng(0)
+        for _ in range(32):
+            legal = model.observation_legal(env.observe_tokens())
+            env.step([int(rng.choice(np.flatnonzero(row))) for row in legal])
+        observation = env.observe_tokens()
+        rows, legal = model.pack_batch(observation), torch.as_tensor(model.observation_legal(observation))
+        torch.manual_seed(0)
+        cpu = train.Agent(dict(env.token_layout(*train.DEFAULT_ARCHITECTURE))).train()
+        cpu.critic.weight.data.normal_(std=.1)
+        mps = train.Agent(cpu.layout).to("mps").train()
+        mps.load_state_dict(cpu.state_dict())
+        mps.precision = "bf16"
+        outputs = []
+        for network, target, precision, pad in ((cpu, "cpu", "fp32", False), (mps, "mps", "bf16", True)):
+            policy, critic = train.predict(network, model.unpack(rows, torch.device(target), network, pad=pad),
+                                           precision)
+            (policy[:, 0].sum() + critic.sum()).backward()
+            outputs.append((policy.detach().cpu(), critic.detach().cpu()))
+        (policy, critic), (mps_policy, mps_critic) = outputs
+        self.assertLess(float((policy - mps_policy)[legal].abs().max()), .02)
+        self.assertLess(float((critic - mps_critic).abs().max()), .03)
+        errors = [float((left.grad - right.grad.cpu()).norm() / left.grad.norm())
+                  for left, right in zip(cpu.parameters(), mps.parameters())
+                  if left.grad is not None and left.grad.norm() > 1e-6]
+        self.assertLess(float(np.median(errors)), .01)
+        self.assertLess(max(errors), .05)
 
     @unittest.skipUnless(torch.backends.mps.is_available(), "MPS unavailable")
     def test_mps_linear_backward_input_matches_aten(self):
@@ -1516,7 +1575,7 @@ class TrajectoryTest(unittest.TestCase):
             policy, env.fingerprint(), "memory", 0, 123, 0, 0, 0, 0, .8, False, 1, 1,
         )
         replay = train.sts2_sim.Batch(1, trace["seed"], 0, ascension=0)
-        observation = replay.observe_tokens(flat=True)
+        observation = replay.observe_tokens()
         result = explain(
             model, observation, json.loads(replay.state(0)), replay.action_descriptors(), trace, 0,
         )
