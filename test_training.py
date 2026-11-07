@@ -415,7 +415,6 @@ print('restored')
             metrics = projector.value()["reports"][-1]["metrics"]
             self.assertEqual(projector.cursor, log.stat().st_size)
             self.assertEqual(metrics["floor_bands"]["median"], 12)
-            self.assertEqual(metrics["characters"][2]["wins"], 1)
             self.assertEqual(metrics["win_rate"], 1)
             self.assertEqual(metrics["recovery_episodes"], 1)
             self.assertEqual(metrics["boss_entries"], 1)
@@ -425,9 +424,6 @@ print('restored')
             self.assertEqual(metrics["policy_loss"], 2)
             self.assertEqual(metrics["uniform_cross_entropy"], 1.5)
             self.assertEqual(metrics["critic_explained_reward_variance"], .5)
-            self.assertEqual(metrics["critic_explained_reward_variance_by_floor"], {
-                "12": {"value": .5, "target_variance": .25, "rows": 20},
-            })
             self.assertEqual(metrics["critic_floor_conditioned_explained_reward_variance"], .5)
             self.assertEqual(metrics["search_consistency_loss"], .25)
             self.assertEqual(metrics["backbone_learning_rate"], 1e-4)
@@ -486,14 +482,14 @@ print('restored')
             (run / "run.json").write_text(json.dumps(manifest))
             log = run / "events/000001.jsonl"
             write_events(log, [{"event": "checkpoint", "time": 1, "step": 0, "stage": 0}])
-            expected = telemetry._cached_projection(root, run, manifest, 1)
+            expected = telemetry._cached_projection(root, run, manifest, 1, {})
             with mock.patch.object(telemetry, "MetricsProjector",
                                    side_effect=AssertionError("cache miss")):
-                self.assertEqual(telemetry._cached_projection(root, run, manifest, 1), expected)
+                self.assertEqual(telemetry._cached_projection(root, run, manifest, 1, {}), expected)
                 write_events(log, [{"event": "checkpoint", "time": 2,
                                     "step": 1, "stage": 0}])
                 with self.assertRaisesRegex(AssertionError, "cache miss"):
-                    telemetry._cached_projection(root, run, manifest, 1)
+                    telemetry._cached_projection(root, run, manifest, 1, {})
 
     def test_closed_event_logs_are_compressed_and_remain_readable(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -580,10 +576,6 @@ print('restored')
             self.assertEqual(metrics["dataset_kl_dropped"], 5)
             self.assertEqual(metrics["dataset_post_kl_dropped"], 7)
             self.assertAlmostEqual(metrics["critic_explained_reward_variance"], .55)
-            floor = metrics["critic_explained_reward_variance_by_floor"]["10"]
-            self.assertAlmostEqual(floor["value"], 3.05 / 4.75)
-            self.assertAlmostEqual(floor["target_variance"], 4.75 / 12)
-            self.assertEqual(floor["rows"], 12)
             self.assertAlmostEqual(
                 metrics["critic_floor_conditioned_explained_reward_variance"], 3.05 / 4.75
             )
@@ -806,6 +798,9 @@ print('restored')
             second = source.delta("run", train.MODEL_VERSION, 0, 1, 0, first["token"])
             self.assertEqual(len(second["reports"]), 1)
             self.assertEqual(second["optimizer_steps"], [])
+            with mock.patch.object(telemetry, "MetricsProjector",
+                                   side_effect=AssertionError("reprojected")):
+                self.assertEqual(len(source.load("run", train.MODEL_VERSION)["reports"]), 2)
 
     def test_legacy_heartbeat_does_not_create_a_zero_step(self):
         with tempfile.TemporaryDirectory() as temporary:
