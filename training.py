@@ -689,7 +689,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
     dataset = ExperienceDataset()
     expert_dataset = ExpertDataset(args.expert_capacity)
     promotion_episodes = []
-    decisions = discarded_steps = handled = sampled = trained = updates = 0
+    decisions = discarded_steps = handled = sampled = trained = updates = reserved = 0
     worker_accounted = [0] * args.samplers
     worker_resolved = [0] * args.samplers
     sampler_generations = [0] * args.samplers
@@ -931,6 +931,8 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
         return stage_upload(value) if target.type != "cpu" else value
 
     def reserve_batch(size):
+        nonlocal reserved
+        reserved += 1
         expert_stale = len(expert_dataset)
         expert_dataset.prune(revisions["policy_revision"], args.expert_max_lag)
         expert_stale -= len(expert_dataset)
@@ -1035,9 +1037,14 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                 > torch.mps.recommended_max_memory() * (.4 if periodic else .75):
             torch.mps.empty_cache()
 
+    def ready():
+        return len(dataset) >= args.batch and (
+            stop.is_set() or decisions >= min(budget, (reserved + 1) * args.decisions_per_update)
+        )
+
     def prefetch():
         drain_samples()
-        if not pending and len(dataset) >= args.batch:
+        if not pending and ready():
             pending.append(reserve_batch(args.batch))
 
     def drain_results():
@@ -1290,7 +1297,7 @@ def train_stream(model, optimizer, args, sampler_session, stage, target, deadlin
                     ingested = decisions != before
                     sampler_done = samplers_done()
                 boundary = min(next_report, next_save) - (base_decisions + handled)
-                enough = len(dataset) >= args.batch
+                enough = ready()
                 if boundary <= 0:
                     break
                 if not enough:
@@ -2273,7 +2280,7 @@ def train(args):
         raise ValueError("invalid sampler watchdog")
     if args.mps_empty_cache_updates < 0 or args.learning_rate_warmup_steps < 0:
         raise ValueError("invalid optimizer interval")
-    if (args.winning_capacity < 0 or args.priority_decay <= 0
+    if (args.winning_capacity < 0 or args.priority_decay <= 0 or args.decisions_per_update < 0
             or args.search_consistency_weight < 0 or args.search_consistency_batch < 1):
         raise ValueError("invalid replay setting")
     if min(args.head_learning_rate_multiplier, args.critic_learning_rate_multiplier) <= 0 \
