@@ -108,7 +108,9 @@ internal sealed class TraceCapture : IDisposable
             new Dictionary<string, object?>
             {
                 ["complete"] = false,
-                ["resumed_append"] = capture._writer!.LastSequence > 0
+                ["resumed_append"] = capture._writer!.LastSequence > 0,
+                ["start_cards"] = System.Environment.GetEnvironmentVariable("SPIREFYSH_START_CARDS"),
+                ["start_relics"] = System.Environment.GetEnvironmentVariable("SPIREFYSH_START_RELICS")
             }));
         Console.WriteLine($"[Spirefysh] Trace opened: {configuredPath}");
         return capture;
@@ -408,6 +410,10 @@ internal sealed class TraceCapture : IDisposable
             Console.Error.WriteLine($"[Spirefysh] Selector pick not written: {exception.Message}");
         }
     }
+
+    public void OnCrystalClick(int x, int y, bool big) => Guard("crystal sphere click", () =>
+        Write(new TraceEvent(0, "choice_made", null, null, null, null, null, null,
+            new Dictionary<string, object?> { ["selector"] = "crystal_sphere", ["x"] = x, ["y"] = y, ["big"] = big })));
 
     // Scroll Boxes: each bundle is one option; the chosen bundle's cards become the selected ids.
     public void OnBundleChoiceOffered(IReadOnlyList<IReadOnlyList<CardModel>> bundles)

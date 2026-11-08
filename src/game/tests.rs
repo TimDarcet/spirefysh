@@ -664,7 +664,7 @@ fn rolling_boulder_ticks_damage_and_display() {
     combat.player.add_instance(power_id::ROLLING_BOULDER, 5, 0);
 
     let boulder = game.combat().unwrap().player.powers[0];
-    game.tick_boulder(&content, boulder);
+    game.tick_boulder(boulder);
     game.resolve(&content);
 
     let combat = game.combat().unwrap();
@@ -805,7 +805,8 @@ fn fresh_runs_start_in_a_real_first_act_at_neow() {
     let mut seen = [false; 2];
     for seed in 1..=8 {
         let mut game = Game::new_character_ascension(&content, seed, 0, 10).unwrap();
-        let selected = game.rngs.up_front.clone().below(2) as usize;
+        let selected =
+            Rng::from_seed(game.seed.wrapping_add(hash("act_selection")) as u64).below(2) as usize;
         game.begin_run(&content).unwrap();
         seen[selected] = true;
         assert_eq!(game.act, acts[selected]);
@@ -892,10 +893,10 @@ fn later_acts_reveal_their_floor_zero_ancient_deterministically() {
 fn standard_acts_use_ordinal_map_profiles() {
     let content = foundation_content();
     for (number, name, boss_floor, rooms) in [
-        (1, "ACT.THE_OVERGROWTH", 14, [21, 11, 5, 8, 3]),
-        (1, "ACT.THE_UNDERDOCKS", 14, [21, 11, 5, 8, 3]),
+        (1, "ACT.THE_OVERGROWTH", 16, [27, 12, 5, 11, 3]),
+        (1, "ACT.THE_UNDERDOCKS", 16, [27, 12, 5, 11, 3]),
         (2, "ACT.THE_HIVE", 15, [25, 10, 5, 11, 3]),
-        (3, "ACT.THE_GLORY", 16, [23, 13, 5, 9, 3]),
+        (3, "ACT.THE_GLORY", 14, [23, 10, 5, 8, 3]),
     ] {
         let act = content.acts.iter().position(|act| act.id == name).unwrap() as Id;
         let mut game = Game::new_character_ascension(&content, 73, 0, 0).unwrap();
@@ -943,7 +944,6 @@ fn standard_acts_use_ordinal_map_profiles() {
             combat.queue.clear();
             game.finish_combat(&content);
             assert!(matches!(game.phase, Phase::Won));
-            assert_eq!((game.run.act - 1) as u16 * 17 + game.run.floor as u16, 51);
         }
     }
 }
@@ -1265,7 +1265,7 @@ fn spawned_enemies_reuse_dead_slots_and_clear_slot_state() {
         ..Power::default()
     }]]));
 
-    let slot = game.spawn_enemy(&content, "MONSTER.TOUGH_EGG");
+    let slot = game.spawn_enemy(&content, "MONSTER.TOUGH_EGG", 5);
 
     let combat = game.combat().unwrap();
     assert_eq!(slot, 0);
@@ -2023,7 +2023,7 @@ fn minions_do_not_keep_combat_open() {
         .unwrap() as Id;
     game.start_combat(&content, encounter).unwrap();
     game.combat_mut().unwrap().enemies[0].creature.hp = 0;
-    game.spawn_enemy(&content, "MONSTER.EYE_WITH_TEETH");
+    game.spawn_enemy(&content, "MONSTER.EYE_WITH_TEETH", 1);
 
     game.finish_combat(&content);
 
@@ -2498,7 +2498,7 @@ fn cloak_clasp_blocks_once_per_card_in_hand() {
     combat.player.block = 0;
     combat.hand.truncate(4);
     for enemy in &mut combat.enemies {
-        enemy.stunned = true;
+        enemy.stunned = 1;
     }
     let barricade = content
         .powers
@@ -2633,7 +2633,7 @@ fn stunned_thieving_hopper_does_not_escape() {
     game.start_combat(&content, encounter).unwrap();
     let enemy = &mut game.combat_mut().unwrap().enemies[0];
     enemy.move_index = 4;
-    enemy.stunned = true;
+    enemy.stunned = 1;
 
     game.step(&content, Action::EndTurn).unwrap();
 

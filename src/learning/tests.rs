@@ -63,95 +63,20 @@ fn v44_galactic_dust_block_preview_matches_play() {
 }
 
 #[test]
-fn lazy_encounters_match_the_constrained_bag_generator() {
-    fn generate(content: &Content, groups: &[(&[Id], usize)], mut rng: Rng) -> Vec<Id> {
-        let mut result = Vec::new();
-        for &(candidates, count) in groups {
-            let mut bag = candidates.to_vec();
-            bag.sort_unstable();
-            for _ in 0..count {
-                if bag.is_empty() {
-                    bag.extend_from_slice(candidates);
-                    bag.sort_unstable();
-                }
-                let previous = result.last().copied();
-                let allowed = |id: Id| {
-                    previous != Some(id)
-                        && previous.is_none_or(|previous| {
-                            encounter_tags(content.encounters[id as usize].id)
-                                & encounter_tags(content.encounters[previous as usize].id)
-                                == 0
-                        })
-                };
-                let constrained = bag.iter().copied().any(allowed);
-                let index = loop {
-                    let index = (rng.double() * bag.len() as f64) as usize;
-                    if !constrained || allowed(bag[index]) {
-                        break index;
-                    }
-                };
-                result.push(bag.remove(index));
-            }
-        }
-        result
-    }
-
+fn run_start_rolls_every_acts_rooms_weak_encounters_first() {
     let content = foundation_content();
-    let act = content
-        .acts
-        .iter()
-        .position(|act| {
-            act.encounters
-                .iter()
-                .any(|id| content.encounters[*id as usize].id.contains("_WEAK"))
-                && act
-                    .encounters
-                    .iter()
-                    .any(|id| !content.encounters[*id as usize].id.contains("_WEAK"))
-                && !act.elites.is_empty()
-        })
-        .unwrap() as Id;
     let mut game = Game::new_character_ascension(&content, 1, 0, 10).unwrap();
-    game.begin_act(&content, act).unwrap();
-    let weak = content.acts[act as usize]
-        .encounters
+    game.begin_run(&content).unwrap();
+    let weak = |id: &Id| content.encounters[*id as usize].id.contains("_WEAK");
+    assert_eq!((game.encounters.len(), game.elites.len()), (15, 15));
+    assert!(game.encounters[..3].iter().all(weak) && !game.encounters[3..].iter().any(weak));
+    let later: Vec<_> = game
+        .later_rooms
         .iter()
-        .copied()
-        .filter(|id| content.encounters[*id as usize].id.contains("_WEAK"))
-        .collect::<Vec<_>>();
-    let regular = content.acts[act as usize]
-        .encounters
-        .iter()
-        .copied()
-        .filter(|id| !content.encounters[*id as usize].id.contains("_WEAK"))
-        .collect::<Vec<_>>();
-    let counts = (
-        game.weak_encounters_left as usize,
-        game.regular_encounters_left as usize,
-        game.elite_encounters_left as usize,
-    );
-    let seed = 91;
-    let expected = generate(
-        &content,
-        &[(&weak, counts.0), (&regular, counts.1)],
-        Rng::from_seed(seed),
-    );
-    game.rngs.up_front = Rng::from_seed(seed);
-    let actual = (0..expected.len())
-        .map(|_| game.next_encounter(&content, false).unwrap())
-        .collect::<Vec<_>>();
-    assert_eq!(actual, expected);
-
-    let expected = generate(
-        &content,
-        &[(content.acts[act as usize].elites, counts.2)],
-        Rng::from_seed(seed),
-    );
-    game.rngs.up_front = Rng::from_seed(seed);
-    let actual = (0..expected.len())
-        .map(|_| game.next_encounter(&content, true).unwrap())
-        .collect::<Vec<_>>();
-    assert_eq!(actual, expected);
+        .map(|rooms| rooms.encounters.len())
+        .collect();
+    assert_eq!(later, [14, 13]);
+    assert_eq!(game.ancient, content.event_id("EVENT.NEOW"));
 }
 
 #[test]
@@ -186,36 +111,21 @@ fn v56_distinguishes_remaining_encounter_bags_with_the_same_last_encounter() {
         .unwrap();
     let mut game = Game::new_character_ascension(&content, 568, 0, 10).unwrap();
     game.begin_act(&content, act).unwrap();
-    game.weak_encounters_left = 0;
-    game.regular_encounters_left = 3;
-    game.encounters = vec![first_id, shared, second_id];
-    let reach = |wanted| {
-        (0..1024)
-            .find_map(|seed| {
-                let mut reached = game.clone();
-                reached.rngs.up_front = Rng::from_seed(seed);
-                (reached.next_encounter(&content, false) == Some(wanted)
-                    && reached.next_encounter(&content, false) == Some(shared))
-                .then_some(reached)
-            })
-            .unwrap()
-    };
-    let mut first = reach(first_id);
-    let mut second = reach(second_id);
-    assert_eq!(first.last_encounter, second.last_encounter);
-    assert_ne!(first.encounters, second.encounters);
+    game.encounters_visited = 2;
+    let mut first = game.clone();
+    first.encounters = vec![first_id, shared, second_id];
+    let mut second = game;
+    second.encounters = vec![second_id, shared, first_id];
     assert_ne!(
         canonical_words(&build_observation(&first, &content, layout)),
         canonical_words(&build_observation(&second, &content, layout))
     );
-    assert_eq!(first.next_encounter(&content, false), Some(second_id));
-    assert_eq!(second.next_encounter(&content, false), Some(first_id));
 }
 
 #[test]
 fn encounter_bag_enforces_public_repeat_constraints() {
     let content = foundation_content();
-    let (act, previous, allowed) = content
+    let (_, previous, allowed) = content
         .acts
         .iter()
         .enumerate()
@@ -235,18 +145,15 @@ fn encounter_bag_enforces_public_repeat_constraints() {
         })
         .unwrap();
     let mut game = Game::new_character_ascension(&content, 2, 0, 10).unwrap();
-    game.begin_act(&content, act).unwrap();
-    game.weak_encounters_left = 1;
-    game.regular_encounters_left = 0;
-    game.last_encounter = Some(previous);
-    game.encounters = vec![previous, allowed];
     for seed in 1..=32 {
-        let mut sampled = game.clone();
-        sampled.rngs.up_front = Rng::from_seed(seed);
-        assert_eq!(sampled.next_encounter(&content, false), Some(allowed));
+        game.rngs.up_front = Rng::from_seed(seed);
+        let mut encounters = vec![previous];
+        game.grab_encounters(&content, &[], vec![previous, allowed], 1, &mut encounters);
+        assert_eq!(encounters, [previous, allowed]);
     }
-    game.encounters = vec![previous];
-    assert_eq!(game.next_encounter(&content, false), Some(previous));
+    let mut encounters = vec![previous];
+    game.grab_encounters(&content, &[], vec![previous], 1, &mut encounters);
+    assert_eq!(encounters, [previous, previous]);
 }
 
 #[test]
@@ -268,7 +175,8 @@ fn replay_keeps_its_forced_encounter() {
     };
     resample_hidden(&mut game, &content, 9);
     game.step(&content, Action::Path(0)).unwrap();
-    assert!(game.encounters.is_empty());
+    assert_eq!(game.encounters, [content.acts[0].encounters[0]]);
+    assert_eq!(game.encounters_visited, 1);
 }
 
 #[test]
@@ -277,9 +185,8 @@ fn direct_event_combat_does_not_consume_encounter_bags() {
     let mut game = Game::new_character_ascension(&content, 3, 0, 10).unwrap();
     game.begin_act(&content, 0).unwrap();
     let before = (
-        game.weak_encounters_left,
-        game.regular_encounters_left,
-        game.elite_encounters_left,
+        game.encounters_visited,
+        game.elites_visited,
         game.encounters.clone(),
         game.elites.clone(),
     );
@@ -288,9 +195,8 @@ fn direct_event_combat_does_not_consume_encounter_bags() {
     assert_eq!(
         before,
         (
-            game.weak_encounters_left,
-            game.regular_encounters_left,
-            game.elite_encounters_left,
+            game.encounters_visited,
+            game.elites_visited,
             game.encounters,
             game.elites,
         )

@@ -971,14 +971,20 @@ impl Ctx<'_> {
         token.code(layout, Semantic::Character, run.character as u32);
         token.flag(layout, Flag::DamageTaken, game.damage_taken);
         let (hp, max_hp) = (run.hp.max(0) as f32, run.max_hp.max(1) as f32);
+        let weak = weak_encounters(game, self.content);
+        let visited = game.encounters_visited as usize;
+        let left = game.encounters.len().saturating_sub(visited);
         token.f.copy_from_slice(&[
             run.ascension as f32 / 20.0,
             run.act as f32 / 3.0,
             run.floor as f32 / 60.0,
             game.bosses_visited as f32 / 3.0,
-            game.weak_encounters_left as f32 / 20.0,
-            game.regular_encounters_left as f32 / 20.0,
-            game.elite_encounters_left as f32 / 20.0,
+            weak.saturating_sub(visited) as f32 / 20.0,
+            left.min(game.encounters.len() - weak) as f32 / 20.0,
+            game.elites
+                .len()
+                .saturating_sub(game.elites_visited as usize) as f32
+                / 20.0,
             hp / 30.0,
             max_hp / 30.0,
             hp / max_hp,
@@ -1537,9 +1543,9 @@ impl<'a> Items<'a> {
                 token.code(layout, Semantic::OfferKind, 0);
                 token.code(layout, Semantic::Room, room_index(room) as u32);
             }
-            CardReward::Fixed(id, rarity) => {
+            CardReward::Fixed(character, rarity) => {
                 token.code(layout, Semantic::OfferKind, 1);
-                token.code(layout, Semantic::Card, base_card_id(id as u32));
+                token.code(layout, Semantic::Character, character as u32);
                 token.code(layout, Semantic::Rarity, rarity as u32);
             }
             CardReward::Kaleidoscope => token.code(layout, Semantic::OfferKind, 2),
@@ -1942,7 +1948,7 @@ impl Encoder<'_> {
                 token.code(layout, Semantic::ActorKind, 2);
                 token.code(layout, Semantic::Enemy, enemy.creature.id as u32);
                 token.code(layout, Semantic::EnemyPosition, index.min(32) as u32);
-                let movement = if enemy.stunned {
+                let movement = if enemy.stunned > 0 {
                     content.enemies.iter().map(|enemy| enemy.moves.len() as u32).sum()
                 } else {
                     enemy_move_id(content, enemy.creature.id, enemy.move_index)
@@ -2123,7 +2129,7 @@ fn token_order(left: &Token, right: &Token) -> std::cmp::Ordering {
 /// The enemy's intended damage to the player this turn after every modifier, and its hits.
 fn intent(game: &Game, content: &Content, index: usize) -> (f32, f32) {
     let enemy = &game.combat().unwrap().enemies[index];
-    if enemy.stunned || enemy.creature.hp <= 0 {
+    if enemy.stunned > 0 || enemy.creature.hp <= 0 {
         return (0.0, 0.0);
     }
     let context = Context { source: Actor::Enemy(index), ..Context::player() };
@@ -2777,29 +2783,40 @@ fn public_relic_bag(game: &Game, layout: Layout) -> Vec<Vec<Id>> {
     bag
 }
 
+fn weak_encounters(game: &Game, content: &Content) -> usize {
+    (game.encounters.iter())
+        .take_while(|&&id| content.encounters[id as usize].id.contains("_WEAK"))
+        .count()
+}
+
+/// The encounters left in the bag of the act's current stage (weak encounters, then regular
+/// ones, or the elites): its pool less those fought since the bag was last refilled.
 fn public_encounters(game: &Game, content: &Content, elite: bool) -> Vec<Id> {
-    let full = public_encounter_pool(game, content, elite);
-    let active = if elite {
-        game.elite_encounters_left > 0
+    let act = &content.acts[game.act as usize];
+    let (list, visited, weak) = if elite {
+        (&game.elites, game.elites_visited as usize, 0)
     } else {
-        game.weak_encounters_left > 0 || game.regular_encounters_left > 0
+        (
+            &game.encounters,
+            game.encounters_visited as usize,
+            weak_encounters(game, content),
+        )
     };
-    if !active {
-        return full;
+    let start = if visited < weak { 0 } else { weak };
+    let mut pool = if elite {
+        act.elites.to_vec()
+    } else {
+        (act.encounters.iter().copied())
+            .filter(|&id| content.encounters[id as usize].id.contains("_WEAK") == (visited < weak))
+            .collect()
+    };
+    pool.sort_unstable();
+    if visited >= list.len() || pool.is_empty() {
+        return pool;
     }
-    let remaining = if elite {
-        &game.elites
-    } else {
-        &game.encounters
-    };
-    let mut public = remaining
-        .iter()
-        .copied()
-        .filter(|id| full.contains(id))
-        .collect::<Vec<_>>();
-    public.sort_unstable();
-    public.dedup();
-    if public.is_empty() { full } else { public }
+    let refill = start + (visited - start) / pool.len() * pool.len();
+    pool.retain(|id| !list[refill..visited].contains(id));
+    pool
 }
 
 fn relic_state(game: &Game, content: &Content, id: Id) -> [f32; 2] {
@@ -3008,27 +3025,6 @@ fn event_option_payload(game: &Game, content: &Content, index: usize) -> Option<
             .map(|value| i32::try_from(value).expect("public event option exceeds i32")),
         _ => None,
     }
-}
-
-fn public_encounter_pool(game: &Game, content: &Content, elite: bool) -> Vec<Id> {
-    let act = &content.acts[game.act as usize];
-    if elite {
-        return act.elites.to_vec();
-    }
-    act.encounters
-        .iter()
-        .copied()
-        .filter(|&id| {
-            let weak = content.encounters[id as usize].id.contains("_WEAK");
-            if game.weak_encounters_left > 0 {
-                weak
-            } else if game.regular_encounters_left > 0 {
-                !weak
-            } else {
-                true
-            }
-        })
-        .collect()
 }
 
 fn scale_payload(scale: Scale) -> (u32, u32, i32) {
@@ -3334,18 +3330,40 @@ fn resample_hidden(game: &mut Game, content: &Content, seed: u64) {
             game.shared_relic_deques[rarity].push(relic);
         }
     }
-    if replaying || game.encounters.is_empty() {
-        game.encounters = encounters;
+    // The rooms still ahead are rolled again, from what is left of their bags; a replay keeps
+    // the trace's next encounters.
+    let act = &content.acts[game.act as usize];
+    if !replaying {
+        let (weak, regular): (Vec<_>, Vec<_>) = (act.encounters.iter())
+            .partition(|&&id| content.encounters[id as usize].id.contains("_WEAK"));
+        let weak_count = weak_encounters(game, content);
+        let (length, visited) = (game.encounters.len(), game.encounters_visited as usize);
+        let mut list = std::mem::take(&mut game.encounters);
+        list.truncate(visited);
+        if visited < weak_count {
+            game.grab_encounters(content, &weak, encounters, weak_count - visited, &mut list);
+            game.grab_encounters(content, &regular, vec![], length - weak_count, &mut list);
+        } else if visited < length {
+            game.grab_encounters(content, &regular, encounters, length - visited, &mut list);
+        }
+        game.encounters = list;
+        let (length, visited) = (game.elites.len(), game.elites_visited as usize);
+        let mut list = std::mem::take(&mut game.elites);
+        list.truncate(visited);
+        let left = length.saturating_sub(visited);
+        game.grab_encounters(content, act.elites, elites, left, &mut list);
+        game.elites = list;
     }
-    if replaying || game.elites.is_empty() {
-        game.elites = elites;
+    let mut darv: Vec<_> = (content.event_id("EVENT.DARV").into_iter())
+        .filter(|&id| game.ancient != Some(id))
+        .collect();
+    for index in 0..game.later_rooms.len() {
+        let count = game.rngs.up_front.below(darv.len() as u32 + 1) as usize;
+        let shared: Vec<_> = darv.drain(..count).collect();
+        game.later_rooms[index] = game.roll_rooms(content, game.later_rooms[index].act, &shared);
     }
-    game.events = content.acts[game.act as usize].events.to_vec();
-    game.encounters.sort_unstable();
-    game.elites.sort_unstable();
+    game.events = act.events.to_vec();
     game.events.sort_unstable();
-    rng.shuffle(&mut game.encounters);
-    rng.shuffle(&mut game.elites);
     rng.shuffle(&mut game.events);
     for relics in game
         .relic_deques

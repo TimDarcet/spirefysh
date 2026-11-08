@@ -1,9 +1,12 @@
 use std::{env, process::ExitCode};
-use sts2_sim::replay_trace;
+use sts2_sim::{lockstep_trace, replay_trace};
 
 fn main() -> ExitCode {
+    if env::args().nth(1).as_deref() == Some("--lockstep") {
+        return lockstep(env::args().nth(2));
+    }
     let Some(path) = env::args().nth(1) else {
-        eprintln!("usage: cargo run --bin replay -- TRACE.ndjson [LIMIT]");
+        eprintln!("usage: cargo run --bin replay -- [--lockstep] TRACE.ndjson [LIMIT]");
         return ExitCode::FAILURE;
     };
     let limit = env::args()
@@ -57,4 +60,37 @@ fn main() -> ExitCode {
     } else {
         ExitCode::FAILURE
     }
+}
+
+/// Plays the trace's run from its seed and reports the first decision where it leaves the game.
+fn lockstep(path: Option<String>) -> ExitCode {
+    let Some(path) = path else {
+        eprintln!("usage: cargo run --bin replay -- --lockstep TRACE.ndjson");
+        return ExitCode::FAILURE;
+    };
+    let report = match lockstep_trace(&path) {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!("{path}: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!(
+        "{} of {} decisions in sync, floor {}",
+        report.matched, report.decisions, report.floor
+    );
+    for (sequence, drift) in &report.rng_drifts {
+        println!("RNG drift from sequence {sequence}: {drift}");
+    }
+    let Some(divergence) = report.divergence else {
+        return ExitCode::SUCCESS;
+    };
+    println!(
+        "diverged at sequence {} ({})",
+        divergence.sequence, divergence.action
+    );
+    for difference in &divergence.differences {
+        println!("  {difference}");
+    }
+    ExitCode::FAILURE
 }

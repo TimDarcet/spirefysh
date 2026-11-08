@@ -15,7 +15,7 @@ mod replay;
 
 pub use foundation::{foundation_content, foundation_game};
 pub use learning::ValueModel;
-pub use replay::{Divergence, ReplayReport, replay_trace};
+pub use replay::{Divergence, LockstepReport, ReplayReport, lockstep_trace, replay_trace};
 
 pub type Id = u16;
 
@@ -1126,6 +1126,10 @@ impl Content {
         self.relics.iter().position(|x| x.id == id).map(|x| x as Id)
     }
 
+    pub fn event_id(&self, id: &str) -> Option<Id> {
+        self.events.iter().position(|x| x.id == id).map(|x| x as Id)
+    }
+
     pub fn potion_id(&self, id: &str) -> Option<Id> {
         self.potions
             .iter()
@@ -1829,7 +1833,8 @@ pub struct Enemy {
     pub last_move: usize,
     pub repeats: u8,
     pub move_history: Vec<usize>,
-    pub stunned: bool,
+    /// The rolls a stun (CreatureCmd.Stun) still holds; a stunned enemy skips its move.
+    pub stunned: u8,
     pub value: i16,
     pub slot: u8,
 }
@@ -2093,6 +2098,14 @@ pub struct Combat {
     belt_buckle: bool,
     burning_sticks: bool,
     red_skull: bool,
+    /// Call for Backups the rats performed (CallForBackupCount).
+    rat_calls: u8,
+    /// Deck cards Thieving Hoppers hold (Swipe), by hopper instance.
+    stolen: Vec<(u32, Card)>,
+    /// Stolen cards whose hopper died: they come back as rewards.
+    returned: Vec<Card>,
+    /// The enemies that fled (EscapedCreatures).
+    escaped: Vec<Id>,
     throwing_axe: bool,
     vambrace: bool,
     block_doubler: Option<u32>,
@@ -2342,7 +2355,7 @@ impl Rngs {
             combat_card_generation: named("combat_card_generation"),
             combat_card_selection: named("combat_card_selection"),
             combat_energy_costs: named("combat_energy_costs"),
-            combat_orb_generation: named("combat_orb_generation"),
+            combat_orb_generation: named("combat_orbs"),
             combat_potion_generation: named("combat_potion_generation"),
             combat_targets: named("combat_targets"),
             monster_ai: named("monster_ai"),
@@ -2391,26 +2404,29 @@ fn hash(value: &str) -> u32 {
     a.wrapping_add(b.wrapping_mul(1_566_083_941))
 }
 
+/// EncounterModel.Tags, one bit each: Burrower, Chomper, Crawler, Exoskeletons, Knights,
+/// Mushroom, Nibbit, Scrolls, Seapunk, Shrinker, Slimes, Slugs, Thieves, Workers.
 fn encounter_tags(id: &str) -> u16 {
-    [
-        ("SCROLLS_OF_BITING", 1),
-        ("BOWLBUG", 2),
-        ("SLUMBER", 2),
-        ("EXOSKELETON", 4),
-        ("OVERGROWTH_FLORA", 8 | 16),
-        ("SHROOM", 8 | 16),
-        ("SLIME", 16),
-        ("FUZZY_WURM_CRAWLER", 32),
-        ("OVERGROWTH_CRAWLERS", 32 | 64),
-        ("SHRINKER", 64),
-        ("NIBBIT", 128),
-        ("CORPSE_SLUGS", 256),
-        ("SEAPUNK", 512),
-        ("UNDERDOCKS_WILDLIFE", 512),
-    ]
-    .into_iter()
-    .filter_map(|(needle, tag)| id.contains(needle).then_some(tag))
-    .fold(0, |tags, tag| tags | tag)
+    match encounter_entry(id) {
+        "TUNNELER_WEAK" => 1,
+        "CHOMPERS_NORMAL" => 2,
+        "TUNNELER_NORMAL" => 1 | 2,
+        "FUZZY_WURM_CRAWLER_WEAK" => 4,
+        "EXOSKELETONS_NORMAL" | "EXOSKELETONS_WEAK" => 8,
+        "KNIGHTS_ELITE" => 16,
+        "SNAPPING_JAXFRUIT_NORMAL" => 32,
+        "NIBBITS_WEAK" => 64,
+        "SCROLLS_OF_BITING_NORMAL" | "SCROLLS_OF_BITING_WEAK" => 128,
+        "SEAPUNK_NORMAL" | "SEAPUNK_WEAK" => 256,
+        "SHRINKER_BEETLE_WEAK" => 512,
+        "OVERGROWTH_CRAWLERS" => 4 | 512,
+        "SLIMES_NORMAL" | "SLIMES_WEAK" => 1024,
+        "FLYCONID_NORMAL" => 32 | 1024,
+        "CORPSE_SLUGS_NORMAL" | "CORPSE_SLUGS_WEAK" => 2048,
+        "THIEVING_HOPPER_WEAK" => 4096,
+        "BOWLBUGS_NORMAL" | "BOWLBUGS_WEAK" | "SLUMBERING_BEETLE_NORMAL" => 8192,
+        _ => 0,
+    }
 }
 
 fn encounter_entry(id: &str) -> &str {
@@ -2433,6 +2449,13 @@ fn encounter_entry(id: &str) -> &str {
         "ENCOUNTER.THE_UNDERDOCKS_WEAK_CORPSE_SLUGS" => "CORPSE_SLUGS_WEAK",
         "ENCOUNTER.THE_UNDERDOCKS_NORMAL_TWO_TAILED_RATS" => "TWO_TAILED_RATS_NORMAL",
         "ENCOUNTER.THE_UNDERDOCKS_ELITE_PHANTASMAL_GARDENERS" => "PHANTASMAL_GARDENERS_ELITE",
+        "ENCOUNTER.THE_OVERGROWTH_NORMAL_SHROOM_AND_SLIME" => "SNAPPING_JAXFRUIT_NORMAL",
+        "ENCOUNTER.THE_OVERGROWTH_ELITE_PHROG_PARASITE" => "PHROG_PARASITE_ELITE",
+        "ENCOUNTER.THE_OVERGROWTH_BOSS_VANTOM" => "VANTOM_BOSS",
+        "ENCOUNTER.THE_GLORY_ELITE_KNIGHT_GANG" => "KNIGHTS_ELITE",
+        "ENCOUNTER.THE_GLORY_ELITE_SOUL_NEXUS" => "SOUL_NEXUS_ELITE",
+        "ENCOUNTER.THE_GLORY_NORMAL_LOST_AND_FORGOTTEN" => "THE_LOST_AND_FORGOTTEN_NORMAL",
+        "ENCOUNTER.THE_GLORY_BOSS_QUEEN" => "QUEEN_BOSS",
         "ENCOUNTER.EVENT_ENCOUNTERS_NORMAL_PUNCH_CONSTRUCTS" => "PUNCH_OFF_EVENT_ENCOUNTER",
         "ENCOUNTER.PUNCH_OFF_EVENT_ENCOUNTER" => "PUNCH_OFF_EVENT_ENCOUNTER",
         _ => id.strip_prefix("ENCOUNTER.").unwrap_or(id),
@@ -2447,6 +2470,17 @@ struct Expectation {
     unknown: bool,
     drawn: i16,
     discarded: i16,
+}
+
+/// An act's RoomSet: its events, encounters and elites are visited in order, in a loop.
+#[derive(Clone, Debug)]
+struct Rooms {
+    act: Id,
+    events: Vec<Id>,
+    encounters: Vec<Id>,
+    elites: Vec<Id>,
+    bosses: [Option<Id>; 2],
+    ancient: Option<Id>,
 }
 
 #[derive(Clone, Debug)]
@@ -2465,14 +2499,13 @@ pub struct Game {
     bosses: [Option<Id>; 2],
     bosses_visited: u8,
     encounters: Vec<Id>,
+    encounters_visited: u8,
     elites: Vec<Id>,
-    weak_encounters_left: u8,
-    regular_encounters_left: u8,
-    elite_encounters_left: u8,
-    last_encounter: Option<Id>,
-    last_elite: Option<Id>,
+    elites_visited: u8,
     ancient: Option<Id>,
     events: Vec<Id>,
+    /// The rooms of the acts still ahead, all rolled when the run starts.
+    later_rooms: Vec<Rooms>,
     visited_events: Vec<Id>,
     enemy_starts: Vec<usize>,
     seed: u32,
@@ -2525,6 +2558,11 @@ pub struct Game {
     conveyor: bool,
     crystal: Option<CrystalSphere>,
     reward_gold_parts: Vec<i32>,
+    /// Floors of the finished acts: TotalFloor counts visited map points; maps differ in length.
+    past_floors: u16,
+    /// A transform batch's replacements, by the deck index each original left: CardCmd.Transform
+    /// adds them in that order once the batch is chosen.
+    transformed: Vec<(usize, Card)>,
     fake_merchant: Vec<Id>,
     fake_shop: bool,
     /// The Courier refills a slot only once a purchase completes, after any pickup screen it opened.

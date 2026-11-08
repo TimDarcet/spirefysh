@@ -297,6 +297,7 @@ const LISTENERS: &[(Trigger, &[&str])] = &[
         Trigger::AfterDeath,
         &[
             "CARD.MELANCHOLY",
+            "POWER.SWIPE_POWER",
             "POWER.ADAPTABLE_POWER",
             "POWER.CONSTRICT_POWER",
             "POWER.CRAB_RAGE_POWER",
@@ -487,6 +488,8 @@ impl Game {
         let play = self.combat_mut().unwrap().plays.last_mut().unwrap();
         play.recorded = recorded;
         let context = play.context;
+        // SurroundedPower.BeforeCardPlayed turns to every targeted play, auto-plays included.
+        self.face_target(context.target);
         let powers = self.creature(Actor::Player).powers.clone();
         self.fire(content, Trigger::BeforeCardPlayed, context, powers);
     }
@@ -627,7 +630,7 @@ impl Game {
         {
             let end = END_ENEMY_TURN.contains(&Effect::Fire(trigger));
             let allies = [Actor::Player, Actor::Osty].into_iter().filter(|_| end);
-            let enemies = self.participants(content).into_iter().map(Actor::Enemy);
+            let enemies = self.participants().into_iter().map(Actor::Enemy);
             let listening = |actor: Actor, power: &Power| {
                 let def = content.powers[power.id as usize];
                 let hears = if matches!(actor, Actor::Enemy(_)) {
@@ -746,6 +749,25 @@ impl Game {
         }
     }
 
+    /// Whether the enemy already made its move this enemy turn.
+    fn moved(&self, index: usize) -> bool {
+        let steps = || (self.combat().unwrap().queue.iter()).map(|pending| pending.effect);
+        let waiting =
+            |effect| matches!(effect, Effect::Step(Step::EnemyMove(i, _)) if i as usize == index);
+        steps().any(|effect| effect == Effect::Step(Step::EnemyTurnEnd)) && !steps().any(waiting)
+    }
+
+    /// SetMoveImmediate to a move it must perform once (CreatureCmd.Stun, About to Blow): it
+    /// replaces this turn's move, unless the enemy already moved this turn, when it holds through
+    /// the next roll.
+    pub(super) fn stun(&mut self, index: usize, stun: usize) {
+        if self.moved(index) {
+            self.set_move(index, stun, usize::MAX, 0);
+        } else {
+            self.set_move(index, stun, stun, 1).move_history.push(stun);
+        }
+    }
+
     fn set_move(&mut self, index: usize, next: usize, last: usize, repeats: u8) -> &mut Enemy {
         let enemy = &mut self.combat_mut().unwrap().enemies[index];
         enemy.move_index = next;
@@ -783,7 +805,7 @@ impl Game {
                     && content.enemies[self.creature(owner).id as usize].id
                         == "MONSTER.BOWLBUG_ROCK"
                 {
-                    self.set_move(index, 1, usize::MAX, 0);
+                    self.stun(index, 1);
                 }
             }
             // A creature the hit killed can't receive Monarch's Gaze (CanReceivePowers).
@@ -949,18 +971,14 @@ impl Game {
                             | power_id::SHACKLING_POTION
                     )
                 });
-                self.set_move(index, 2, 2, 1).move_history.push(2);
+                self.stun(index, 2);
             }
             (Trigger::AfterDamageReceived, "POWER.SHRIEK_POWER")
                 if hurt && self.creature(owner).hp > 0 && self.creature(owner).hp <= amount =>
             {
                 let Actor::Enemy(index) = owner else { return };
                 (self.creature_mut(owner).powers).retain(|power| power.id != power_id::SHRIEK);
-                // Stunned on its own turn, it keeps the stun past this turn's move roll.
-                let held = self.combat().unwrap().enemy_turn;
-                let enemy = self.set_move(index, 2, 2, 1);
-                enemy.move_history.push(2);
-                enemy.stunned |= held;
+                self.stun(index, 2);
             }
             (Trigger::AfterDamageReceived, "POWER.SLIPPERY_POWER") if hurt => {
                 self.creature_mut(owner).consume_power(power_id::SLIPPERY)
@@ -973,7 +991,7 @@ impl Game {
                 let Actor::Enemy(index) = owner else { return };
                 self.creature_mut(owner).consume_power(power_id::SLUMBER);
                 if self.creature(owner).power(power_id::SLUMBER) == 0 {
-                    self.set_move(index, 2, usize::MAX, 0);
+                    self.stun(index, 2);
                 }
             }
             (Trigger::AfterDamageReceived, "POWER.ASLEEP_POWER")
@@ -984,7 +1002,7 @@ impl Game {
                 let Actor::Enemy(index) = owner else { return };
                 (self.creature_mut(owner).powers)
                     .retain(|power| !matches!(power.id, power_id::PLATING | power_id::ASLEEP));
-                self.set_move(index, 5, usize::MAX, 0);
+                self.stun(index, 5);
             }
             (Trigger::AfterDamageReceived, "RELIC.DEMON_TONGUE")
                 if hurt && player_turn && !self.combat().unwrap().demon_tongue =>
@@ -1112,8 +1130,20 @@ impl Game {
             "POWER.RAVENOUS_POWER" if other && !prevented => {
                 self.creature_mut(owner)
                     .add_power(power_id::STRENGTH, power.amount);
+                // Stunned into its last move: after this turn's, if it already moved.
                 let Actor::Enemy(owner) = owner else { return };
-                self.combat_mut().unwrap().enemies[owner].stunned = true;
+                self.combat_mut().unwrap().enemies[owner].stunned = 1 + self.moved(owner) as u8;
+            }
+            // SwipePower.BeforeDeath: a killed hopper drops its stolen card.
+            "POWER.SWIPE_POWER" if mine && !prevented => {
+                let combat = self.combat_mut().unwrap();
+                let hopper = combat.enemies[index].instance;
+                let (returned, kept) =
+                    (combat.stolen.iter()).partition(|(holder, _)| *holder == hopper);
+                combat.stolen = kept;
+                combat
+                    .returned
+                    .extend(returned.into_iter().map(|(_, card): (u32, Card)| card));
             }
             "POWER.CRAB_RAGE_POWER" if other => {
                 self.creature_mut(owner).add_power(power_id::STRENGTH, 6);
@@ -1127,9 +1157,8 @@ impl Game {
                 (creature.powers).retain(|power| power.id == power_id::STEAM_ERUPTION);
                 creature.hp = i16::MAX;
                 creature.max_hp = i16::MAX;
-                let enemy = self.set_move(index, 7, 7, 1);
-                enemy.move_history.push(7);
-                enemy.value = power.amount;
+                self.stun(index, 7);
+                self.combat_mut().unwrap().enemies[index].value = power.amount;
             }
             "POWER.ADAPTABLE_POWER" if mine && enemy_id(self, dead) == "MONSTER.TEST_SUBJECT" => {
                 strip(self, &|power| {
@@ -1164,16 +1193,16 @@ impl Game {
             // Its spawns still see it among the enemies (unique HP rolls).
             "POWER.STOCK_POWER" if mine && !prevented && power.amount > 0 => {
                 self.corpse_hp = Some(self.creature(dead).max_hp);
-                let spawned = self.spawn_enemy(content, "MONSTER.AXEBOT");
+                let Actor::Enemy(index) = dead else { return };
+                let slot = self.combat().unwrap().enemies[index].slot;
+                let spawned = self.spawn_enemy(content, "MONSTER.AXEBOT", slot);
                 self.corpse_hp = None;
                 let creature = self.creature_mut(Actor::Enemy(spawned));
                 creature.powers.retain(|power| power.id != power_id::STOCK);
                 if power.amount > 1 {
                     creature.add_power(power_id::STOCK, power.amount - 1);
                 }
-                self.set_move(spawned, 0, usize::MAX, 0)
-                    .move_history
-                    .clear();
+                self.start_move(spawned, 0);
             }
             "POWER.SURPRISE_POWER" if mine && !prevented => {
                 let stolen = (self.creature(dead).powers.iter())
@@ -1181,8 +1210,8 @@ impl Game {
                     .map(|power| power.value)
                     .sum();
                 self.corpse_hp = Some(self.creature(dead).max_hp);
-                self.spawn_enemy(content, "MONSTER.SNEAKY_GREMLIN");
-                let fat = self.spawn_enemy(content, "MONSTER.FAT_GREMLIN");
+                self.spawn_enemy(content, "MONSTER.SNEAKY_GREMLIN", 0);
+                let fat = self.spawn_enemy(content, "MONSTER.FAT_GREMLIN", 0);
                 self.corpse_hp = None;
                 if stolen > 0 {
                     self.creature_mut(Actor::Enemy(fat))
@@ -1956,7 +1985,7 @@ impl Game {
                 }
             }
             (Trigger::AfterPlayerTurnStart, "POWER.ROLLING_BOULDER_POWER") => {
-                self.tick_boulder(content, power)
+                self.tick_boulder(power)
             }
             (Trigger::AfterPlayerTurnStart, "POWER.TOOLS_OF_THE_TRADE_POWER") => {
                 effects.push(Effect::Discard(amount, false))
@@ -2473,7 +2502,7 @@ impl Game {
 
     /// The enemies starting their side's turn, in slot order: the living ones and those about to
     /// revive (Illusion, Reattach, Adaptable).
-    pub(super) fn participants(&self, content: &Content) -> Vec<usize> {
+    pub(super) fn participants(&self) -> Vec<usize> {
         let enemies = &self.combat().unwrap().enemies;
         let primary_alive = (enemies.iter())
             .any(|enemy| enemy.creature.hp > 0 && enemy.creature.power(power_id::MINION) == 0);
@@ -2492,7 +2521,7 @@ impl Game {
                     || enemy.creature.power(power_id::ADAPTABLE) > 0 && enemy.move_index == 0
             })
             .collect();
-        participants.sort_by_key(|&index| self.slot_order(content, index));
+        participants.sort_by_key(|&index| enemies[index].slot);
         participants
     }
 
@@ -2549,7 +2578,7 @@ impl Game {
             Step::RollMoves if !self.combat().unwrap().extra_turn => self.roll_moves(content),
             Step::RollMoves => {}
             Step::ClearBlock if self.combat().unwrap().enemy_turn => {
-                for index in self.participants(content) {
+                for index in self.participants() {
                     self.clear_block(content, Actor::Enemy(index));
                 }
             }
@@ -2833,7 +2862,7 @@ impl Game {
                 push_effects(&mut combat.queue, ENEMY_TURN, Context::player());
             }
             // The last step queued: the moves still resolve each enemy's move in turn.
-            Step::EnemyMoves => self.enemy_moves(content),
+            Step::EnemyMoves => self.enemy_moves(),
             Step::EnemyMove(index, instance) => self.enemy_move(content, index as usize, instance),
             Step::EnemyMoveDone(index, move_index, stunned) => {
                 self.enemy_move_done(content, index as usize, move_index as usize, stunned)

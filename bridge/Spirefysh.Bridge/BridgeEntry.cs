@@ -10,6 +10,7 @@ using MegaCrit.Sts2.Core.GameActions;
 using MegaCrit.Sts2.Core.Helpers;
 using MegaCrit.Sts2.Core.Modding;
 using MegaCrit.Sts2.Core.Nodes;
+using MegaCrit.Sts2.Core.Random;
 using MegaCrit.Sts2.Core.Rooms;
 using MegaCrit.Sts2.Core.Runs;
 
@@ -73,6 +74,9 @@ public static class BridgeEntry
                     harmony.Patch(
                         RequiredMethod(typeof(CommandLineHelper), nameof(CommandLineHelper.GetValue)),
                         postfix: new HarmonyMethod(typeof(BridgeEntry), nameof(AutoSlayValue)));
+                    harmony.Patch(
+                        RequiredMethod(typeof(SeedHelper), nameof(SeedHelper.GetRandomSeed)),
+                        prefix: new HarmonyMethod(typeof(BridgeEntry), nameof(EpisodeSeed)));
                     harmony.Patch(
                         RequiredMethod(typeof(RunManager), nameof(RunManager.SetUpNewSingleplayer)),
                         prefix: new HarmonyMethod(typeof(BridgeEntry), nameof(ConfigureNewSingleplayer)));
@@ -170,6 +174,11 @@ public static class BridgeEntry
         if (key == "seed" && string.IsNullOrWhiteSpace(__result))
             __result = _capture?.AutoSlaySeed;
     }
+
+    // The character screen clears AutoSlay's seed override, so the run seed would come from
+    // Rng.Chaotic, which games launched in the same second share; draw it from the episode instead.
+    private static void EpisodeSeed(ref Rng? rng) =>
+        rng ??= new Rng((uint)StringHelper.GetDeterministicHashCode(_capture!.AutoSlaySeed));
 
     // Harmony binds these by argument name. New oracle runs never create or update a run save.
     private static void ConfigureNewSingleplayer(

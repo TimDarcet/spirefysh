@@ -138,7 +138,6 @@ impl Game {
         let chemical_x = self.has_relic(content, "RELIC.CHEMICAL_X");
         let brilliant_scarf = self.has_relic(content, "RELIC.BRILLIANT_SCARF")
             && self.combat().unwrap().history.manual_plays == 4;
-        self.face_target(target);
         let combat = self.combat_mut().unwrap();
         let card = combat.hand.remove(hand);
         combat.bound_played |= card.affliction == Affliction::Bound;
@@ -265,9 +264,6 @@ impl Game {
                 effect: Effect::RawBlock(Target::Player, Amount::fixed(block, block)),
                 context,
             });
-        }
-        if context.card != Some(card_id::BOMBARDMENT) && !self.replaying {
-            self.queue_bombardments();
         }
         self.before_card_played(content);
         // Star-spending relics fire when resources are spent, before the card resolves.
@@ -732,13 +728,13 @@ impl Game {
 
     /// Its hits land on the enemies one at a time, left to right, so a death in between
     /// resolves before the next hit (Crab Rage's block); then it grows by 5.
-    pub(super) fn tick_boulder(&mut self, content: &Content, boulder: Power) {
+    pub(super) fn tick_boulder(&mut self, boulder: Power) {
         let Some(live) = self.creature_mut(Actor::Player).instance_mut(boulder) else {
             return;
         };
         let amount = live.amount;
         live.amount = amount.saturating_add(5);
-        let enemies = self.targets(content, Target::AllEnemies, Context::player());
+        let enemies = self.targets(Target::AllEnemies, Context::player());
         for enemy in enemies.into_iter().rev() {
             let Actor::Enemy(index) = enemy else { continue };
             self.combat_mut().unwrap().queue.push(Pending {
@@ -772,7 +768,7 @@ impl Game {
         }
         let amount = live.value;
         let previous = self.combat_mut().unwrap().pending_hits.replace(vec![]);
-        for target in self.targets(content, Target::AllEnemies, Context::player()) {
+        for target in self.targets(Target::AllEnemies, Context::player()) {
             self.damage(
                 content,
                 Actor::Player,
@@ -788,8 +784,8 @@ impl Game {
     }
 
     /// ExecuteEnemyTurn and EndEnemyTurn: each enemy's move step in slot order, then the turn end.
-    pub(super) fn enemy_moves(&mut self, content: &Content) {
-        let participants = self.participants(content);
+    pub(super) fn enemy_moves(&mut self) {
+        let participants = self.participants();
         let combat = self.combat_mut().unwrap();
         push_effects(&mut combat.queue, hooks::END_ENEMY_TURN, Context::player());
         // A creature spawned this turn into a dead participant's slot waits for its next turn.
@@ -801,8 +797,8 @@ impl Game {
 
     pub(super) fn enemy_move(&mut self, content: &Content, index: usize, instance: u32) {
         let enemy = &self.combat().unwrap().enemies[index];
-        let (move_index, id, stunned) = (enemy.move_index, enemy.creature.id, enemy.stunned);
-        if enemy.instance != instance || !self.participants(content).contains(&index) {
+        let (move_index, id, stunned) = (enemy.move_index, enemy.creature.id, enemy.stunned > 0);
+        if enemy.instance != instance || !self.participants().contains(&index) {
             return;
         }
         self.combat_mut().unwrap().queue.push(Pending {
@@ -924,7 +920,7 @@ impl Game {
             }
             ("MONSTER.TEST_SUBJECT", 6) => {
                 for _ in 0..if self.run.ascension >= 9 { 5 } else { 3 } {
-                    self.add_generated(
+                    self.add_uncredited(
                         content,
                         Pile::Discard,
                         Card {
@@ -941,19 +937,12 @@ impl Game {
                 );
             }
             ("MONSTER.OVICOPTER", 0) => {
-                let eggs = self
-                    .combat()
-                    .unwrap()
-                    .enemies
-                    .iter()
-                    .filter(|enemy| {
-                        enemy.creature.hp > 0
-                            && content.enemies[enemy.creature.id as usize].id == "MONSTER.TOUGH_EGG"
-                    })
-                    .count();
                 // Three eggs, each into the last free of the five egg slots.
-                for _ in 0..3.min(5usize.saturating_sub(eggs)) {
-                    let egg = self.spawn_enemy(content, "MONSTER.TOUGH_EGG");
+                for _ in 0..3 {
+                    let Some(slot) = self.free_slot((1..=5).rev()) else {
+                        break;
+                    };
+                    let egg = self.spawn_enemy(content, "MONSTER.TOUGH_EGG", slot);
                     self.apply_power(content, Actor::Enemy(egg), power_id::MINION, 1);
                     self.apply_power(content, Actor::Enemy(egg), power_id::HATCH, 1);
                 }
@@ -967,10 +956,12 @@ impl Game {
                 egg.powers.retain(|power| power.id == power_id::MINION);
             }
             ("MONSTER.FOGMOG", 0) => {
-                self.spawn_enemy(content, "MONSTER.EYE_WITH_TEETH");
+                self.spawn_enemy(content, "MONSTER.EYE_WITH_TEETH", 1);
             }
             ("MONSTER.LIVING_FOG", 1) => {
-                self.spawn_enemy(content, "MONSTER.GAS_BOMB");
+                if let Some(slot) = self.free_slot(1..=5) {
+                    self.spawn_enemy(content, "MONSTER.GAS_BOMB", slot);
+                }
                 push_effects(&mut self.combat_mut().unwrap().queue, effects, context);
             }
             ("MONSTER.FABRICATOR", 0) => {
@@ -997,27 +988,19 @@ impl Game {
                     id: card_id::DAZED,
                     ..Card::default()
                 };
-                self.add_generated(content, Pile::Discard, dazed);
-                self.add_random(content, Pile::Draw, dazed);
+                self.add_uncredited(content, Pile::Discard, dazed);
+                self.insert_random(Pile::Draw, dazed);
             }
-            ("MONSTER.TWO_TAILED_RAT", 3)
-                if self
-                    .combat()
-                    .unwrap()
-                    .enemies
-                    .iter()
-                    .filter(|enemy| {
-                        content.enemies[enemy.creature.id as usize].id == "MONSTER.TWO_TAILED_RAT"
-                    })
-                    .count()
-                    < 5 =>
-            {
-                let rat = self.spawn_enemy(content, "MONSTER.TWO_TAILED_RAT");
-                // A rat called for backup picks its first move with the next intents.
-                self.combat_mut().unwrap().enemies[rat].value = 1;
+            ("MONSTER.TWO_TAILED_RAT", 3) => {
+                self.combat_mut().unwrap().rat_calls += 1;
+                if let Some(slot) = self.free_slot((1..=5).rev()) {
+                    let rat = self.spawn_enemy(content, "MONSTER.TWO_TAILED_RAT", slot);
+                    // A rat called for backup picks its first move with the next intents.
+                    self.combat_mut().unwrap().enemies[rat].value = 1;
+                }
             }
             ("MONSTER.THE_OBSCURA", 0) => {
-                self.spawn_enemy(content, "MONSTER.PARAFRIGHT");
+                self.spawn_enemy(content, "MONSTER.PARAFRIGHT", 1);
             }
             ("MONSTER.ENTOMANCER", 2) => {
                 let hive = self
@@ -1074,7 +1057,8 @@ impl Game {
                 self.kill_actor(content, Actor::Enemy(index))
             }
             ("MONSTER.THIEVING_HOPPER", 4) | ("MONSTER.FAT_GREMLIN", 1) => {
-                self.creature_mut(Actor::Enemy(index)).hp = 0
+                self.creature_mut(Actor::Enemy(index)).hp = 0;
+                self.combat_mut().unwrap().escaped.push(id);
             }
             _ => {}
         }
@@ -1141,7 +1125,9 @@ impl Game {
                     .iter()
                     .position(|candidate| candidate.instance == card.instance)
                 {
-                    self.run.deck.remove(index);
+                    let card = self.run.deck.remove(index);
+                    let combat = self.combat_mut().unwrap();
+                    combat.stolen.push((combat.enemies[enemy].instance, card));
                 }
                 self.creature_mut(Actor::Enemy(enemy))
                     .add_power(power_id::SWIPE, 1);
@@ -1151,8 +1137,12 @@ impl Game {
     }
 
     pub(super) fn roll_moves(&mut self, content: &Content) {
-        let Phase::Combat(combat) = &mut self.phase else {
+        if self.combat().is_none() {
             return;
+        }
+        let rat_slot_free = self.free_slot(1..=5).is_some();
+        let Phase::Combat(combat) = &mut self.phase else {
+            unreachable!()
         };
         let living = combat
             .enemies
@@ -1163,36 +1153,37 @@ impl Game {
             enemy.creature.hp > 0
                 && content.enemies[enemy.creature.id as usize].id == "MONSTER.TORCH_HEAD_AMALGAM"
         });
-        let rat_count = combat
-            .enemies
-            .iter()
-            .filter(|enemy| {
-                content.enemies[enemy.creature.id as usize].id == "MONSTER.TWO_TAILED_RAT"
-            })
-            .count();
-        let rat_calls = combat
-            .enemies
-            .iter()
-            .flat_map(|enemy| &enemy.move_history)
-            .filter(|&&move_index| move_index == 3)
-            .count();
-        let mut rat_summon_queued = false;
-        for (slot, enemy) in combat.enemies.iter_mut().enumerate() {
-            if enemy.creature.hp <= 0 {
+        // PrepareForNextTurn rolls the enemies in slot order.
+        let mut order: Vec<_> = (0..combat.enemies.len()).collect();
+        order.sort_by_key(|&index| combat.enemies[index].slot);
+        for index in order {
+            // CanSummon: no other rat shows Call for Backup, whether just rolled or just performed.
+            let rat_calling = (combat.enemies.iter().enumerate()).any(|(other, enemy)| {
+                other != index
+                    && enemy.creature.hp > 0
+                    && enemy.move_index == 3
+                    && content.enemies[enemy.creature.id as usize].id == "MONSTER.TWO_TAILED_RAT"
+            });
+            let enemy = &mut combat.enemies[index];
+            // The dead don't roll, but a dead segment's Dead move goes on to Reattach.
+            let reattaching = enemy.creature.power(power_id::REATTACH) > 0 && enemy.last_move == 3;
+            if enemy.creature.hp <= 0 && !reattaching {
                 continue;
             }
-            if enemy.stunned {
-                enemy.stunned = false;
+            if enemy.stunned > 0 {
+                enemy.stunned -= 1;
                 continue;
             }
             let moves = content.enemies[enemy.creature.id as usize].moves;
-            if content.enemies[enemy.creature.id as usize].id == "MONSTER.WRIGGLER" {
+            if content.enemies[enemy.creature.id as usize].id == "MONSTER.WRIGGLER"
+                && enemy.last_move != usize::MAX
+            {
                 // After the spawn stun, wriggler1/3 bite and wriggler2/4 wriggle (by slot name,
                 // kept in `value`); older states fall back to list parity.
                 let biter = if enemy.value > 0 {
                     enemy.value % 2 == 1
                 } else {
-                    slot % 2 == 0
+                    index % 2 == 0
                 };
                 let chosen = match enemy.last_move {
                     0 if biter => 1,
@@ -1307,7 +1298,7 @@ impl Game {
             }
             if id == "MONSTER.FROG_KNIGHT" && enemy.last_move == 0 {
                 let charged = enemy.move_history.contains(&3);
-                let chosen = if charged || enemy.creature.hp * 2 >= enemy.creature.max_hp {
+                let chosen = if charged || enemy.creature.hp >= enemy.creature.max_hp / 2 {
                     2
                 } else {
                     3
@@ -1325,12 +1316,20 @@ impl Game {
                     .filter(|&&move_index| move_index < 3)
                     .count();
                 let can_summon = basic_moves >= 2
-                    && rat_calls < 3
-                    && rat_count < 5
-                    && !rat_summon_queued
+                    && combat.rat_calls < 3
+                    && rat_slot_free
+                    && !rat_calling
                     && !enemy.move_history.contains(&3);
+                // Screech has a 3-move cooldown; the others can't repeat.
+                let screeched = enemy
+                    .move_history
+                    .iter()
+                    .rev()
+                    .take(3)
+                    .any(|&prior| prior == 2);
                 let mut choices: Vec<_> = (0..if can_summon { 4 } else { 3 })
                     .filter(|&move_index| move_index != enemy.last_move)
+                    .filter(|&move_index| move_index != 2 || !screeched)
                     .collect();
                 let total: u16 = choices.iter().map(|&i| moves[i].weight as u16).sum();
                 let mut roll = self.rngs.monster_ai.below(total as u32) as u16;
@@ -1342,7 +1341,6 @@ impl Game {
                     roll -= moves[chosen].weight as u16;
                     chosen = i;
                 }
-                rat_summon_queued |= chosen == 3;
                 enemy.last_move = chosen;
                 enemy.move_index = chosen;
                 enemy.repeats = 1;
@@ -1376,11 +1374,8 @@ impl Game {
                     .any(|&prior| prior == i)
             });
             if choices.is_empty() {
-                if next.is_empty() {
-                    choices.push(enemy.last_move);
-                } else {
-                    choices.extend_from_slice(next);
-                }
+                // With every weight zeroed, RandomBranchState still draws and takes the first one.
+                choices.push(next.first().copied().unwrap_or(0));
             }
             let mut chosen = choices[0];
             if random && self.expectation.is_none() {
@@ -1593,7 +1588,8 @@ impl Game {
     }
 
     pub(crate) fn resolve(&mut self, content: &Content) {
-        while self.combat().is_some_and(|x| x.choice.is_none()) {
+        // The player's death ends the combat on the spot: nothing queued after it resolves.
+        while self.combat().is_some_and(|x| x.choice.is_none() && x.player.hp > 0) {
             let Some(pending) = self.combat_mut().and_then(|x| x.queue.pop()) else {
                 break;
             };
@@ -1715,7 +1711,7 @@ impl Game {
                             && self.creature(Actor::Player).power(power_id::SEEKING_EDGE) > 0;
                     let previous =
                         area.then(|| self.combat_mut().unwrap().pending_hits.replace(vec![]));
-                    for actor in self.targets(content, target, pending.context) {
+                    for actor in self.targets(target, pending.context) {
                         let targeted = self.instance(actor);
                         // A later play of the series still targets the card's original creature, which a
                         // respawn (Axebot's Stock) has replaced.
@@ -1807,7 +1803,7 @@ impl Game {
                 // An area hit strikes every target before deaths resolve (e.g. Crab Rage).
                 let previous = (target == Target::AllEnemies)
                     .then(|| self.combat_mut().unwrap().pending_hits.replace(vec![]));
-                for actor in self.targets(content, target, pending.context) {
+                for actor in self.targets(target, pending.context) {
                     for _ in 0..hits {
                         self.damage_with_bonus(
                             content,
@@ -1841,7 +1837,7 @@ impl Game {
                     .card
                     .map(|card| content.cards[card as usize].id);
                 let mut kills = 0;
-                for actor in self.targets(content, target, pending.context) {
+                for actor in self.targets(target, pending.context) {
                     // A death can refill the target's slot (Surprise's gremlins), so the splash
                     // skips the target by instance.
                     let hit = self.instance(actor);
@@ -1856,7 +1852,7 @@ impl Game {
                     // A refilled slot (Surprise's gremlins) means the hit creature died.
                     kills += (self.instance(actor) != hit || self.creature(actor).hp <= 0) as i16;
                     if card == Some("CARD.OMNISLICE") {
-                        for other in self.targets(content, Target::AllEnemies, pending.context) {
+                        for other in self.targets(Target::AllEnemies, pending.context) {
                             if self.instance(other) != hit {
                                 self.damage(
                                     content,
@@ -1882,7 +1878,7 @@ impl Game {
                 }
             }
             Effect::Damage(target, _) => {
-                let targets = self.targets(content, target, pending.context);
+                let targets = self.targets(target, pending.context);
                 let previous = self.combat_mut().unwrap().pending_hits.replace(vec![]);
                 for &actor in &targets {
                     self.damage(
@@ -1903,30 +1899,30 @@ impl Game {
                 }
             }
             Effect::Kill(target) => {
-                for actor in self.targets(content, target, pending.context) {
+                for actor in self.targets(target, pending.context) {
                     self.kill_actor(content, actor);
                 }
             }
             Effect::Stun(target) => {
-                for actor in self.targets(content, target, pending.context) {
+                for actor in self.targets(target, pending.context) {
                     if let Actor::Enemy(index) = actor {
-                        self.combat_mut().unwrap().enemies[index].stunned = true;
+                        self.combat_mut().unwrap().enemies[index].stunned = 1;
                     }
                 }
             }
             Effect::DoomKill => {
-                let enemies = self.targets(content, Target::AllEnemies, pending.context);
+                let enemies = self.targets(Target::AllEnemies, pending.context);
                 self.doom_kill(content, enemies);
             }
             // HP loss is unblockable, unpowered damage (CreatureCmd.Damage).
             Effect::LoseHp(target, _) => {
-                for actor in self.targets(content, target, pending.context) {
+                for actor in self.targets(target, pending.context) {
                     let kind = DamageKind::Unblockable;
                     self.damage_with_bonus(content, actor, amount, kind, pending.context);
                 }
             }
             Effect::Block(target, _) => {
-                let targets = self.targets(content, target, pending.context);
+                let targets = self.targets(target, pending.context);
                 for &actor in &targets {
                     let powered = pending.context.card.is_some()
                         || matches!(pending.context.source, Actor::Enemy(_));
@@ -1951,12 +1947,9 @@ impl Game {
                 }
             }
             Effect::ToricToughness(_) => {
-                // It stores the block the card gained, so none under No Block.
-                let value = if self.creature(Actor::Player).power(power_id::NO_BLOCK) > 0 {
-                    0
-                } else {
-                    amount
-                };
+                // It stores the block the card gained (Dexterity, Frail, No Block included).
+                let card = pending.context.card;
+                let value = self.modify_block(content, Actor::Player, amount, card, true).0;
                 self.creature_mut(Actor::Player).powers.push(Power {
                     id: power_id::TORIC_TOUGHNESS,
                     amount: 2,
@@ -1984,7 +1977,7 @@ impl Game {
                 self.gain_block(content, Actor::Player, amount, pending.context.card, false);
             }
             Effect::RawBlock(target, _) => {
-                for actor in self.targets(content, target, pending.context) {
+                for actor in self.targets(target, pending.context) {
                     if amount > 0 {
                         self.gain_block(content, actor, amount, None, false);
                         continue;
@@ -2000,7 +1993,7 @@ impl Game {
                 }
             }
             Effect::Heal(target, _) => {
-                for actor in self.targets(content, target, pending.context) {
+                for actor in self.targets(target, pending.context) {
                     // Enemies don't heal once the combat is ending (Knowledge Demon's heal
                     // after Thorns killed it).
                     if actor != Actor::Player && self.enemies_defeated() {
@@ -2012,7 +2005,7 @@ impl Game {
                 self.sync_red_skull(content);
             }
             Effect::HealPercent(target, _) => {
-                for actor in self.targets(content, target, pending.context) {
+                for actor in self.targets(target, pending.context) {
                     let heal = self.creature(actor).max_hp.saturating_mul(amount.max(0)) / 100;
                     let creature = self.creature_mut(actor);
                     creature.hp = creature.hp.saturating_add(heal).min(creature.max_hp);
@@ -2144,12 +2137,12 @@ impl Game {
             }
             // Slow only counts card plays (SlowAmount); it isn't a debuff application.
             Effect::ApplyPower(target, power_id::SLOW, _) => {
-                for actor in self.targets(content, target, pending.context) {
+                for actor in self.targets(target, pending.context) {
                     self.creature_mut(actor).add_power(power_id::SLOW, amount);
                 }
             }
             Effect::ApplyPower(target, id, _) => {
-                for actor in self.targets(content, target, pending.context) {
+                for actor in self.targets(target, pending.context) {
                     let new = self.creature(actor).power(id) == 0;
                     self.apply_power(content, actor, id, amount);
                     if new
@@ -2177,7 +2170,7 @@ impl Game {
                 }
             }
             Effect::ApplyDebuff(target, id, _) => {
-                for actor in self.targets(content, target, pending.context) {
+                for actor in self.targets(target, pending.context) {
                     let amount = self.modify_power_amount(content, actor, id, amount);
                     if self.apply_debuff(content, actor, id, amount)
                         && let Actor::Enemy(source) = pending.context.source
@@ -2203,12 +2196,12 @@ impl Game {
             }
             // Bubble Bubble applies its poison normally (Artifact, Unsettling Lamp, Snecko Skull).
             Effect::StackPower(target, id, _) => {
-                for actor in self.targets(content, target, pending.context) {
+                for actor in self.targets(target, pending.context) {
                     self.apply_power(content, actor, id, amount);
                 }
             }
             Effect::DoublePower(target, id, minimum) => {
-                for actor in self.targets(content, target, pending.context) {
+                for actor in self.targets(target, pending.context) {
                     let amount = self.creature(actor).power(id).max(minimum);
                     let amount = self.modify_power_amount(content, actor, id, amount);
                     self.apply_debuff(content, actor, id, amount);
@@ -2280,12 +2273,12 @@ impl Game {
                 }
             }
             Effect::RemovePower(target, id) => {
-                for actor in self.targets(content, target, pending.context) {
+                for actor in self.targets(target, pending.context) {
                     self.creature_mut(actor).powers.retain(|x| x.id != id)
                 }
             }
             Effect::TemporaryStrength(target, restore, _) => {
-                for actor in self.targets(content, target, pending.context) {
+                for actor in self.targets(target, pending.context) {
                     let amount =
                         -self.modify_power_amount(content, actor, power_id::STRENGTH, -amount);
                     if self.apply_debuff(content, actor, power_id::STRENGTH, -amount) {
@@ -2409,16 +2402,18 @@ impl Game {
                 } else {
                     0
                 };
+                let enemy = matches!(pending.context.source, Actor::Enemy(_));
                 for _ in 0..count {
-                    self.add_generated(
-                        content,
-                        pile,
-                        Card {
-                            id,
-                            value,
-                            ..Card::default()
-                        },
-                    );
+                    let card = Card {
+                        id,
+                        value,
+                        ..Card::default()
+                    };
+                    if enemy {
+                        self.add_uncredited(content, pile, card);
+                    } else {
+                        self.add_generated(content, pile, card);
+                    }
                 }
             }
             Effect::AddUpgradedCard(pile, id, count) => {
@@ -2996,15 +2991,17 @@ impl Game {
                 }
             }
             Effect::AddRandom(pile, id, count) => {
+                let enemy = matches!(pending.context.source, Actor::Enemy(_));
                 for _ in 0..count {
-                    self.add_random(
-                        content,
-                        pile,
-                        Card {
-                            id,
-                            ..Card::default()
-                        },
-                    );
+                    let card = Card {
+                        id,
+                        ..Card::default()
+                    };
+                    if enemy {
+                        self.insert_random(pile, card);
+                    } else {
+                        self.add_random(content, pile, card);
+                    }
                 }
             }
             Effect::FranticEscape => {
@@ -4377,7 +4374,7 @@ impl Game {
         }
         if (attack || overflow_kind) && hp_target == Actor::Player && lost > 0 {
             for _ in 0..self.creature(source).power(power_id::PAINFUL_STABS).max(0) {
-                self.add_generated(
+                self.add_uncredited(
                     content,
                     Pile::Discard,
                     Card {
@@ -4631,7 +4628,7 @@ impl Game {
                 candidates[self.rngs.niche.below(candidates.len() as u32) as usize]
             };
             let fur_coat = self.fur_coat_active();
-            self.insert_enemy(
+            let index = self.insert_enemy(
                 Enemy {
                     instance,
                     creature: Creature {
@@ -4642,19 +4639,20 @@ impl Game {
                         powers: vec![],
                     },
                     move_index: 0,
-                    last_move: 0,
-                    repeats: 1,
-                    move_history: vec![0],
-                    stunned: false,
+                    last_move: usize::MAX,
+                    repeats: 0,
+                    move_history: vec![],
+                    stunned: 0,
                     value: wriggler,
-                    slot: 0,
+                    slot: wriggler as u8 + 1,
                 },
                 false,
             );
+            self.start_move(index, 0);
         }
     }
 
-    pub(super) fn spawn_enemy(&mut self, content: &Content, name: &str) -> usize {
+    pub(super) fn spawn_enemy(&mut self, content: &Content, name: &str, slot: u8) -> usize {
         let id = content
             .enemies
             .iter()
@@ -4682,12 +4680,6 @@ impl Game {
             })
             .collect();
         let fur_coat = self.fur_coat_active();
-        let enemies = &self.combat().unwrap().enemies;
-        let free = |slot: &u8| {
-            enemies
-                .iter()
-                .all(|e| e.creature.hp <= 0 || e.slot != *slot)
-        };
         let enemy = Enemy {
             instance,
             creature: Creature {
@@ -4701,48 +4693,44 @@ impl Game {
             last_move: usize::MAX,
             repeats: 0,
             move_history: vec![],
-            stunned: false,
+            stunned: 0,
             value: 0,
-            // A rat called for backup or a laid egg takes the last free slot.
-            slot: if matches!(name, "MONSTER.TWO_TAILED_RAT" | "MONSTER.TOUGH_EGG") {
-                let last = enemies.iter().map(|enemy| enemy.slot).max();
-                (1..=last.unwrap_or_default().max(5))
-                    .rev()
-                    .find(free)
-                    .unwrap_or(0)
-            } else if FABRICATOR_BOTS.contains(&name) {
-                // A fabricated bot takes the first free slot (bot1, bot2, fabricator, bot3, bot4).
-                (1..=5).find(free).unwrap_or(0)
-            } else {
-                0
-            },
+            slot,
         };
-        self.insert_enemy(enemy, true)
+        let index = self.insert_enemy(enemy, true);
+        self.start_move(index, def.start);
+        index
     }
 
-    /// Summons the game slots in front of their summoner, so they come first in its enemy list.
-    fn slot_order(&self, content: &Content, index: usize) -> (bool, u8) {
-        let enemy = &self.combat().unwrap().enemies[index];
-        let front = matches!(
-            content.enemies[enemy.creature.id as usize].id,
-            "MONSTER.GAS_BOMB"
-                | "MONSTER.EYE_WITH_TEETH"
-                | "MONSTER.PARAFRIGHT"
-                | "MONSTER.TOUGH_EGG"
-        );
-        (!front, enemy.slot)
+    /// A creature added on the player's turn rolls at once (AfterCreatureAdded), which keeps its
+    /// first move; one added on the enemy turn keeps it through the next roll.
+    pub(super) fn start_move(&mut self, index: usize, start: usize) {
+        let rolled = !self.combat().unwrap().enemy_turn;
+        let enemy = &mut self.combat_mut().unwrap().enemies[index];
+        enemy.move_index = start;
+        enemy.last_move = if rolled { start } else { usize::MAX };
+        enemy.repeats = rolled as u8;
+        enemy.move_history = if rolled { vec![start] } else { vec![] };
     }
 
-    fn alive_in_slot_order(&self, content: &Content) -> Vec<usize> {
-        let mut alive: Vec<_> = (0..self.combat().unwrap().enemies.len())
-            .filter(|&index| self.combat().unwrap().enemies[index].creature.hp > 0)
+    /// The first of `slots` no living enemy holds (Encounter.GetNextSlot).
+    fn free_slot(&self, mut slots: impl Iterator<Item = u8>) -> Option<u8> {
+        let enemies = &self.combat().unwrap().enemies;
+        slots.find(|&slot| enemies.iter().all(|e| e.creature.hp <= 0 || e.slot != slot))
+    }
+
+    /// The living enemies in the game's order, sorted by slot (SortEnemiesBySlotName).
+    fn alive_in_slot_order(&self) -> Vec<usize> {
+        let enemies = &self.combat().unwrap().enemies;
+        let mut alive: Vec<_> = (0..enemies.len())
+            .filter(|&i| enemies[i].creature.hp > 0)
             .collect();
-        alive.sort_by_key(|&index| self.slot_order(content, index));
+        alive.sort_by_key(|&index| enemies[index].slot);
         alive
     }
 
-    fn random_enemy(&mut self, content: &Content) -> Option<usize> {
-        let alive = self.alive_in_slot_order(content);
+    fn random_enemy(&mut self) -> Option<usize> {
+        let alive = self.alive_in_slot_order();
         if alive.is_empty() {
             return None;
         }
@@ -4837,7 +4825,9 @@ impl Game {
         let options: Vec<_> = (set..set + 2).filter(|&bot| bot + 1 != last).collect();
         let bot = options[self.rngs.monster_ai.below(options.len() as u32) as usize];
         self.combat_mut().unwrap().enemies[fabricator].value = bot as i16 + 1;
-        let spawned = self.spawn_enemy(content, FABRICATOR_BOTS[bot]);
+        // The first free slot of bot1, bot2, fabricator, bot3, bot4.
+        let slot = self.free_slot([1, 2, 4, 5].into_iter()).unwrap_or(0);
+        let spawned = self.spawn_enemy(content, FABRICATOR_BOTS[bot], slot);
         self.apply_power(content, Actor::Enemy(spawned), power_id::MINION, 1);
     }
 
@@ -4985,13 +4975,7 @@ impl Game {
         if let Actor::Enemy(index) = target
             && content.enemies[self.creature(target).id as usize].id == "MONSTER.TUNNELER"
         {
-            let combat = self.combat_mut().unwrap();
-            let held = combat.enemy_turn;
-            let enemy = &mut combat.enemies[index];
-            enemy.move_index = 3;
-            enemy.last_move = 3;
-            enemy.repeats = 1;
-            enemy.stunned |= held;
+            self.stun(index, 3);
         }
     }
 
@@ -5198,7 +5182,7 @@ impl Game {
                     amount,
                     ..Power::default()
                 });
-            } else if id == power_id::RITUAL && before == 0 {
+            } else if id == power_id::RITUAL && before == 0 && matches!(actor, Actor::Enemy(_)) {
                 self.creature_mut(actor)
                     .add_power_with_skip_next_decay(id, amount, true);
             } else {
@@ -5494,7 +5478,7 @@ impl Game {
         if self.combat().unwrap().orbs_channeled == 7 && self.has_relic(content, "RELIC.METRONOME")
         {
             let previous = self.combat_mut().unwrap().pending_hits.replace(vec![]);
-            for enemy in self.targets(content, Target::AllEnemies, Context::player()) {
+            for enemy in self.targets(Target::AllEnemies, Context::player()) {
                 self.damage(
                     content,
                     Actor::Player,
@@ -5897,7 +5881,7 @@ impl Game {
             Condition::TargetAttacking => context.target.is_some_and(|target| {
                 let enemy = &self.combat().unwrap().enemies[target];
                 let def = &content.enemies[enemy.creature.id as usize];
-                !enemy.stunned
+                enemy.stunned == 0
                     && (def.moves[enemy.move_index].intent.starts_with("Attack")
                         || effects_attack(def.moves[enemy.move_index].effects))
             }),
@@ -5908,7 +5892,7 @@ impl Game {
         }
     }
 
-    fn targets(&mut self, content: &Content, target: Target, context: Context) -> Vec<Actor> {
+    fn targets(&mut self, target: Target, context: Context) -> Vec<Actor> {
         // A card's target is a creature, not a slot: a respawn into the slot (Axebot's Stock)
         // isn't the creature the card was played on.
         let targeted =
@@ -5994,7 +5978,7 @@ impl Game {
                     let alive = self.combat().unwrap().enemies[target].creature.hp > 0;
                     return Vec::from_iter(alive.then_some(Actor::Enemy(target)));
                 }
-                Vec::from_iter(self.random_enemy(content).map(Actor::Enemy))
+                Vec::from_iter(self.random_enemy().map(Actor::Enemy))
             }
             Target::LowestHpEnemy => self
                 .combat()
@@ -6185,8 +6169,10 @@ impl Game {
                 let mut card = Card {
                     id,
                     upgrades,
+                    instance: self.next_card,
                     ..Card::default()
                 };
+                self.next_card = self.next_card.saturating_add(1);
                 self.afflict_new(content, &mut card);
                 self.pile_mut(pile)[index] = card;
                 self.trigger_generated(content, id);
@@ -6233,6 +6219,8 @@ impl Game {
             CardOp::TakeOffer => {
                 let mut card = self.remove_pile(pile, index);
                 self.combat_mut().unwrap().offer.clear();
+                card.instance = self.next_card;
+                self.next_card = self.next_card.saturating_add(1);
                 self.afflict_new(content, &mut card);
                 self.add_to_hand(card);
                 self.trigger_generated(content, card.id);
@@ -6515,7 +6503,7 @@ impl Game {
         {
             self.combat_mut().unwrap().beat_down.swap_remove(index);
             if card.target(def) == Target::ChosenEnemy && !fan_shiv && context.target.is_none() {
-                context.target = self.random_enemy(content);
+                context.target = self.random_enemy();
             }
         }
         // Smoggy afflicts skills only once a skill play has finished.
@@ -6526,7 +6514,7 @@ impl Game {
         let no_target = card.target(def) == Target::ChosenEnemy
             && !fan_shiv
             && context.target.is_none()
-            && self.alive_in_slot_order(content).is_empty();
+            && self.alive_in_slot_order().is_empty();
         // Normality, Velvet Choker, Sloth and Ringing stop auto-plays too (Hook.ShouldPlay).
         let sloth = combat.player.power(power_id::SLOTH);
         // Velvet Choker counts finished plays: not the card this auto-play happens inside.
@@ -6555,7 +6543,7 @@ impl Game {
             self.combat_mut().unwrap().bound_played |= card.affliction == Affliction::Bound;
         }
         if card.target(def) == Target::ChosenEnemy && !fan_shiv && context.target.is_none() {
-            context.target = self.random_enemy(content);
+            context.target = self.random_enemy();
         }
         context.source = Actor::Player;
         context.card = Some(card.id);
@@ -6706,8 +6694,10 @@ impl Game {
             }
             false
         } else if card_type != CardType::Power && flags & EXHAUST != 0 {
+            // This play's Exhaust (Havoc's ExhaustOnNextPlay included) doesn't carry to the next.
             combat.exhaust.push(Card {
-                flags: unexpired.flags & !RETURN_TO_DRAW,
+                flags: unexpired.flags & !(RETURN_TO_DRAW | EXHAUST),
+                turn_flags: unexpired.turn_flags & !EXHAUST,
                 ..unexpired
             });
             true
@@ -6810,7 +6800,7 @@ impl Game {
         *value = value.saturating_add(damage.clamp(0, i16::MAX as i64) as i16);
     }
 
-    /// A played Maul makes every Maul hit harder, auto-plays included.
+    /// A played Maul makes every Maul in combat hit harder, auto-plays included (not the deck's).
     fn grow_maul(&mut self, card: &mut Card) {
         if card.id != card_id::MAUL {
             return;
@@ -6826,11 +6816,6 @@ impl Game {
             .chain(&mut combat.exhaust)
             .chain(played(&mut combat.queue))
         {
-            if other.id == card_id::MAUL {
-                other.value += increase;
-            }
-        }
-        for other in &mut self.run.deck {
             if other.id == card_id::MAUL {
                 other.value += increase;
             }
@@ -6976,9 +6961,21 @@ impl Game {
         }
     }
 
+    /// CardPileCmd.AddGeneratedCardsToCombat: nothing once the fight is won.
     fn add_generated(&mut self, content: &Content, pile: Pile, card: Card) {
+        if self.enemies_defeated() {
+            return;
+        }
         let card = self.add_to_pile(content, pile, card);
         self.trigger_generated(content, card.id);
+    }
+
+    /// A card an enemy adds has no creator: the player's generation hooks (and Supermassive's
+    /// count) ignore it.
+    fn add_uncredited(&mut self, content: &Content, pile: Pile, card: Card) {
+        if !self.enemies_defeated() {
+            self.add_to_pile(content, pile, card);
+        }
     }
 
     /// Adds a new card to a pile without the generation hooks (CardPileCmd.Add).
@@ -7032,6 +7029,9 @@ impl Game {
     }
 
     pub(super) fn add_random(&mut self, content: &Content, pile: Pile, mut card: Card) {
+        if self.enemies_defeated() {
+            return;
+        }
         self.afflict_new(content, &mut card);
         let card = self.insert_random(pile, card);
         self.trigger_generated(content, card.id);
@@ -7348,8 +7348,10 @@ impl Game {
                     Phase::Won
                 }
             } else if content.acts.get(self.act as usize).is_some() {
+                if royalties > 0 {
+                    self.reward_gold_parts.push(royalties);
+                }
                 let mut rewards = self.rewards(content, hunts);
-                rewards.gold += royalties;
                 rewards.removals = removals;
                 Phase::Rewards(rewards)
             } else {

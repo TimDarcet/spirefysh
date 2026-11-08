@@ -5,9 +5,7 @@ use crate::game::{
     price, price_mut, relic_deques,
 };
 use crate::*;
-use serde_json::Value;
-#[cfg(any(test, feature = "python"))]
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{
     cell::RefCell,
     collections::{BTreeMap, HashMap},
@@ -769,6 +767,627 @@ pub fn replay_trace(path: impl AsRef<Path>) -> io::Result<ReplayReport> {
     Ok(report)
 }
 
+/// A run the simulator plays from the trace's seed alone, taking each traced action: its state
+/// must equal the game's at every decision. Nothing is copied from the capture. An RNG stream
+/// called a different number of times is noted (its first decision) and the run goes on until the
+/// state itself differs.
+#[derive(Debug, Default)]
+pub struct LockstepReport {
+    pub decisions: usize,
+    pub matched: usize,
+    pub floor: u8,
+    pub rng_drifts: Vec<(u64, String)>,
+    pub divergence: Option<Divergence>,
+}
+
+pub fn lockstep_trace(path: impl AsRef<Path>) -> io::Result<LockstepReport> {
+    let content = foundation_content();
+    let invalid = |error: String| io::Error::new(io::ErrorKind::InvalidData, error);
+    let (mut records, mut started) = (Vec::new(), Value::Null);
+    for line in BufReader::new(File::open(path)?).lines() {
+        let record: Value =
+            serde_json::from_str(&line?).map_err(|error| invalid(error.to_string()))?;
+        if record["kind"] == "episode_started" {
+            started = record["metadata"].clone();
+        }
+        if matches!(
+            record["kind"].as_str(),
+            Some("decision" | "choice_made" | "transition_quarantined")
+        ) {
+            records.push(record);
+        }
+    }
+    let mut report = LockstepReport::default();
+    let Some(first) = records.iter().find(|record| record["kind"] == "decision") else {
+        return Ok(report);
+    };
+    let mut game = lockstep_start(&content, first, &started).map_err(invalid)?;
+    let (mut index, mut picks, mut last) = (0, Vec::new(), None);
+    while index < records.len() {
+        let record = &records[index];
+        index += 1;
+        let mut merged = 0;
+        let differences = match record["kind"].as_str() {
+            Some("choice_made") => {
+                picks.push(record["metadata"].clone());
+                continue;
+            }
+            Some("transition_quarantined") => {
+                vec!["the capture lost track of the game here".into()]
+            }
+            _ => {
+                report.decisions += 1;
+                // The proceed after a boss isn't traced: the next act has already begun.
+                if game.room == Room::Boss
+                    && record["before"]["act"].as_u64() > Some(game.run.act as u64)
+                {
+                    game.step(&content, Action::Leave)
+                        .map_err(|error| invalid(format!("{error:?}")))?;
+                }
+                let mut differences = compare_snapshot(
+                    &content,
+                    &game,
+                    &record["before"],
+                    &record["oracle_before"],
+                    false,
+                );
+                differences.extend(compare_map(&game, &record["before"]));
+                differences.extend(compare_bags(&content, &game, &record["oracle_before"]));
+                differences.extend(compare_room(&content, &game, &record["before"]));
+                let ids = lockstep_ids(&content, &game, record);
+                differences.extend(compare_moves(&content, &game, record, &ids));
+                let sequence = record["sequence"].as_u64().unwrap_or_default();
+                for drift in differences.extract_if(.., |difference| {
+                    difference.contains(": simulator ")
+                        && (difference.starts_with("run.") || difference.starts_with("player.1."))
+                }) {
+                    let stream = drift.split(':').next().unwrap_or_default().to_owned();
+                    if !report
+                        .rng_drifts
+                        .iter()
+                        .any(|(_, seen)| seen.starts_with(&stream))
+                    {
+                        report.rng_drifts.push((sequence, drift));
+                    }
+                }
+                // A card reward is claimed, then its card picked: one simulator action.
+                let action = &record["action"];
+                let card_reward = action["kind"] == "take_reward"
+                    && action["runtime_type"]
+                        .as_str()
+                        .is_some_and(|kind| kind.ends_with("CardReward"));
+                let pick = records[index..]
+                    .iter()
+                    .position(|next| next["kind"] == "decision")
+                    .filter(|&offset| {
+                        card_reward && records[index + offset]["action"]["kind"] == "choose_cards"
+                    });
+                let choice = pick.map(|offset| &records[index + offset]);
+                if differences.is_empty() {
+                    let mut record = record.clone();
+                    record["action"] = relabel(&record["action"], &ids);
+                    for pick in &mut picks {
+                        *pick = relabel(pick, &ids);
+                    }
+                    differences = step_lockstep(&content, &mut game, &record, choice, &mut picks)
+                        .err()
+                        .unwrap_or_default();
+                }
+                if let Some(offset) = pick {
+                    // Its choice-made events came before the pick; nothing else happens between.
+                    index += offset + 1;
+                    report.decisions += 1;
+                    merged = 1;
+                }
+                differences
+            }
+        };
+        if !differences.is_empty() {
+            report.divergence = Some(Divergence {
+                sequence: record["sequence"].as_u64().unwrap_or_default(),
+                game_action_id: record["game_action_id"].as_u64(),
+                action: record["action"]["kind"]
+                    .as_str()
+                    .unwrap_or("unknown")
+                    .to_owned(),
+                differences,
+            });
+            break;
+        }
+        report.matched += 1 + merged;
+        last = Some(record);
+    }
+    if let (None, Some(last)) = (&report.divergence, last) {
+        let differences = compare_snapshot(
+            &content,
+            &game,
+            &last["after"],
+            &last["oracle_after"],
+            false,
+        );
+        if !differences.is_empty() {
+            report.divergence = Some(Divergence {
+                sequence: last["sequence"].as_u64().unwrap_or_default(),
+                game_action_id: last["game_action_id"].as_u64(),
+                action: "end of trace".into(),
+                differences,
+            });
+        }
+    }
+    report.floor = game.run.floor;
+    Ok(report)
+}
+
+/// The simulator's ids for the game's cards and enemies, which it numbers differently, matched
+/// by their places in the snapshot.
+fn lockstep_ids(content: &Content, game: &Game, record: &Value) -> HashMap<String, String> {
+    let mut ids = HashMap::new();
+    let Some(combat) = game.combat() else {
+        return ids;
+    };
+    let (player, oracle) = (&record["before"]["players"][0], &record["oracle_before"]);
+    let draw: Vec<_> = array(&oracle["hidden_draw_order"])
+        .iter()
+        .rev()
+        .cloned()
+        .collect();
+    for (cards, traced) in [
+        (&combat.hand, array(&player["hand"]).to_vec()),
+        (&combat.discard, array(&player["discard_pile"]).to_vec()),
+        (&combat.exhaust, array(&player["exhaust_pile"]).to_vec()),
+        (&combat.draw, draw),
+    ] {
+        for (card, traced) in cards.iter().zip(traced) {
+            if let Some(id) = traced["instance_id"].as_str() {
+                ids.insert(id.to_owned(), format!("combat-card:{}", card.instance - 1));
+            }
+        }
+    }
+    // Enemies by model, in the game's slot order.
+    let mut living: Vec<_> = combat
+        .enemies
+        .iter()
+        .filter(|enemy| enemy.creature.hp > 0)
+        .collect();
+    living.sort_by_key(|enemy| enemy.slot);
+    for traced in array(&record["before"]["combat"]["enemies"]) {
+        let model = traced["model_id"].as_str().unwrap_or_default();
+        if traced["hit_points"].as_i64() > Some(0)
+            && let Some(id) = traced["instance_id"].as_str()
+            && let Some(index) = (living.iter())
+                .position(|enemy| content.enemies[enemy.creature.id as usize].id == model)
+        {
+            ids.insert(
+                id.to_owned(),
+                format!("creature:{}", living.remove(index).instance - 1),
+            );
+        }
+    }
+    ids
+}
+
+fn relabel(value: &Value, ids: &HashMap<String, String>) -> Value {
+    match value {
+        Value::String(id) => Value::String(ids.get(id).unwrap_or(id).clone()),
+        Value::Array(values) => values.iter().map(|value| relabel(value, ids)).collect(),
+        Value::Object(fields) => (fields.iter())
+            .map(|(key, value)| (key.clone(), relabel(value, ids)))
+            .collect(),
+        value => value.clone(),
+    }
+}
+
+/// The moves the enemies are about to make.
+fn compare_moves(
+    content: &Content,
+    game: &Game,
+    record: &Value,
+    ids: &HashMap<String, String>,
+) -> Vec<String> {
+    let Some(combat) = game.combat() else {
+        return vec![];
+    };
+    let mut differences = vec![];
+    for traced in array(&record["before"]["combat"]["enemies"]) {
+        let id = traced["instance_id"].as_str().unwrap_or_default();
+        let Some(move_id) = record["oracle_before"]["enemy_move_ids"][id].as_str() else {
+            continue;
+        };
+        let Some(enemy) = (ids.get(id)).and_then(|ours| {
+            combat
+                .enemies
+                .iter()
+                .find(|enemy| enemy.instance == instance_id(ours))
+        }) else {
+            continue;
+        };
+        // CreatureCmd.Stun shows as STUNNED, which the simulator plays as a stun or a Stun move.
+        let def = &content.enemies[enemy.creature.id as usize];
+        let stunned = enemy.stunned > 0
+            || move_id == "STUNNED" && def.moves[enemy.move_index].intent == "Stun";
+        if (move_id == "STUNNED") != stunned {
+            differences.push(format!(
+                "{id} stunned: simulator {} != game {move_id}",
+                enemy.stunned
+            ));
+        }
+        if stunned {
+            continue;
+        }
+        let expected = infer_move(def, traced, move_id);
+        if enemy.move_index != expected {
+            differences.push(format!(
+                "{id} move: simulator {:?} != game {move_id} ({:?})",
+                def.moves[enemy.move_index].intent, def.moves[expected].intent
+            ));
+        }
+    }
+    differences
+}
+
+/// The floor, and the event being played.
+fn compare_room(content: &Content, game: &Game, state: &Value) -> Vec<String> {
+    let mut differences = vec![];
+    if state["act_floor"].as_u64() != Some(game.run.floor as u64) {
+        differences.push(format!(
+            "floor: simulator {} != game {}",
+            game.run.floor, state["act_floor"]
+        ));
+    }
+    if let (Phase::Event(id, _), Some(event)) = (&game.phase, state["room_model_id"].as_str())
+        && state["phase"] == "event"
+        && content.events[*id as usize].id != event
+    {
+        differences.push(format!(
+            "event: simulator {} != game {event}",
+            content.events[*id as usize].id
+        ));
+    }
+    differences
+}
+
+/// The relic grab bags, front first.
+fn compare_bags(content: &Content, game: &Game, oracle: &Value) -> Vec<String> {
+    let mut differences = vec![];
+    for (name, deques) in [
+        ("player", &game.relic_deques),
+        ("shared", &game.shared_relic_deques),
+    ] {
+        for (deque, rarity) in deques.iter().zip(["Common", "Uncommon", "Rare", "Shop"]) {
+            let bag = format!("{name}.{rarity}");
+            let simulator: Vec<_> = deque
+                .iter()
+                .map(|&id| content.relics[id as usize].id)
+                .collect();
+            let game: Vec<_> = array(&oracle["relic_grab_bags"][&bag])
+                .iter()
+                .filter_map(Value::as_str)
+                .collect();
+            if simulator != game {
+                differences.push(format!(
+                    "{bag} grab bag: simulator {simulator:?} != game {game:?}"
+                ));
+            }
+        }
+    }
+    differences
+}
+
+/// The map's points the game shows (rows past the ancient's), with their kinds and children.
+fn compare_map(game: &Game, state: &Value) -> Vec<String> {
+    let key = |room: Room| match room {
+        Room::Unknown | Room::Event => "unknown".to_owned(),
+        room => format!("{room:?}"),
+    };
+    let traced: BTreeMap<(u8, u8), (String, Vec<(u8, u8)>)> = array(&state["map"])
+        .iter()
+        .map(|point| {
+            let coord = |point: &Value| {
+                (
+                    point["column"].as_u64().unwrap_or(0) as u8,
+                    point["row"].as_u64().unwrap_or(0) as u8,
+                )
+            };
+            let mut children: Vec<_> = array(&point["children"]).iter().map(coord).collect();
+            children.sort_unstable();
+            (
+                coord(point),
+                (
+                    key(trace_room(point["point_type"].as_str().unwrap_or_default())),
+                    children,
+                ),
+            )
+        })
+        .collect();
+    let nodes = &game.map.nodes;
+    let simulated: BTreeMap<(u8, u8), (String, Vec<(u8, u8)>)> = nodes
+        .iter()
+        .filter(|node| {
+            traced.contains_key(&(node.lane, node.floor))
+                || node.floor > 0 && node.room != Room::Boss
+        })
+        .map(|node| {
+            let mut children: Vec<_> = node
+                .next
+                .iter()
+                .map(|&next| (nodes[next].lane, nodes[next].floor))
+                .collect();
+            children.sort_unstable();
+            ((node.lane, node.floor), (key(node.room), children))
+        })
+        .collect();
+    let coords: std::collections::BTreeSet<_> = traced.keys().chain(simulated.keys()).collect();
+    (coords.into_iter())
+        .filter(|coord| traced.get(coord) != simulated.get(coord))
+        .map(|coord| {
+            format!(
+                "map at {coord:?} (of {} game points): simulator {:?} != game {:?}",
+                traced.len(),
+                simulated.get(coord),
+                traced.get(coord)
+            )
+        })
+        .collect()
+}
+
+/// The run as it starts: the trace's character and ascension, and the seed its RNG streams share.
+fn lockstep_start(content: &Content, record: &Value, started: &Value) -> Result<Game, String> {
+    let character = text(&record["before"]["players"][0], "character_id")?;
+    let character = find_id(&content.characters, character, |character| character.id)?;
+    let ascension = number(&record["before"], "ascension")? as u8;
+    let up_front = record["oracle_before"]["rng_seeds"]["run.UpFront"]
+        .as_u64()
+        .ok_or("capture has no RNG seeds")?;
+    let seed = (up_front as u32).wrapping_sub(hash("up_front"));
+    let mut game = Game::new_character_ascension(content, seed as u64, character, ascension)
+        .map_err(|error| format!("{error:?}"))?;
+    game.set_up_run(content)
+        .map_err(|error| format!("{error:?}"))?;
+    // The bridge's loadout (traced, else from the environment of older traces) joins the deck and
+    // relics once the run is set up; then each new relic's AfterObtained runs in order.
+    let loadout = |name: &str| {
+        let traced = started[name.to_lowercase()].as_str().map(str::to_owned);
+        let list = traced.or_else(|| std::env::var(format!("SPIREFYSH_{name}")).ok());
+        list.unwrap_or_default()
+            .split(',')
+            .map(|entry| entry.trim().to_owned())
+            .filter(|entry| !entry.is_empty())
+            .collect::<Vec<_>>()
+    };
+    for entry in loadout("START_CARDS") {
+        let (id, enchantment) = entry.split_once('@').unwrap_or((&entry, ""));
+        let value =
+            json!({"model_id": id, "enchantment_model_id": enchantment, "enchantment_amount": 1});
+        let instance = game.next_card;
+        game.next_card += 1;
+        game.run.deck.push(Card {
+            instance,
+            ..card(content, &value)?
+        });
+    }
+    let relics: Vec<_> = (loadout("START_RELICS").iter())
+        .map(|id| find_id(&content.relics, id, |relic| relic.id))
+        .collect::<Result<_, _>>()?;
+    for &id in &relics {
+        game.remove_relic_from_bags(id);
+        game.run.relics.push(id);
+    }
+    for id in relics {
+        game.after_obtained(content, id);
+    }
+    game.enter_neow(content)
+        .map_err(|error| format!("{error:?}"))?;
+    Ok(game)
+}
+
+/// Steps a traced decision, then the AutoSlay picks the game made while resolving it.
+fn step_lockstep(
+    content: &Content,
+    game: &mut Game,
+    record: &Value,
+    card_pick: Option<&Value>,
+    picks: &mut Vec<Value>,
+) -> Result<(), Vec<String>> {
+    let (action, after) = (&record["action"], &record["after"]);
+    if action["kind"] == "choose_cards" {
+        step_traced_choice(content, game, action)?;
+    } else if let Some(choice) = card_pick {
+        let offered: Vec<_> = array(&choice["action"]["candidate_ids"])
+            .iter()
+            .filter_map(|id| model_card(content, id.as_str()?))
+            .collect();
+        // An event's card reward (The Future of Potions) is the simulator's card choice.
+        let (cards, take): (_, fn(usize) -> Action) = match &game.phase {
+            Phase::Rewards(rewards) => (&rewards.cards, Action::RewardCard),
+            Phase::ChooseCards(cards, ..) => (cards, Action::Choose),
+            _ => {
+                return Err(vec![format!(
+                    "card reward claimed outside rewards: {:?}",
+                    game.phase
+                )]);
+            }
+        };
+        let key = |card: &Card| (content.cards[card.id as usize].id, card.upgrades);
+        if cards.iter().map(key).ne(offered.iter().map(key)) {
+            return Err(vec![format!(
+                "card reward: simulator {:?} != game {:?}",
+                cards.iter().map(key).collect::<Vec<_>>(),
+                offered.iter().map(key).collect::<Vec<_>>()
+            )]);
+        }
+        let step = match array(&choice["action"]["selected_ids"])
+            .first()
+            .and_then(Value::as_str)
+        {
+            Some(selected) => {
+                let wanted = model_card(content, selected).map(|card| key(&card));
+                let index = cards.iter().position(|card| Some(key(card)) == wanted);
+                take(index.ok_or_else(|| vec![format!("card reward has no {selected}")])?)
+            }
+            None => Action::Cancel,
+        };
+        game.step(content, step)
+            .map_err(|error| vec![format!("card reward rejected: {error:?}")])?;
+    } else {
+        // A purchase the game refused (no room for the potion) changes nothing.
+        let gold = |state: &Value| state["players"][0]["gold"].as_i64();
+        if action["kind"] == "shop_purchase" && gold(&record["before"]) == gold(after) {
+            return Ok(());
+        }
+        // The game's proceed button isn't traced: moving on the map leaves the screen.
+        if action["kind"] == "map_node" && !matches!(game.phase, Phase::Map) {
+            game.step(content, Action::Leave)
+                .map_err(|error| vec![format!("leaving {:?} rejected: {error:?}", game.phase)])?;
+        }
+        let step =
+            action_from_snapshot(content, game, action, after).map_err(|error| vec![error])?;
+        let phase = format!("{step:?} in {:?}", game.phase);
+        game.step(content, step).map_err(|error| {
+            vec![format!(
+                "rejected ({error:?}): {}",
+                &phase[..phase.len().min(300)]
+            )]
+        })?;
+    }
+    while step_traced_pick(content, game, picks, after)?
+        || step_deck_pick(content, game, picks)?
+        || step_crystal_pick(content, game, picks)?
+    {}
+    // Picks precede their decision: those left (a Smith inferred from the deck) are stale.
+    picks.clear();
+    Ok(())
+}
+
+/// Steps the automated selector's pick on a deck screen or among offered cards.
+fn step_deck_pick(
+    content: &Content,
+    game: &mut Game,
+    picks: &mut Vec<Value>,
+) -> Result<bool, Vec<String>> {
+    let screen = matches!(
+        game.phase,
+        Phase::RemoveCards(..)
+            | Phase::UpgradeCards(..)
+            | Phase::TransformCards(..)
+            | Phase::EnchantCards(..)
+            | Phase::ChooseCards(..)
+    );
+    if !screen || picks.is_empty() {
+        return Ok(false);
+    }
+    step_traced_choice(content, game, &picks.remove(0))?;
+    Ok(true)
+}
+
+/// Steps AutoSlay's traced Crystal Sphere click.
+fn step_crystal_pick(
+    content: &Content,
+    game: &mut Game,
+    picks: &mut Vec<Value>,
+) -> Result<bool, Vec<String>> {
+    let Some(crystal) = &game.crystal else {
+        return Ok(false);
+    };
+    if picks.first().is_none_or(|pick| pick["selector"] != "crystal_sphere") {
+        return Ok(false);
+    }
+    let pick = picks.remove(0);
+    let reject = |error: Error| vec![format!("crystal click rejected: {error:?}")];
+    let big = pick["big"] == true;
+    if crystal.big != big {
+        game.step(content, Action::CrystalTool(big)).map_err(reject)?;
+    }
+    let coordinate = |key: &str| pick[key].as_u64().unwrap_or_default() as u8;
+    game.step(content, Action::CrystalCell(coordinate("x"), coordinate("y")))
+        .map_err(reject)?;
+    Ok(true)
+}
+
+/// Steps a traced card choice: the pending combat choice's picks, or the pick on a deck screen
+/// (removal, upgrade, transform, enchant) or among offered cards.
+fn step_traced_choice(
+    content: &Content,
+    game: &mut Game,
+    action: &Value,
+) -> Result<(), Vec<String>> {
+    let reject = |error: Error| vec![format!("choice rejected: {error:?}")];
+    let matches = |card: &Card, selected: &str| {
+        if let Some(model) = selected.strip_prefix("model-card:") {
+            let (model, upgrades) = model.split_once(':').unwrap_or((model, "0"));
+            content.cards[card.id as usize].id == model && upgrades.parse() == Ok(card.upgrades)
+        } else {
+            card.instance == instance_id(selected)
+        }
+    };
+    let selected = array(&action["selected_ids"]);
+    if let Phase::ChooseBundles(bundles) = &game.phase {
+        let index = (bundles.iter())
+            .position(|bundle| {
+                bundle.len() == selected.len()
+                    && bundle
+                        .iter()
+                        .zip(selected)
+                        .all(|(card, id)| matches(card, id.as_str().unwrap_or_default()))
+            })
+            .ok_or_else(|| vec![format!("no bundle is {selected:?}")])?;
+        return game.step(content, Action::Choose(index)).map_err(reject);
+    }
+    if game.combat().is_none() {
+        if selected.is_empty() {
+            return game.step(content, Action::Cancel).map_err(reject);
+        }
+        // Deck screens name cards by their deck index, which shifts as cards go.
+        let selected: Vec<_> = (selected.iter().filter_map(Value::as_str))
+            .map(|id| match id.strip_prefix("deck-card:") {
+                Some(index) => (index.rsplit(':').next())
+                    .and_then(|index| game.run.deck.get(index.parse::<usize>().ok()?))
+                    .map_or(id.to_owned(), |card| {
+                        format!("combat-card:{}", card.instance - 1)
+                    }),
+                None => id.to_owned(),
+            })
+            .collect();
+        for selected in &selected {
+            let (cards, step): (&[Card], fn(usize) -> Action) = match &game.phase {
+                Phase::RemoveCards(..) | Phase::TransformCards(..) => {
+                    (&game.run.deck, Action::RemoveCard)
+                }
+                Phase::UpgradeCards(..) => (&game.run.deck, Action::Smith),
+                Phase::EnchantCards(..) => (&game.run.deck, Action::Enchant),
+                Phase::ChooseCards(cards, ..) => (cards, Action::Choose),
+                phase => return Err(vec![format!("no card choice pending in {phase:?}")]),
+            };
+            let index = (cards.iter().position(|card| matches(card, selected)))
+                .ok_or_else(|| vec![format!("choice has no {selected}")])?;
+            game.step(content, step(index)).map_err(reject)?;
+        }
+        return Ok(());
+    }
+    if selected.is_empty() && action["can_skip"] == true {
+        game.step(content, Action::Done).map_err(reject)?;
+    }
+    for selected in selected {
+        let selected = selected.as_str().unwrap_or_default();
+        let combat = game
+            .combat()
+            .ok_or_else(|| vec!["choice ended combat".into()])?;
+        let choice =
+            (combat.choice).ok_or_else(|| vec!["simulator did not request card choice".into()])?;
+        let index = (replay_pile(combat, choice.pile).iter())
+            .position(|card| matches(card, selected))
+            .ok_or_else(|| {
+                vec![format!(
+                    "choice has no {selected}; offered {:?}",
+                    (replay_pile(combat, choice.pile).iter())
+                        .map(|card| content.cards[card.id as usize].id)
+                        .collect::<Vec<_>>()
+                )]
+            })?;
+        game.step(content, Action::Choose(index)).map_err(reject)?;
+    }
+    Ok(())
+}
+
 fn replay_record(
     content: &Content,
     report: &mut ReplayReport,
@@ -1367,46 +1986,7 @@ fn replay_decision(
                 return Err(differences);
             }
         }
-        let selected = array(&choice["action"]["selected_ids"]);
-        if selected.is_empty() && choice["action"]["can_skip"] == true {
-            game.step(content, Action::Done)
-                .map_err(|error| vec![format!("choice rejected: {error:?}")])?;
-        }
-        for selected in selected {
-            let selected = selected.as_str().unwrap_or_default();
-            let combat = game
-                .combat()
-                .ok_or_else(|| vec!["choice ended combat".into()])?;
-            let choice = combat
-                .choice
-                .ok_or_else(|| vec!["simulator did not request card choice".into()])?;
-            let index = replay_pile(combat, choice.pile)
-                .iter()
-                .position(|card| {
-                    if selected.starts_with("model-card:") {
-                        let mut parts = selected.split(':').skip(1);
-                        let model = parts.next().unwrap_or_default();
-                        let upgrades = parts
-                            .next()
-                            .and_then(|value| value.parse().ok())
-                            .unwrap_or(0);
-                        content.cards[card.id as usize].id == model && card.upgrades == upgrades
-                    } else {
-                        card.instance == instance_id(selected)
-                    }
-                })
-                .ok_or_else(|| {
-                    vec![format!(
-                        "choice has no {selected}; offered {:?}",
-                        replay_pile(combat, choice.pile)
-                            .iter()
-                            .map(|card| content.cards[card.id as usize].id)
-                            .collect::<Vec<_>>()
-                    )]
-                })?;
-            game.step(content, Action::Choose(index))
-                .map_err(|error| vec![format!("choice rejected: {error:?}")])?;
-        }
+        step_traced_choice(content, &mut game, &choice["action"])?;
     }
     let mut inferred_choice = false;
     // A fight won without any decision (event fights) settles past the combat entirely.
@@ -2199,7 +2779,7 @@ fn replay_decision(
             resync(
                 "resync.enemy_stunned",
                 &mut enemy.stunned,
-                move_id == "STUNNED",
+                (move_id == "STUNNED") as u8,
             );
             if let Some(expected) = array(&after["combat"]["enemies"]).iter().find(|expected| {
                 expected["instance_id"] == instance.as_str()
@@ -3026,10 +3606,10 @@ fn game_from_snapshot(
             last_move: move_index,
             repeats,
             move_history,
-            stunned: move_id == "STUNNED"
+            stunned: (move_id == "STUNNED"
                 && !content.enemies[id as usize].moves[move_index]
                     .intent
-                    .contains("Stun"),
+                    .contains("Stun")) as u8,
             // The Waterfall Giant's pressure gun grows by 5 each use and its explosion deals the
             // stored steam; the intents show the modified totals.
             value: match content.enemies[id as usize].id {
@@ -3665,6 +4245,10 @@ fn game_from_snapshot(
             .iter()
             .any(|relic| relic["model_id"] == "RELIC.BURNING_STICKS" && relic["state"] != "Active"),
         red_skull: relic_active(player, "RELIC.RED_SKULL"),
+        rat_calls: 0,
+        stolen: vec![],
+        returned: vec![],
+        escaped: vec![],
         throwing_axe: !relic_active(player, "RELIC.THROWING_AXE"),
         vambrace: array(&player["relics"])
             .iter()
@@ -3784,7 +4368,7 @@ fn snapshot_game(
         rng.forward(oracle["rng_counters"][&key].as_u64().unwrap_or_default());
         rng
     };
-    let mut game = Game {
+    Game {
         run,
         map,
         phase,
@@ -3819,17 +4403,15 @@ fn snapshot_game(
         bosses: [None; 2],
         bosses_visited: 0,
         encounters: replay_state.encounter_bag(content, act, false, None),
+        encounters_visited: 0,
         elites: replay_state.encounter_bag(content, act, true, None),
-        weak_encounters_left: replay_state.weak_encounters_left,
-        regular_encounters_left: replay_state.regular_encounters_left,
-        elite_encounters_left: replay_state.elite_encounters_left,
-        last_encounter: replay_state.last_encounter,
-        last_elite: replay_state.last_elite,
+        elites_visited: 0,
         // The act's opening ancient is only known once its node is entered.
         ancient: after["room_model_id"]
             .as_str()
             .and_then(|id| trace_event(content, id).ok()),
         events: vec![],
+        later_rooms: vec![],
         visited_events: replay_state.visited_events.clone(),
         enemy_starts: vec![],
         seed,
@@ -3899,6 +4481,9 @@ fn snapshot_game(
             .clone()
             .filter(|_| state["room_model_id"] == "EVENT.CRYSTAL_SPHERE"),
         reward_gold_parts: replay_state.reward_gold_parts.clone(),
+        transformed: vec![],
+        past_floors: (state["total_floor"].as_u64().unwrap_or_default())
+            .saturating_sub(state["act_floor"].as_u64().unwrap_or_default()) as u16,
         fake_merchant: replay_state.fake_merchant.clone(),
         fake_shop: replay_state.fake_shop,
         courier_restock: replay_state.courier_restock.clone(),
@@ -3930,10 +4515,7 @@ fn snapshot_game(
         sword_of_stone: relic_amount(player, "RELIC.SWORD_OF_STONE"),
         replaying: true,
         expectation: None,
-    };
-    // The captured grab bags still hold relics the game only drops when it next pulls.
-    game.purge_disallowed_relics(content);
-    game
+    }
 }
 
 fn run_game_from_snapshot(
@@ -4715,7 +5297,7 @@ fn action_from_snapshot(
             let index = id
                 .split(':')
                 .nth(2)
-                .and_then(|index| index.parse().ok())
+                .and_then(|index| index.parse::<usize>().ok())
                 .ok_or("invalid event option")?;
             let name = id
                 .rsplit(['.', ':'])
@@ -4723,11 +5305,18 @@ fn action_from_snapshot(
                 .unwrap_or_default()
                 .replace(' ', "_")
                 .to_uppercase();
-            if let Some(relic) = content
-                .relics
-                .iter()
-                .position(|relic| relic.id == format!("RELIC.{name}"))
-            {
+            // An option that names the relic it grants (Colossal Flower's Pollinous Core) runs
+            // its other effects too.
+            let effects = match &game.phase {
+                Phase::Event(_, options) => {
+                    options.get(index).map_or(&[][..], |option| option.effects)
+                }
+                _ => &[],
+            };
+            if let Some(relic) = (content.relics.iter()).position(|relic| {
+                relic.id == format!("RELIC.{name}")
+                    && !effects.contains(&RunEffect::AddRelic(relic.id))
+            }) {
                 Ok(Action::EventRelic(index, relic as Id))
             } else {
                 Ok(Action::Event(index))
@@ -4937,6 +5526,15 @@ fn compare_snapshot(
         &draw,
         &oracle["hidden_draw_order"],
     );
+    let orbs: Vec<_> = (combat.orbs.iter())
+        .map(|orb| content.orbs()[orb.id as usize].id)
+        .collect();
+    let expected_orbs: Vec<_> = (array(&expected_player["orbs"]).iter())
+        .map(|orb| orb["model_id"].as_str().unwrap_or_default())
+        .collect();
+    if orbs != expected_orbs {
+        diff.push(format!("orbs: simulator {orbs:?} != game {expected_orbs:?}"));
+    }
     compare_powers(
         &mut diff,
         content,
@@ -5013,7 +5611,7 @@ fn compare_snapshot(
             diff.push(format!("{path}.move: invalid index {}", actual.move_index));
             continue;
         };
-        let actual_intent = if actual.stunned {
+        let actual_intent = if actual.stunned > 0 {
             "Stun"
         } else {
             move_def.intent
@@ -5679,7 +6277,8 @@ fn infer_move(enemy: &EnemyDef, state: &Value, move_id: &str) -> usize {
         ("MONSTER.FOSSIL_STALKER", "TACKLE_MOVE") => Some(0),
         ("MONSTER.FOSSIL_STALKER", "LATCH_MOVE") => Some(1),
         ("MONSTER.FOSSIL_STALKER", "LASH_MOVE") => Some(2),
-        ("MONSTER.LIVING_FOG", "ADVANCED_GAS_MOVE" | "SUPER_GAS_BLAST_MOVE") => Some(0),
+        ("MONSTER.LIVING_FOG", "ADVANCED_GAS_MOVE") => Some(0),
+        ("MONSTER.LIVING_FOG", "SUPER_GAS_BLAST_MOVE") => Some(2),
         ("MONSTER.LIVING_FOG", "BLOAT_MOVE") => Some(1),
         ("MONSTER.FOGMOG", "ILLUSION_MOVE") => Some(0),
         ("MONSTER.FOGMOG", "SWIPE_MOVE") => Some(1),
