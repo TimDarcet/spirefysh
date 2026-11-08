@@ -1156,7 +1156,7 @@ fn v57_control_and_resolving_play_state_are_continuations() {
     assert!(tokens.iter().any(|token| token.parent == playing as u32
         && token.domain == CARD_DOMAIN as u8
         && has(token, layout, Semantic::Card, version)));
-    let cooking = event_effect_index(&RunEffect::FinishCooking) as u32;
+    let cooking = RunEffect::FinishCooking.variant();
     assert!(tokens.iter().any(|token| has(token, layout, Semantic::RunEffect, cooking)));
     for kind in 2..=3 {
         assert!(tokens.iter().any(|token| has(token, layout, Semantic::PlayKind, kind)));
@@ -1745,9 +1745,12 @@ fn v55_action_and_phase_discriminants_are_exhaustive() {
         Action::Leave,
     ];
     assert_eq!(
-        actions.iter().map(action_kind).collect::<Vec<_>>(),
-        (0..labels::ACTIONS.len()).collect::<Vec<_>>()
+        actions.iter().map(Variant::variant).collect::<Vec<_>>(),
+        (0..labels::variants("Action").len() as u32).collect::<Vec<_>>()
     );
+    for (action, name) in actions.iter().zip(labels::variants("Action")) {
+        assert_eq!(format!("{action:?}").split([' ', '(']).next(), Some(*name));
+    }
 
     let content = foundation_content();
     let mut game = Game::new_character_ascension(&content, 556, 0, 10).unwrap();
@@ -1791,7 +1794,7 @@ fn v55_action_and_phase_discriminants_are_exhaustive() {
 #[test]
 fn v56_layout_uses_explicit_token_dimensions_and_positions() {
     let layout = Layout::new(&foundation_content());
-    assert_eq!((VERSION, VALUE_MODEL_VERSION), (64, 80));
+    assert_eq!((VERSION, VALUE_MODEL_VERSION), (65, 81));
     assert_eq!(
         (
             DEFAULT_MODEL_WIDTH,
@@ -1874,7 +1877,7 @@ fn v57_actions_are_legal_only_and_only_suspended_offers_are_phase_children() {
     assert_eq!(placed(&observation, Place::Phase).count(), 2);
     let children = phase_children(&observation, 1);
     assert!(children.iter().any(|token| token.domain == OFFER_DOMAIN as u8
-        && has(token, layout, Semantic::OfferKind, 4)
+        && has(token, layout, Semantic::ShopItem, 0)
         && token.f[0] == 0.1));
     assert!(children.iter().any(|token| token.domain == CARD_DOMAIN as u8
         && has(token, layout, Semantic::Card, base_card_id(card.id as u32))));
@@ -1990,7 +1993,7 @@ fn v56_continuations_are_flat_execution_items() {
     }
     assert!(tokens.iter().all(|token| (token.place == Place::Continuation) == (token.parent == NONE)));
     for effect in [random[0], random[1]] {
-        let code = layout.semantic(Semantic::Effect, effect_index(&effect) as u32);
+        let code = layout.semantic(Semantic::Effect, effect.variant());
         assert!(tokens.iter().all(|token| !token.c.contains(&code)));
     }
 }
@@ -2023,7 +2026,7 @@ fn v56_continuation_amounts_use_declared_scales_and_current_values() {
         },
     });
     let tokens = queue_tokens(&game, &content);
-    let damage = effect_index(&Effect::Damage(Target::Player, amount)) as u32;
+    let damage = Effect::Damage(Target::Player, amount).variant();
     let effect = (tokens.iter())
         .find(|token| has(token, layout, Semantic::Effect, damage))
         .unwrap();
@@ -2203,5 +2206,5 @@ fn traced_state_observations_are_stable() {
         }
     }
     assert_eq!(states, 200);
-    assert_eq!(digest, 4607526811213350950);
+    assert_eq!(digest, 5341664509664835271);
 }

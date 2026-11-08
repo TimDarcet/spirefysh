@@ -11,8 +11,8 @@ use std::{
 };
 
 const MAGIC: &[u8; 8] = b"STSVALUE";
-const VERSION: u32 = 64;
-const VALUE_MODEL_VERSION: u32 = 80;
+const VERSION: u32 = 65;
+const VALUE_MODEL_VERSION: u32 = 81;
 const TERMINAL_CATEGORIES: usize = 83;
 const PHASES: usize = 12;
 const MAP_NODE_KINDS: usize = 26;
@@ -433,7 +433,8 @@ enum Semantic {
     TinkerRider,
     ConveyorDish,
     EventAction,
-    OfferKind,
+    CardReward,
+    ShopItem,
     PlayKind,
     Flag,
     TokenRole,
@@ -497,7 +498,8 @@ const SEMANTIC_NAMES: [&str; Semantic::Count as usize] = [
     "tinker_rider",
     "conveyor_dish",
     "event_action",
-    "offer_kind",
+    "card_reward",
+    "shop_item",
     "play_kind",
     "flag",
     "token_role",
@@ -568,68 +570,76 @@ impl Token {
     }
 
     fn actor(&mut self, game: &Game, layout: Layout, actor: Actor) {
-        match actor {
-            Actor::Player => self.code(layout, Semantic::ActorKind, 0),
-            Actor::Osty => self.code(layout, Semantic::ActorKind, 1),
-            Actor::Enemy(index) => {
-                self.code(layout, Semantic::ActorKind, 2);
-                self.enemy(game, layout, index);
-            }
+        self.code(layout, Semantic::ActorKind, actor.variant());
+        if let Actor::Enemy(index) = actor {
+            self.enemy(game, layout, index);
         }
     }
 
     fn scale(&mut self, layout: Layout, scale: Scale) {
-        let (kind, argument, _) = scale_payload(scale);
-        self.code(layout, Semantic::Scale, kind);
-        match kind {
-            8 => self.code(layout, Semantic::Card, base_card_id(argument)),
-            22 | 24 | 25 | 27 | 29 | 31 => self.code(layout, Semantic::Power, argument),
-            26 => self.bits(layout, Semantic::TagBit, argument),
-            30 => self.code(layout, Semantic::CardType, argument),
+        self.code(layout, Semantic::Scale, scale.variant());
+        match scale {
+            Scale::ExhaustId(id) => self.code(layout, Semantic::Card, base_card_id(id as u32)),
+            Scale::OrbTypesPower(id)
+            | Scale::TargetPower(id)
+            | Scale::TargetPowerDiv(id, _)
+            | Scale::Power(id)
+            | Scale::EventPower(id)
+            | Scale::EnemyPowerTotal(id) => self.code(layout, Semantic::Power, id as u32),
+            Scale::Tagged(tag) => self.bits(layout, Semantic::TagBit, tag as u32),
+            Scale::HandType(kind) => self.code(layout, Semantic::CardType, kind as u32),
             _ => {}
         }
     }
 
     /// Codes the filter; returns its cost argument.
     fn filter(&mut self, layout: Layout, filter: CardFilter) -> i32 {
-        let (kind, argument, signed) = filter_payload(filter);
-        self.code(layout, Semantic::Filter, kind);
-        match kind {
-            1 | 3 | 5 => {
-                self.code(layout, Semantic::CardType, argument);
-                if kind == 3 {
-                    self.bits(layout, Semantic::TurnFlagBit, signed as u32);
-                }
+        self.code(layout, Semantic::Filter, filter.variant());
+        match filter {
+            CardFilter::Type(kind) | CardFilter::NotType(kind) => {
+                self.code(layout, Semantic::CardType, kind as u32)
             }
-            4 | 9 => self.bits(layout, Semantic::FlagBit, argument),
-            6 => self.code(layout, Semantic::Card, base_card_id(argument)),
+            CardFilter::TypeWithoutTurnFlag(kind, flag) => {
+                self.code(layout, Semantic::CardType, kind as u32);
+                self.bits(layout, Semantic::TurnFlagBit, flag as u32);
+            }
+            CardFilter::WithoutFlag(flag) | CardFilter::Flag(flag) => {
+                self.bits(layout, Semantic::FlagBit, flag as u32)
+            }
+            CardFilter::Id(id) => self.code(layout, Semantic::Card, base_card_id(id as u32)),
+            CardFilter::Cost(cost) | CardFilter::PlayableCost(cost) => return cost as i32,
             _ => {}
         }
-        if matches!(kind, 7 | 8) { signed } else { 0 }
+        0
     }
 
     /// Codes the operation; returns its cost argument.
     fn op(&mut self, layout: Layout, op: CardOp) -> i32 {
-        let (kind, argument, _, signed) = op_payload(op);
-        self.code(layout, Semantic::CardOp, kind);
-        match kind {
-            0 | 16 => self.code(layout, Semantic::Pile, argument),
-            4 => self.bits(layout, Semantic::FlagBit, argument),
-            5 => self.bits(layout, Semantic::TurnFlagBit, argument),
-            7 => self.code(layout, Semantic::Card, base_card_id(argument)),
+        self.code(layout, Semantic::CardOp, op.variant());
+        match op {
+            CardOp::Move(pile) | CardOp::MoveFree(pile) => {
+                self.code(layout, Semantic::Pile, pile as u32)
+            }
+            CardOp::Flag(flag) => self.bits(layout, Semantic::FlagBit, flag as u32),
+            CardOp::TurnFlag(flag) => self.bits(layout, Semantic::TurnFlagBit, flag as u32),
+            CardOp::Transform(id, _) => self.code(layout, Semantic::Card, base_card_id(id as u32)),
+            CardOp::Cost(cost) | CardOp::SetCost(cost) => return cost as i32,
             _ => {}
         }
-        if matches!(kind, 2 | 3) { signed } else { 0 }
+        0
     }
 
     fn condition(&mut self, layout: Layout, condition: Condition) {
-        let (kind, argument, ..) = condition_payload(condition);
-        self.code(layout, Semantic::Condition, kind);
-        match kind {
-            3 | 4 => self.code(layout, Semantic::Power, argument),
-            7 | 16 => self.code(layout, Semantic::CardType, argument),
-            15 => self.code(layout, Semantic::Orb, argument),
-            22 => self.code(layout, Semantic::Card, base_card_id(argument)),
+        self.code(layout, Semantic::Condition, condition.variant());
+        match condition {
+            Condition::TargetHasPower(id) | Condition::SourceHasPower(id) => {
+                self.code(layout, Semantic::Power, id as u32)
+            }
+            Condition::HandWithout(kind) | Condition::CardType(kind) => {
+                self.code(layout, Semantic::CardType, kind as u32)
+            }
+            Condition::HasOrb(id) => self.code(layout, Semantic::Orb, id as u32),
+            Condition::Card(id) => self.code(layout, Semantic::Card, base_card_id(id as u32)),
             _ => {}
         }
     }
@@ -677,27 +687,27 @@ impl Layout {
                 content.enemies.iter().map(|enemy| enemy.moves.len()).sum::<usize>() + 1,
             ),
             (Semantic::Orb, content.orbs.len()),
-            (Semantic::OrbTiming, 8),
+            (Semantic::OrbTiming, labels::variants("OrbTiming").len()),
             (Semantic::Event, content.events.len()),
             (Semantic::EventValue, content.events.len() * 4),
             (Semantic::EncounterNormal, 57),
             (Semantic::EncounterElite, 13),
-            (Semantic::Enchantment, labels::ENCHANTMENTS.len()),
-            (Semantic::CardType, labels::CARD_TYPES.len()),
-            (Semantic::Rarity, labels::RARITIES.len()),
-            (Semantic::Room, labels::ROOMS.len()),
-            (Semantic::Target, labels::TARGETS.len()),
-            (Semantic::Pile, labels::PILES.len()),
+            (Semantic::Enchantment, labels::variants("Enchantment").len()),
+            (Semantic::CardType, labels::variants("CardType").len()),
+            (Semantic::Rarity, labels::variants("CardRarity").len()),
+            (Semantic::Room, labels::variants("Room").len()),
+            (Semantic::Target, labels::variants("Target").len()),
+            (Semantic::Pile, labels::variants("Pile").len()),
             (Semantic::Phase, PHASES),
             (Semantic::SuspendedPhase, PHASES),
-            (Semantic::Action, labels::ACTIONS.len()),
-            (Semantic::Effect, labels::EFFECTS.len()),
-            (Semantic::EffectFlag, labels::EFFECTS.len() * 2),
-            (Semantic::RunEffect, labels::RUN_EFFECTS.len()),
-            (Semantic::Condition, labels::CONDITIONS.len()),
-            (Semantic::Filter, labels::FILTERS.len()),
-            (Semantic::CardOp, labels::CARD_OPS.len()),
-            (Semantic::Scale, labels::SCALES.len()),
+            (Semantic::Action, labels::variants("Action").len()),
+            (Semantic::Effect, labels::variants("Effect").len()),
+            (Semantic::EffectFlag, labels::variants("Effect").len() * 2),
+            (Semantic::RunEffect, labels::variants("RunEffect").len()),
+            (Semantic::Condition, labels::variants("Condition").len()),
+            (Semantic::Filter, labels::variants("CardFilter").len()),
+            (Semantic::CardOp, labels::variants("CardOp").len()),
+            (Semantic::Scale, labels::variants("Scale").len()),
             (Semantic::EnemyPosition, 33),
             (Semantic::PowerPosition, 65),
             (Semantic::OrbPosition, 17),
@@ -714,20 +724,21 @@ impl Layout {
             (Semantic::FlagBit, 16),
             (Semantic::TurnFlagBit, 16),
             (Semantic::TagBit, 16),
-            (Semantic::ActorKind, labels::ACTOR_KINDS.len()),
+            (Semantic::ActorKind, labels::variants("Actor").len()),
             (Semantic::MapNodeKind, MAP_NODE_KINDS),
             (Semantic::MapModifier, 2),
             (Semantic::RouteKind, 4),
-            (Semantic::Requirement, labels::REQUIREMENTS.len()),
+            (Semantic::Requirement, labels::variants("Requirement").len()),
             (Semantic::TinkerRider, 9),
             (Semantic::ConveyorDish, 8),
             (Semantic::EventAction, 13),
-            (Semantic::OfferKind, labels::OFFER_KINDS.len()),
+            (Semantic::CardReward, labels::variants("CardReward").len()),
+            (Semantic::ShopItem, labels::variants("ShopItem").len()),
             (Semantic::PlayKind, labels::PLAY_KINDS.len()),
             (Semantic::Flag, FLAG_NAMES.len()),
             (Semantic::TokenRole, labels::TOKEN_ROLES.len()),
             (Semantic::Collection, labels::COLLECTIONS.len()),
-            (Semantic::Trigger, Trigger::BeforeCardPlayed as usize + 1),
+            (Semantic::Trigger, labels::variants("Trigger").len()),
         ] {
             semantic_sizes[namespace as usize] = size as u32;
         }
@@ -850,7 +861,7 @@ impl Ctx<'_> {
         let index = phase_index(phase).expect("terminal phase has no observation") as u32;
         let namespace = if suspended { Semantic::SuspendedPhase } else { Semantic::Phase };
         token.code(layout, namespace, index);
-        token.code(layout, Semantic::Room, room_index(game.room) as u32);
+        token.code(layout, Semantic::Room, game.room as u32);
         let mut f = [0.0; 7];
         match phase {
             Phase::Combat(combat) => {
@@ -860,7 +871,7 @@ impl Ctx<'_> {
                 token.flag(layout, Flag::ForcedEnd, combat.force_end);
                 if let Some(choice) = combat.choice {
                     token.flag(layout, Flag::Optional, choice.optional);
-                    token.code(layout, Semantic::Pile, pile_index(choice.pile) as u32);
+                    token.code(layout, Semantic::Pile, choice.pile as u32);
                     f[0] = choice.remaining as f32 / 10.0;
                     f[1] = token.filter(layout, choice.filter) as f32 / 10.0;
                     f[2] = token.op(layout, choice.op) as f32 / 10.0;
@@ -1008,7 +1019,7 @@ impl Ctx<'_> {
     fn candidate(self, action: Action, legal: bool, map_ids: &[u32], enemies: &[u32]) -> CandidateRow {
         let (game, content, layout) = (self.game, self.content, self.layout);
         let mut token = Token::new(ACTION_DOMAIN, Place::Candidate, NONE);
-        token.code(layout, Semantic::Action, action_kind(&action) as u32);
+        token.code(layout, Semantic::Action, action.variant());
         let phase = phase_index(&game.phase).expect("terminal phase has no action");
         token.code(layout, Semantic::Phase, phase as u32);
         let target = match action {
@@ -1157,11 +1168,11 @@ impl<'a> Items<'a> {
                 _ => {}
             }
         }
-        let index = effect_index(&effect) as u32;
+        let index = effect.variant();
         let mut token = Token::new(EFFECT_DOMAIN, Place::Child, NONE);
         let t = &mut token;
-        let target = |t: &mut Token, target| t.code(layout, Semantic::Target, target_index(target));
-        let pile = |t: &mut Token, pile| t.code(layout, Semantic::Pile, pile_index(pile) as u32);
+        let target = |t: &mut Token, target| t.code(layout, Semantic::Target, target as u32);
+        let pile = |t: &mut Token, pile| t.code(layout, Semantic::Pile, pile as u32);
         let card = |t: &mut Token, id: Id| t.code(layout, Semantic::Card, base_card_id(id as u32));
         let flag = |t: &mut Token, slot: u32, value: bool| {
             if value {
@@ -1496,7 +1507,7 @@ impl<'a> Items<'a> {
         }
         let count = count.map(|value| value / 10.0);
         let primary = quantity.or(count).unwrap_or(0.0);
-        t.amount(layout, Semantic::RunEffect, event_effect_index(&effect) as u32, primary);
+        t.amount(layout, Semantic::RunEffect, effect.variant(), primary);
         t.f.copy_from_slice(&[count.unwrap_or(0.0), second, most]);
         self.push(token);
         match effect {
@@ -1521,13 +1532,16 @@ impl<'a> Items<'a> {
 
     fn option(&mut self, option: EventOption) {
         let mut token = Token::new(OPTION_DOMAIN, Place::Child, NONE);
-        let (kind, gold, hp) = match option.requirement {
-            Requirement::Always => (0, 0.0, 0.0),
-            Requirement::Gold(value) => (1, value as f32 / 1_000.0, 0.0),
-            Requirement::Hp(value) => (2, 0.0, value as f32 / 30.0),
-            Requirement::Deck => (3, 0.0, 0.0),
+        let (gold, hp) = match option.requirement {
+            Requirement::Gold(value) => (value as f32 / 1_000.0, 0.0),
+            Requirement::Hp(value) => (0.0, value as f32 / 30.0),
+            Requirement::Always | Requirement::Deck => (0.0, 0.0),
         };
-        token.code(self.ctx.layout, Semantic::Requirement, kind);
+        token.code(
+            self.ctx.layout,
+            Semantic::Requirement,
+            option.requirement.variant(),
+        );
         token.f.copy_from_slice(&[gold, hp]);
         self.push(token);
         for &effect in option.effects {
@@ -1538,34 +1552,28 @@ impl<'a> Items<'a> {
     fn card_reward(&mut self, reward: CardReward) {
         let layout = self.ctx.layout;
         let mut token = Token::new(OFFER_DOMAIN, Place::Child, NONE);
+        token.code(layout, Semantic::CardReward, reward.variant());
         match reward {
-            CardReward::Standard(room) => {
-                token.code(layout, Semantic::OfferKind, 0);
-                token.code(layout, Semantic::Room, room_index(room) as u32);
-            }
+            CardReward::Standard(room) => token.code(layout, Semantic::Room, room as u32),
             CardReward::Fixed(character, rarity) => {
-                token.code(layout, Semantic::OfferKind, 1);
                 token.code(layout, Semantic::Character, character as u32);
                 token.code(layout, Semantic::Rarity, rarity as u32);
             }
-            CardReward::Kaleidoscope => token.code(layout, Semantic::OfferKind, 2),
-            CardReward::Crystal(rarity) => {
-                token.code(layout, Semantic::OfferKind, 3);
-                token.code(layout, Semantic::Rarity, rarity as u32);
-            }
+            CardReward::Crystal(rarity) => token.code(layout, Semantic::Rarity, rarity as u32),
+            CardReward::Kaleidoscope => {}
         }
         self.push(token);
     }
 
     fn shop(&mut self, item: &ShopItem) {
-        let (kind, price) = match item {
-            ShopItem::Card(_, price) => (4, price),
-            ShopItem::Relic(_, price) => (5, price),
-            ShopItem::Potion(_, price) => (6, price),
-            ShopItem::Remove(price) => (7, price),
+        let price = match item {
+            ShopItem::Card(_, price) | ShopItem::Relic(_, price) | ShopItem::Potion(_, price) => {
+                price
+            }
+            ShopItem::Remove(price) => price,
         };
         let mut token = Token::new(OFFER_DOMAIN, Place::Child, NONE);
-        token.code(self.ctx.layout, Semantic::OfferKind, kind);
+        token.code(self.ctx.layout, Semantic::ShopItem, item.variant());
         token.f[0] = *price as f32 / 1_000.0;
         self.push(token);
         match item {
@@ -1847,7 +1855,7 @@ impl Encoder<'_> {
         let player = self.actor(Place::Player, &combat.player, None);
         let history = combat.history;
         let mut token = Token::new(HISTORY_DOMAIN, Place::Child, player);
-        token.code(layout, Semantic::ActorKind, 0);
+        token.code(layout, Semantic::ActorKind, Actor::Player.variant());
         token.f.copy_from_slice(&[
             history.cards as f32 / 10.0,
             history.manual_cards as f32 / 10.0,
@@ -1934,7 +1942,7 @@ impl Encoder<'_> {
         ]);
         match (place, enemy) {
             (Place::Player, _) => {
-                token.code(layout, Semantic::ActorKind, 0);
+                token.code(layout, Semantic::ActorKind, Actor::Player.variant());
                 f[7..13].copy_from_slice(&[
                     game.max_energy(content) as f32 / 5.0,
                     combat.draw_per_turn as f32 / 10.0,
@@ -1945,7 +1953,7 @@ impl Encoder<'_> {
                 ]);
             }
             (_, Some((index, enemy))) => {
-                token.code(layout, Semantic::ActorKind, 2);
+                token.code(layout, Semantic::ActorKind, Actor::Enemy(index).variant());
                 token.code(layout, Semantic::Enemy, enemy.creature.id as u32);
                 token.code(layout, Semantic::EnemyPosition, index.min(32) as u32);
                 let movement = if enemy.stunned > 0 {
@@ -1966,7 +1974,7 @@ impl Encoder<'_> {
                     intent_hits / 10.0,
                 ]);
             }
-            _ => token.code(layout, Semantic::ActorKind, 1),
+            _ => token.code(layout, Semantic::ActorKind, Actor::Osty.variant()),
         }
         token.f.copy_from_slice(&f);
         self.push(token)
@@ -2202,7 +2210,7 @@ fn canonical_map(game: &Game, content: &Content, layout: Layout) -> CanonicalMap
     let mut order = (0..game.map.nodes.len()).collect::<Vec<_>>();
     order.sort_by_key(|&index| {
         let node = &game.map.nodes[index];
-        (node.floor, node.lane, room_index(node.room))
+        (node.floor, node.lane, node.room as usize)
     });
     for pair in order.windows(2) {
         let (left, right) = (&game.map.nodes[pair[0]], &game.map.nodes[pair[1]]);
@@ -2439,19 +2447,6 @@ fn event_actions(options: &[EventOption]) -> impl Iterator<Item = u8> + '_ {
     })
 }
 
-fn room_index(room: Room) -> usize {
-    match room {
-        Room::Combat => 0,
-        Room::Elite => 1,
-        Room::Boss => 2,
-        Room::Unknown => 3,
-        Room::Event => 4,
-        Room::Shop => 5,
-        Room::Rest => 6,
-        Room::Treasure => 7,
-    }
-}
-
 fn map_bosses(content: &Content) -> Vec<Id> {
     let mut bosses = Vec::new();
     for &id in content
@@ -2516,21 +2511,7 @@ fn map_node_kind(
 }
 
 fn phase_index(phase: &Phase) -> Option<usize> {
-    Some(match phase {
-        Phase::Map => 0,
-        Phase::Combat(_) => 1,
-        Phase::Rewards(_) => 2,
-        Phase::Shop(_) => 3,
-        Phase::Rest => 4,
-        Phase::Event(..) => 5,
-        Phase::RemoveCards(..) => 6,
-        Phase::UpgradeCards(..) => 7,
-        Phase::TransformCards(..) => 8,
-        Phase::EnchantCards(..) => 9,
-        Phase::ChooseCards(..) => 10,
-        Phase::ChooseBundles(..) => 11,
-        Phase::Won | Phase::Dead => return None,
-    })
+    (!matches!(phase, Phase::Won | Phase::Dead)).then(|| phase.variant() as usize)
 }
 
 fn canonical_progress(game: &Game) -> u8 {
@@ -2544,16 +2525,6 @@ fn canonical_progress(game: &Game) -> u8 {
     };
     assert!(progress <= 72, "canonical progress {progress} exceeds 72");
     progress
-}
-
-fn pile_index(pile: Pile) -> usize {
-    match pile {
-        Pile::Draw => 0,
-        Pile::Hand => 1,
-        Pile::Discard => 2,
-        Pile::Exhaust => 3,
-        Pile::Offer => 4,
-    }
 }
 
 fn master_cards(deck: &[Card]) -> HashMap<u32, usize> {
@@ -2610,139 +2581,6 @@ fn ancient_offer(game: &Game, content: &Content, index: usize) -> Option<Id> {
         .copied()
         .filter(|&id| id > 0 && id as usize <= content.relics.len())
         .map(|id| id as Id - 1)
-}
-
-fn effect_index(effect: &Effect) -> usize {
-    match effect {
-        Effect::Attack(..) => 0,
-        Effect::AttackMany(..) => 1,
-        Effect::OstyAttack(..) => 2,
-        Effect::OstyAttackMany(..) => 3,
-        Effect::MoveDamage(..) => 4,
-        Effect::Damage(..) => 5,
-        Effect::Kill(..) => 6,
-        Effect::Stun(..) => 7,
-        Effect::DoomKill => 8,
-        Effect::LoseHp(..) => 9,
-        Effect::Block(..) => 10,
-        Effect::BlockNextTurn(..) => 11,
-        Effect::DodgeRoll(..) => 12,
-        Effect::DrawBlockIf(..) => 13,
-        Effect::RawBlock(..) => 14,
-        Effect::Heal(..) => 15,
-        Effect::HealPercent(..) => 16,
-        Effect::MaxHp(..) => 17,
-        Effect::Gold(..) => 18,
-        Effect::RandomPotion => 19,
-        Effect::Bomb(..) => 20,
-        Effect::Automation(..) => 21,
-        Effect::Panache(..) => 22,
-        Effect::RollingBoulder(..) => 23,
-        Effect::ToricToughness(..) => 24,
-        Effect::ApplyPower(..) => 25,
-        Effect::ApplyDebuff(..) => 26,
-        Effect::StackPower(..) => 27,
-        Effect::DoublePower(..) => 28,
-        Effect::Misery(..) => 29,
-        Effect::RemovePower(..) => 30,
-        Effect::TemporaryStrength(..) => 31,
-        Effect::Draw(..) => 32,
-        Effect::HandDraw(..) => 33,
-        Effect::DrawAmount(..) => 34,
-        Effect::DrawTo(..) => 35,
-        Effect::DrawUntilNot(..) => 36,
-        Effect::ChooseDraw(..) => 37,
-        Effect::FreeHand => 38,
-        Effect::Energy(..) => 39,
-        Effect::DoubleEnergy => 40,
-        Effect::AddCard(..) => 41,
-        Effect::AddUpgradedCard(..) => 42,
-        Effect::AddFlaggedCard(..) => 43,
-        Effect::RandomCard(..) => 44,
-        Effect::RandomColorless(..) => 45,
-        Effect::RandomColorlessOther(..) => 46,
-        Effect::OfferColorless(..) => 47,
-        Effect::OfferCharacter(..) => 48,
-        Effect::OfferCharacterRetain(..) => 49,
-        Effect::OfferCharacterType(..) => 50,
-        Effect::OfferOtherCharacter(..) => 51,
-        Effect::RandomCharacter(..) => 52,
-        Effect::DistinctCharacter(..) => 53,
-        Effect::RandomCharacterCost0(..) => 54,
-        Effect::RandomCardOp(..) => 55,
-        Effect::AutoPlayRandom(..) => 56,
-        Effect::ChooseRandomDraw(..) => 57,
-        Effect::SelectAmount(..) => 58,
-        Effect::ShuffleHandDraw(..) => 59,
-        Effect::FillPotions => 60,
-        Effect::RandomizeHandCosts => 61,
-        Effect::ReplayTagged(..) => 62,
-        Effect::ChannelSlots(..) => 63,
-        Effect::DistinctColorless(..) => 64,
-        Effect::AddRandomCard(..) => 65,
-        Effect::AddRandom(..) => 66,
-        Effect::FranticEscape => 67,
-        Effect::Aggression(..) => 68,
-        Effect::AutoPlayDraw(..) => 69,
-        Effect::Stoke => 70,
-        Effect::Stampede => 71,
-        Effect::Fire(_) => 72,
-        Effect::FlakCannon(..) => 73,
-        Effect::CopyCard(..) => 74,
-        Effect::Discard(..) => 75,
-        Effect::DiscardHandDraw => 76,
-        Effect::DiscardHandAdd(..) => 77,
-        Effect::PlayExhaustedShivs => 78,
-        Effect::AutoPlay(..) | Effect::Uproar | Effect::Juggle | Effect::ConfusedRoll(..) => 79,
-        Effect::PlacePlayed(..)
-        | Effect::CheckEmptyHand
-        | Effect::MummifiedHand
-        | Effect::ReturnLate(..) => 80,
-        Effect::WhisperingEarring(..) => 81,
-        Effect::MoveAll(..) => 82,
-        Effect::DrawFiltered(..) => 83,
-        Effect::DrawFilteredStep(..) => 84,
-        Effect::FinishDrawFiltered(..) => 85,
-        Effect::Exhaust(..) => 86,
-        Effect::ExhaustForBlock(..) => 87,
-        Effect::ExhaustForAttack(..) => 88,
-        Effect::ExhaustAttackStep(..) => 89,
-        Effect::Upgrade(..) => 90,
-        Effect::TransformHand(..) => 91,
-        Effect::If(..) => 92,
-        Effect::Repeat(..) => 93,
-        Effect::Random(..) => 94,
-        Effect::Channel(..) => 95,
-        Effect::RandomOrb(..) => 96,
-        Effect::Evoke(..) => 97,
-        Effect::EvokeMany(..) => 98,
-        Effect::EvokeLast(..) => 99,
-        Effect::EvokeAll(..) => 100,
-        Effect::PassiveFirst(..) => 101,
-        Effect::PassiveLast(..) => 102,
-        Effect::PassiveAll => 103,
-        Effect::PassiveLightning(..) => 119,
-        Effect::OrbSlots(..) => 104,
-        Effect::Stars(..) => 105,
-        Effect::Forge(..) => 106,
-        Effect::Summon(..) => 107,
-        Effect::MaxEnergy(..) => 108,
-        Effect::GrowCard(..) => 109,
-        Effect::GrowDrawn(..) => 110,
-        Effect::GrowAll(..) => 111,
-        Effect::PersistCard(..) => 112,
-        Effect::SetCardCost(..) => 113,
-        Effect::ReduceCardCost(..) => 114,
-        Effect::CapHandCosts => 115,
-        Effect::RecycleHand(..) => 116,
-        Effect::EndTurn => 117,
-        Effect::Select(..) => 118,
-        Effect::Listen(..) => 120,
-        Effect::Step(_) => 121,
-        Effect::BeforePlay => 122,
-        Effect::OnPlay => 123,
-        Effect::AfterPlay => 124,
-    }
 }
 
 /// The relics a run's bag starts with, sorted.
@@ -2894,103 +2732,10 @@ fn relic_state(game: &Game, content: &Content, id: Id) -> [f32; 2] {
     }
 }
 
-fn action_kind(action: &Action) -> usize {
-    match action {
-        Action::Play { .. } => 0,
-        Action::Potion { .. } => 1,
-        Action::DiscardPotion(_) => 2,
-        Action::Choose(_) => 3,
-        Action::EndTurn => 4,
-        Action::Path(_) => 5,
-        Action::RewardGold => 6,
-        Action::RewardCard(_) => 7,
-        Action::RewardRelic(_) => 8,
-        Action::RewardPotion(_) => 9,
-        Action::RewardRemove => 10,
-        Action::RerollCards => 11,
-        Action::SacrificeCards => 12,
-        Action::Buy(_) => 13,
-        Action::Rest => 14,
-        Action::Hatch => 15,
-        Action::Lift => 16,
-        Action::Cook => 17,
-        Action::Kindle => 18,
-        Action::Dig => 19,
-        Action::Smith(_) => 20,
-        Action::Event(_) => 21,
-        Action::CrystalCell(..) => 22,
-        Action::CrystalTool(_) => 23,
-        Action::EventRelic(..) => 24,
-        Action::EventCard(..) => 25,
-        Action::Enchant(_) => 26,
-        Action::RemoveCard(_) => 27,
-        Action::Clone => 28,
-        Action::Cancel => 29,
-        Action::Done => 30,
-        Action::Leave => 31,
-    }
-}
-
 fn candidate_actions(game: &Game, content: &Content) -> (Vec<Action>, Vec<bool>) {
     let legal = game.actions(content);
     let mask = vec![true; legal.len()];
     (legal, mask)
-}
-
-fn event_effect_index(effect: &RunEffect) -> usize {
-    match effect {
-        RunEffect::Gold(_) => 0,
-        RunEffect::RandomGold(..) => 1,
-        RunEffect::LoseAllGold => 2,
-        RunEffect::Heal(_) => 3,
-        RunEffect::HealPercent(_) => 4,
-        RunEffect::FullHeal => 5,
-        RunEffect::LoseHp(_) => 6,
-        RunEffect::MaxHp(_) => 7,
-        RunEffect::MaxHpTo(_) => 8,
-        RunEffect::AddCard(..) => 9,
-        RunEffect::AddRelic(_) => 10,
-        RunEffect::AddPotion(_) => 11,
-        RunEffect::PotionRewards(..) => 12,
-        RunEffect::RandomPotionReward(_) => 13,
-        RunEffect::NextRelics(_) => 14,
-        RunEffect::RelicOfRarity(_) => 15,
-        RunEffect::EventRelic => 16,
-        RunEffect::RandomCard(_) => 17,
-        RunEffect::RandomRelic(_) => 18,
-        RunEffect::DiscardPotion(_) => 19,
-        RunEffect::DiscardRandomPotion => 20,
-        RunEffect::RemoveCards(..) => 21,
-        RunEffect::UpgradeCards(_) => 22,
-        RunEffect::UpgradeRandom(_) => 23,
-        RunEffect::UpgradeShuffled(_) => 24,
-        RunEffect::UpgradeAll => 25,
-        RunEffect::DowngradeRandom(_) => 26,
-        RunEffect::CloneDeck => 27,
-        RunEffect::TransformCards(..) => 28,
-        RunEffect::EnchantCards(..) => 29,
-        RunEffect::SkipEventRng(_) => 30,
-        RunEffect::ChooseCommonCards(..) => 31,
-        RunEffect::ChooseRewardCards(..) => 32,
-        RunEffect::RemoveRandomCard => 33,
-        RunEffect::Options(_) => 34,
-        RunEffect::EventAction(_) => 35,
-        RunEffect::FinishCooking => 36,
-    }
-}
-
-fn target_index(target: Target) -> u32 {
-    match target {
-        Target::Source => 0,
-        Target::Player => 1,
-        Target::Osty => 2,
-        Target::ChosenEnemy => 3,
-        Target::ChosenEnemyOrDead => 4,
-        Target::AllEnemies => 5,
-        Target::OtherEnemies => 6,
-        Target::RandomEnemy => 7,
-        Target::LowestHpEnemy => 8,
-    }
 }
 
 fn public_event_slots(content: &Content, id: Id) -> &'static [usize] {
@@ -3024,58 +2769,6 @@ fn event_option_payload(game: &Game, content: &Content, index: usize) -> Option<
             .copied()
             .map(|value| i32::try_from(value).expect("public event option exceeds i32")),
         _ => None,
-    }
-}
-
-fn scale_payload(scale: Scale) -> (u32, u32, i32) {
-    match scale {
-        Scale::None => (0, 0, 0),
-        Scale::X => (1, 0, 0),
-        Scale::Block => (2, 0, 0),
-        Scale::Energy => (3, 0, 0),
-        Scale::MissingHp => (4, 0, 0),
-        Scale::DrawSize => (5, 0, 0),
-        Scale::DiscardSize => (6, 0, 0),
-        Scale::ExhaustSize => (7, 0, 0),
-        Scale::ExhaustId(id) => (8, id as u32, 0),
-        Scale::HandSize => (9, 0, 0),
-        Scale::CardsPlayed => (10, 0, 0),
-        Scale::AttacksPlayed => (11, 0, 0),
-        Scale::PriorAttacks => (12, 0, 0),
-        Scale::SkillsPlayed => (13, 0, 0),
-        Scale::EnergySpent => (14, 0, 0),
-        Scale::Exhausted => (15, 0, 0),
-        Scale::HpLost => (16, 0, 0),
-        Scale::HpLossEvents => (17, 0, 0),
-        Scale::CardValue => (18, 0, 0),
-        Scale::LivingEnemies => (19, 0, 0),
-        Scale::Orbs => (20, 0, 0),
-        Scale::OrbTypes => (21, 0, 0),
-        Scale::OrbTypesPower(id) => (22, id as u32, 0),
-        Scale::Stars => (23, 0, 0),
-        Scale::TargetPower(id) => (24, id as u32, 0),
-        Scale::TargetPowerDiv(id, divisor) => (25, id as u32, divisor as i32),
-        Scale::Tagged(tag) => (26, tag as u32, 0),
-        Scale::Power(id) => (27, id as u32, 0),
-        Scale::Event => (28, 0, 0),
-        Scale::EventPower(id) => (29, id as u32, 0),
-        Scale::HandType(kind) => (30, kind as u32, 0),
-        Scale::EnemyPowerTotal(id) => (31, id as u32, 0),
-        Scale::TargetDebuffs => (32, 0, 0),
-        Scale::Discarded => (33, 0, 0),
-        Scale::DrawnCombat => (34, 0, 0),
-        Scale::StarCards => (35, 0, 0),
-        Scale::StarsGained => (36, 0, 0),
-        Scale::Generated => (37, 0, 0),
-        Scale::PriorTargetHits => (38, 0, 0),
-        Scale::OstyHp => (39, 0, 0),
-        Scale::OstyMaxHp => (40, 0, 0),
-        Scale::OstyAttacks => (41, 0, 0),
-        Scale::EtherealPlayed => (42, 0, 0),
-        Scale::LightningChanneled => (43, 0, 0),
-        Scale::LastDamage => (44, 0, 0),
-        Scale::ExtraDrawn => (45, 0, 0),
-        Scale::TurnDiv(divisor) => (46, 0, divisor as i32),
     }
 }
 
@@ -3136,78 +2829,6 @@ fn effect_amounts(effect: Effect) -> Vec<(Amount, f32)> {
         | Summon(amount)
         | Repeat(amount, _) => vec![(amount, 10.0)],
         _ => vec![],
-    }
-}
-
-fn condition_payload(condition: Condition) -> (u32, u32, i32, i32) {
-    match condition {
-        Condition::Always => (0, 0, 0, 0),
-        Condition::Upgraded => (1, 0, 0, 0),
-        Condition::TargetAlive => (2, 0, 0, 0),
-        Condition::TargetHasPower(id) => (3, id as u32, 0, 0),
-        Condition::SourceHasPower(id) => (4, id as u32, 0, 0),
-        Condition::HandAtMost(value) => (5, value as u32, 0, 0),
-        Condition::HandAtLeast(value) => (6, value as u32, 0, 0),
-        Condition::HandWithout(kind) => (7, kind as u32, 0, 0),
-        Condition::HandEmpty => (8, 0, 0, 0),
-        Condition::EventAtLeast(value) => (9, 0, value as i32, 0),
-        Condition::ExhaustAtLeast(value) => (10, value as u32, 0, 0),
-        Condition::ExhaustedThisTurn => (11, 0, 0, 0),
-        Condition::HpLostThisTurn => (12, 0, 0, 0),
-        Condition::TargetDead => (13, 0, 0, 0),
-        Condition::FirstTurn => (14, 0, 0, 0),
-        Condition::HasOrb(id) => (15, id as u32, 0, 0),
-        Condition::CardType(kind) => (16, kind as u32, 0, 0),
-        Condition::PriorCardsBelow(values) => (17, values[0] as u32, values[1] as i32, 0),
-        Condition::TargetAttacking => (18, 0, 0, 0),
-        Condition::XAtLeast(value) => (19, 0, value as i32, 0),
-        Condition::OstyAlive => (20, 0, 0, 0),
-        Condition::DoomApplied => (21, 0, 0, 0),
-        Condition::Card(id) => (22, id as u32, 0, 0),
-    }
-}
-
-fn filter_payload(filter: CardFilter) -> (u32, u32, i32) {
-    match filter {
-        CardFilter::Any => (0, 0, 0),
-        CardFilter::Type(kind) => (1, kind as u32, 0),
-        CardFilter::AttackOrPower => (2, 0, 0),
-        CardFilter::TypeWithoutTurnFlag(kind, flag) => (3, kind as u32, flag as i32),
-        CardFilter::WithoutFlag(flag) => (4, flag as u32, 0),
-        CardFilter::NotType(kind) => (5, kind as u32, 0),
-        CardFilter::Id(id) => (6, id as u32, 0),
-        CardFilter::Cost(cost) => (7, 0, cost as i32),
-        CardFilter::PlayableCost(cost) => (8, 0, cost as i32),
-        CardFilter::Flag(flag) => (9, flag as u32, 0),
-        CardFilter::Upgradable => (10, 0, 0),
-        CardFilter::Colorless => (11, 0, 0),
-        CardFilter::Rare => (12, 0, 0),
-        CardFilter::NoReplay => (13, 0, 0),
-        CardFilter::PlayableOrAny => (14, 0, 0),
-        CardFilter::CostsResource => (15, 0, 0),
-    }
-}
-
-fn op_payload(op: CardOp) -> (u32, u32, u32, i32) {
-    match op {
-        CardOp::Move(pile) => (0, pile as u32, 0, 0),
-        CardOp::Upgrade => (1, 0, 0, 0),
-        CardOp::Cost(cost) => (2, 0, 0, cost as i32),
-        CardOp::SetCost(cost) => (3, 0, 0, cost as i32),
-        CardOp::Flag(flag) => (4, flag as u32, 0, 0),
-        CardOp::TurnFlag(flag) => (5, flag as u32, 0, 0),
-        CardOp::CopyNextTurn(count) => (6, count as u32, 0, 0),
-        CardOp::Transform(id, upgrades) => (7, id as u32, upgrades as u32, 0),
-        CardOp::AutoPlay(count) => (8, count as u32, 0, 0),
-        CardOp::CopySelected(count) => (9, count as u32, 0, 0),
-        CardOp::TakeOffer => (10, 0, 0, 0),
-        CardOp::Transfigure => (11, 0, 0, 0),
-        CardOp::Replay(count) => (12, count as u32, 0, 0),
-        CardOp::TakeFetched => (13, 0, 0, 0),
-        CardOp::TransformRandom => (14, 0, 0, 0),
-        CardOp::DiscardDraw => (15, 0, 0, 0),
-        CardOp::MoveFree(pile) => (16, pile as u32, 0, 0),
-        CardOp::FreeCombat => (17, 0, 0, 0),
     }
 }
 

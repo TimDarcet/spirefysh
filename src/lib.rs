@@ -19,6 +19,27 @@ pub use replay::{Divergence, LockstepReport, ReplayReport, lockstep_trace, repla
 
 pub type Id = u16;
 
+/// A variant's declaration index. Only for `#[repr(u8)]` enums without explicit discriminants:
+/// those start with a discriminant byte counting variants from 0 (`std::mem::discriminant`).
+pub unsafe trait Variant: Sized {
+    fn variant(&self) -> u32 {
+        unsafe { *(self as *const Self).cast::<u8>() as u32 }
+    }
+}
+
+unsafe impl Variant for Scale {}
+unsafe impl Variant for Condition {}
+unsafe impl Variant for CardFilter {}
+unsafe impl Variant for CardOp {}
+unsafe impl Variant for Effect {}
+unsafe impl Variant for RunEffect {}
+unsafe impl Variant for Requirement {}
+unsafe impl Variant for Phase {}
+unsafe impl Variant for Action {}
+unsafe impl Variant for CardReward {}
+unsafe impl Variant for ShopItem {}
+unsafe impl Variant for Actor {}
+
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum Pile {
     Draw,
@@ -150,6 +171,7 @@ pub enum Trigger {
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[repr(u8)]
 pub enum Scale {
     None,
     X,
@@ -249,6 +271,7 @@ impl Amount {
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[repr(u8)]
 pub enum Condition {
     Always,
     Upgraded,
@@ -284,6 +307,7 @@ pub enum PlayCondition {
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[repr(u8)]
 pub enum CardFilter {
     Any,
     Type(CardType),
@@ -304,6 +328,7 @@ pub enum CardFilter {
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[repr(u8)]
 pub enum CardOp {
     Move(Pile),
     Upgrade,
@@ -326,6 +351,7 @@ pub enum CardOp {
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[repr(u8)]
 pub enum Effect {
     /// A hook pass starts: its listeners are snapshotted and queued.
     Fire(Trigger),
@@ -1015,6 +1041,7 @@ pub enum Room {
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[repr(u8)]
 pub enum Requirement {
     Always,
     Gold(i32),
@@ -1023,6 +1050,7 @@ pub enum Requirement {
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[repr(u8)]
 pub enum RunEffect {
     Gold(i32),
     RandomGold(i32, i32),
@@ -1883,6 +1911,7 @@ pub struct History {
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[repr(u8)]
 pub enum Actor {
     Player,
     Osty,
@@ -2174,6 +2203,7 @@ pub struct Rewards {
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[repr(u8)]
 pub enum CardReward {
     Standard(Room),
     Fixed(Id, CardRarity),
@@ -2192,6 +2222,7 @@ struct CrystalSphere {
 }
 
 #[derive(Clone, Debug)]
+#[repr(u8)]
 pub enum ShopItem {
     Card(Card, i32),
     Relic(Id, i32),
@@ -2200,6 +2231,7 @@ pub enum ShopItem {
 }
 
 #[derive(Clone, Debug)]
+#[repr(u8)]
 pub enum Phase {
     Map,
     Combat(Box<Combat>),
@@ -2590,6 +2622,7 @@ pub struct Game {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[repr(u8)]
 pub enum Action {
     Play { hand: usize, target: Option<usize> },
     Potion { slot: usize, target: Option<usize> },
