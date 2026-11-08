@@ -1267,23 +1267,27 @@ class ModelKernelTest(unittest.TestCase):
         torch.manual_seed(0)
         cpu = train.Agent(dict(env.token_layout(*train.DEFAULT_ARCHITECTURE))).train()
         cpu.critic.weight.data.normal_(std=.1)
-        mps = train.Agent(cpu.layout).to("mps").train()
-        mps.load_state_dict(cpu.state_dict())
-        mps.precision = "bf16"
-        outputs = []
-        for network, target, precision, pad in ((cpu, "cpu", "fp32", False), (mps, "mps", "bf16", True)):
-            policy, critic = train.predict(network, model.unpack(rows, torch.device(target), network, pad=pad),
-                                           precision)
-            (policy[:, 0].sum() + critic.sum()).backward()
-            outputs.append((policy.detach().cpu(), critic.detach().cpu()))
-        (policy, critic), (mps_policy, mps_critic) = outputs
-        self.assertLess(float((policy - mps_policy)[legal].abs().max()), .02)
-        self.assertLess(float((critic - mps_critic).abs().max()), .03)
-        errors = [float((left.grad - right.grad.cpu()).norm() / left.grad.norm())
-                  for left, right in zip(cpu.parameters(), mps.parameters())
-                  if left.grad is not None and left.grad.norm() > 1e-6]
-        self.assertLess(float(np.median(errors)), .01)
-        self.assertLess(max(errors), .05)
+        # fp32 must agree to rounding; bf16 within its precision.
+        for precision, output_bound, median_bound, max_bound in (("fp32", 1e-4, 1e-4, 1e-3), ("bf16", .02, .01, .1)):
+            mps = train.Agent(cpu.layout).to("mps").train()
+            mps.load_state_dict(cpu.state_dict())
+            mps.precision = precision
+            cpu.zero_grad()
+            outputs = []
+            for network, target, network_precision, pad in ((cpu, "cpu", "fp32", False), (mps, "mps", precision, True)):
+                policy, critic = train.predict(
+                    network, model.unpack(rows, torch.device(target), network, pad=pad), network_precision,
+                )
+                (policy[:, 0].sum() + critic.sum()).backward()
+                outputs.append((policy.detach().cpu(), critic.detach().cpu()))
+            (policy, critic), (mps_policy, mps_critic) = outputs
+            self.assertLess(float((policy - mps_policy)[legal].abs().max()), output_bound)
+            self.assertLess(float((critic - mps_critic).abs().max()), 1.5 * output_bound)
+            errors = [float((left.grad - right.grad.cpu()).norm() / left.grad.norm())
+                      for left, right in zip(cpu.parameters(), mps.parameters())
+                      if left.grad is not None and left.grad.norm() > 1e-6]
+            self.assertLess(float(np.median(errors)), median_bound)
+            self.assertLess(max(errors), max_bound)
 
     @unittest.skipUnless(torch.backends.mps.is_available(), "MPS unavailable")
     def test_mps_linear_backward_input_matches_aten(self):

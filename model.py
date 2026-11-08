@@ -2484,8 +2484,9 @@ class Agent(nn.Module):
         action_row, action_flat, _legal, policy_sequence, actions, path_rows, path_nodes, \
             action_group, global_layout, target_rows, target_group = action_index
         action = self._values(encoded, children, action_group)
-        action = action.index_add(0, path_rows, nodes[path_nodes].to(action.dtype))
-        action = action.index_add(0, target_rows, self._values(encoded, children, target_group))
+        # In place: on MPS, an out-of-place index_add with an empty index returns garbage.
+        action.index_add_(0, path_rows, nodes[path_nodes].to(action.dtype))
+        action.index_add_(0, target_rows, self._values(encoded, children, target_group))
         action = _layer_norm(action, self.action_norm)
         values, rows = [], []
         segments = getattr(self, "_explanation_segments", None)
