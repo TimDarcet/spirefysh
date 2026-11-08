@@ -735,7 +735,7 @@ impl SearchNode {
             candidates.len(),
             BuildHasherDefault::default(),
         );
-        let mut kind_counts = [0; labels::ACTIONS.len()];
+        let mut kind_counts = vec![0; labels::variants("Action").len()];
         let mut edges = Vec::with_capacity(action_count);
         for (candidate, (row, probability)) in candidates
             .into_iter()
@@ -747,7 +747,7 @@ impl SearchNode {
                 .or_default();
             let current_occurrence = *occurrence;
             *occurrence += 1;
-            let kind = action_kind(&row.action);
+            let kind = row.action.variant() as usize;
             let kind_occurrence = kind_counts[kind];
             kind_counts[kind] += usize::from(row.legal);
             if row.legal && probability.is_finite() {
@@ -2197,7 +2197,7 @@ fn game_state(game: &Game, content: &Content) -> serde_json::Value {
         "max_hp": game.run.max_hp,
         "gold": game.run.gold,
         "deck": game.run.deck.iter().map(&card).collect::<Vec<_>>(),
-        "relics": game.run.relics.iter().map(|id| content.relics[*id as usize].id).collect::<Vec<_>>(),
+        "relics": game.run.relics.iter().map(|relic| content.relics[relic.id as usize].id).collect::<Vec<_>>(),
         "potions": game.run.potions.iter().map(|id| id.map(|id| content.potions[id as usize].id)).collect::<Vec<_>>(),
     });
     match &game.phase {
@@ -3966,7 +3966,7 @@ fn teacher_choice(game: &Game, content: &Content) -> usize {
             if let Some((index, _)) = actions
                 .iter()
                 .enumerate()
-                .find(|(_, action)| action_kind(action) == kind)
+                .find(|(_, action)| action.variant() as usize == kind)
             {
                 return index;
             }
@@ -4004,7 +4004,7 @@ fn teacher_choice(game: &Game, content: &Content) -> usize {
             if let Some((index, _)) = actions
                 .iter()
                 .enumerate()
-                .find(|(_, action)| action_kind(action) == kind)
+                .find(|(_, action)| action.variant() as usize == kind)
             {
                 return index;
             }
@@ -5857,7 +5857,7 @@ impl Batch {
             game.run
                 .relics
                 .iter()
-                .map(|id| self.content.relics[*id as usize].id)
+                .map(|relic| self.content.relics[relic.id as usize].id)
                 .collect::<Vec<_>>(),
             game.run
                 .deck
@@ -6504,7 +6504,7 @@ impl Batch {
                 } else {
                     self.actions.push(vec![row.candidates[0].action.clone()]);
                 }
-                action_kinds.push(action_kind(&row.candidates[0].action) as u32);
+                action_kinds.push(row.candidates[0].action.variant());
                 cached_features.push(PyBytes::new(py, &[]));
                 packed_rows.push(PyBytes::new(py, &packed));
                 continue;
@@ -6525,7 +6525,7 @@ impl Batch {
             choices.push(choice as i64);
             log_probabilities.push(log_policy[choice]);
             critic_values.push(*expected);
-            action_kinds.push(action_kind(&row.candidates[choice].action) as u32);
+            action_kinds.push(row.candidates[choice].action.variant());
             if advance {
                 selected_actions.push(row.candidates[choice].action.clone());
             } else {

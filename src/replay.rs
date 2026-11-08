@@ -111,31 +111,20 @@ struct ReplayState {
     relic_deques: [Vec<Id>; 4],
     shared_relic_deques: [Vec<Id>; 4],
     card_variants: Vec<u8>,
-    lasting_candy: u8,
-    paels_wing: u8,
-    silver_crucible: u8,
-    silken_tress: bool,
-    maw_bank: u8,
-    silver_treasures: u8,
-    golden_compass: Option<u8>,
+    /// The sim's relics, whose state the capture mostly lacks.
+    relics: Vec<Relic>,
     // The sim's count of not-fully-blocked hits on the player (turn, hits); not captured.
     unblocked_hits: (u16, i16),
-    winged_boots: u8,
-    fishing_rod: u8,
     rest_used: u8,
-    girya: u8,
-    pumpkin_candle: i32,
     /// The newest aggro bot seen this combat (instance, 1 + FABRICATOR_BOTS index): the
     /// Fabricator's last spawn, which may already be dead and removed.
     aggro_bot: Option<(u32, i16)>,
     paels_cards: Vec<Card>,
-    pollinous_core: u8,
     fur_coat_act: Option<u8>,
     fur_coat: Vec<(u8, u8)>,
     toy_box_offers: Vec<Id>,
     wax_relics: Vec<usize>,
     melted_relics: Vec<usize>,
-    toy_box_combats: u8,
     parasol: Vec<ShopItem>,
     parasol_removal: bool,
     conveyor: bool,
@@ -145,7 +134,6 @@ struct ReplayState {
     fake_merchant: Vec<Id>,
     fake_shop: bool,
     courier_restock: Option<(usize, ShopItem)>,
-    fake_happy_flower: u8,
     /// The discard piles seen by the choices offered during the decision being replayed.
     offered_discards: Vec<Value>,
     /// The automated selector's picks (`choice_made`) during the decision being replayed.
@@ -173,28 +161,16 @@ impl Default for ReplayState {
             relic_deques: std::array::from_fn(|_| vec![]),
             shared_relic_deques: std::array::from_fn(|_| vec![]),
             card_variants: vec![],
-            lasting_candy: 0,
-            paels_wing: 0,
-            silver_crucible: 0,
-            silken_tress: false,
-            maw_bank: 0,
-            silver_treasures: 0,
-            golden_compass: None,
+            relics: vec![],
             unblocked_hits: (0, 0),
-            winged_boots: 0,
-            fishing_rod: 0,
             rest_used: 0,
-            girya: 0,
-            pumpkin_candle: 0,
             aggro_bot: None,
             paels_cards: vec![],
-            pollinous_core: 0,
             fur_coat_act: None,
             fur_coat: vec![],
             toy_box_offers: vec![],
             wax_relics: vec![],
             melted_relics: vec![],
-            toy_box_combats: 0,
             parasol: vec![],
             parasol_removal: false,
             conveyor: false,
@@ -204,7 +180,6 @@ impl Default for ReplayState {
             fake_merchant: vec![],
             fake_shop: false,
             courier_restock: None,
-            fake_happy_flower: 0,
             offered_discards: vec![],
             picks: vec![],
         }
@@ -1170,7 +1145,7 @@ fn lockstep_start(content: &Content, record: &Value, started: &Value) -> Result<
         .collect::<Result<_, _>>()?;
     for &id in &relics {
         game.remove_relic_from_bags(id);
-        game.run.relics.push(id);
+        game.run.relics.push(Relic::new(id));
     }
     for id in relics {
         game.after_obtained(content, id);
@@ -1583,7 +1558,7 @@ fn replay_decision(
         _ => false,
     } && player_state(before) == player_state(after);
     let parasol = (game.run.relics.iter())
-        .position(|&id| content.relics[id as usize].id == "RELIC.LORDS_PARASOL");
+        .position(|relic| content.relics[relic.id as usize].id == "RELIC.LORDS_PARASOL");
     // Lord's Parasol buys the shop asynchronously, after the traced map_node state.
     let bought = parasol
         .filter(|_| traced_action["kind"] == "map_node" && after["phase"] == "shop")
@@ -1609,8 +1584,8 @@ fn replay_decision(
     } else {
         game.step(content, action)
     };
-    if let Some((index, id)) = bought {
-        game.run.relics.insert(index, id);
+    if let Some((index, relic)) = bought {
+        game.run.relics.insert(index, relic);
     }
     if let Err(error) = stepped {
         return Err(vec![format!("action rejected: {error:?}")]);
@@ -1642,7 +1617,7 @@ fn replay_decision(
             else {
                 continue;
             };
-            if let Some(index) = relics.iter().position(|&current| current == id) {
+            if let Some(index) = relics.iter().position(|current| current.id == id) {
                 relics.remove(index);
             } else {
                 tally("resync.reward_relic");
@@ -3079,26 +3054,14 @@ fn replay_decision(
     {
         *variant = (rider / 3 + 1) as u8 * 10 + rider as u8 + 1;
     }
-    replay_state.lasting_candy = game.lasting_candy;
-    replay_state.paels_wing = game.paels_wing;
-    replay_state.silver_crucible = game.silver_crucible;
-    replay_state.silken_tress = game.silken_tress;
-    replay_state.maw_bank = game.maw_bank;
-    replay_state.silver_treasures = game.silver_treasures;
-    replay_state.golden_compass = game.golden_compass;
-    replay_state.winged_boots = game.winged_boots;
-    replay_state.fishing_rod = game.fishing_rod;
     replay_state.rest_used = game.rest_used;
-    replay_state.girya = game.girya;
-    replay_state.pumpkin_candle = game.pumpkin_candle;
+    replay_state.relics = game.run.relics.clone();
     replay_state.paels_cards = game.paels_cards.clone();
-    replay_state.pollinous_core = game.pollinous_core;
     replay_state.fur_coat_act = game.fur_coat_act;
     replay_state.fur_coat = game.fur_coat.clone();
     replay_state.toy_box_offers = game.toy_box_offers.clone();
     replay_state.wax_relics = game.wax_relics.clone();
     replay_state.melted_relics = game.melted_relics.clone();
-    replay_state.toy_box_combats = game.toy_box_combats;
     replay_state.parasol = game.parasol.clone();
     replay_state.parasol_removal = game.parasol_removal;
     replay_state.conveyor = game.conveyor;
@@ -3108,7 +3071,6 @@ fn replay_decision(
     replay_state.fake_merchant = game.fake_merchant.clone();
     replay_state.fake_shop = game.fake_shop;
     replay_state.courier_restock = game.courier_restock.clone();
-    replay_state.fake_happy_flower = game.fake_happy_flower;
     if quarantined && before["phase"] == "combat" {
         tally("skip.quarantined");
         return Ok(());
@@ -3165,7 +3127,7 @@ fn sync_run(
         number(player, "hit_points").map_err(|error| vec![error])? as i16,
         number(player, "max_hit_points").map_err(|error| vec![error])? as i16,
         number(player, "gold").map_err(|error| vec![error])? as i32,
-        ids(&content.relics, &player["relics"], |relic| relic.id).map_err(|error| vec![error])?,
+        captured_relics(content, &player["relics"], &old.relics).map_err(|error| vec![error])?,
     );
     sync_deck(content, game, &player["deck"])?;
     if game.run != old {
@@ -3475,10 +3437,11 @@ fn game_from_snapshot(
             }
         }
     }
-    let relics = ids(&content.relics, &player["relics"], |x| x.id)?;
+    let mut relics = captured_relics(content, &player["relics"], &replay_state.relics)?;
+    restore_relics(content, player, &mut relics, happy_flower);
     let energy_relics = relics
         .iter()
-        .filter(|&&id| ENERGY_RELICS.contains(&content.relics[id as usize].id))
+        .filter(|relic| ENERGY_RELICS.contains(&content.relics[relic.id as usize].id))
         .count() as u8;
     let ascension = state["ascension"].as_u64().unwrap_or_default() as u8;
     let slots = player["potion_slots"].as_u64().map_or_else(
@@ -3486,7 +3449,7 @@ fn game_from_snapshot(
             (if ascension >= 4 { 2 } else { 3 })
                 + relics
                     .iter()
-                    .map(|&id| match content.relics[id as usize].id {
+                    .map(|relic| match content.relics[relic.id as usize].id {
                         "RELIC.POTION_BELT" => 2,
                         "RELIC.PHIAL_HOLSTER" => 1,
                         "RELIC.ALCHEMICAL_COFFER" => 4,
@@ -3534,7 +3497,6 @@ fn game_from_snapshot(
             oracle_after,
             run,
             replay_state,
-            happy_flower,
         );
     }
     let combat_state = &state["combat"];
@@ -3728,10 +3690,8 @@ fn game_from_snapshot(
     let borrowed_time = player_creature.power(power_id::BORROWED_TIME);
     let tangled = player_creature.power(power_id::TANGLED);
     let curious = player_creature.power(power_id::CURIOUS);
-    let spiked_gauntlets = run
-        .relics
-        .iter()
-        .any(|&id| content.relics[id as usize].id == "RELIC.SPIKED_GAUNTLETS");
+    let spiked_gauntlets = (run.relics.iter())
+        .any(|relic| content.relics[relic.id as usize].id == "RELIC.SPIKED_GAUNTLETS");
     let has = |id| player_creature.power(id) > 0;
     // Void Form, or Brilliant Scarf's fifth card this turn.
     let all_free = history.manual_cards < player_creature.power(power_id::VOID_FORM)
@@ -3964,7 +3924,7 @@ fn game_from_snapshot(
         } else {
             run.relics
                 .iter()
-                .any(|&id| content.relics[id as usize].id == "RELIC.CRACKED_CORE")
+                .any(|relic| content.relics[relic.id as usize].id == "RELIC.CRACKED_CORE")
                 as usize
         };
         let lightning = find_id(&content.orbs, "ORB.LIGHTNING_ORB", |orb| orb.id)?;
@@ -4180,8 +4140,6 @@ fn game_from_snapshot(
         .max(0) as u8,
         nightmares: nightmare_copies(content, player, oracle, after),
         dampened,
-        paels_tears: false,
-        orichalcum: false,
         plays: vec![],
         queue: vec![],
         choice: None,
@@ -4190,35 +4148,9 @@ fn game_from_snapshot(
         pending_hits: None,
         force_end: false,
         enemy_turn: false,
-        centennial_puzzle: number(player, "player_hp_loss_events_this_combat")? > 0,
-        // Demon Tongue heals the first HP loss of each player turn.
-        demon_tongue: player["player_lost_hp_this_turn"]
-            .as_bool()
-            .unwrap_or(false),
-        // Permafrost fires on the combat's first power play.
-        permafrost: number(player, "powers_played_this_combat").unwrap_or_default() > 0
-            || played("powers", history.powers) > 0,
-        // Older captures lack used_relics; any Strength gained this combat used the helmet.
-        ruined_helmet: used_relic(player, "RELIC.RUINED_HELMET").unwrap_or_else(|| {
-            array(&player["powers"]).iter().any(|power| {
-                power["model_id"] == "POWER.STRENGTH_POWER" && power["amount"].as_i64() > Some(0)
-            })
-        }),
-        // Music Box copies only the turn's first finished attack.
-        music_box: played("attacks", history.attacks) > 0,
         music_box_card: None,
         swift_after_return: 0,
-
-        mini_regent: used_relic(player, "RELIC.MINI_REGENT").unwrap_or(false),
-        rainbow_ring: relic_active(player, "RELIC.RAINBOW_RING"),
-        attacks_mod3: (played("attacks", history.attacks) % 3).max(0) as u8,
         discard_draw: (0, vec![]),
-        // The relic shows its own counter, which misses skills auto-played before its
-        // AfterSideTurnStart reset (Tools of the Trade's Sly discards). Older captures, which
-        // predate used_relics, also show a melted wax copy's frozen counter.
-        letter_opener: relic_amount_opt(player, "RELIC.LETTER_OPENER")
-            .filter(|_| player.get("used_relics").is_some())
-            .unwrap_or((played("skills", history.skills) % 3).max(0) as u8),
         bound_played,
         // Played cards keep Bound, but a played Bound power leaves every pile: count it when Bound
         // was played this turn and no played-looking Bound card remains.
@@ -4238,35 +4170,14 @@ fn game_from_snapshot(
         setup: false,
         potions: 0,
         unsettling_lamp: None,
-        unsettling_used: !relic_active(player, "RELIC.UNSETTLING_LAMP"),
         applying_hook: false,
-        belt_buckle: relic_active(player, "RELIC.BELT_BUCKLE"),
-        burning_sticks: array(&player["relics"])
-            .iter()
-            .any(|relic| relic["model_id"] == "RELIC.BURNING_STICKS" && relic["state"] != "Active"),
-        red_skull: relic_active(player, "RELIC.RED_SKULL"),
         rat_calls: 0,
         stolen: vec![],
         returned: vec![],
         escaped: vec![],
-        throwing_axe: !relic_active(player, "RELIC.THROWING_AXE"),
-        vambrace: array(&player["relics"])
-            .iter()
-            .any(|relic| relic["model_id"] == "RELIC.VAMBRACE" && relic["state"] != "Active"),
         block_doubler: None,
         curled: Vec::new(),
-        // Pael's Eye goes Normal once used, or after a manual play this turn.
-        paels_eye: history.manual_cards == 0
-            && array(&player["relics"])
-                .iter()
-                .any(|relic| relic["model_id"] == "RELIC.PAELS_EYE" && relic["state"] == "Normal"),
         extra_turn: false,
-        // A ready Pael's Legion hides its counter and reports StackCount 1.
-        paels_legion: if relic_active(player, "RELIC.PAELS_LEGION") {
-            0
-        } else {
-            relic_amount(player, "RELIC.PAELS_LEGION")
-        },
         history_course: last_played(content, player, oracle, history).unwrap_or(history.last_card),
         beat_down: Vec::new(),
         next_creature: oracle["next_creature_id"]
@@ -4318,11 +4229,6 @@ fn game_from_snapshot(
     let mut game = Game {
         event_rng,
         event_combat,
-        pen_nib: if relic_active(player, "RELIC.PEN_NIB") {
-            9
-        } else {
-            relic_amount(player, "RELIC.PEN_NIB") % 10
-        },
         ..snapshot_game(
             content,
             state,
@@ -4336,9 +4242,61 @@ fn game_from_snapshot(
             act,
             seed,
             replay_state,
-            happy_flower,
         )
     };
+    // The relics' state within the combat, as the capture shows it.
+    let attacks = (played("attacks", history.attacks) % 3).max(0) as i32;
+    let hp_lost = number(player, "player_hp_loss_events_this_combat")? > 0;
+    for (relic, traced) in game.run.relics.iter_mut().zip(array(&player["relics"])) {
+        let id = content.relics[relic.id as usize].id;
+        let active = traced["state"] == "Active";
+        let amount = traced["amount"].as_u64().unwrap_or_default() as i32;
+        relic.combat = match id {
+            "RELIC.CENTENNIAL_PUZZLE" => hp_lost as i32,
+            // Demon Tongue heals the first HP loss of each player turn.
+            "RELIC.DEMON_TONGUE" => player["player_lost_hp_this_turn"]
+                .as_bool()
+                .unwrap_or(false) as i32,
+            // Permafrost fires on the combat's first power play.
+            "RELIC.PERMAFROST" => {
+                (number(player, "powers_played_this_combat").unwrap_or_default() > 0
+                    || played("powers", history.powers) > 0) as i32
+            }
+            // Older captures lack used_relics; any Strength gained this combat used the helmet.
+            "RELIC.RUINED_HELMET" => used_relic(player, id).unwrap_or_else(|| {
+                array(&player["powers"]).iter().any(|power| {
+                    power["model_id"] == "POWER.STRENGTH_POWER"
+                        && power["amount"].as_i64() > Some(0)
+                })
+            }) as i32,
+            // Music Box copies only the turn's first finished attack.
+            "RELIC.MUSIC_BOX" => (played("attacks", history.attacks) > 0) as i32,
+            "RELIC.MINI_REGENT" => used_relic(player, id).unwrap_or(false) as i32,
+            "RELIC.RAINBOW_RING" | "RELIC.BELT_BUCKLE" | "RELIC.RED_SKULL" => active as i32,
+            "RELIC.ORNAMENTAL_FAN" | "RELIC.KUNAI" | "RELIC.SHURIKEN" | "RELIC.KUSARIGAMA" => {
+                attacks
+            }
+            // The relic shows its own counter, which misses skills auto-played before its
+            // AfterSideTurnStart reset (Tools of the Trade's Sly discards). Older captures, which
+            // predate used_relics, also show a melted wax copy's frozen counter.
+            "RELIC.LETTER_OPENER" => relic_amount_opt(player, id)
+                .filter(|_| player.get("used_relics").is_some())
+                .unwrap_or((played("skills", history.skills) % 3).max(0) as u8)
+                as i32,
+            "RELIC.UNSETTLING_LAMP"
+            | "RELIC.THROWING_AXE"
+            | "RELIC.BURNING_STICKS"
+            | "RELIC.VAMBRACE" => !active as i32,
+            // Pael's Eye goes Normal once used, or after a manual play this turn.
+            "RELIC.PAELS_EYE" => (history.manual_cards == 0 && traced["state"] == "Normal") as i32,
+            // A ready Pael's Legion hides its counter and reports StackCount 1.
+            "RELIC.PAELS_LEGION" if !active => amount,
+            _ => 0,
+        };
+        if id == "RELIC.PEN_NIB" && active {
+            relic.counters[0] = 9;
+        }
+    }
     // The captured max energy is ModifyMaxEnergy's result; the combat stores its base.
     let modifiers = game.max_energy(content) - game.combat().unwrap().max_energy;
     if let Phase::Combat(combat) = &mut game.phase {
@@ -4360,7 +4318,6 @@ fn snapshot_game(
     act: Id,
     seed: u32,
     replay_state: &ReplayState,
-    happy_flower: u8,
 ) -> Game {
     let player = &state["players"][0];
     let rng = |key: String| {
@@ -4374,10 +4331,6 @@ fn snapshot_game(
         phase,
         act,
         room,
-        // Newer captures show the relic's combat count modulo 3.
-        fishing_rod: relic_amount_opt(player, "RELIC.FISHING_ROD")
-            .filter(|_| player.get("cards_played_this_turn").is_some())
-            .map_or(replay_state.fishing_rod, |amount| amount % 3),
         run_queue: vec![],
         resume: None,
         rngs: Rngs {
@@ -4416,23 +4369,6 @@ fn snapshot_game(
         enemy_starts: vec![],
         seed,
         unknown_odds: replay_state.unknown_odds,
-        happy_flower,
-        tea_set: array(&player["relics"])
-            .iter()
-            .find(|relic| {
-                relic["state"] == "Active"
-                    && matches!(
-                        relic["model_id"].as_str(),
-                        Some("RELIC.VENERABLE_TEA_SET" | "RELIC.FAKE_VENERABLE_TEA_SET")
-                    )
-            })
-            .map_or(0, |relic| {
-                if relic["model_id"] == "RELIC.VENERABLE_TEA_SET" {
-                    2
-                } else {
-                    1
-                }
-            }),
         replacing_potion: false,
         pending_potion: None,
         removal_price: 0,
@@ -4445,33 +4381,20 @@ fn snapshot_game(
         shared_relic_deques: replay_state.shared_relic_deques.clone(),
         reward_continuation: None,
         prefetched_card_rewards: vec![],
-        wongo_combats: wongo_combats(player),
         spoils: None,
         event_combat: 0,
         damage_taken: false,
-        lasting_candy: replay_state.lasting_candy,
-        paels_wing: replay_state.paels_wing,
-        silver_crucible: replay_state.silver_crucible,
-        silken_tress: replay_state.silken_tress,
         rerolled_cards: false,
-        maw_bank: spent_maw_banks(player).unwrap_or(replay_state.maw_bank),
-        silver_treasures: replay_state.silver_treasures,
-        golden_compass: replay_state.golden_compass,
-        winged_boots: replay_state.winged_boots,
         rest_used: replay_state.rest_used,
-        girya: replay_state.girya,
-        pumpkin_candle: replay_state.pumpkin_candle,
         astrolabe: false,
         transform_niche: false,
         paels_tooth: false,
         paels_cards: paels_cards(content, player, &replay_state.paels_cards),
-        pollinous_core: replay_state.pollinous_core,
         fur_coat_act: replay_state.fur_coat_act,
         fur_coat: replay_state.fur_coat.clone(),
         toy_box_offers: replay_state.toy_box_offers.clone(),
         wax_relics: replay_state.wax_relics.clone(),
         melted_relics: melted_relics(player, &replay_state.melted_relics),
-        toy_box_combats: replay_state.toy_box_combats,
         parasol: replay_state.parasol.clone(),
         parasol_removal: replay_state.parasol_removal,
         conveyor: replay_state.conveyor,
@@ -4488,31 +4411,6 @@ fn snapshot_game(
         fake_shop: replay_state.fake_shop,
         courier_restock: replay_state.courier_restock.clone(),
         corpse_hp: None,
-        fake_happy_flower: replay_state.fake_happy_flower,
-        lizard_tail: relic_disabled(player, "RELIC.LIZARD_TAIL"),
-        nunchaku: relic_amount(player, "RELIC.NUNCHAKU") % 10,
-        pendulum: player["pendulum_turns_seen"].as_u64().map_or_else(
-            || {
-                if relic_active(player, "RELIC.PENDULUM") {
-                    2
-                } else {
-                    relic_amount(player, "RELIC.PENDULUM") % 3
-                }
-            },
-            |turns| turns as u8 % 3,
-        ),
-        pen_nib: relic_amount(player, "RELIC.PEN_NIB") % 10,
-        iron_club: relic_amount(player, "RELIC.IRON_CLUB") % 4,
-        joss_paper: relic_amount(player, "RELIC.JOSS_PAPER") % 5,
-        joss_paper_ethereal: 0,
-        tuning_fork: relic_amount(player, "RELIC.TUNING_FORK") % 10,
-        bone_tea: relic_disabled(player, "RELIC.BONE_TEA"),
-        tea_of_discourtesy: relic_disabled(player, "RELIC.TEA_OF_DISCOURTESY"),
-        galactic_dust: relic_amount(player, "RELIC.GALACTIC_DUST") % 10,
-        book_of_five_rings: relic_amount(player, "RELIC.BOOK_OF_FIVE_RINGS") % 5,
-        ember_tea: relic_amount_opt(player, "RELIC.EMBER_TEA")
-            .map_or(0, |amount| 5u8.saturating_sub(amount.min(5))),
-        sword_of_stone: relic_amount(player, "RELIC.SWORD_OF_STONE"),
         replaying: true,
         expectation: None,
     }
@@ -4527,7 +4425,6 @@ fn run_game_from_snapshot(
     oracle_after: &Value,
     run: Run,
     replay_state: &ReplayState,
-    happy_flower: u8,
 ) -> Result<Game, String> {
     let player = &state["players"][0];
     let map = trace_map(state, action, after);
@@ -4842,17 +4739,19 @@ fn run_game_from_snapshot(
         replay_state.fake_merchant.clone()
     };
     let after_player = &after["players"][0];
-    let pendulum = player["pendulum_turns_seen"].as_u64().map_or_else(
-        || {
-            if number(after_player, "cards_drawn_this_combat").unwrap_or_default() > run.draw as i64
-            {
-                2
-            } else {
-                relic_amount(player, "RELIC.PENDULUM") % 3
-            }
-        },
-        |turns| turns as u8 % 3,
-    );
+    let mut run = run;
+    if player["pendulum_turns_seen"].is_null()
+        && let Some(pendulum) = (run.relics.iter_mut())
+            .find(|relic| content.relics[relic.id as usize].id == "RELIC.PENDULUM")
+    {
+        let drawn =
+            number(after_player, "cards_drawn_this_combat").unwrap_or_default() > run.draw as i64;
+        pendulum.counters[0] = if drawn {
+            2
+        } else {
+            relic_amount(player, "RELIC.PENDULUM") as i32 % 3
+        };
+    }
     Ok(Game {
         bosses: if next_room == Room::Boss {
             [next_encounter, None]
@@ -4890,7 +4789,6 @@ fn run_game_from_snapshot(
         spoils,
         fake_merchant,
         fake_shop: state["room_model_id"] == "EVENT.FAKE_MERCHANT",
-        pendulum,
         ..snapshot_game(
             content,
             state,
@@ -4904,7 +4802,6 @@ fn run_game_from_snapshot(
             act,
             seed,
             replay_state,
-            happy_flower,
         )
     })
 }
@@ -5409,7 +5306,7 @@ fn compare_snapshot(
         .run
         .relics
         .iter()
-        .map(|&id| content.relics[id as usize].id)
+        .map(|relic| content.relics[relic.id as usize].id)
         .collect();
     let expected_relics: Vec<_> = array(&expected_player["relics"])
         .iter()
@@ -6694,13 +6591,63 @@ fn text<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
     value[key].as_str().ok_or_else(|| format!("missing {key}"))
 }
 
-fn wongo_combats(player: &Value) -> Option<u8> {
-    array(&player["relics"])
-        .iter()
-        .find(|relic| {
-            relic["model_id"] == "RELIC.WONGOS_MYSTERY_TICKET" && relic["state"] != "Disabled"
+/// The captured relics, each keeping the state of the sim's same copy.
+fn captured_relics(content: &Content, traced: &Value, sim: &[Relic]) -> Result<Vec<Relic>, String> {
+    let mut sim = sim.to_vec();
+    let ids = ids(&content.relics, traced, |relic| relic.id)?;
+    Ok((ids.into_iter())
+        .map(|id| match sim.iter().position(|relic| relic.id == id) {
+            Some(index) => sim.remove(index),
+            None => Relic::new(id),
         })
-        .map(|relic| 5u8.saturating_sub(relic["amount"].as_u64().unwrap_or(5) as u8))
+        .collect())
+}
+
+/// The run counters the captured relics show (`relics` in the capture's order).
+fn restore_relics(content: &Content, player: &Value, relics: &mut [Relic], happy_flower: u8) {
+    for (relic, traced) in relics.iter_mut().zip(array(&player["relics"])) {
+        let id = content.relics[relic.id as usize].id;
+        let (active, disabled) = (traced["state"] == "Active", traced["state"] == "Disabled");
+        let amount = traced["amount"].as_u64().map(|amount| amount as i32);
+        let shown = amount.unwrap_or_default();
+        match id {
+            "RELIC.HAPPY_FLOWER" => relic.counters[0] = happy_flower as i32,
+            "RELIC.VENERABLE_TEA_SET" | "RELIC.FAKE_VENERABLE_TEA_SET" => {
+                relic.counters[0] = active as i32
+            }
+            "RELIC.WONGOS_MYSTERY_TICKET" if disabled => relic.counters[1] = 1,
+            "RELIC.WONGOS_MYSTERY_TICKET" => relic.counters[0] = 5 - amount.unwrap_or(5).min(5),
+            // Each Maw Bank is spent on its own; older captures lack relic states.
+            "RELIC.MAW_BANK" if traced["state"].is_string() => relic.counters[0] = disabled as i32,
+            "RELIC.LIZARD_TAIL" | "RELIC.BONE_TEA" | "RELIC.TEA_OF_DISCOURTESY" => {
+                relic.counters[0] = disabled as i32
+            }
+            "RELIC.NUNCHAKU" | "RELIC.PEN_NIB" | "RELIC.TUNING_FORK" | "RELIC.GALACTIC_DUST" => {
+                relic.counters[0] = shown % 10
+            }
+            "RELIC.IRON_CLUB" => relic.counters[0] = shown % 4,
+            "RELIC.JOSS_PAPER" | "RELIC.BOOK_OF_FIVE_RINGS" => relic.counters[0] = shown % 5,
+            "RELIC.SWORD_OF_STONE" => relic.counters[0] = shown,
+            "RELIC.EMBER_TEA" => relic.counters[0] = amount.map_or(0, |amount| 5 - amount.min(5)),
+            "RELIC.PENDULUM" => {
+                relic.counters[0] = player["pendulum_turns_seen"]
+                    .as_u64()
+                    .map_or(if active { 2 } else { shown % 3 }, |turns| {
+                        (turns % 3) as i32
+                    })
+            }
+            // Newer captures show the relic's combat count modulo 3.
+            "RELIC.FISHING_ROD"
+                if player.get("cards_played_this_turn").is_some() && amount.is_some() =>
+            {
+                relic.counters[0] = shown % 3
+            }
+            _ => {}
+        }
+        if id == "RELIC.JOSS_PAPER" {
+            relic.combat = 0;
+        }
+    }
 }
 
 fn relic_amount(player: &Value, id: &str) -> u8 {
@@ -6713,12 +6660,6 @@ fn relic_amount_opt(player: &Value, id: &str) -> Option<u8> {
         .find(|relic| relic["model_id"] == id)
         .and_then(|relic| relic["amount"].as_u64())
         .map(|amount| amount as u8)
-}
-
-fn relic_disabled(player: &Value, id: &str) -> bool {
-    array(&player["relics"])
-        .iter()
-        .any(|relic| relic["model_id"] == id && relic["state"] == "Disabled")
 }
 
 // Pael's Tooth keeps its cards out of the deck; newer captures record them as
@@ -6940,15 +6881,6 @@ fn played_shivs(
     )
 }
 
-/// Each Maw Bank is spent on its own; captured relic states say which ones are.
-fn spent_maw_banks(player: &Value) -> Option<u8> {
-    let banks = array(&player["relics"])
-        .iter()
-        .filter(|relic| relic["model_id"] == "RELIC.MAW_BANK");
-    (banks.clone().all(|relic| relic["state"].is_string()))
-        .then(|| banks.filter(|relic| relic["state"] == "Disabled").count() as u8)
-}
-
 // A melted wax relic shows as Disabled; tracked indices go stale when the relic list shifts.
 // Relics that disable themselves once used up are not melted.
 fn melted_relics(player: &Value, melted: &[usize]) -> Vec<usize> {
@@ -6985,12 +6917,6 @@ fn used_relic(player: &Value, id: &str) -> Option<bool> {
     player["used_relics"]
         .as_array()
         .map(|relics| relics.iter().any(|relic| relic == id))
-}
-
-fn relic_active(player: &Value, id: &str) -> bool {
-    array(&player["relics"])
-        .iter()
-        .any(|relic| relic["model_id"] == id && relic["state"] == "Active")
 }
 
 fn number(value: &Value, key: &str) -> Result<i64, String> {

@@ -292,7 +292,7 @@ def wilson(wins, runs):
 def episode_summary(rows):
     wins = sum(row[0] for row in rows)
     floors = [row[1] for row in rows]
-    boss_entries = sum(row[0] or row[1] >= 51 for row in rows)
+    boss_entries = sum(row[0] or row[1] >= 49 for row in rows)
     return {
         "episodes": len(rows), "wins": wins,
         "win_rate": wins / max(1, len(rows)), "win_rate_interval": wilson(wins, len(rows)),
@@ -700,7 +700,7 @@ class MetricsProjector:
             window["_floors"][floor] += 1
             window["_characters"][character][0] += 1
             window["_characters"][character][1] += int(episode["won"])
-            window["_boss_entries"] += int(episode["won"] or floor >= 51)
+            window["_boss_entries"] += int(episode["won"] or floor >= 49)
             window["_caps"][0] += int(episode.get("step_cap", False))
             window["_caps"][1] += int(episode.get("combat_cap", False))
             window["_caps"][2] += int(episode.get("empty_actions", False))
@@ -1063,7 +1063,7 @@ def _live_projector(projectors, root, run, manifest, session_id):
     if saved is None or saved[0].manifest != manifest or saved[0].session_id != session_id:
         segments = lineage_segments(root, manifest["run_id"], session_id) or \
             [(run / manifest["sessions"][-1]["log"], None)]
-        signature = 9, [(str(path.resolve()), end) for path, end in segments], \
+        signature = 10, [(str(path.resolve()), end) for path, end in segments], \
             [(path.stat().st_size, path.stat().st_mtime_ns) for path, _ in segments[:-1]]
         saved = projectors[run] = [None, signature, None]
         try:

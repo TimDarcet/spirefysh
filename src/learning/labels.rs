@@ -1,427 +1,24 @@
 use super::*;
+use std::sync::LazyLock;
 
-// Tables mirror effect_index, event_effect_index, action_kind, *_payload, room_index,
-// target_index, pile_index and phase_index; the model tags token roles and collections.
-pub(super) const EFFECTS: [&str; 125] = [
-    "Attack",
-    "AttackMany",
-    "OstyAttack",
-    "OstyAttackMany",
-    "MoveDamage",
-    "Damage",
-    "Kill",
-    "Stun",
-    "DoomKill",
-    "LoseHp",
-    "Block",
-    "BlockNextTurn",
-    "DodgeRoll",
-    "DrawBlockIf",
-    "RawBlock",
-    "Heal",
-    "HealPercent",
-    "MaxHp",
-    "Gold",
-    "RandomPotion",
-    "Bomb",
-    "Automation",
-    "Panache",
-    "RollingBoulder",
-    "ToricToughness",
-    "ApplyPower",
-    "ApplyDebuff",
-    "StackPower",
-    "DoublePower",
-    "Misery",
-    "RemovePower",
-    "TemporaryStrength",
-    "Draw",
-    "HandDraw",
-    "DrawAmount",
-    "DrawTo",
-    "DrawUntilNot",
-    "ChooseDraw",
-    "FreeHand",
-    "Energy",
-    "DoubleEnergy",
-    "AddCard",
-    "AddUpgradedCard",
-    "AddFlaggedCard",
-    "RandomCard",
-    "RandomColorless",
-    "RandomColorlessOther",
-    "OfferColorless",
-    "OfferCharacter",
-    "OfferCharacterRetain",
-    "OfferCharacterType",
-    "OfferOtherCharacter",
-    "RandomCharacter",
-    "DistinctCharacter",
-    "RandomCharacterCost",
-    "RandomCardOp",
-    "AutoPlayRandom",
-    "ChooseRandomDraw",
-    "SelectAmount",
-    "ShuffleHandDraw",
-    "FillPotions",
-    "RandomizeHandCosts",
-    "ReplayTagged",
-    "ChannelSlots",
-    "DistinctColorless",
-    "AddRandomCard",
-    "AddRandom",
-    "FranticEscape",
-    "Aggression",
-    "AutoPlayDraw",
-    "Stoke",
-    "Stampede",
-    "Fire",
-    "FlakCannon",
-    "CopyCard",
-    "Discard",
-    "DiscardHandDraw",
-    "DiscardHandAdd",
-    "PlayExhaustedShivs",
-    "AutoPlay",
-    "PlacePlayed",
-    "WhisperingEarring",
-    "MoveAll",
-    "DrawFiltered",
-    "DrawFilteredStep",
-    "FinishDrawFiltered",
-    "Exhaust",
-    "ExhaustForBlock",
-    "ExhaustForAttack",
-    "ExhaustAttackStep",
-    "Upgrade",
-    "TransformHand",
-    "If",
-    "Repeat",
-    "Random",
-    "Channel",
-    "RandomOrb",
-    "Evoke",
-    "EvokeMany",
-    "EvokeLast",
-    "EvokeAll",
-    "PassiveFirst",
-    "PassiveLast",
-    "PassiveAll",
-    "OrbSlots",
-    "Stars",
-    "Forge",
-    "Summon",
-    "MaxEnergy",
-    "GrowCard",
-    "GrowDrawn",
-    "GrowAll",
-    "PersistCard",
-    "SetCardCost",
-    "ReduceCardCost",
-    "CapHandCosts",
-    "RecycleHand",
-    "EndTurn",
-    "Select",
-    "PassiveLightning",
-    "Listen",
-    "Step",
-    "BeforePlay",
-    "OnPlay",
-    "AfterPlay",
-];
-
-pub(super) const TRIGGERS: [&str; 35] = [
-    "AfterRoomEntered",
-    "BeforeCombatStart",
-    "BeforeCombatStartLate",
-    "BeforeSideTurnStart",
-    "AfterBlockCleared",
-    "AfterEnergyReset",
-    "AfterEnergyResetLate",
-    "BeforeHandDraw",
-    "AfterPlayerTurnStart",
-    "AfterPlayerTurnStartLate",
-    "AfterSideTurnStart",
-    "AfterSideTurnStartLate",
-    "AutoPrePlay",
-    "AutoPrePlayLate",
-    "BeforeSideTurnEndVeryEarly",
-    "BeforeSideTurnEndEarly",
-    "BeforeSideTurnEnd",
-    "AfterSideTurnEnd",
-    "AfterSideTurnEndLate",
-    "TurnEnd",
-    "AfterCardPlayed",
-    "AttackPlayed",
-    "SkillPlayed",
-    "PowerPlayed",
-    "AfterBlockGained",
-    "AfterDamageGiven",
-    "AfterDamageReceived",
-    "AfterDeath",
-    "AfterCardDrawn",
-    "AfterCardGeneratedForCombat",
-    "AfterCardExhausted",
-    "AfterShuffle",
-    "AfterPotionUsed",
-    "AfterCombatVictory",
-    "BeforeCardPlayed",
-];
-
-pub(super) const RUN_EFFECTS: [&str; 37] = [
-    "Gold",
-    "RandomGold",
-    "LoseAllGold",
-    "Heal",
-    "HealPercent",
-    "FullHeal",
-    "LoseHp",
-    "MaxHp",
-    "MaxHpTo",
-    "AddCard",
-    "AddRelic",
-    "AddPotion",
-    "PotionRewards",
-    "RandomPotionReward",
-    "NextRelics",
-    "RelicOfRarity",
-    "EventRelic",
-    "RandomCard",
-    "RandomRelic",
-    "DiscardPotion",
-    "DiscardRandomPotion",
-    "RemoveCards",
-    "UpgradeCards",
-    "UpgradeRandom",
-    "UpgradeShuffled",
-    "UpgradeAll",
-    "DowngradeRandom",
-    "CloneDeck",
-    "TransformCards",
-    "EnchantCards",
-    "SkipEventRng",
-    "ChooseCommonCards",
-    "ChooseRewardCards",
-    "RemoveRandomCard",
-    "Options",
-    "EventAction",
-    "FinishCooking",
-];
-
-pub(super) const ACTIONS: [&str; 32] = [
-    "Play",
-    "Potion",
-    "DiscardPotion",
-    "Choose",
-    "EndTurn",
-    "Path",
-    "RewardGold",
-    "RewardCard",
-    "RewardRelic",
-    "RewardPotion",
-    "RewardRemove",
-    "RerollCards",
-    "SacrificeCards",
-    "Buy",
-    "Rest",
-    "Hatch",
-    "Lift",
-    "Cook",
-    "Kindle",
-    "Dig",
-    "Smith",
-    "Event",
-    "CrystalCell",
-    "CrystalTool",
-    "EventRelic",
-    "EventCard",
-    "Enchant",
-    "RemoveCard",
-    "Clone",
-    "Cancel",
-    "Done",
-    "Leave",
-];
-
-pub(super) const CONDITIONS: [&str; 23] = [
-    "Always",
-    "Upgraded",
-    "TargetAlive",
-    "TargetHasPower",
-    "SourceHasPower",
-    "HandAtMost",
-    "HandAtLeast",
-    "HandWithout",
-    "HandEmpty",
-    "EventAtLeast",
-    "ExhaustAtLeast",
-    "ExhaustedThisTurn",
-    "HpLostThisTurn",
-    "TargetDead",
-    "FirstTurn",
-    "HasOrb",
-    "CardType",
-    "PriorCardsBelow",
-    "TargetAttacking",
-    "XAtLeast",
-    "OstyAlive",
-    "DoomApplied",
-    "Card",
-];
-
-pub(super) const FILTERS: [&str; 16] = [
-    "Any",
-    "Type",
-    "AttackOrPower",
-    "TypeWithoutTurnFlag",
-    "WithoutFlag",
-    "NotType",
-    "Id",
-    "Cost",
-    "PlayableCost",
-    "Flag",
-    "Upgradable",
-    "Colorless",
-    "Rare",
-    "NoReplay",
-    "PlayableOrAny",
-    "CostsResource",
-];
-
-pub(super) const CARD_OPS: [&str; 18] = [
-    "Move",
-    "Upgrade",
-    "Cost",
-    "SetCost",
-    "Flag",
-    "TurnFlag",
-    "CopyNextTurn",
-    "Transform",
-    "AutoPlay",
-    "CopySelected",
-    "TakeOffer",
-    "Transfigure",
-    "Replay",
-    "TakeFetched",
-    "TransformRandom",
-    "DiscardDraw",
-    "MoveFree",
-    "FreeCombat",
-];
-
-pub(super) const SCALES: [&str; 47] = [
-    "None",
-    "X",
-    "Block",
-    "Energy",
-    "MissingHp",
-    "DrawSize",
-    "DiscardSize",
-    "ExhaustSize",
-    "ExhaustId",
-    "HandSize",
-    "CardsPlayed",
-    "AttacksPlayed",
-    "PriorAttacks",
-    "SkillsPlayed",
-    "EnergySpent",
-    "Exhausted",
-    "HpLost",
-    "HpLossEvents",
-    "CardValue",
-    "LivingEnemies",
-    "Orbs",
-    "OrbTypes",
-    "OrbTypesPower",
-    "Stars",
-    "TargetPower",
-    "TargetPowerDiv",
-    "Tagged",
-    "Power",
-    "Event",
-    "EventPower",
-    "HandType",
-    "EnemyPowerTotal",
-    "TargetDebuffs",
-    "Discarded",
-    "DrawnCombat",
-    "StarCards",
-    "StarsGained",
-    "Generated",
-    "PriorTargetHits",
-    "OstyHp",
-    "OstyMaxHp",
-    "OstyAttacks",
-    "EtherealPlayed",
-    "LightningChanneled",
-    "LastDamage",
-    "ExtraDrawn",
-    "TurnDiv",
-];
-
-pub(super) const CARD_TYPES: [&str; 6] = ["Attack", "Skill", "Power", "Status", "Curse", "Quest"];
-
-pub(super) const RARITIES: [&str; 7] = [
-    "Basic", "Common", "Uncommon", "Rare", "Ancient", "Event", "Quest",
-];
-
-pub(super) const ENCHANTMENTS: [&str; 22] = [
-    "Adroit",
-    "Clone",
-    "Corrupted",
-    "Glam",
-    "Goopy",
-    "Imbued",
-    "Inky",
-    "Instinct",
-    "Momentum",
-    "Nimble",
-    "PerfectFit",
-    "RoyallyApproved",
-    "Sharp",
-    "Slither",
-    "SlumberingEssence",
-    "SoulsPower",
-    "Sown",
-    "Spiral",
-    "Steady",
-    "Swift",
-    "TezcatarasEmber",
-    "Vigorous",
-];
-
-pub(super) const ROOMS: [&str; 8] = [
-    "Combat", "Elite", "Boss", "Unknown", "Event", "Shop", "Rest", "Treasure",
-];
-
-pub(super) const TARGETS: [&str; 9] = [
-    "Source",
-    "Player",
-    "Osty",
-    "ChosenEnemy",
-    "ChosenEnemyOrDead",
-    "AllEnemies",
-    "OtherEnemies",
-    "RandomEnemy",
-    "LowestHpEnemy",
-];
-
-pub(super) const PILES: [&str; 5] = ["Draw", "Hand", "Discard", "Exhaust", "Offer"];
-
-pub(super) const PHASES: [&str; 12] = [
-    "Map",
-    "Combat",
-    "Rewards",
-    "Shop",
-    "Rest",
-    "Event",
-    "RemoveCards",
-    "UpgradeCards",
-    "TransformCards",
-    "EnchantCards",
-    "ChooseCards",
-    "ChooseBundles",
-];
+/// Each enum of lib.rs, its variant names in declaration order (their `Variant` index), read from
+/// the declarations so the names follow them.
+pub(super) fn variants(name: &str) -> &'static [&'static str] {
+    static ENUMS: LazyLock<HashMap<&str, Vec<&str>>> = LazyLock::new(|| {
+        (include_str!("../lib.rs").split("\npub enum ").skip(1))
+            .map(|declaration| {
+                let (name, body) = declaration.split_once(" {\n").unwrap();
+                let variants = (body.split("\n}").next().unwrap().lines())
+                    .filter_map(|line| line.strip_prefix("    "))
+                    .filter(|line| line.starts_with(char::is_uppercase))
+                    .map(|line| line.split(|c: char| !c.is_alphanumeric()).next().unwrap())
+                    .collect();
+                (name, variants)
+            })
+            .collect()
+    });
+    &ENUMS[name]
+}
 
 pub(super) const CARD_FLAGS: [&str; 16] = [
     "exhaust",
@@ -443,23 +40,6 @@ pub(super) const CARD_FLAGS: [&str; 16] = [
 ];
 
 pub(super) const TAGS: [&str; 5] = ["strike", "defend", "shiv", "Osty attack", "minion"];
-
-pub(super) const ORB_TIMINGS: [&str; 2] = ["turn start", "turn end"];
-
-pub(super) const REQUIREMENTS: [&str; 4] = ["always", "gold", "HP", "deck"];
-
-pub(super) const ACTOR_KINDS: [&str; 3] = ["player", "Osty", "enemy"];
-
-pub(super) const OFFER_KINDS: [&str; 8] = [
-    "standard card reward",
-    "fixed card reward",
-    "Kaleidoscope card reward",
-    "Crystal Sphere card reward",
-    "shop card",
-    "shop relic",
-    "shop potion",
-    "shop removal",
-];
 
 pub(super) const PLAY_KINDS: [&str; 4] = ["queued auto-play", "manual play", "extra turn", "random curse"];
 
@@ -513,6 +93,12 @@ pub(super) fn concept_labels(content: &Content) -> Vec<String> {
                 },
                 n if n == Semantic::Power as usize => content.powers[value].id.to_string(),
                 n if n == Semantic::Relic as usize => content.relics[value].id.to_string(),
+                n if n == Semantic::RelicValue as usize => {
+                    format!("{} second counter", content.relics[value].id)
+                }
+                n if n == Semantic::RelicCombat as usize => {
+                    format!("{} combat state", content.relics[value].id)
+                }
                 n if n == Semantic::Potion as usize => content
                     .potions
                     .get(value)
@@ -532,30 +118,32 @@ pub(super) fn concept_labels(content: &Content) -> Vec<String> {
                     [encounters[1][value] as usize]
                     .id
                     .to_string(),
-                n if n == Semantic::Enchantment as usize => named(&ENCHANTMENTS, value),
-                n if n == Semantic::CardType as usize => named(&CARD_TYPES, value),
-                n if n == Semantic::Rarity as usize => named(&RARITIES, value),
-                n if n == Semantic::Room as usize => named(&ROOMS, value),
-                n if n == Semantic::Target as usize => named(&TARGETS, value),
-                n if n == Semantic::Pile as usize => named(&PILES, value),
+                n if n == Semantic::Enchantment as usize => named(variants("Enchantment"), value),
+                n if n == Semantic::Affliction as usize => named(variants("Affliction"), value),
+                n if n == Semantic::CardType as usize => named(variants("CardType"), value),
+                n if n == Semantic::Rarity as usize => named(variants("CardRarity"), value),
+                n if n == Semantic::Room as usize => named(variants("Room"), value),
+                n if n == Semantic::Target as usize => named(variants("Target"), value),
+                n if n == Semantic::Pile as usize => named(variants("Pile"), value),
                 n if n == Semantic::Phase as usize || n == Semantic::SuspendedPhase as usize => {
-                    named(&PHASES, value)
+                    named(variants("Phase"), value)
                 }
-                n if n == Semantic::Action as usize => named(&ACTIONS, value),
-                n if n == Semantic::Effect as usize => named(&EFFECTS, value),
-                n if n == Semantic::RunEffect as usize => named(&RUN_EFFECTS, value),
-                n if n == Semantic::Condition as usize => named(&CONDITIONS, value),
-                n if n == Semantic::Filter as usize => named(&FILTERS, value),
-                n if n == Semantic::CardOp as usize => named(&CARD_OPS, value),
-                n if n == Semantic::Scale as usize => named(&SCALES, value),
+                n if n == Semantic::Action as usize => named(variants("Action"), value),
+                n if n == Semantic::Effect as usize => named(variants("Effect"), value),
+                n if n == Semantic::RunEffect as usize => named(variants("RunEffect"), value),
+                n if n == Semantic::Condition as usize => named(variants("Condition"), value),
+                n if n == Semantic::Filter as usize => named(variants("CardFilter"), value),
+                n if n == Semantic::CardOp as usize => named(variants("CardOp"), value),
+                n if n == Semantic::Scale as usize => named(variants("Scale"), value),
                 n if n == Semantic::FlagBit as usize || n == Semantic::TurnFlagBit as usize => {
                     named(&CARD_FLAGS, value)
                 }
                 n if n == Semantic::TagBit as usize => named(&TAGS, value),
-                n if n == Semantic::OrbTiming as usize => named(&ORB_TIMINGS, value),
-                n if n == Semantic::Requirement as usize => named(&REQUIREMENTS, value),
-                n if n == Semantic::ActorKind as usize => named(&ACTOR_KINDS, value),
-                n if n == Semantic::OfferKind as usize => named(&OFFER_KINDS, value),
+                n if n == Semantic::OrbTiming as usize => named(variants("OrbTiming"), value),
+                n if n == Semantic::Requirement as usize => named(variants("Requirement"), value),
+                n if n == Semantic::ActorKind as usize => named(variants("Actor"), value),
+                n if n == Semantic::CardReward as usize => named(variants("CardReward"), value),
+                n if n == Semantic::ShopItem as usize => named(variants("ShopItem"), value),
                 n if n == Semantic::PlayKind as usize => named(&PLAY_KINDS, value),
                 n if n == Semantic::Flag as usize => named(&FLAG_NAMES, value),
                 n if n == Semantic::PowerValue as usize => format!("{} value", content.powers[value].id),
@@ -563,7 +151,11 @@ pub(super) fn concept_labels(content: &Content) -> Vec<String> {
                     format!("{} slot {}", content.events[value / 4].id, value % 4)
                 }
                 n if n == Semantic::EffectFlag as usize => {
-                    format!("{} flag {}", named(&EFFECTS, value / 2), value % 2)
+                    format!(
+                        "{} flag {}",
+                        named(variants("Effect"), value / 2),
+                        value % 2
+                    )
                 }
                 n if n == Semantic::CrystalWidth as usize
                     || n == Semantic::CrystalHeight as usize =>
@@ -572,7 +164,7 @@ pub(super) fn concept_labels(content: &Content) -> Vec<String> {
                 }
                 n if n == Semantic::TokenRole as usize => named(&TOKEN_ROLES, value),
                 n if n == Semantic::Collection as usize => named(&COLLECTIONS, value),
-                n if n == Semantic::Trigger as usize => named(&TRIGGERS, value),
+                n if n == Semantic::Trigger as usize => named(variants("Trigger"), value),
                 _ => format!("{value}"),
             };
             labels[layout.semantic_offsets[namespace] as usize + value] =
