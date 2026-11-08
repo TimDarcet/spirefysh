@@ -59,6 +59,8 @@ def stage_upload(value, shared=False):
             return stage_upload, len(tensors) - 1
         if isinstance(item, tuple):
             return tuple(flatten(child) for child in item)
+        if isinstance(item, dict):
+            return {key: flatten(child) for key, child in item.items()}
         return item
 
     structure = flatten(value)
@@ -87,6 +89,8 @@ def upload(value, target, staged=False):
             return buffers[dtype][offset:offset + shape.numel()].view(shape)
         if isinstance(item, tuple):
             return tuple(rebuild(child) for child in item)
+        if isinstance(item, dict):
+            return {key: rebuild(child) for key, child in item.items()}
         return item
 
     return rebuild(structure)
@@ -1869,7 +1873,7 @@ def evaluate(model, args, target, seed=None, runs=None, stage=None, max_steps=No
             combat_caps += int(combat_capped.sum())
             empty_count += int(empty_actions.sum())
         wins = sum(outcome == 1 for outcome in outcomes)
-        boss_entries = sum(outcome == 1 or floor >= 51 for outcome, floor in zip(outcomes, floors))
+        boss_entries = sum(outcome == 1 or floor >= 49 for outcome, floor in zip(outcomes, floors))
         reports.append({
             "character": character, "runs": total, "resolved": total - caps, "wins": wins,
             "win_rate": wins / total, "win_rate_interval": wilson(wins, total),
@@ -2009,7 +2013,7 @@ def evaluate_search_policies(args):
                     if finished:
                         env.reset(finished, 0)
             wins = sum(outcomes); boss_entries = sum(
-                won or floor >= 51 for won, floor in zip(outcomes, floors)
+                won or floor >= 49 for won, floor in zip(outcomes, floors)
             )
             characters.append({
                 "character": character, "runs": args.runs, "wins": wins,
