@@ -119,6 +119,7 @@ pub(super) fn concept_labels(content: &Content) -> Vec<String> {
                     .id
                     .to_string(),
                 n if n == Semantic::Enchantment as usize => named(variants("Enchantment"), value),
+                n if n == Semantic::Affliction as usize => named(variants("Affliction"), value),
                 n if n == Semantic::CardType as usize => named(variants("CardType"), value),
                 n if n == Semantic::Rarity as usize => named(variants("CardRarity"), value),
                 n if n == Semantic::Room as usize => named(variants("Room"), value),

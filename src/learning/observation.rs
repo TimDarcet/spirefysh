@@ -160,7 +160,7 @@ const DOMAINS: [(&str, usize, &[&str]); 22] = [
             "card rewards ÷ 10",
         ],
     ),
-    ("card", 6, &CARD_FIELDS),
+    ("card", 7, &CARD_FIELDS),
     (
         "actor",
         5,
@@ -348,12 +348,13 @@ enum Flag {
     DamageTaken,
     Nightmare,
     HistoryCourse,
+    Stolen,
     ElseBranch,
     UncommonReward,
     AnyNumber,
 }
 
-const FLAG_NAMES: [&str; 20] = [
+const FLAG_NAMES: [&str; 21] = [
     "combat choice pending",
     "enemy turn",
     "turn ending",
@@ -371,6 +372,7 @@ const FLAG_NAMES: [&str; 20] = [
     "took damage this run",
     "nightmare",
     "history course",
+    "stolen",
     "else branch",
     "uncommon potion reward",
     "any number",
@@ -396,6 +398,7 @@ enum Semantic {
     EncounterNormal,
     EncounterElite,
     Enchantment,
+    Affliction,
     CardType,
     Rarity,
     Room,
@@ -463,6 +466,7 @@ const SEMANTIC_NAMES: [&str; Semantic::Count as usize] = [
     "encounter_normal",
     "encounter_elite",
     "enchantment",
+    "affliction",
     "card_type",
     "rarity",
     "room",
@@ -699,6 +703,7 @@ impl Layout {
             (Semantic::EncounterNormal, 57),
             (Semantic::EncounterElite, 13),
             (Semantic::Enchantment, labels::variants("Enchantment").len()),
+            (Semantic::Affliction, labels::variants("Affliction").len()),
             (Semantic::CardType, labels::variants("CardType").len()),
             (Semantic::Rarity, labels::variants("CardRarity").len()),
             (Semantic::Room, labels::variants("Room").len()),
@@ -813,6 +818,9 @@ impl Ctx<'_> {
         if let Some(enchantment) = card.enchantment {
             let amount = card.enchantment_amount as f32 / 30.0;
             token.amount(layout, Semantic::Enchantment, enchantment as u32, amount);
+        }
+        if card.affliction != Affliction::None {
+            token.code(layout, Semantic::Affliction, card.affliction as u32);
         }
         if let Some(&master) = self.masters.get(&card.instance) {
             token.code(layout, Semantic::DeckOrigin, (master as u32 - 1).min(256));
@@ -1918,6 +1926,15 @@ impl Encoder<'_> {
                 let mut token = Token::new(MOVE_DOMAIN, Place::Move, actor);
                 let id = enemy_move_id(content, enemy.creature.id, movement);
                 token.code(layout, Semantic::EnemyMove, id);
+                self.push(token);
+            }
+            for &(_, card) in combat
+                .stolen
+                .iter()
+                .filter(|(hopper, _)| *hopper == enemy.instance)
+            {
+                let mut token = self.ctx.card(card, Place::Effect, actor);
+                token.flag(layout, Flag::Stolen, true);
                 self.push(token);
             }
         }

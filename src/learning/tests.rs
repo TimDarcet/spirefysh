@@ -1694,6 +1694,54 @@ fn relic_counters_are_numeric_inputs_of_any_size() {
 }
 
 #[test]
+fn afflictions_stolen_cards_and_relic_combat_state_are_encoded() {
+    let content = foundation_content();
+    let layout = Layout::new(&content);
+    let mut game = Game::new_character_ascension(&content, 557, 0, 10).unwrap();
+    game.begin_act(&content, 0).unwrap();
+    game.start_combat(&content, content.acts[0].encounters[0])
+        .unwrap();
+    let opener = content.relic_id("RELIC.LETTER_OPENER").unwrap();
+    game.run.relics.push(Relic {
+        combat: 2,
+        ..Relic::new(opener)
+    });
+    let Phase::Combat(combat) = &mut game.phase else {
+        unreachable!()
+    };
+    let card = |name| Card {
+        id: content.card_id(name).unwrap(),
+        ..Card::default()
+    };
+    combat.hand = vec![Card {
+        affliction: Affliction::Bound,
+        ..card("CARD.STRIKE_IRONCLAD")
+    }];
+    combat
+        .stolen
+        .push((combat.enemies[0].instance, card("CARD.BASH")));
+    let observation = build_observation(&game, &content, layout);
+    let (_, hand) = placed(&observation, Place::Hand).next().unwrap();
+    assert!(has(
+        hand,
+        layout,
+        Semantic::Affliction,
+        Affliction::Bound as u32
+    ));
+    let (enemy, _) = placed(&observation, Place::Enemy).next().unwrap();
+    assert!(placed(&observation, Place::Effect).any(|(_, token)| {
+        token.parent == enemy as u32 && has(token, layout, Semantic::Flag, Flag::Stolen as u32)
+    }));
+    let (_, relic) = (placed(&observation, Place::Relic))
+        .find(|(_, token)| has(token, layout, Semantic::Relic, opener as u32))
+        .unwrap();
+    assert_eq!(
+        amount_of(relic, layout, Semantic::RelicCombat, opener as u32),
+        Some(0.2)
+    );
+}
+
+#[test]
 fn wax_relics_encode_queue_progress_and_melted_state() {
     let content = foundation_content();
     let layout = Layout::new(&content);
@@ -2223,5 +2271,5 @@ fn traced_state_observations_are_stable() {
         }
     }
     assert_eq!(states, 200);
-    assert_eq!(digest, 13546217295347668749);
+    assert_eq!(digest, 11561557366040895596);
 }
