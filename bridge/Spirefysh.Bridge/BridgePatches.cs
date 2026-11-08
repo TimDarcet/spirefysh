@@ -11,6 +11,7 @@ using MegaCrit.Sts2.Core.Entities.Cards;
 using MegaCrit.Sts2.Core.Entities.Merchant;
 using MegaCrit.Sts2.Core.Entities.Players;
 using MegaCrit.Sts2.Core.Entities.RestSite;
+using MegaCrit.Sts2.Core.Events.Custom.CrystalSphereEvent;
 using MegaCrit.Sts2.Core.GameActions;
 using MegaCrit.Sts2.Core.GameActions.Multiplayer;
 using MegaCrit.Sts2.Core.Models;
@@ -87,6 +88,8 @@ internal static class BridgePatches
             postfix: new HarmonyMethod(typeof(BridgePatches), nameof(AfterRunEnded)));
         PatchPrefix(harmony, typeof(RunManager),
             nameof(RunManager.Abandon), nameof(BeforeRunAbandoned));
+        PatchPrefix(harmony, typeof(CrystalSphereMinigame),
+            nameof(CrystalSphereMinigame.CellClicked), nameof(BeforeCrystalClick));
         // AutoSlay's (and Vakuu's) selector answers CardSelectCmd without a PlayerChoiceResult.
         foreach (var method in typeof(CardSelectCmd).Assembly.GetTypes()
                      .Where(type => type is { IsClass: true, IsAbstract: false } &&
@@ -160,6 +163,11 @@ internal static class BridgePatches
             Console.Error.WriteLine($"[Spirefysh] Selector pick not captured: {exception.Message}");
         }
     }
+
+    // AutoSlay plays the Crystal Sphere minigame without a PlayerChoiceResult.
+    private static void BeforeCrystalClick(CrystalSphereMinigame __instance, CrystalSphereCell clickedCell) =>
+        Observe("crystal sphere click", () => _capture?.OnCrystalClick(clickedCell.X, clickedCell.Y,
+            __instance.CrystalSphereTool == CrystalSphereMinigame.CrystalSphereToolType.Big));
 
     private static void BeforeCardReward(CardReward __instance) =>
         Observe("card reward offer", () => _cardReward = __instance);

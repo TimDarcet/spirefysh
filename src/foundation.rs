@@ -1524,8 +1524,8 @@ const WIKI_FOSSIL_STALKER_MOVES: &[MoveDef] = &[
     MoveDef {
         intent: "Attack 9, Frail 1",
         weight: 1,
-        max_repeats: 1,
-        next: &[],
+        max_repeats: 2,
+        next: &[1, 0, 2],
         effects: &[
             Effect::Attack(Target::Player, Amount::ascended(9, 11), 1),
             Effect::ApplyPower(Target::Player, power_id::FRAIL, Amount::fixed(1, 1)),
@@ -1534,15 +1534,15 @@ const WIKI_FOSSIL_STALKER_MOVES: &[MoveDef] = &[
     MoveDef {
         intent: "Attack 12",
         weight: 1,
-        max_repeats: 1,
-        next: &[],
+        max_repeats: 2,
+        next: &[1, 0, 2],
         effects: &[Effect::Attack(Target::Player, Amount::ascended(12, 14), 1)],
     },
     MoveDef {
         intent: "Attack 3x2",
         weight: 1,
-        max_repeats: 1,
-        next: &[],
+        max_repeats: 2,
+        next: &[1, 0, 2],
         effects: &[Effect::Attack(Target::Player, Amount::ascended(3, 4), 2)],
     },
 ];
@@ -1732,8 +1732,8 @@ const WIKI_HUNTER_KILLER_MOVES: &[MoveDef] = &[
     },
     MoveDef {
         intent: "Attack 8x3",
-        weight: 2,
-        max_repeats: u8::MAX,
+        weight: 1,
+        max_repeats: 2,
         next: &[1, 2],
         effects: &[Effect::Attack(Target::Player, Amount::ascended(7, 8), 3)],
     },
@@ -1780,7 +1780,7 @@ const WIKI_INKLET_MOVES: &[MoveDef] = &[
         intent: "Attack 3",
         weight: 1,
         max_repeats: 1,
-        next: &[1, 2],
+        next: &[2, 1],
         effects: &[Effect::Attack(Target::Player, Amount::ascended(3, 4), 1)],
     },
     MoveDef {
@@ -2466,8 +2466,8 @@ const WIKI_SCROLL_OF_BITING_MOVES: &[MoveDef] = &[
     },
     MoveDef {
         intent: "Attack 5x2",
-        weight: 2,
-        max_repeats: u8::MAX,
+        weight: 1,
+        max_repeats: 2,
         next: &[0, 1],
         effects: &[Effect::Attack(Target::Player, Amount::ascended(5, 6), 2)],
     },
@@ -2821,8 +2821,8 @@ const WIKI_SPECTRAL_KNIGHT_MOVES: &[MoveDef] = &[
     },
     MoveDef {
         intent: "Attack 15",
-        weight: 2,
-        max_repeats: u8::MAX,
+        weight: 1,
+        max_repeats: 2,
         next: &[1, 2],
         effects: &[Effect::Attack(Target::Player, Amount::ascended(15, 17), 1)],
     },
@@ -4024,10 +4024,7 @@ const WIKI_EVENT_17_OPTIONS: &[EventOption] = &[
     },
     EventOption {
         requirement: Requirement::Always,
-        effects: &[
-            RunEffect::LoseHp(15),
-            RunEffect::AddRelic("RELIC.FRAGRANT_MUSHROOM"),
-        ],
+        effects: &[RunEffect::AddRelic("RELIC.FRAGRANT_MUSHROOM")],
     },
 ];
 const WIKI_EVENT_18_OPTIONS: &[EventOption] = &[
@@ -4629,7 +4626,7 @@ const WIKI_ENCOUNTER_2: &[Id] = &[122];
 const WIKI_ENCOUNTER_3: &[Id] = &[63];
 const WIKI_ENCOUNTER_4: &[Id] = &[95];
 const WIKI_ENCOUNTER_5: &[Id] = &[119];
-const WIKI_ENCOUNTER_6: &[Id] = &[112];
+const WIKI_ENCOUNTER_6: &[Id] = &[112, 112, 112, 112];
 const WIKI_ENCOUNTER_7: &[Id] = &[38];
 const WIKI_ENCOUNTER_10: &[Id] = &[23];
 const WIKI_ENCOUNTER_11: &[Id] = &[29];
@@ -4827,13 +4824,13 @@ pub(crate) const UNCOMMON_RELICS: &[Id] = &[
     177, 179, 180, 181, 182, 184, 185, 188, 206, 207, 210, 221, 232, 235, 249, 250, 259, 260, 264,
 ];
 pub(crate) const RARE_RELICS: &[Id] = &[
-    24, 26, 28, 30, 42, 55, 61, 67, 80, 89, 93, 94, 96, 106, 109, 112, 114, 120, 130, 136, 137,
-    142, 145, 146, 149, 151, 161, 162, 178, 189, 193, 194, 202, 203, 213, 223, 224, 234, 240, 247,
-    254, 255, 258, 261, 263, 268, 274, 275, 279,
+    24, 26, 28, 30, 42, 52, 55, 56, 61, 67, 80, 89, 93, 94, 96, 106, 109, 112, 114, 120, 130, 136,
+    137, 142, 145, 146, 149, 151, 161, 162, 178, 189, 193, 194, 202, 203, 213, 223, 224, 234, 240,
+    247, 254, 255, 258, 261, 263, 268, 274, 275,
 ];
 pub(crate) const SHOP_RELICS: &[Id] = &[
-    10, 29, 45, 47, 48, 53, 57, 69, 73, 95, 99, 119, 124, 144, 148, 154, 157, 165, 200, 209, 212,
-    217, 227, 245, 252, 262, 269, 276,
+    10, 29, 45, 47, 48, 53, 57, 69, 72, 73, 95, 99, 119, 124, 128, 144, 148, 154, 157, 165, 200,
+    209, 212, 217, 227, 245, 252, 262, 269, 276,
 ];
 const FOUNDATION_POTIONS: &[Id] = &[
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
@@ -4922,7 +4919,7 @@ const COLORLESS_CARDS: &[&str] = &[
 const STARTER_RELICS: &[Id] = &[0];
 const DEFECT_RELICS: &[Id] = &[6];
 const IRONCLAD_RELIC_POOL: &[Id] = &[47, 56, 67, 179, 204, 213, 221];
-const DEFECT_RELIC_POOL: &[Id] = &[8, 80, 9, 145, 193, 10, 11];
+const DEFECT_RELIC_POOL: &[Id] = &[8, 80, 9, 193, 145, 10, 11];
 const SILENT_RELIC_POOL: &[Id] = &[106, 157, 178, 230, 249, 254, 260];
 const REGENT_RELIC_POOL: &[Id] = &[83, 92, 136, 146, 162, 206, 269];
 const NECROBINDER_RELIC_POOL: &[Id] = &[30, 38, 41, 42, 90, 114, 262];
@@ -13720,7 +13717,7 @@ pub fn foundation_content() -> Content {
                 hooks: EMPTY_HOOKS,
             },
             RelicDef {
-                id: "RELIC.CHARON_S_ASHES",
+                id: "RELIC.CHARONS_ASHES",
                 hooks: CHARONS_ASHES_HOOKS,
             },
             RelicDef {
@@ -14616,10 +14613,6 @@ pub fn foundation_content() -> Content {
             RelicDef {
                 id: "RELIC.CHOSEN_CHEESE",
                 hooks: EMPTY_HOOKS,
-            },
-            RelicDef {
-                id: "RELIC.CHARONS_ASHES",
-                hooks: CHARONS_ASHES_HOOKS,
             },
             RelicDef {
                 id: "RELIC.NEOWS_BONES",

@@ -190,14 +190,12 @@ impl Game {
             bosses: [None; 2],
             bosses_visited: 0,
             encounters: vec![],
+            encounters_visited: 0,
             elites: vec![],
-            weak_encounters_left: 0,
-            regular_encounters_left: 0,
-            elite_encounters_left: 0,
-            last_encounter: None,
-            last_elite: None,
+            elites_visited: 0,
             ancient: None,
             events: vec![],
+            later_rooms: vec![],
             visited_events: vec![],
             enemy_starts: vec![],
             seed: seed as u32,
@@ -249,6 +247,8 @@ impl Game {
             conveyor: false,
             crystal: None,
             reward_gold_parts: vec![],
+            transformed: vec![],
+            past_floors: 0,
             fake_merchant: vec![],
             fake_shop: false,
             courier_restock: None,
@@ -324,6 +324,8 @@ impl Game {
     fn populate_relics(&mut self, content: &Content, character: &[Id]) {
         let shared = content.acts[0].relics;
         self.shared_relic_deques = relic_deques(shared.iter().copied(), &mut self.rngs.up_front);
+        // The shared bag also shuffles a deque of the pool's two Ancient relics.
+        self.rngs.up_front.forward(1);
         self.relic_deques = relic_deques(
             shared.iter().copied().chain(character.iter().copied()),
             &mut self.rngs.up_front,
@@ -342,9 +344,6 @@ impl Game {
             content.acts[act as usize].id,
             "ACT.THE_OVERGROWTH" | "ACT.THE_UNDERDOCKS" | "ACT.THE_HIVE" | "ACT.THE_GLORY"
         );
-        if new_run {
-            self.run.hp = 0;
-        }
         if !standard {
             let missing = self.run.max_hp - self.run.hp;
             self.run.hp += if self.run.ascension >= 2 {
@@ -353,6 +352,7 @@ impl Game {
                 missing
             };
         }
+        self.past_floors += self.run.floor as u16;
         self.act = act;
         self.run.act = match content.acts[act as usize].id {
             "ACT.THE_HIVE" => 2,
@@ -360,62 +360,20 @@ impl Game {
             _ => 1,
         };
         self.run.floor = u8::from(new_run && !standard);
-        if new_run {
-            self.rngs.up_front.forward(2);
-        }
-        let def = &content.acts[act as usize];
-        self.events = def.events.to_vec();
-        self.rngs.up_front.shuffle(&mut self.events);
-        let weak: Vec<_> = def
-            .encounters
-            .iter()
-            .copied()
-            .filter(|&id| content.encounters[id as usize].id.contains("_WEAK"))
-            .collect();
-        let regular: Vec<_> = def
-            .encounters
-            .iter()
-            .copied()
-            .filter(|&id| !content.encounters[id as usize].id.contains("_WEAK"))
-            .collect();
-        let weak_count = if self.run.act == 3 { 2 } else { 3 };
-        let room_count = match self.run.act {
-            2 => 14,
-            3 => 13,
-            _ => 15,
+        let rooms = match self.later_rooms.first() {
+            Some(rooms) if rooms.act == act => self.later_rooms.remove(0),
+            _ => self.roll_rooms(content, act, &[]),
         };
-        self.weak_encounters_left = if weak.is_empty() { 0 } else { weak_count as u8 };
-        self.regular_encounters_left = if regular.is_empty() {
-            0
-        } else {
-            (room_count - weak_count) as u8
-        };
-        self.elite_encounters_left = if def.elites.is_empty() { 0 } else { 15 };
-        self.encounters = if self.weak_encounters_left > 0 {
-            weak
-        } else {
-            regular
-        };
-        self.elites = def.elites.to_vec();
-        self.last_encounter = None;
-        self.last_elite = None;
-        self.bosses[0] = self.pick(def.bosses);
-        self.rngs.up_front.forward(1);
-        self.bosses[1] = if self.run.ascension >= 10 && self.run.act == 3 {
-            let remaining: Vec<_> = def
-                .bosses
-                .iter()
-                .copied()
-                .filter(|boss| Some(*boss) != self.bosses[0])
-                .collect();
-            self.pick(&remaining)
-        } else {
-            None
-        };
+        self.events = rooms.events;
+        self.encounters = rooms.encounters;
+        self.encounters_visited = 0;
+        self.elites = rooms.elites;
+        self.elites_visited = 0;
+        self.bosses = rooms.bosses;
+        self.ancient = rooms.ancient;
         self.bosses_visited = 0;
         self.unknown_odds = [1000, -10_000, 200, 300];
         self.map = self.make_map(content);
-        self.ancient = self.next_ancient(content);
         self.spoils = (self.run.act == 2
             && self
                 .run
@@ -435,6 +393,12 @@ impl Game {
     }
 
     pub(crate) fn begin_run(&mut self, content: &Content) -> Result<(), Error> {
+        self.set_up_run(content)?;
+        self.enter_neow(content)
+    }
+
+    /// RunManager's setup: the acts, their rooms and the first act's map.
+    pub(crate) fn set_up_run(&mut self, content: &Content) -> Result<(), Error> {
         let find = |name| {
             content
                 .acts
@@ -444,65 +408,95 @@ impl Game {
                 .ok_or(Error::InvalidContent)
         };
         let acts = [find("ACT.THE_OVERGROWTH")?, find("ACT.THE_UNDERDOCKS")?];
-        let act = acts[self.rngs.up_front.below(acts.len() as u32) as usize];
+        // StartRunLobby rolls the acts from their own stream (ActModel.GetRandomList).
+        let mut selection = Rng::from_seed(self.seed.wrapping_add(hash("act_selection")) as u64);
+        let act = acts[selection.below(acts.len() as u32) as usize];
+        // RunManager.GenerateRooms: Darv joins a random subset of the later acts' ancients.
+        let mut shared: Vec<_> = content.event_id("EVENT.DARV").into_iter().collect();
+        let mut subsets = [vec![], vec![]];
+        for subset in &mut subsets {
+            let count = self.rngs.up_front.below(shared.len() as u32 + 1) as usize;
+            *subset = shared.drain(..count).collect();
+        }
+        let [hive, glory] = subsets;
+        self.later_rooms = vec![
+            self.roll_rooms(content, act, &[]),
+            self.roll_rooms(content, find("ACT.THE_HIVE")?, &hive),
+            self.roll_rooms(content, find("ACT.THE_GLORY")?, &glory),
+        ];
         self.begin_act(content, act)?;
-        let ancient = self
-            .map
-            .nodes
-            .iter()
+        Ok(())
+    }
+
+    /// The run opens in the first act's ancient room.
+    pub(crate) fn enter_neow(&mut self, content: &Content) -> Result<(), Error> {
+        let ancient = (self.map.nodes.iter())
             .position(|node| node.floor == 0)
             .ok_or(Error::InvalidContent)?;
         self.enter_room(content, ancient);
         Ok(())
     }
 
-    fn next_ancient(&mut self, content: &Content) -> Option<Id> {
-        let darv = content
-            .events
-            .iter()
-            .position(|event| event.id == "EVENT.DARV")? as Id;
-        let choices: &[(&str, u32)] = match self.run.act {
-            1 => &[("EVENT.NEOW", 1)],
-            2 => &[
-                ("EVENT.OROBAS", 7),
-                ("EVENT.PAEL", 7),
-                ("EVENT.TEZCATARA", 7),
-                ("EVENT.DARV", 3),
-            ],
-            3 if self.visited_events.contains(&darv) => &[
-                ("EVENT.NONUPEIPE", 1),
-                ("EVENT.TANX", 1),
-                ("EVENT.VAKUU", 1),
-            ],
-            3 => &[
-                ("EVENT.NONUPEIPE", 13),
-                ("EVENT.TANX", 13),
-                ("EVENT.VAKUU", 13),
-                ("EVENT.DARV", 3),
-            ],
-            _ => return None,
+    /// ActModel.GenerateRooms with every epoch revealed.
+    pub(crate) fn roll_rooms(
+        &mut self,
+        content: &Content,
+        act: Id,
+        shared_ancients: &[Id],
+    ) -> Rooms {
+        let def = &content.acts[act as usize];
+        let mut events = def.events.to_vec();
+        self.rngs.up_front.shuffle(&mut events);
+        let (weak_count, room_count, ancients): (_, _, &[&str]) = match def.id {
+            "ACT.THE_HIVE" => (2, 14, &["EVENT.OROBAS", "EVENT.PAEL", "EVENT.TEZCATARA"]),
+            "ACT.THE_GLORY" => (2, 13, &["EVENT.NONUPEIPE", "EVENT.TANX", "EVENT.VAKUU"]),
+            _ => (3, 15, &["EVENT.NEOW"]),
         };
-        let mut roll = self
-            .rngs
-            .up_front
-            .below(choices.iter().map(|choice| choice.1).sum());
-        choices.iter().find_map(|&(name, weight)| {
-            if roll < weight {
-                content
-                    .events
-                    .iter()
-                    .position(|event| event.id == name)
-                    .map(|id| id as Id)
-            } else {
-                roll -= weight;
-                None
-            }
-        })
+        let (weak, regular): (Vec<_>, Vec<_>) = def
+            .encounters
+            .iter()
+            .partition(|&&id| content.encounters[id as usize].id.contains("_WEAK"));
+        let mut encounters = vec![];
+        self.grab_encounters(content, &weak, vec![], weak_count, &mut encounters);
+        self.grab_encounters(
+            content,
+            &regular,
+            vec![],
+            room_count - weak_count,
+            &mut encounters,
+        );
+        let mut elites = vec![];
+        self.grab_encounters(content, def.elites, vec![], 15, &mut elites);
+        let boss = self.pick(def.bosses);
+        let ancients: Vec<_> = ancients
+            .iter()
+            .filter_map(|&name| content.event_id(name))
+            .chain(shared_ancients.iter().copied())
+            .collect();
+        let ancient = self.pick(&ancients);
+        // RunManager.GenerateRooms adds the last act's second boss right after its rooms.
+        let others: Vec<_> = def
+            .bosses
+            .iter()
+            .copied()
+            .filter(|&id| Some(id) != boss)
+            .collect();
+        let second_boss = (self.run.ascension >= 10 && def.id == "ACT.THE_GLORY")
+            .then(|| self.pick(&others))
+            .flatten();
+        Rooms {
+            act,
+            events,
+            encounters,
+            elites,
+            bosses: [boss, second_boss],
+            ancient,
+        }
     }
 
     /// The game's TotalFloor: acts 1 and 2 are 17 and 16 floors long.
-    fn total_floor(&self) -> u16 {
-        [0, 17, 33][self.run.act.clamp(1, 3) as usize - 1] + self.run.floor as u16
+    pub(crate) fn total_floor(&self) -> u16 {
+        self.past_floors + self.run.floor as u16
     }
 
     pub fn start_combat(&mut self, content: &Content, encounter: Id) -> Result<(), Error> {
@@ -651,6 +645,8 @@ impl Game {
                         }
                         "MONSTER.KIN_FOLLOWER" if index == 0 && enemy_ids.len() == 3 => 2,
                         "MONSTER.CHOMPER" if index == 1 && enemy_ids.len() == 2 => 1,
+                        // Dense Vegetation's wrigglers skip the spawn stun: wriggler1/3 bite.
+                        "MONSTER.WRIGGLER" => 1 + index % 2,
                         "MONSTER.NIBBIT" if enemy_ids.len() == 2 => {
                             if index == 0 {
                                 1
@@ -672,16 +668,17 @@ impl Game {
                 last_move: usize::MAX,
                 repeats: 0,
                 move_history: vec![],
-                stunned: false,
+                stunned: 0,
                 value: 0,
-                // The pack takes the last three of the encounter's five slots.
-                slot: if entry == "TWO_TAILED_RATS_NORMAL" {
-                    index as u8 + 3
-                } else if entry == "FABRICATOR_NORMAL" {
-                    // The Fabricator sits between the bots' slots (bot1, bot2, fabricator, bot3, bot4).
-                    3
-                } else {
-                    0
+                // The 1-based slot in the encounter's Slots, which order the enemies; only
+                // summoners' encounters leave slots free (before or around their monsters).
+                slot: match entry {
+                    "PHROG_PARASITE_ELITE" => 1,
+                    "FOGMOG_NORMAL" | "THE_OBSCURA_NORMAL" => 2,
+                    "TWO_TAILED_RATS_NORMAL" => index as u8 + 3,
+                    "FABRICATOR_NORMAL" => 3,
+                    "LIVING_FOG_NORMAL" | "OVICOPTER_NORMAL" => 6,
+                    _ => 0,
                 },
             });
         }
@@ -820,6 +817,10 @@ impl Game {
             belt_buckle: false,
             burning_sticks: false,
             red_skull: false,
+            rat_calls: 0,
+            stolen: vec![],
+            returned: vec![],
+            escaped: vec![],
             throwing_axe: false,
             vambrace: false,
             block_doubler: None,
@@ -1185,7 +1186,8 @@ impl Game {
             for (id, node) in nodes.iter().enumerate() {
                 if reachable[id] && ending[id] && (node.children.len() > 1 || node.row == 0) {
                     let begin = segments.len();
-                    walk(nodes, &ending, &mut vec![id], 0, &mut segments, &mut arena);
+                    // A leading 1 keeps segments of different lengths apart (Unknown packs to 0).
+                    walk(nodes, &ending, &mut vec![id], 1, &mut segments, &mut arena);
                     segments[begin..].sort_unstable();
                 }
             }
@@ -1310,6 +1312,7 @@ impl Game {
                     if removed != 0 {
                         changed = true;
                     } else {
+                        // The first segment with breakable edges loses all of them.
                         for segment in &group {
                             for pair in segment.windows(2) {
                                 if nodes[pair[0]].children.len() >= 2
@@ -1317,8 +1320,10 @@ impl Game {
                                 {
                                     remove_edge(nodes, pair[0], pair[1]);
                                     changed = true;
-                                    break 'groups;
                                 }
+                            }
+                            if changed {
+                                break 'groups;
                             }
                         }
                     }
@@ -1333,9 +1338,9 @@ impl Game {
         }
 
         let length = match self.run.act {
-            1 => 14,
+            1 => 16,
             2 => 15,
-            _ => 16,
+            _ => 14,
         };
         let spoils = self.run.act == 2
             && self
@@ -1351,16 +1356,16 @@ impl Game {
         let mut rng = Rng::from_seed(self.seed.wrapping_add(hash(&rng_name)) as u64);
         let (rests, unknowns) = match self.run.act {
             1 => (
-                5 + rng.below(2) as usize,
-                rng.gaussian(12.0, 1.0, 10, 14) as usize - 1,
+                rng.gaussian(7.0, 1.0, 6, 7) as usize,
+                rng.gaussian(12.0, 1.0, 10, 14) as usize,
             ),
             2 => (
                 rng.gaussian(6.0, 1.0, 6, 7) as usize,
                 rng.gaussian(12.0, 1.0, 10, 14) as usize - 1,
             ),
             _ => (
-                rng.gaussian(7.0, 1.0, 6, 7) as usize,
-                rng.gaussian(12.0, 1.0, 10, 14) as usize,
+                5 + rng.below(2) as usize,
+                rng.gaussian(12.0, 1.0, 10, 14) as usize - 1,
             ),
         };
         let mut nodes = Vec::new();
@@ -1443,17 +1448,7 @@ impl Game {
                                     .iter()
                                     .any(|&child| nodes[child].col as i8 - target as i8 == -delta)
                             });
-                        let existing = grid[row][target];
-                        (target >= min
-                            && target <= max
-                            && !crossover
-                            && existing.is_none_or(|id| {
-                                (nodes[id].parents.contains(&current)
-                                    || nodes[id].parents.len() < 3)
-                                    && (nodes[current].children.len() < 3
-                                        || nodes[current].children.contains(&id))
-                            }))
-                        .then_some(target)
+                        (target >= min && target <= max && !crossover).then_some(target)
                     })
                     .unwrap_or_else(|| col.clamp(min, max));
                 let child = point(&mut nodes, &mut grid, next, row);
@@ -1493,7 +1488,7 @@ impl Game {
         for id in grid[length - 1].into_iter().flatten() {
             add(&mut nodes, id, boss);
         }
-        for &id in &starts {
+        for id in grid[1].into_iter().flatten() {
             add(&mut nodes, ancient, id);
         }
         for id in grid[length - 1].into_iter().flatten() {
@@ -2202,7 +2197,7 @@ impl Game {
                 let def = content.cards[card.id as usize];
                 def.rarity == CardRarity::Basic && card.flags(def) & ETERNAL == 0
             }),
-            "EVENT.ZEN_WEAVER" => self.run.gold >= 50,
+            "EVENT.ZEN_WEAVER" => self.run.gold >= 125,
             _ => true,
         }
     }
@@ -2243,13 +2238,13 @@ impl Game {
                 self.add_card(content, card);
             }
             Action::RewardRelic(index) => {
-                let (relic, exhausted, remaining) = if let Phase::Rewards(rewards) = &mut self.phase
-                {
-                    let id = rewards.relics.remove(index);
-                    (Some(id), rewards.relics.is_empty(), rewards.clone())
-                } else {
-                    unreachable!()
-                };
+                let (relic, exhausted, mut remaining) =
+                    if let Phase::Rewards(rewards) = &mut self.phase {
+                        let id = rewards.relics.remove(index);
+                        (Some(id), rewards.relics.is_empty(), rewards.clone())
+                    } else {
+                        unreachable!()
+                    };
                 if let Some(id) = relic {
                     let wax = self
                         .toy_box_offers
@@ -2259,6 +2254,13 @@ impl Game {
                         .is_some();
                     self.phase = Phase::Map;
                     self.obtain_relic(content, id);
+                    // CardReward.OnRelicObtained: rolled card rewards take the new relic's changes.
+                    let mut prefetched = std::mem::take(&mut self.prefetched_card_rewards);
+                    let rolled = std::iter::once(&mut remaining.cards).chain(&mut prefetched);
+                    for cards in rolled.filter(|cards| !cards.is_empty()) {
+                        self.modify_reward_cards_with(content, cards, id, true);
+                    }
+                    self.prefetched_card_rewards = prefetched;
                     if wax {
                         self.wax_relics.push(self.run.relics.len() - 1);
                     }
@@ -2354,7 +2356,7 @@ impl Game {
                 self.paels_wing = self.paels_wing.saturating_add(1);
                 if self.paels_wing.is_multiple_of(2) {
                     let rarity = self.roll_relic_rarity();
-                    if let Some(relic) = self.pull_relic(false, rarity, false, false) {
+                    if let Some(relic) = self.pull_relic(content, false, rarity, false, false) {
                         self.obtain_relic(content, relic);
                     }
                 }
@@ -2397,7 +2399,7 @@ impl Game {
                 let destination = self.rest_destination(content, 64);
                 self.resume = Some(destination);
                 let rarity = self.roll_relic_rarity();
-                if let Some(relic) = self.pull_relic(false, rarity, false, false) {
+                if let Some(relic) = self.pull_relic(content, false, rarity, false, false) {
                     self.obtain_relic(content, relic);
                 }
                 if matches!(self.phase, Phase::Rest) {
@@ -2474,7 +2476,9 @@ impl Game {
                                 let mut relics = Vec::new();
                                 for _ in 0..2 {
                                     let rarity = self.roll_relic_rarity();
-                                    relics.extend(self.pull_relic(false, rarity, false, false));
+                                    relics.extend(
+                                        self.pull_relic(content, false, rarity, false, false),
+                                    );
                                 }
                                 self.resume = (!second && another).then(|| {
                                     self.event_data[3] = 2;
@@ -2515,7 +2519,7 @@ impl Game {
                             }
                             let rarity = self.roll_relic_rarity();
                             let relics = self
-                                .pull_relic(false, rarity, false, false)
+                                .pull_relic(content, false, rarity, false, false)
                                 .into_iter()
                                 .collect();
                             self.phase = Phase::Rewards(Rewards {
@@ -2555,7 +2559,7 @@ impl Game {
                             return;
                         }
                         "EVENT.DENSE_VEGETATION" if self.event_data[3] == 0 && index == 0 => {
-                            self.run.hp = (self.run.hp - 8).max(0);
+                            self.take_damage(content, 8);
                             self.gain_gold(content, self.event_data[0] as i32);
                             self.phase = Phase::Map;
                             return;
@@ -2784,6 +2788,11 @@ impl Game {
                 && self.map.nodes[node].floor == self.map.nodes[current].floor + 1
         });
         if self.map.nodes[node].floor == 0 {
+            // The ancient heals (BeforeEventStarted); Neow first empties the HP the starting
+            // relics left.
+            if self.run.act == 1 {
+                self.run.hp = 0;
+            }
             let missing = self.run.max_hp - self.run.hp;
             self.run.hp += if self.run.ascension >= 2 {
                 missing * 4 / 5
@@ -2796,7 +2805,6 @@ impl Game {
             self.winged_boots += 1;
         }
         self.run.floor = self.map.nodes[node].floor + 1;
-        self.purge_disallowed_relics(content);
         self.room = self.map.nodes[node].room;
         let unknown = self.room == Room::Unknown;
         for _ in self.maw_bank as usize..self.relic_count(content, "RELIC.MAW_BANK") as usize {
@@ -2878,13 +2886,8 @@ impl Game {
         let act = &content.acts[self.act as usize];
         match self.room {
             Room::Combat => {
-                let id = if !self.replaying {
-                    self.next_encounter(content, false)
-                } else if self.encounters.is_empty() {
-                    self.pick(act.encounters)
-                } else {
-                    Some(self.encounters.remove(0))
-                };
+                let id = next_room(&self.encounters, &mut self.encounters_visited)
+                    .or_else(|| self.pick(act.encounters));
                 if let Some(id) = id {
                     self.start_combat(content, id).unwrap();
                 } else {
@@ -2892,13 +2895,8 @@ impl Game {
                 }
             }
             Room::Elite => {
-                let id = if !self.replaying {
-                    self.next_encounter(content, true)
-                } else if self.elites.is_empty() {
-                    self.pick(act.elites)
-                } else {
-                    Some(self.elites.remove(0))
-                };
+                let id = next_room(&self.elites, &mut self.elites_visited)
+                    .or_else(|| self.pick(act.elites));
                 if let Some(id) = id {
                     self.start_combat(content, id).unwrap();
                 } else {
@@ -2924,6 +2922,10 @@ impl Game {
                         .iter()
                         .any(|card| content.cards[card.id as usize].id == "CARD.LANTERN_KEY");
                 let event = if self.map.nodes[node].floor == 0 {
+                    // Entering the ancient's room counts as an event visited (RoomSet.MarkVisited).
+                    if !self.events.is_empty() {
+                        self.events.rotate_left(1);
+                    }
                     self.ancient
                 } else if lantern {
                     content
@@ -3065,7 +3067,9 @@ impl Game {
                                 relics.into_iter().map(|index| index as u32).collect();
                             for _ in 0..3 {
                                 let rarity = self.roll_relic_rarity();
-                                if let Some(relic) = self.pull_relic(false, rarity, false, false) {
+                                if let Some(relic) =
+                                    self.pull_relic(content, false, rarity, false, false)
+                                {
                                     self.relic_queue.push(relic);
                                 }
                             }
@@ -3089,7 +3093,10 @@ impl Game {
                         _ => {}
                     }
                 }
-                self.event_relic = None;
+                // Wongo's pulls its featured Rare as it opens (GenerateInitialOptions).
+                self.event_relic = event
+                    .filter(|id| content.events[*id as usize].id == "EVENT.WELCOME_TO_WONGOS")
+                    .and_then(|_| self.pull_relic(content, false, 2, false, true));
                 if event.is_some_and(|id| content.events[id as usize].id == "EVENT.SLIPPERY_BRIDGE")
                 {
                     self.pick_slippery_card(content, None);
@@ -3134,7 +3141,8 @@ impl Game {
                             .map(|relic| {
                                 ShopItem::Relic(
                                     *relic,
-                                    (50.0 * self.rngs.shops.float(0.85, 1.15)).round() as i32,
+                                    (50.0 * self.rngs.shops.float(0.85, 1.15)).round_ties_even()
+                                        as i32,
                                 )
                             })
                             .collect(),
@@ -3172,7 +3180,7 @@ impl Game {
                 );
                 let roll = self.rngs.treasure_room_relics.single();
                 let relics = self
-                    .pull_relic(true, relic_rarity(roll), false, false)
+                    .pull_relic(content, true, relic_rarity(roll), false, false)
                     .into_iter()
                     .collect();
                 self.phase = Phase::Rewards(Rewards {
@@ -3536,6 +3544,19 @@ impl Game {
         }
         let mut rewards = self.encounter_rewards(content);
         self.modify_combat_rewards(content, &mut rewards, hunts);
+        // Stolen cards come back as SpecialCardRewards, listed before the card reward.
+        let returned = self
+            .combat()
+            .map_or(vec![], |combat| combat.returned.clone());
+        for card in returned.into_iter().rev() {
+            let offer = std::mem::replace(&mut rewards.cards, vec![card]);
+            if !offer.is_empty() {
+                rewards
+                    .card_rewards
+                    .insert(0, CardReward::Standard(self.room));
+                self.prefetched_card_rewards.insert(0, offer);
+            }
+        }
         rewards
     }
 
@@ -3560,7 +3581,35 @@ impl Game {
             min = min * 3 / 4;
             max = max * 3 / 4;
         }
-        let gold = min + self.rngs.rewards.below((max - min + 1) as u32) as i32;
+        // CalculateGoldProportion: fled enemies take their share, and no gold is left without one.
+        let proportion = self.combat().map_or(1.0, |combat| {
+            let enemy = |id: &Id| content.enemies[*id as usize].id;
+            if combat
+                .escaped
+                .iter()
+                .any(|id| enemy(id) == "MONSTER.FAT_GREMLIN")
+            {
+                // GremlinMercNormal: the fat gremlin takes half, or all once it stole gold.
+                let heist = combat
+                    .enemies
+                    .iter()
+                    .any(|e| e.creature.power(power_id::HEIST) > 0);
+                if heist { 0.0 } else { 0.5 }
+            } else {
+                let kinds: std::collections::BTreeSet<_> =
+                    combat.enemies.iter().map(|e| e.creature.id).collect();
+                1.0 - combat.escaped.len() as f32 / kinds.len() as f32
+            }
+        });
+        let (min, max) = (
+            (min as f32 * proportion).round_ties_even() as i32,
+            (max as f32 * proportion).round_ties_even() as i32,
+        );
+        let gold = if proportion > 0.0 {
+            min + self.rngs.rewards.below((max - min + 1) as u32) as i32
+        } else {
+            0
+        };
         let potions = if potion {
             self.reward_potions(&potion_pool, 1)
         } else {
@@ -3575,20 +3624,36 @@ impl Game {
         );
         let relics = if self.room == Room::Elite {
             let rarity = self.roll_relic_rarity();
-            self.pull_relic(false, rarity, false, false)
+            self.pull_relic(content, false, rarity, false, false)
                 .into_iter()
                 .collect()
         } else {
             vec![]
         };
-        Rewards {
-            gold: gold + self.reward_gold_parts.iter().sum::<i32>(),
+        let mut rewards = Rewards {
+            gold,
             cards,
             card_rewards: vec![],
             relics,
             potions,
             removals: 0,
+        };
+        // ExtraRewards (gold stolen back, Royalties) follow, and Populate still rolls each
+        // (NextInt(amount, amount + 1)).
+        for extra in std::mem::take(&mut self.reward_gold_parts) {
+            self.rngs.rewards.below(1);
+            self.add_gold_reward(&mut rewards, extra);
         }
+        rewards
+    }
+
+    /// Another GoldReward on the screen: each is claimed on its own, in order.
+    fn add_gold_reward(&mut self, rewards: &mut Rewards, gold: i32) {
+        if self.reward_gold_parts.is_empty() && rewards.gold > 0 {
+            self.reward_gold_parts.push(rewards.gold);
+        }
+        self.reward_gold_parts.push(gold);
+        rewards.gold += gold;
     }
 
     fn resume_battle_dummy(&mut self, content: &Content, setting: u8) {
@@ -3614,7 +3679,7 @@ impl Game {
             }
             3 => {
                 let rarity = self.roll_relic_rarity();
-                if let Some(relic) = self.pull_relic(false, rarity, false, false) {
+                if let Some(relic) = self.pull_relic(content, false, rarity, false, false) {
                     self.obtain_relic(content, relic);
                 }
                 self.phase = Phase::Map;
@@ -3652,7 +3717,7 @@ impl Game {
                 let rarity = self.roll_relic_rarity();
                 rewards
                     .relics
-                    .extend(self.pull_relic(false, rarity, false, false));
+                    .extend(self.pull_relic(content, false, rarity, false, false));
                 let pool = self.potion_pool(content);
                 rewards.potions = self.reward_potions(&pool, 1);
             }
@@ -3696,21 +3761,21 @@ impl Game {
         pool: &[Id],
         count: usize,
         room: Room,
+        encounter: bool,
         upgrade: bool,
     ) -> Vec<Card> {
-        let (rare, uncommon, mut offset) = match room {
+        let (rare, uncommon, offset) = match room {
             Room::Elite => (if self.run.ascension >= 7 { 500 } else { 1000 }, 4000, true),
             Room::Boss => (10_000, 0, false),
             _ => (if self.run.ascension >= 7 { 149 } else { 300 }, 3700, true),
         };
-        offset &= upgrade;
         let mut chosen = Vec::new();
         for _ in 0..count {
             let roll = self.rngs.rewards.single();
             let rare_chance = rare + if offset { self.rarity_offset } else { 0 };
-            // Non-encounter rewards (Room::Treasure, e.g. Orrery) roll base odds without touching
-            // the rarity offset, and RollWithBaseOdds compares uncommon against its own odds alone.
-            let rarity = if room == Room::Treasure {
+            // Non-encounter rewards (CardCreationSource.Other, e.g. Orrery) roll base odds without
+            // touching the rarity offset; RollWithBaseOdds compares uncommon against its own odds.
+            let rarity = if !encounter {
                 if roll < rare as f32 / 10_000.0 {
                     CardRarity::Rare
                 } else if roll < uncommon as f32 / 10_000.0 {
@@ -3809,14 +3874,18 @@ impl Game {
                 };
                 self.reward_cards(content, pool, 3, room, true)
             }
+            // Glass Eye offers the player's class (ForNonCombatWithUniformOdds: pool modifiers, no
+            // upgrade roll), Colorful Philosophers the others (NoCardPoolModifications, rolled).
             CardReward::Fixed(character, rarity) => {
-                let mut cards = self.fixed_cards(
-                    content,
-                    content.characters[character as usize].cards,
-                    rarity,
-                    3,
-                );
-                self.modify_reward_cards(content, &mut cards);
+                let base = content.characters[character as usize].cards;
+                let glass_eye = character == self.run.character;
+                let pool = if glass_eye {
+                    self.card_reward_pool(content, base)
+                } else {
+                    base.to_vec()
+                };
+                let mut cards = self.fixed_cards(content, &pool, rarity, 3, !glass_eye);
+                self.modify_reward_cards(content, &mut cards, true);
                 cards
             }
             CardReward::Kaleidoscope => {
@@ -3833,21 +3902,23 @@ impl Game {
                 self.rngs.niche.shuffle(&mut characters);
                 let mut cards = Vec::new();
                 for character in characters.into_iter().take(3) {
-                    let mut card = self.card_rewards(
+                    // CardCreationSource.Other: base odds, leaving the rarity offset alone.
+                    cards.extend(self.card_rewards(
                         content,
                         content.characters[character as usize].cards,
                         1,
-                        Room::Combat,
+                        Room::Treasure,
+                        false,
                         true,
-                    );
-                    self.modify_reward_cards(content, &mut card);
-                    cards.extend(card);
+                    ));
                 }
+                // Its manually set CardReward runs the hooks once over all three.
+                self.modify_reward_cards(content, &mut cards, true);
                 cards
             }
             CardReward::Crystal(rarity) => {
                 let mut cards = self.crystal_cards(content, rarity);
-                self.modify_reward_cards(content, &mut cards);
+                self.modify_reward_cards(content, &mut cards, true);
                 cards
             }
         }
@@ -3861,6 +3932,37 @@ impl Game {
         room: Room,
         upgrade: bool,
     ) -> Vec<Card> {
+        let pool = self.card_reward_pool(content, base);
+        let encounter = room != Room::Treasure;
+        let mut cards = self.card_rewards(content, &pool, count, room, encounter, upgrade);
+        // Lasting Candy reads the unmodified options: the base pool, without Prismatic Gem's.
+        if encounter && self.lasting_candy > 0 && self.lasting_candy.is_multiple_of(2) {
+            let mut powers: Vec<_> = base
+                .iter()
+                .copied()
+                .filter(|id| {
+                    content.cards[*id as usize].card_type == CardType::Power
+                        && !cards.iter().any(|card| card.id == *id)
+                })
+                .collect();
+            if powers.is_empty() {
+                powers = base
+                    .iter()
+                    .copied()
+                    .filter(|id| content.cards[*id as usize].card_type == CardType::Power)
+                    .collect();
+            }
+            if !powers.is_empty() {
+                cards.extend(self.card_rewards(content, &powers, 1, room, false, upgrade));
+            }
+        }
+        self.modify_reward_cards(content, &mut cards, true);
+        cards
+    }
+
+    /// A CardReward's pool (ModifyCardRewardCreationOptions acts on IsCardReward options only):
+    /// Prismatic Gem offers every class, Dingy Rug adds the colorless cards.
+    fn card_reward_pool(&self, content: &Content, base: &[Id]) -> Vec<Id> {
         let mut pool = base.to_vec();
         if self.has_relic(content, "RELIC.PRISMATIC_GEM") {
             pool = content
@@ -3881,69 +3983,57 @@ impl Game {
                 true
             }
         });
-        let mut cards = self.card_rewards(content, &pool, count, room, upgrade);
-        if room != Room::Treasure && self.lasting_candy > 0 && self.lasting_candy.is_multiple_of(2)
-        {
-            let mut powers: Vec<_> = pool
-                .iter()
-                .copied()
-                .filter(|id| {
-                    content.cards[*id as usize].card_type == CardType::Power
-                        && !cards.iter().any(|card| card.id == *id)
-                })
-                .collect();
-            if powers.is_empty() {
-                powers = pool
-                    .iter()
-                    .copied()
-                    .filter(|id| content.cards[*id as usize].card_type == CardType::Power)
-                    .collect();
-            }
-            if !powers.is_empty() {
-                cards.extend(self.card_rewards(content, &powers, 1, room, upgrade));
-            }
-        }
-        self.modify_reward_cards(content, &mut cards);
-        cards
+        pool
     }
 
-    fn modify_reward_cards(&mut self, content: &Content, cards: &mut [Card]) {
+    /// Hook.TryModifyCardRewardOptions on rolled cards; `reward` when they belong to a CardReward
+    /// (IsCardReward), which Silver Crucible and Silken Tress require.
+    fn modify_reward_cards(&mut self, content: &Content, cards: &mut [Card], reward: bool) {
         for (index, relic) in self.run.relics.clone().into_iter().enumerate() {
-            if self.melted_relics.contains(&index) {
-                continue;
+            if !self.melted_relics.contains(&index) {
+                self.modify_reward_cards_with(content, cards, relic, reward);
             }
-            match content.relics[relic as usize].id {
-                "RELIC.MOLTEN_EGG" => upgrade_type(content, cards, CardType::Attack),
-                "RELIC.TOXIC_EGG" => upgrade_type(content, cards, CardType::Skill),
-                "RELIC.FROZEN_EGG" => upgrade_type(content, cards, CardType::Power),
-                "RELIC.SILVER_CRUCIBLE" if self.silver_crucible < 3 => {
-                    upgrade_all(content, cards);
-                    self.silver_crucible += 1;
-                }
-                "RELIC.LAVA_LAMP" if !self.damage_taken && self.room == Room::Combat => {
-                    upgrade_all(content, cards)
-                }
-                "RELIC.FRESNEL_LENS" => enchant_all(content, cards, Enchantment::Nimble, 2),
-                "RELIC.GLITTER" => enchant_all(content, cards, Enchantment::Glam, 1),
-                "RELIC.SILKEN_TRESS" if !self.silken_tress => {
-                    enchant_all(content, cards, Enchantment::Glam, 1);
-                    self.silken_tress = true;
-                }
-                "RELIC.WING_CHARM" => {
-                    let valid: Vec<_> = cards
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, card)| can_enchant(content, card, Enchantment::Swift, None))
-                        .map(|(index, _)| index)
-                        .collect();
-                    if !valid.is_empty() {
-                        let index = valid[self.rngs.niche.below(valid.len() as u32) as usize];
-                        cards[index].enchantment = Some(Enchantment::Swift);
-                        cards[index].enchantment_amount = 1;
-                    }
-                }
-                _ => {}
+        }
+    }
+
+    fn modify_reward_cards_with(
+        &mut self,
+        content: &Content,
+        cards: &mut [Card],
+        relic: Id,
+        reward: bool,
+    ) {
+        match content.relics[relic as usize].id {
+            "RELIC.MOLTEN_EGG" => upgrade_type(content, cards, CardType::Attack),
+            "RELIC.TOXIC_EGG" => upgrade_type(content, cards, CardType::Skill),
+            "RELIC.FROZEN_EGG" => upgrade_type(content, cards, CardType::Power),
+            "RELIC.SILVER_CRUCIBLE" if reward && self.silver_crucible < 3 => {
+                upgrade_all(content, cards);
+                self.silver_crucible += 1;
             }
+            "RELIC.LAVA_LAMP" if !self.damage_taken && self.room == Room::Combat => {
+                upgrade_all(content, cards)
+            }
+            "RELIC.FRESNEL_LENS" => enchant_all(content, cards, Enchantment::Nimble, 2),
+            "RELIC.GLITTER" => enchant_all(content, cards, Enchantment::Glam, 1),
+            "RELIC.SILKEN_TRESS" if reward && !self.silken_tress => {
+                enchant_all(content, cards, Enchantment::Glam, 1);
+                self.silken_tress = true;
+            }
+            "RELIC.WING_CHARM" => {
+                let valid: Vec<_> = cards
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, card)| can_enchant(content, card, Enchantment::Swift, None))
+                    .map(|(index, _)| index)
+                    .collect();
+                if !valid.is_empty() {
+                    let index = valid[self.rngs.niche.below(valid.len() as u32) as usize];
+                    cards[index].enchantment = Some(Enchantment::Swift);
+                    cards[index].enchantment_amount = 1;
+                }
+            }
+            _ => {}
         }
     }
 
@@ -3953,6 +4043,7 @@ impl Game {
         pool: &[Id],
         rarity: CardRarity,
         count: usize,
+        upgrade: bool,
     ) -> Vec<Card> {
         let mut options: Vec<_> = pool
             .iter()
@@ -3962,8 +4053,10 @@ impl Game {
         let mut cards = Vec::new();
         for _ in 0..count.min(options.len()) {
             let id = options.remove(self.rngs.rewards.below(options.len() as u32) as usize);
-            let upgrade = self.rngs.rewards.single()
-                <= (self.run.act - 1) as f32 * if self.run.ascension >= 7 { 0.125 } else { 0.25 };
+            let upgrade = upgrade
+                && self.rngs.rewards.single()
+                    <= (self.run.act - 1) as f32
+                        * if self.run.ascension >= 7 { 0.125 } else { 0.25 };
             cards.push(Card {
                 id,
                 upgrades: (upgrade && rarity != CardRarity::Rare) as u8,
@@ -3971,6 +4064,22 @@ impl Game {
             });
         }
         cards
+    }
+
+    /// A screen of card rewards, all rolled as it opens (RewardsSet.Populate); the first is shown.
+    fn card_reward_screen(&mut self, content: &Content, rewards: &[CardReward]) -> Rewards {
+        let cards = self.make_card_reward(content, rewards[0]);
+        self.prefetched_card_rewards = (rewards[1..].iter())
+            .map(|&reward| self.make_card_reward(content, reward))
+            .collect();
+        Rewards {
+            gold: 0,
+            cards,
+            card_rewards: rewards[1..].to_vec(),
+            relics: vec![],
+            potions: vec![],
+            removals: 0,
+        }
     }
 
     /// `hunts` extra card rewards (The Hunt's fatal kills) come before the relic hooks.
@@ -3988,7 +4097,7 @@ impl Game {
             }
             match content.relics[relic as usize].id {
                 "RELIC.AMETHYST_AUBERGINE" if !(self.room == Room::Boss && self.run.act == 3) => {
-                    rewards.gold += 15
+                    self.add_gold_reward(rewards, 15)
                 }
                 // Event fights are Monster rooms too (the Battleworn Dummy gives no rewards).
                 "RELIC.PRAYER_WHEEL" if self.room == Room::Combat => {
@@ -4007,14 +4116,14 @@ impl Game {
                     let rarity = self.roll_relic_rarity();
                     rewards
                         .relics
-                        .extend(self.pull_relic(false, rarity, false, false));
+                        .extend(self.pull_relic(content, false, rarity, false, false));
                 }
                 "RELIC.LAVA_ROCK" if self.room == Room::Boss && self.run.act == 1 => {
                     for _ in 0..2 {
                         let rarity = self.roll_relic_rarity();
                         rewards
                             .relics
-                            .extend(self.pull_relic(false, rarity, false, false));
+                            .extend(self.pull_relic(content, false, rarity, false, false));
                     }
                 }
                 "RELIC.WONGOS_MYSTERY_TICKET"
@@ -4025,7 +4134,7 @@ impl Game {
                         let rarity = self.roll_relic_rarity();
                         rewards
                             .relics
-                            .extend(self.pull_relic(false, rarity, false, false));
+                            .extend(self.pull_relic(content, false, rarity, false, false));
                     }
                 }
                 _ => {}
@@ -4073,24 +4182,24 @@ impl Game {
             });
             let Some(id) = id else { continue };
             chosen.push(id);
-            let upgrade = self.rngs.rewards.single()
-                <= (self.run.act - 1) as f32 * if self.run.ascension >= 7 { 0.125 } else { 0.25 };
+            // RollForUpgrade at odds of -999999999: merchant cards draw but never upgrade.
+            self.rngs.rewards.single();
             let base = match content.cards[id as usize].rarity {
                 CardRarity::Rare => 150,
                 CardRarity::Uncommon => 75,
                 _ => 50,
             };
-            let mut cost = (base as f32 * self.rngs.shops.float(0.95, 1.05)).round() as i32;
+            let mut cost =
+                (base as f32 * self.rngs.shops.float(0.95, 1.05)).round_ties_even() as i32;
             if index == sale {
-                cost = (base as f32 * self.rngs.shops.float(0.95, 1.05)).round() as i32 / 2;
+                cost =
+                    (base as f32 * self.rngs.shops.float(0.95, 1.05)).round_ties_even() as i32 / 2;
             }
             items.push(ShopItem::Card(
                 self.merchant_card(
                     content,
                     Card {
                         id,
-                        upgrades: (upgrade && content.cards[id as usize].rarity != CardRarity::Rare)
-                            as u8,
                         ..Card::default()
                     },
                 ),
@@ -4109,17 +4218,16 @@ impl Game {
             }
             let id = options[self.rngs.shops.below(options.len() as u32) as usize];
             chosen.push(id);
-            let upgrade = self.rngs.rewards.single()
-                <= (self.run.act - 1) as f32 * if self.run.ascension >= 7 { 0.125 } else { 0.25 };
+            // RollForUpgrade at odds of -999999999: merchant cards draw but never upgrade.
+            self.rngs.rewards.single();
             let base = if rarity == CardRarity::Rare { 150 } else { 75 };
-            let base = (base as f32 * 1.15).round();
-            let cost = (base * self.rngs.shops.float(0.95, 1.05)).round() as i32;
+            let base = (base as f32 * 1.15).round_ties_even();
+            let cost = (base * self.rngs.shops.float(0.95, 1.05)).round_ties_even() as i32;
             items.push(ShopItem::Card(
                 self.merchant_card(
                     content,
                     Card {
                         id,
-                        upgrades: (upgrade && rarity != CardRarity::Rare) as u8,
                         ..Card::default()
                     },
                 ),
@@ -4128,11 +4236,11 @@ impl Game {
         }
         let rarities = [self.roll_relic_rarity(), self.roll_relic_rarity(), 3];
         for rarity in rarities {
-            if let Some(id) = self.pull_relic(false, rarity, true, true) {
+            if let Some(id) = self.pull_relic(content, false, rarity, true, true) {
                 let base = [175, 225, 275, 200][relic_group(id).unwrap_or(rarity as usize)];
                 items.push(ShopItem::Relic(
                     id,
-                    (base as f32 * self.rngs.shops.float(0.85, 1.15)).round() as i32,
+                    (base as f32 * self.rngs.shops.float(0.85, 1.15)).round_ties_even() as i32,
                 ));
             }
         }
@@ -4147,7 +4255,7 @@ impl Game {
             };
             ShopItem::Potion(
                 id,
-                (base as f32 * self.rngs.shops.float(0.95, 1.05)).round() as i32,
+                (base as f32 * self.rngs.shops.float(0.95, 1.05)).round_ties_even() as i32,
             )
         }));
         let (base, increase) = if self.run.ascension >= 6 {
@@ -4323,9 +4431,8 @@ impl Game {
                     (!options.is_empty()).then_some(options)
                 })?;
                 let id = options[self.rngs.shops.below(options.len() as u32) as usize];
-                let upgrade = self.rngs.rewards.single()
-                    <= (self.run.act - 1) as f32
-                        * if self.run.ascension >= 7 { 0.125 } else { 0.25 };
+                // RollForUpgrade at odds of -999999999: merchant cards draw but never upgrade.
+                self.rngs.rewards.single();
                 let rarity = content.cards[id as usize].rarity;
                 let base = match rarity {
                     CardRarity::Rare => 150,
@@ -4333,7 +4440,7 @@ impl Game {
                     _ => 50,
                 };
                 let base = if colorless {
-                    (base as f32 * 1.15).round() as i32
+                    (base as f32 * 1.15).round_ties_even() as i32
                 } else {
                     base
                 };
@@ -4342,20 +4449,19 @@ impl Game {
                         content,
                         Card {
                             id,
-                            upgrades: (upgrade && rarity != CardRarity::Rare) as u8,
                             ..Card::default()
                         },
                     ),
-                    (base as f32 * self.rngs.shops.float(0.95, 1.05)).round() as i32,
+                    (base as f32 * self.rngs.shops.float(0.95, 1.05)).round_ties_even() as i32,
                 )
             }
             ShopItem::Relic(_, _) => {
                 let rarity = self.roll_relic_rarity();
-                let id = self.pull_relic(false, rarity, true, true)?;
+                let id = self.pull_relic(content, false, rarity, true, true)?;
                 let base = [175, 225, 275, 200][relic_group(id).unwrap_or(rarity as usize)];
                 ShopItem::Relic(
                     id,
-                    (base as f32 * self.rngs.shops.float(0.85, 1.15)).round() as i32,
+                    (base as f32 * self.rngs.shops.float(0.85, 1.15)).round_ties_even() as i32,
                 )
             }
             ShopItem::Potion(_, _) => {
@@ -4369,7 +4475,7 @@ impl Game {
                 };
                 ShopItem::Potion(
                     id,
-                    (base as f32 * self.rngs.shops.float(0.95, 1.05)).round() as i32,
+                    (base as f32 * self.rngs.shops.float(0.95, 1.05)).round_ties_even() as i32,
                 )
             }
             ShopItem::Remove(_) => return None,
@@ -4549,6 +4655,11 @@ impl Game {
     pub(crate) fn obtain_relic(&mut self, content: &Content, id: Id) {
         self.remove_relic_from_bags(id);
         self.run.relics.push(id);
+        self.after_obtained(content, id);
+    }
+
+    /// RelicModel.AfterObtained.
+    pub(crate) fn after_obtained(&mut self, content: &Content, id: Id) {
         match content.relics[id as usize].id {
             "RELIC.STRAWBERRY" => {
                 self.run.max_hp += 7;
@@ -4602,7 +4713,7 @@ impl Game {
                     );
                 }
                 let relics = (0..3)
-                    .filter_map(|rarity| self.pull_relic(false, rarity, false, false))
+                    .filter_map(|rarity| self.pull_relic(content, false, rarity, false, false))
                     .collect();
                 self.phase = Phase::Rewards(Rewards {
                     gold: 0,
@@ -4639,7 +4750,7 @@ impl Game {
                 self.phase = Phase::ChooseCards(cards, 1, false);
             }
             "RELIC.GNARLED_HAMMER" => {
-                self.phase = Phase::EnchantCards(Enchantment::Sharp, 3, 3, None, false)
+                self.phase = Phase::EnchantCards(Enchantment::Sharp, 3, 3, None, true)
             }
             "RELIC.HEFTY_TABLET" => {
                 let mut pool: Vec<_> = content.characters[self.run.character as usize]
@@ -4656,19 +4767,13 @@ impl Game {
                         ..Card::default()
                     });
                 }
-                if let Some(injury) = content.card_id("CARD.INJURY") {
-                    self.add_card(
-                        content,
-                        Card {
-                            id: injury,
-                            ..Card::default()
-                        },
-                    );
-                }
+                self.modify_reward_cards(content, &mut cards, false);
+                // The Injury joins the deck after the chosen card.
+                self.run_queue.push(RunEffect::AddCard("CARD.INJURY", 1));
                 self.phase = Phase::ChooseCards(cards, 1, true);
             }
             "RELIC.KIFUDA" => {
-                self.phase = Phase::EnchantCards(Enchantment::Adroit, 3, 3, None, false)
+                self.phase = Phase::EnchantCards(Enchantment::Adroit, 3, 3, None, true)
             }
             "RELIC.PUNCH_DAGGER" => {
                 self.phase = Phase::EnchantCards(Enchantment::Momentum, 5, 1, None, false)
@@ -4685,8 +4790,8 @@ impl Game {
                 self.phase = Phase::EnchantCards(Enchantment::RoyallyApproved, 1, 1, None, false);
             }
             "RELIC.FRAGRANT_MUSHROOM" => {
-                self.run.hp = (self.run.hp - 15).max(0);
-                self.upgrade_random(content, 3, None, false);
+                self.take_damage(content, 15);
+                self.upgrade_random(content, 2, None, false);
             }
             "RELIC.SAND_CASTLE" => self.upgrade_random(content, 6, None, false),
             "RELIC.WAR_PAINT" => self.upgrade_random(content, 2, Some(CardType::Skill), false),
@@ -4734,19 +4839,8 @@ impl Game {
                 });
             }
             "RELIC.SCROLL_BOXES" => {
-                let mut pool = content.characters[self.run.character as usize]
-                    .cards
-                    .to_vec();
-                if self.has_relic(content, "RELIC.PRISMATIC_GEM") {
-                    pool = content
-                        .characters
-                        .iter()
-                        .flat_map(|character| character.cards)
-                        .copied()
-                        .collect();
-                } else if self.has_relic(content, "RELIC.DINGY_RUG") {
-                    pool.extend_from_slice(content.colorless());
-                }
+                // Without IsCardReward, Prismatic Gem and Dingy Rug leave its pool alone.
+                let pool = content.characters[self.run.character as usize].cards;
                 let mut used = Vec::new();
                 let mut bundles = Vec::new();
                 for _ in 0..2 {
@@ -4788,24 +4882,15 @@ impl Game {
             }
             "RELIC.GLASS_EYE" => {
                 let character = self.run.character;
-                let cards = self
-                    .make_card_reward(content, CardReward::Fixed(character, CardRarity::Common));
-                self.phase = Phase::Rewards(Rewards {
-                    gold: 0,
-                    cards,
-                    card_rewards: [
-                        CardRarity::Common,
-                        CardRarity::Uncommon,
-                        CardRarity::Uncommon,
-                        CardRarity::Rare,
-                    ]
-                    .into_iter()
-                    .map(|rarity| CardReward::Fixed(character, rarity))
-                    .collect(),
-                    relics: vec![],
-                    potions: vec![],
-                    removals: 0,
-                });
+                let rarities = [
+                    CardRarity::Common,
+                    CardRarity::Common,
+                    CardRarity::Uncommon,
+                    CardRarity::Uncommon,
+                    CardRarity::Rare,
+                ];
+                let rewards = rarities.map(|rarity| CardReward::Fixed(character, rarity));
+                self.phase = Phase::Rewards(self.card_reward_screen(content, &rewards));
             }
             "RELIC.SEA_GLASS" => {
                 let characters: Vec<_> = content
@@ -4830,7 +4915,9 @@ impl Game {
                 let pool = content.characters[character as usize].cards;
                 let mut cards = Vec::new();
                 for rarity in [CardRarity::Common, CardRarity::Uncommon, CardRarity::Rare] {
-                    cards.extend(self.fixed_cards(content, pool, rarity, 5));
+                    let mut offer = self.fixed_cards(content, pool, rarity, 5, false);
+                    self.modify_reward_cards(content, &mut offer, false);
+                    cards.extend(offer);
                 }
                 self.phase = Phase::ChooseCards(cards, 15, true);
             }
@@ -4902,7 +4989,7 @@ impl Game {
                 let mut relics = Vec::new();
                 for _ in 0..4 {
                     let rarity = self.roll_relic_rarity();
-                    relics.extend(self.pull_relic(false, rarity, false, false));
+                    relics.extend(self.pull_relic(content, false, rarity, false, false));
                 }
                 self.toy_box_offers = relics.clone();
                 self.phase = Phase::Rewards(Rewards {
@@ -4933,25 +5020,31 @@ impl Game {
                 }
             }
             "RELIC.ARCHAIC_TOOTH" => {
-                for (from, to) in [
+                let upgrades = [
                     ("CARD.BASH", "CARD.BREAK"),
                     ("CARD.NEUTRALIZE", "CARD.SUPPRESS"),
                     ("CARD.UNLEASH", "CARD.PROTECTOR"),
                     ("CARD.FALLING_STAR", "CARD.METEOR_SHOWER"),
                     ("CARD.DUALCAST", "CARD.QUADCAST"),
-                ] {
-                    if let Some(card) = self
-                        .run
-                        .deck
-                        .iter_mut()
-                        .find(|card| content.cards[card.id as usize].id == from)
-                        && let Some(id) = content.card_id(to)
-                    {
-                        card.id = id;
-                        card.upgrades = 0;
-                        card.enchantment = None;
-                        break;
-                    }
+                ];
+                // The deck's first starter card with an upgrade transforms (CardCmd.Transform: the
+                // upgraded, enchanted copy joins the deck's end).
+                let found = self.run.deck.iter().enumerate().find_map(|(index, card)| {
+                    let from = content.cards[card.id as usize].id;
+                    let (_, to) = upgrades.iter().find(|(key, _)| *key == from)?;
+                    Some((index, content.card_id(to)?))
+                });
+                if let Some((index, id)) = found {
+                    let old = self.run.deck.remove(index);
+                    let card = Card {
+                        id,
+                        upgrades: old.upgrades,
+                        enchantment: old.enchantment,
+                        enchantment_amount: old.enchantment_amount,
+                        enchantment_value: old.enchantment_value,
+                        ..Card::default()
+                    };
+                    self.add_card(content, card);
                 }
             }
             "RELIC.TOUCH_OF_OROBAS" => {
@@ -5052,7 +5145,7 @@ impl Game {
                 for _ in 0..2 {
                     let rarity = self.roll_relic_rarity();
                     let relic = if self.relic_queue.is_empty() {
-                        self.pull_relic(false, rarity, false, false)
+                        self.pull_relic(content, false, rarity, false, false)
                     } else {
                         Some(self.relic_queue.remove(0))
                     };
@@ -5060,16 +5153,16 @@ impl Game {
                         self.obtain_relic(content, relic);
                     }
                 }
+                // The class's Basic Strike and Defend, whatever the deck holds.
+                let starter = content.characters[self.run.character as usize].deck;
                 let cards: Vec<_> = [STRIKE_TAG, DEFEND_TAG]
                     .into_iter()
                     .filter_map(|tag| {
-                        self.run.deck.iter().find(|card| {
-                            let id = card.id;
+                        starter.iter().map(|&(id, _)| id).find(|&id| {
                             let card = content.cards[id as usize];
                             card.rarity == CardRarity::Basic && card.tags & tag != 0
                         })
                     })
-                    .map(|card| card.id)
                     .collect();
                 for id in cards {
                     self.add_card(
@@ -5089,7 +5182,8 @@ impl Game {
             "RELIC.PRECISE_SCISSORS" => self.phase = Phase::RemoveCards(1, 0, false),
             "RELIC.BIIIG_HUG" => self.phase = Phase::RemoveCards(4, 0, false),
             "RELIC.PRECARIOUS_SHEARS" => {
-                self.run.hp = (self.run.hp - 16).max(0);
+                // The damage lands once the cards are removed.
+                self.run_queue.push(RunEffect::LoseHp(16));
                 self.phase = Phase::RemoveCards(2, 0, false);
             }
             "RELIC.ASTROLABE" => {
@@ -5103,7 +5197,7 @@ impl Game {
             }
             "RELIC.CLAWS" => {
                 if let Some(id) = content.card_id("CARD.MAUL") {
-                    self.phase = Phase::TransformCards(Some(id), 6, false);
+                    self.phase = Phase::TransformCards(Some(id), 6, true);
                 }
             }
             "RELIC.POMANDER" => self.phase = Phase::UpgradeCards(1, false),
@@ -5199,7 +5293,7 @@ impl Game {
             "RELIC.SMALL_CAPSULE" => {
                 let rarity = self.roll_relic_rarity();
                 let relics = self
-                    .pull_relic(false, rarity, false, false)
+                    .pull_relic(content, false, rarity, false, false)
                     .into_iter()
                     .collect();
                 self.phase = Phase::Rewards(Rewards {
@@ -5213,7 +5307,7 @@ impl Game {
             }
             "RELIC.LOST_COFFER" => {
                 let pool = content.characters[self.run.character as usize].cards;
-                let cards = self.reward_cards(content, pool, 3, Room::Combat, true);
+                let cards = self.reward_cards(content, pool, 3, Room::Treasure, true);
                 let potion_pool = self.potion_pool(content);
                 let potions = self.reward_potions(&potion_pool, 1);
                 self.phase = Phase::Rewards(Rewards {
@@ -5234,13 +5328,12 @@ impl Game {
                     .collect();
                 if !pool.is_empty() {
                     let id = pool[self.rngs.rewards.below(pool.len() as u32) as usize];
-                    self.add_card(
-                        content,
-                        Card {
-                            id,
-                            ..Card::default()
-                        },
-                    );
+                    let mut card = [Card {
+                        id,
+                        ..Card::default()
+                    }];
+                    self.modify_reward_cards(content, &mut card, false);
+                    self.add_card(content, card[0]);
                 }
             }
             id @ ("RELIC.NEOWS_TORMENT"
@@ -5268,7 +5361,9 @@ impl Game {
                 }
             }
             "RELIC.LEAD_PAPERWEIGHT" => {
-                let cards = self.card_rewards(content, content.colorless(), 2, Room::Combat, true);
+                let mut cards =
+                    self.card_rewards(content, content.colorless(), 2, Room::Treasure, false, true);
+                self.modify_reward_cards(content, &mut cards, false);
                 self.resume = Some(Phase::Map);
                 self.phase = Phase::ChooseCards(cards, 1, true);
             }
@@ -5318,6 +5413,12 @@ impl Game {
             }
             _ => {}
         }
+    }
+
+    /// CreatureCmd.Damage outside combat, which Tungsten Rod still softens.
+    fn take_damage(&mut self, content: &Content, amount: i16) {
+        let lost = amount - self.relic_count(content, "RELIC.TUNGSTEN_ROD") as i16;
+        self.run.hp = (self.run.hp - lost.max(0)).max(0);
     }
 
     pub(super) fn gain_gold(&mut self, content: &Content, amount: i32) {
@@ -5461,9 +5562,10 @@ impl Game {
             pool[rng.below(pool.len() as u32) as usize]
         });
         self.run.deck.remove(index);
-        let preserve = target.is_some();
-        self.add_card(
-            content,
+        // Only Claws' Mauls keep the original's upgrade and enchantment.
+        let preserve = target.is_some_and(|id| content.cards[id as usize].id == "CARD.MAUL");
+        self.transformed.push((
+            index,
             Card {
                 id,
                 upgrades: if self.astrolabe {
@@ -5491,7 +5593,15 @@ impl Game {
                 enchantment_value: old.enchantment_value,
                 ..Card::default()
             },
-        );
+        ));
+    }
+
+    fn add_transformed(&mut self, content: &Content) {
+        let mut cards = std::mem::take(&mut self.transformed);
+        cards.sort_by_key(|&(index, _)| index);
+        for (_, card) in cards {
+            self.add_card(content, card);
+        }
     }
 
     fn resolve_run(&mut self, content: &Content) {
@@ -5516,7 +5626,7 @@ impl Game {
                     self.run.hp = (self.run.hp + amount).min(self.run.max_hp);
                 }
                 RunEffect::FullHeal => self.run.hp = self.run.max_hp,
-                RunEffect::LoseHp(amount) => self.run.hp = (self.run.hp - amount).max(0),
+                RunEffect::LoseHp(amount) => self.take_damage(content, amount),
                 RunEffect::MaxHp(amount) => {
                     self.run.max_hp = (self.run.max_hp + amount).max(1);
                     self.run.hp = (self.run.hp + amount.max(0)).min(self.run.max_hp);
@@ -5579,7 +5689,7 @@ impl Game {
                     for _ in 0..count {
                         let id = if self.relic_queue.is_empty() {
                             let rarity = self.roll_relic_rarity();
-                            self.pull_relic(false, rarity, false, false)
+                            self.pull_relic(content, false, rarity, false, false)
                         } else {
                             Some(self.relic_queue.remove(0))
                         };
@@ -5589,7 +5699,8 @@ impl Game {
                     }
                 }
                 RunEffect::RelicOfRarity(rarity) => {
-                    if let Some(id) = self.pull_relic(false, rarity as usize, false, true) {
+                    if let Some(id) = self.pull_relic(content, false, rarity as usize, false, true)
+                    {
                         self.obtain_relic(content, id);
                     }
                 }
@@ -5597,7 +5708,7 @@ impl Game {
                     if let Some(id) = self
                         .event_relic
                         .take()
-                        .or_else(|| self.pull_relic(false, 2, false, true))
+                        .or_else(|| self.pull_relic(content, false, 2, false, true))
                     {
                         self.obtain_relic(content, id);
                     }
@@ -5807,6 +5918,7 @@ impl Game {
                             .unwrap();
                         self.transform_selected(content, index, target);
                     }
+                    self.add_transformed(content);
                 }
                 RunEffect::EnchantCards(enchantment, amount, count, card_type) => {
                     let cards: Vec<_> = self
@@ -5848,6 +5960,7 @@ impl Game {
                             ..Card::default()
                         });
                     }
+                    self.modify_reward_cards(content, &mut cards, false);
                     self.phase = Phase::ChooseCards(cards, picks, false);
                     return;
                 }
@@ -5858,8 +5971,8 @@ impl Game {
                     } else {
                         pool
                     };
-                    let cards =
-                        self.card_rewards(content, pool, offered as usize, Room::Combat, true);
+                    let count = offered as usize;
+                    let cards = self.reward_cards(content, pool, count, Room::Treasure, false);
                     self.phase = Phase::ChooseCards(cards, picks, true);
                     return;
                 }
@@ -5926,6 +6039,7 @@ impl Game {
     }
 
     fn finish_run_choice(&mut self, content: &Content) {
+        self.add_transformed(content);
         self.astrolabe = false;
         self.transform_niche = false;
         if self.conveyor {
@@ -6230,13 +6344,14 @@ impl Game {
             removals: 0,
         };
         self.reward_gold_parts.clear();
+        self.prefetched_card_rewards.clear();
         for item in crystal.revealed {
             match crystal.items[item].4 {
                 0 => {
                     let rarity = relic_rarity(self.event_rng.as_mut().unwrap().single());
                     rewards
                         .relics
-                        .extend(self.pull_relic(false, rarity, false, false));
+                        .extend(self.pull_relic(content, false, rarity, false, false));
                 }
                 1 | 2 => {
                     let rare = crystal.items[item].4 == 2;
@@ -6259,13 +6374,18 @@ impl Game {
                 3..=5 => {
                     let rarity = [CardRarity::Common, CardRarity::Uncommon, CardRarity::Rare]
                         [(crystal.items[item].4 - 3) as usize];
+                    // RewardsSet.Populate rolls every reward up front, in revealed order.
+                    let cards = self.make_card_reward(content, CardReward::Crystal(rarity));
                     if rewards.cards.is_empty() {
-                        rewards.cards = self.make_card_reward(content, CardReward::Crystal(rarity));
+                        rewards.cards = cards;
                     } else {
                         rewards.card_rewards.push(CardReward::Crystal(rarity));
+                        self.prefetched_card_rewards.push(cards);
                     }
                 }
                 7 | 8 => {
+                    // A fixed GoldReward still draws its amount (NextInt(amount, amount + 1)).
+                    self.event_rng.as_mut().unwrap().below(1);
                     let gold = if crystal.items[item].4 == 7 { 10 } else { 30 };
                     rewards.gold += gold;
                     self.reward_gold_parts.push(gold);
@@ -6286,19 +6406,8 @@ impl Game {
     }
 
     fn crystal_cards(&mut self, content: &Content, rarity: CardRarity) -> Vec<Card> {
-        let mut pool = content.characters[self.run.character as usize]
-            .cards
-            .to_vec();
-        if self.has_relic(content, "RELIC.PRISMATIC_GEM") {
-            pool = content
-                .characters
-                .iter()
-                .flat_map(|character| character.cards)
-                .copied()
-                .collect();
-        } else if self.has_relic(content, "RELIC.DINGY_RUG") {
-            pool.extend_from_slice(content.colorless());
-        }
+        let base = content.characters[self.run.character as usize].cards;
+        let mut pool = self.card_reward_pool(content, base);
         pool.retain(|id| content.cards[*id as usize].rarity == rarity);
         let mut cards = Vec::new();
         for _ in 0..3.min(pool.len()) {
@@ -6324,7 +6433,8 @@ impl Game {
             "EVENT.ABYSSAL_BATHS" => {
                 let damage = 3 + self.event_data[0] as i16;
                 self.run.max_hp += 2;
-                self.run.hp = (self.run.hp + 2 - damage).max(0);
+                self.run.hp += 2;
+                self.take_damage(content, damage);
                 self.event_data[0] += 1;
                 self.phase = event_page(id, &[0, 9]);
                 self.resume = None;
@@ -6336,13 +6446,12 @@ impl Game {
                 } else {
                     content.colorless()
                 };
-                let cards = self.reward_cards(
-                    content,
-                    pool,
-                    if action == 0 { 5 } else { 3 },
-                    Room::Combat,
-                    false,
-                );
+                // Rip's colorless offer is a CardReward (NoCardPoolModifications); Share Knowledge
+                // rolls its cards directly.
+                let count = if action == 0 { 5 } else { 3 };
+                let mut cards =
+                    self.card_rewards(content, pool, count, Room::Treasure, false, false);
+                self.modify_reward_cards(content, &mut cards, action == 1);
                 if action == 0 {
                     self.phase = Phase::ChooseCards(cards, 1, false);
                 } else {
@@ -6359,19 +6468,9 @@ impl Game {
             }
             "EVENT.COLORFUL_PHILOSOPHERS" => {
                 let character = self.event_data[action as usize] as Id - 1;
-                let cards = self
-                    .make_card_reward(content, CardReward::Fixed(character, CardRarity::Common));
-                self.phase = Phase::Rewards(Rewards {
-                    gold: 0,
-                    cards,
-                    card_rewards: [CardRarity::Uncommon, CardRarity::Rare]
-                        .into_iter()
-                        .map(|rarity| CardReward::Fixed(character, rarity))
-                        .collect(),
-                    relics: vec![],
-                    potions: vec![],
-                    removals: 0,
-                });
+                let rarities = [CardRarity::Common, CardRarity::Uncommon, CardRarity::Rare];
+                let rewards = rarities.map(|rarity| CardReward::Fixed(character, rarity));
+                self.phase = Phase::Rewards(self.card_reward_screen(content, &rewards));
                 true
             }
             "EVENT.CRYSTAL_SPHERE" => {
@@ -6450,8 +6549,10 @@ impl Game {
                         return true;
                     }
                     4 => {
-                        let cards =
-                            self.reward_cards(content, content.colorless(), 1, Room::Combat, true);
+                        let colorless = content.colorless();
+                        let mut cards =
+                            self.card_rewards(content, colorless, 1, Room::Treasure, false, false);
+                        self.modify_reward_cards(content, &mut cards, false);
                         if let Some(card) = cards.into_iter().next() {
                             self.add_card(content, card);
                         }
@@ -6493,20 +6594,9 @@ impl Game {
                 true
             }
             "EVENT.INFESTED_AUTOMATON" => {
-                let base = content.characters[self.run.character as usize].cards;
-                let mut pool = if action == 0 && self.has_relic(content, "RELIC.PRISMATIC_GEM") {
-                    content
-                        .characters
-                        .iter()
-                        .flat_map(|character| character.cards)
-                        .copied()
-                        .collect()
-                } else {
-                    base.to_vec()
-                };
-                if action == 0 && self.has_relic(content, "RELIC.DINGY_RUG") {
-                    pool.extend_from_slice(content.colorless());
-                }
+                let mut pool = content.characters[self.run.character as usize]
+                    .cards
+                    .to_vec();
                 pool.retain(|id| {
                     let card = content.cards[*id as usize];
                     if action == 0 {
@@ -6515,8 +6605,8 @@ impl Game {
                         card.cost[0] == 0
                     }
                 });
-                let mut cards = self.card_rewards(content, &pool, 1, Room::Combat, true);
-                self.modify_reward_cards(content, &mut cards);
+                let mut cards = self.card_rewards(content, &pool, 1, Room::Treasure, false, false);
+                self.modify_reward_cards(content, &mut cards, false);
                 if let Some(card) = cards.pop() {
                     self.add_card(content, card);
                 }
@@ -6524,7 +6614,7 @@ impl Game {
             }
             "EVENT.JUNGLE_MAZE_ADVENTURE" => {
                 if action == 0 {
-                    self.run.hp = (self.run.hp - 18).max(0);
+                    self.take_damage(content, 18);
                 }
                 self.gain_gold(content, self.event_data[action as usize] as i32);
                 false
@@ -6532,7 +6622,7 @@ impl Game {
             "EVENT.LUMINOUS_CHOIR" if action == 1 => {
                 self.run.gold -= self.event_data[0] as i32;
                 let rarity = self.roll_relic_rarity();
-                if let Some(relic) = self.pull_relic(false, rarity, false, false) {
+                if let Some(relic) = self.pull_relic(content, false, rarity, false, false) {
                     self.obtain_relic(content, relic);
                 }
                 !matches!(self.phase, Phase::Event(..))
@@ -6550,7 +6640,7 @@ impl Game {
                 }
                 for _ in 0..if action == 2 { 2 } else { 1 } {
                     let rarity = self.roll_relic_rarity();
-                    if let Some(relic) = self.pull_relic(false, rarity, false, false) {
+                    if let Some(relic) = self.pull_relic(content, false, rarity, false, false) {
                         self.obtain_relic(content, relic);
                     }
                 }
@@ -6584,7 +6674,7 @@ impl Game {
                 true
             }
             "EVENT.THE_LEGENDS_WERE_TRUE" if action == 1 => {
-                self.run.hp = (self.run.hp - 8).max(0);
+                self.take_damage(content, 8);
                 let pool = self.potion_pool(content);
                 let potion = (!pool.is_empty())
                     .then(|| pool[self.rngs.rewards.below(pool.len() as u32) as usize]);
@@ -6628,7 +6718,7 @@ impl Game {
                     }
                     return false;
                 }
-                self.run.hp = (self.run.hp - if action == 1 { 5 } else { 15 }).max(0);
+                self.take_damage(content, if action == 1 { 5 } else { 15 });
                 let mut relics = relics;
                 self.event_rng.as_mut().unwrap().shuffle(&mut relics);
                 relics.truncate(action as usize + 1);
@@ -6664,7 +6754,7 @@ impl Game {
             }
             "EVENT.SLIPPERY_BRIDGE" => {
                 let damage = 3 + self.event_data[0] as i16;
-                self.run.hp = (self.run.hp - damage).max(0);
+                self.take_damage(content, damage);
                 self.event_data[0] += 1;
                 let previous = self
                     .run
@@ -6739,10 +6829,12 @@ impl Game {
                     let index = self.rngs.rewards.below(pool.len() as u32) as usize;
                     cards.push(Card {
                         id: pool.remove(index),
-                        upgrades: 1,
                         ..Card::default()
                     });
                 }
+                // Its CardReward's hooks run first, then AfterGenerated upgrades every card.
+                self.modify_reward_cards(content, &mut cards, true);
+                cards.iter_mut().for_each(|card| card.upgrades = 1);
                 self.phase = Phase::ChooseCards(cards, 1, true);
                 true
             }
@@ -6762,7 +6854,7 @@ impl Game {
                     self.add_named_card(content, "CARD.REGRET");
                     for _ in 0..2 {
                         let rarity = self.roll_relic_rarity();
-                        if let Some(relic) = self.pull_relic(false, rarity, false, false) {
+                        if let Some(relic) = self.pull_relic(content, false, rarity, false, false) {
                             self.obtain_relic(content, relic);
                         }
                     }
@@ -6913,90 +7005,41 @@ impl Game {
         rewards
     }
 
-    pub(crate) fn next_encounter(&mut self, content: &Content, elite: bool) -> Option<Id> {
-        if elite {
-            let candidates = content.acts[self.act as usize].elites;
-            if self.elite_encounters_left == 0 {
-                return self.pick(candidates);
-            }
-            let id = Self::pull_encounter(
-                &mut self.rngs.up_front,
-                content,
-                candidates,
-                &mut self.elites,
-                self.last_elite,
-            )?;
-            self.elite_encounters_left -= 1;
-            self.last_elite = Some(id);
-            if self.elite_encounters_left == 0 {
-                self.elites.clear();
-                self.last_elite = None;
-            }
-            return Some(id);
-        }
-        let candidates = content.acts[self.act as usize].encounters;
-        let weak = candidates
-            .iter()
-            .copied()
-            .filter(|id| content.encounters[*id as usize].id.contains("_WEAK"))
-            .collect::<Vec<_>>();
-        let regular = candidates
-            .iter()
-            .copied()
-            .filter(|id| !content.encounters[*id as usize].id.contains("_WEAK"))
-            .collect::<Vec<_>>();
-        let (candidates, left, weak) = if self.weak_encounters_left > 0 {
-            (&weak, &mut self.weak_encounters_left, true)
-        } else if self.regular_encounters_left > 0 {
-            (&regular, &mut self.regular_encounters_left, false)
-        } else {
-            return self.pick(candidates);
-        };
-        let id = Self::pull_encounter(
-            &mut self.rngs.up_front,
-            content,
-            candidates,
-            &mut self.encounters,
-            self.last_encounter,
-        )?;
-        *left -= 1;
-        self.last_encounter = Some(id);
-        if *left == 0 {
-            self.encounters.clear();
-            if !weak || self.regular_encounters_left == 0 {
-                self.last_encounter = None;
-            }
-        }
-        Some(id)
-    }
-
-    fn pull_encounter(
-        rng: &mut Rng,
+    /// Adds `count` encounters grabbed from `bag`, refilled from `pool` whenever empty, each
+    /// avoiding the previous encounter and its tags if it can (ActModel.AddWithoutRepeatingTags).
+    pub(crate) fn grab_encounters(
+        &mut self,
         content: &Content,
-        candidates: &[Id],
-        bag: &mut Vec<Id>,
-        previous: Option<Id>,
-    ) -> Option<Id> {
-        if bag.is_empty() {
-            bag.extend_from_slice(candidates);
-        }
-        bag.sort_unstable();
-        let allowed = |id: Id| {
-            previous != Some(id)
-                && previous.is_none_or(|previous| {
-                    encounter_tags(content.encounters[id as usize].id)
-                        & encounter_tags(content.encounters[previous as usize].id)
-                        == 0
-                })
-        };
-        let constrained = bag.iter().copied().any(allowed);
-        let index = loop {
-            let index = (rng.double() * bag.len() as f64) as usize;
-            if !constrained || allowed(bag[index]) {
-                break index;
+        pool: &[Id],
+        mut bag: Vec<Id>,
+        count: usize,
+        encounters: &mut Vec<Id>,
+    ) {
+        for _ in 0..count {
+            if bag.is_empty() {
+                bag = pool.to_vec();
             }
-        };
-        Some(bag.remove(index))
+            if bag.is_empty() {
+                return;
+            }
+            let previous = encounters.last().copied();
+            let allowed = |id: Id| {
+                previous != Some(id)
+                    && previous.is_none_or(|previous| {
+                        encounter_tags(content.encounters[id as usize].id)
+                            & encounter_tags(content.encounters[previous as usize].id)
+                            == 0
+                    })
+            };
+            let constrained = bag.iter().copied().any(allowed);
+            let index = loop {
+                let index = (self.rngs.up_front.double() * bag.len() as f64) as usize;
+                if !constrained || allowed(bag[index]) {
+                    break index;
+                }
+            };
+            encounters.push(bag.remove(index));
+        }
     }
 
     fn pick(&mut self, values: &[Id]) -> Option<Id> {
@@ -7009,8 +7052,8 @@ impl Game {
 
     /// RelicModel.IsAllowed for a single-player run: some relics stop spawning from the act 3
     /// treasure chest on, and multiplayer or first-run relics never spawn. The game purges them
-    /// from the grab bags for good whenever it pulls; that only changes when the floor does.
-    pub(crate) fn purge_disallowed_relics(&mut self, content: &Content) {
+    /// for good from the grab bag it pulls from.
+    fn purge_disallowed_relics(&mut self, content: &Content, shared: bool) {
         let late = self.total_floor() >= 41;
         let allowed = |id: &Id| match content.relics[*id as usize].id {
             "RELIC.MASSIVE_SCROLL" => false,
@@ -7033,16 +7076,25 @@ impl Game {
             | "RELIC.WHITE_STAR" => !late,
             _ => true,
         };
-        for deque in self
-            .relic_deques
-            .iter_mut()
-            .chain(self.shared_relic_deques.iter_mut())
-        {
+        let deques = if shared {
+            &mut self.shared_relic_deques
+        } else {
+            &mut self.relic_deques
+        };
+        for deque in deques {
             deque.retain(allowed);
         }
     }
 
-    fn pull_relic(&mut self, shared: bool, rarity: usize, back: bool, shop: bool) -> Option<Id> {
+    fn pull_relic(
+        &mut self,
+        content: &Content,
+        shared: bool,
+        rarity: usize,
+        back: bool,
+        shop: bool,
+    ) -> Option<Id> {
+        self.purge_disallowed_relics(content, shared);
         let deques = if shared {
             &mut self.shared_relic_deques
         } else {
@@ -7069,11 +7121,14 @@ impl Game {
                 _ => return None,
             };
         };
-        self.remove_relic_from_bags(id);
+        // The shared bag's relics leave the player's only once obtained (RelicCmd.Obtain).
+        if !shared {
+            self.remove_relic_from_bags(id);
+        }
         Some(id)
     }
 
-    fn remove_relic_from_bags(&mut self, id: Id) {
+    pub(crate) fn remove_relic_from_bags(&mut self, id: Id) {
         for deque in self
             .relic_deques
             .iter_mut()
@@ -7165,4 +7220,10 @@ impl Game {
             }
         }
     }
+}
+
+fn next_room(rooms: &[Id], visited: &mut u8) -> Option<Id> {
+    let id = *rooms.get(*visited as usize % rooms.len().max(1))?;
+    *visited += 1;
+    Some(id)
 }
