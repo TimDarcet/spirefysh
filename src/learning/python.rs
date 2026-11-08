@@ -2197,7 +2197,7 @@ fn game_state(game: &Game, content: &Content) -> serde_json::Value {
         "max_hp": game.run.max_hp,
         "gold": game.run.gold,
         "deck": game.run.deck.iter().map(&card).collect::<Vec<_>>(),
-        "relics": game.run.relics.iter().map(|id| content.relics[*id as usize].id).collect::<Vec<_>>(),
+        "relics": game.run.relics.iter().map(|relic| content.relics[relic.id as usize].id).collect::<Vec<_>>(),
         "potions": game.run.potions.iter().map(|id| id.map(|id| content.potions[id as usize].id)).collect::<Vec<_>>(),
     });
     match &game.phase {
@@ -5857,7 +5857,7 @@ impl Batch {
             game.run
                 .relics
                 .iter()
-                .map(|id| self.content.relics[*id as usize].id)
+                .map(|relic| self.content.relics[relic.id as usize].id)
                 .collect::<Vec<_>>(),
             game.run
                 .deck

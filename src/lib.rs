@@ -2087,8 +2087,6 @@ pub struct Combat {
     poisoned: u8,
     nightmares: Vec<(Card, u8)>,
     dampened: Vec<(u32, u8)>,
-    paels_tears: bool,
-    orichalcum: bool,
     /// Cards being played, the innermost last.
     plays: Vec<Play>,
     queue: Vec<Pending>,
@@ -2100,21 +2098,12 @@ pub struct Combat {
     pending_hits: Option<Vec<Hit>>,
     force_end: bool,
     enemy_turn: bool,
-    centennial_puzzle: bool,
-    demon_tongue: bool,
-    permafrost: bool,
-    ruined_helmet: bool,
-    music_box: bool,
     /// Music Box copies the first attack whose play started this turn, once that play finishes.
     music_box_card: Option<u32>,
     /// Swift's draw on a card that moves itself to the draw pile (Shining Strike), which comes
     /// after that move.
     swift_after_return: u8,
-    mini_regent: bool,
-    rainbow_ring: bool,
-    attacks_mod3: u8,
     discard_draw: (usize, Vec<Card>),
-    letter_opener: u8,
     bound_played: bool,
     bound_this_turn: u8,
     /// The player's turn setup (PlayerTurnPhase.Start), when an emptied hand doesn't count.
@@ -2122,11 +2111,7 @@ pub struct Combat {
     /// Potions whose effects are still resolving (IsExecutingCardOrPotionEffect).
     potions: u8,
     unsettling_lamp: Option<Id>,
-    unsettling_used: bool,
     applying_hook: bool,
-    belt_buckle: bool,
-    burning_sticks: bool,
-    red_skull: bool,
     /// Call for Backups the rats performed (CallForBackupCount).
     rat_calls: u8,
     /// Deck cards Thieving Hoppers hold (Swipe), by hopper instance.
@@ -2135,15 +2120,11 @@ pub struct Combat {
     returned: Vec<Card>,
     /// The enemies that fled (EscapedCreatures).
     escaped: Vec<Id>,
-    throwing_axe: bool,
-    vambrace: bool,
     block_doubler: Option<u32>,
     /// Enemies whose Curl Up a card hit; they curl once that card's play finishes.
     curled: Vec<usize>,
-    paels_eye: bool,
     /// Pael's Eye earned an extra turn, until its setup ends (Rampart skips it).
     extra_turn: bool,
-    paels_legion: u8,
     /// The game's next creature combat id; pets (Osty, Pael's Legion) take ids too.
     next_creature: u32,
     history_course: Option<Card>,
@@ -2168,7 +2149,7 @@ pub struct Run {
     pub max_hp: i16,
     pub gold: i32,
     pub deck: Vec<Card>,
-    pub relics: Vec<Id>,
+    pub relics: Vec<Relic>,
     pub potions: Vec<Option<Id>>,
     pub act: u8,
     pub floor: u8,
@@ -2176,6 +2157,25 @@ pub struct Run {
     pub draw: u8,
     pub orb_slots: u8,
     pub card_shop_removals: u16,
+}
+
+/// An owned relic and its own state, as the game keeps it on the relic: what it counts over the
+/// run (its counter, uses or used-up flag; Silver Crucible counts two things), and what it tracks
+/// within the current combat (cleared when a combat starts).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Relic {
+    pub id: Id,
+    pub counters: [i32; 2],
+    pub combat: i32,
+}
+
+impl Relic {
+    pub fn new(id: Id) -> Self {
+        Self {
+            id,
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2542,8 +2542,6 @@ pub struct Game {
     enemy_starts: Vec<usize>,
     seed: u32,
     unknown_odds: [i16; 4],
-    happy_flower: u8,
-    tea_set: u8,
     replacing_potion: bool,
     pending_potion: Option<Id>,
     removal_price: i32,
@@ -2557,34 +2555,20 @@ pub struct Game {
     reward_continuation: Option<RewardContinuation>,
     /// Extra card rewards (Prayer Wheel, White Star) rolled with the combat rewards, as the game does.
     prefetched_card_rewards: Vec<Vec<Card>>,
-    wongo_combats: Option<u8>,
     spoils: Option<(u8, u8)>,
     event_combat: u8,
     damage_taken: bool,
-    lasting_candy: u8,
-    paels_wing: u8,
-    silver_crucible: u8,
-    silken_tress: bool,
     rerolled_cards: bool,
-    maw_bank: u8,
-    silver_treasures: u8,
-    golden_compass: Option<u8>,
-    winged_boots: u8,
     rest_used: u8,
-    girya: u8,
-    pumpkin_candle: i32,
-    fishing_rod: u8,
     astrolabe: bool,
     transform_niche: bool,
     paels_tooth: bool,
     paels_cards: Vec<Card>,
-    pollinous_core: u8,
     fur_coat_act: Option<u8>,
     fur_coat: Vec<(u8, u8)>,
     toy_box_offers: Vec<Id>,
     wax_relics: Vec<usize>,
     melted_relics: Vec<usize>,
-    toy_box_combats: u8,
     parasol: Vec<ShopItem>,
     parasol_removal: bool,
     conveyor: bool,
@@ -2601,22 +2585,6 @@ pub struct Game {
     courier_restock: Option<(usize, ShopItem)>,
     /// A dying enemy's max HP, for unique HP rolls of the enemies its death spawns.
     corpse_hp: Option<i16>,
-    fake_happy_flower: u8,
-    lizard_tail: bool,
-    nunchaku: u8,
-    pendulum: u8,
-    pen_nib: u8,
-    iron_club: u8,
-    joss_paper: u8,
-    /// Ethereal exhausts Joss Paper only counts at AfterSideTurnEnd (its EtherealCount).
-    joss_paper_ethereal: u8,
-    tuning_fork: u8,
-    bone_tea: bool,
-    tea_of_discourtesy: bool,
-    galactic_dust: u8,
-    book_of_five_rings: u8,
-    ember_tea: u8,
-    sword_of_stone: u8,
     replaying: bool,
     expectation: Option<Expectation>,
 }

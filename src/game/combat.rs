@@ -184,10 +184,11 @@ impl Game {
 
     /// CardModel.OnPlayWrapper's start: the result pile, the play count, then the first play.
     fn start_play(&mut self, content: &Content, mut play: Play) {
-        let throwing_axe =
-            self.has_relic(content, "RELIC.THROWING_AXE") && !self.combat().unwrap().throwing_axe;
+        let axe = self
+            .relic_mut(content, "RELIC.THROWING_AXE")
+            .filter(|axe| axe.combat == 0);
+        let throwing_axe = axe.map(|axe| axe.combat = 1).is_some();
         let combat = self.combat_mut().unwrap();
-        combat.throwing_axe |= throwing_axe;
         let card = &mut play.card;
         let def = content.cards[card.id as usize];
         let card_type = card.card_type(def);
@@ -267,16 +268,20 @@ impl Game {
         }
         self.before_card_played(content);
         // Star-spending relics fire when resources are spent, before the card resolves.
+        let regent = self
+            .relic_mut(content, "RELIC.MINI_REGENT")
+            .filter(|regent| regent.combat == 0);
         if stars > 0
-            && self.has_relic(content, "RELIC.MINI_REGENT")
-            && !self.combat().unwrap().mini_regent
+            && let Some(regent) = regent
         {
-            self.combat_mut().unwrap().mini_regent = true;
+            regent.combat = 1;
             self.apply_power(content, Actor::Player, power_id::STRENGTH, 1);
         }
-        if stars > 0 && self.has_relic(content, "RELIC.GALACTIC_DUST") {
-            let stars = self.galactic_dust as i16 + stars;
-            self.galactic_dust = (stars % 10) as u8;
+        if stars > 0
+            && let Some(dust) = self.relic_mut(content, "RELIC.GALACTIC_DUST")
+        {
+            let stars = dust.counters[0] + stars as i32;
+            dust.counters[0] = stars % 10;
             for _ in 0..stars / 10 {
                 self.gain_block(content, Actor::Player, 10, None, false);
             }
@@ -285,13 +290,15 @@ impl Game {
 
     /// One play's OnPlay, enchantment and affliction, then its AfterPlay step.
     fn queue_play(&mut self, content: &Content) {
-        let pen_nib = self.has_relic(content, "RELIC.PEN_NIB");
+        let pen_nib = self
+            .relic(content, "RELIC.PEN_NIB")
+            .is_some_and(|nib| nib.counters[0] == 0);
         let play = self.combat().unwrap().plays.last().unwrap();
         let (card, base, index) = (play.card, play.context, play.done);
         let def = content.cards[card.id as usize];
         let attack = card.card_type(def) == CardType::Attack;
         let context = Context {
-            pen_nib: pen_nib && attack && self.pen_nib == 0,
+            pen_nib: pen_nib && attack,
             lethal: base.lethal && index == 0,
             upgraded: card.upgrades > 0,
             ..base
@@ -500,12 +507,14 @@ impl Game {
             return;
         }
         self.combat_mut().unwrap().block_doubler = None;
-        if self.has_relic(content, "RELIC.VAMBRACE") {
-            self.combat_mut().unwrap().vambrace = true;
+        if let Some(vambrace) = self.relic_mut(content, "RELIC.VAMBRACE") {
+            vambrace.combat = 1;
         }
-        if self.combat().unwrap().paels_legion == 0 && self.has_relic(content, "RELIC.PAELS_LEGION")
+        if let Some(legion) = self
+            .relic_mut(content, "RELIC.PAELS_LEGION")
+            .filter(|legion| legion.combat == 0)
         {
-            self.combat_mut().unwrap().paels_legion = 2;
+            legion.combat = 2;
         }
     }
 
@@ -4304,11 +4313,11 @@ impl Game {
         }
         if lost > 0 && hp_target == Actor::Player {
             let remaining = (20 - self.combat().unwrap().history.remnant_lost).max(0);
-            for (index, &id) in self.run.relics.iter().enumerate() {
+            for (index, relic) in self.run.relics.iter().enumerate() {
                 if self.melted_relics.contains(&index) {
                     continue;
                 }
-                match content.relics[id as usize].id {
+                match content.relics[relic.id as usize].id {
                     "RELIC.TUNGSTEN_ROD" => lost = (lost - 1).max(0),
                     "RELIC.BEATING_REMNANT" => lost = lost.min(remaining),
                     _ => {}
@@ -4518,10 +4527,11 @@ impl Game {
             return;
         }
         if actor == Actor::Player
-            && !self.lizard_tail
-            && self.has_relic(content, "RELIC.LIZARD_TAIL")
+            && let Some(tail) = self
+                .relic_mut(content, "RELIC.LIZARD_TAIL")
+                .filter(|tail| tail.counters[0] == 0)
         {
-            self.lizard_tail = true;
+            tail.counters[0] = 1;
             self.creature_mut(actor).hp = (self.creature(actor).max_hp / 2).max(1);
             return;
         }
@@ -4794,9 +4804,18 @@ impl Game {
     /// Relic counters that tick as each play finishes (AfterCardPlayed).
     /// Ornamental Fan, Kunai, Shuriken and Kusarigama count finished attack plays this turn.
     fn every_third_attack(&mut self, content: &Content) {
-        let attacks = self.combat().unwrap().attacks_mod3 + 1;
-        self.combat_mut().unwrap().attacks_mod3 = attacks % 3;
-        if attacks == 3 {
+        let mut third = false;
+        for relic in &mut self.run.relics {
+            let id = content.relics[relic.id as usize].id;
+            if matches!(
+                id,
+                "RELIC.ORNAMENTAL_FAN" | "RELIC.KUNAI" | "RELIC.SHURIKEN" | "RELIC.KUSARIGAMA"
+            ) {
+                relic.combat = (relic.combat + 1) % 3;
+                third |= relic.combat == 0;
+            }
+        }
+        if third {
             for _ in 0..self.relic_count(content, "RELIC.ORNAMENTAL_FAN") {
                 self.combat_mut().unwrap().queue.push(Pending {
                     effect: Effect::RawBlock(Target::Player, Amount::fixed(4, 4)),
@@ -4832,12 +4851,15 @@ impl Game {
     }
 
     fn sync_red_skull(&mut self, content: &Content) {
-        if self.combat().is_none() || !self.has_relic(content, "RELIC.RED_SKULL") {
+        if self.combat().is_none() {
             return;
         }
         let active = self.creature(Actor::Player).hp * 2 <= self.creature(Actor::Player).max_hp;
-        if active != self.combat().unwrap().red_skull {
-            self.combat_mut().unwrap().red_skull = active;
+        let Some(skull) = self.relic_mut(content, "RELIC.RED_SKULL") else {
+            return;
+        };
+        if active != (skull.combat != 0) {
+            skull.combat = active as i32;
             self.apply_power(
                 content,
                 Actor::Player,
@@ -4848,12 +4870,15 @@ impl Game {
     }
 
     pub(super) fn sync_belt_buckle(&mut self, content: &Content) {
-        if self.combat().is_none() || !self.has_relic(content, "RELIC.BELT_BUCKLE") {
+        if self.combat().is_none() {
             return;
         }
         let active = self.run.potions.iter().all(Option::is_none);
-        if active != self.combat().unwrap().belt_buckle {
-            self.combat_mut().unwrap().belt_buckle = active;
+        let Some(buckle) = self.relic_mut(content, "RELIC.BELT_BUCKLE") else {
+            return;
+        };
+        if active != (buckle.combat != 0) {
+            buckle.combat = active as i32;
             self.apply_power(
                 content,
                 Actor::Player,
@@ -5013,7 +5038,7 @@ impl Game {
         combat.max_energy
             + (combat.turn >= 2 && self.has_relic(content, "RELIC.BREAD")) as i16
             + (combat.turn >= 3) as i16 * self.relic_count(content, "RELIC.PAELS_FLESH")
-            + (self.pumpkin_candle > 0) as i16
+            + self.pumpkin_candle(content) as i16
             + power(power_id::DEMESNE)
             + power(power_id::FRIENDSHIP)
             + power(power_id::PYRE)
@@ -5103,8 +5128,12 @@ impl Game {
         let combat = self.combat().unwrap();
         let instance = combat.plays.last().map_or(0, |play| play.card.instance);
         let first = combat.block_doubler.is_none_or(|card| card == instance);
-        let vambrace = first && !combat.vambrace && self.has_relic(content, "RELIC.VAMBRACE");
-        let legion = combat.paels_legion == 0 && self.has_relic(content, "RELIC.PAELS_LEGION");
+        let unspent = |name| {
+            self.relic(content, name)
+                .is_some_and(|relic| relic.combat == 0)
+        };
+        let vambrace = first && unspent("RELIC.VAMBRACE");
+        let legion = unspent("RELIC.PAELS_LEGION");
         (1 + vambrace as i16) * (1 + legion as i16)
     }
 
@@ -5218,11 +5247,12 @@ impl Game {
         if actor == Actor::Player
             && id == power_id::STRENGTH
             && amount > 0
-            && self.has_relic(content, "RELIC.RUINED_HELMET")
-            && !self.combat().unwrap().ruined_helmet
+            && let Some(helmet) = self
+                .relic_mut(content, "RELIC.RUINED_HELMET")
+                .filter(|helmet| helmet.combat == 0)
         {
             amount *= 2;
-            self.combat_mut().unwrap().ruined_helmet = true;
+            helmet.combat = 1;
         }
         if id == power_id::POISON
             && matches!(actor, Actor::Enemy(_))
@@ -5235,8 +5265,9 @@ impl Game {
         if !self.combat().unwrap().applying_hook
             && matches!(actor, Actor::Enemy(_))
             && (amount < 0 || content.powers[id as usize].debuff && amount > 0)
-            && self.has_relic(content, "RELIC.UNSETTLING_LAMP")
-            && !self.combat().unwrap().unsettling_used
+            && self
+                .relic(content, "RELIC.UNSETTLING_LAMP")
+                .is_some_and(|lamp| lamp.combat == 0)
             && !self.combat().unwrap().enemy_turn
             && let Some(card) = self.combat().unwrap().plays.last().map(|play| play.card.id)
         {
@@ -7249,15 +7280,21 @@ impl Game {
                     .below(upgradable.len() as u32);
                 self.run.deck[upgradable.remove(choice as usize)].upgrades = 1;
             }
-            if let Some(combats) = &mut self.wongo_combats {
-                *combats = combats.saturating_add(1);
+            if let Some(ticket) = self.relic_mut(content, "RELIC.WONGOS_MYSTERY_TICKET")
+                && ticket.counters[1] == 0
+            {
+                ticket.counters[0] += 1;
             }
-            if self.has_relic(content, "RELIC.LASTING_CANDY") {
-                self.lasting_candy = self.lasting_candy.saturating_add(1);
+            if let Some(candy) = self.relic_mut(content, "RELIC.LASTING_CANDY") {
+                candy.counters[0] += 1;
             }
-            if self.room == Room::Combat && self.has_relic(content, "RELIC.FISHING_ROD") {
-                self.fishing_rod = (self.fishing_rod + 1) % 3;
-                if self.fishing_rod == 0 {
+            let fishing = self.room == Room::Combat;
+            let rod = self
+                .relic_mut(content, "RELIC.FISHING_ROD")
+                .filter(|_| fishing);
+            if let Some(rod) = rod {
+                rod.counters[0] = (rod.counters[0] + 1) % 3;
+                if rod.counters[0] == 0 {
                     let cards: Vec<_> = self
                         .run
                         .deck
@@ -7284,15 +7321,12 @@ impl Game {
                 }
             }
             if self.room == Room::Elite
-                && let Some(index) = self
-                    .run
-                    .relics
-                    .iter()
-                    .position(|&id| content.relics[id as usize].id == "RELIC.SWORD_OF_STONE")
+                && let Some(sword) = (self.run.relics.iter_mut())
+                    .find(|relic| content.relics[relic.id as usize].id == "RELIC.SWORD_OF_STONE")
             {
-                self.sword_of_stone += 1;
-                if self.sword_of_stone >= 5 {
-                    self.run.relics[index] = content.relic_id("RELIC.SWORD_OF_JADE").unwrap();
+                sword.counters[0] += 1;
+                if sword.counters[0] >= 5 {
+                    *sword = Relic::new(content.relic_id("RELIC.SWORD_OF_JADE").unwrap());
                 }
             }
             if !self.paels_cards.is_empty() {
@@ -7302,12 +7336,17 @@ impl Game {
                 card.upgrades = card.upgrades.saturating_add(1);
                 self.add_card(content, card);
             }
-            if self.pumpkin_candle > 0 {
-                self.pumpkin_candle -= 1;
+            if let Some(candle) = self.relic_mut(content, "RELIC.PUMPKIN_CANDLE")
+                && candle.counters[0] > 0
+            {
+                candle.counters[0] -= 1;
             }
-            if self.has_relic(content, "RELIC.TOY_BOX") && self.toy_box_combats < 12 {
-                self.toy_box_combats += 1;
-                if self.toy_box_combats.is_multiple_of(3)
+            let toy_box = self
+                .relic_mut(content, "RELIC.TOY_BOX")
+                .filter(|toy_box| toy_box.counters[0] < 12);
+            if let Some(toy_box) = toy_box {
+                toy_box.counters[0] += 1;
+                if toy_box.counters[0] % 3 == 0
                     && let Some(index) = self
                         .wax_relics
                         .iter()
@@ -7316,7 +7355,7 @@ impl Game {
                 {
                     self.melted_relics.push(index);
                     if matches!(
-                        content.relics[self.run.relics[index] as usize].id,
+                        content.relics[self.run.relics[index].id as usize].id,
                         "RELIC.BLESSED_ANTLER"
                             | "RELIC.ECTOPLASM"
                             | "RELIC.PHILOSOPHERS_STONE"

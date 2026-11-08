@@ -20,7 +20,11 @@ fn canonical_progress_matches_route_geometry() {
     ] {
         game.run.act = act;
         game.run.floor = floor;
-        game.golden_compass = compass;
+        let compass = compass.map(|act: u8| Relic {
+            counters: [act as i32 + 1, 0],
+            ..Relic::new(golden_compass() as Id)
+        });
+        game.run.relics = compass.into_iter().collect();
         assert_eq!(canonical_progress(&game), expected);
     }
 }
@@ -34,8 +38,10 @@ fn v44_galactic_dust_block_preview_matches_play() {
         .unwrap();
     game.run
         .relics
-        .push(content.relic_id("RELIC.GALACTIC_DUST").unwrap());
-    game.galactic_dust = 9;
+        .push(Relic::new(content.relic_id("RELIC.GALACTIC_DUST").unwrap()));
+    game.relic_mut(&content, "RELIC.GALACTIC_DUST")
+        .unwrap()
+        .counters[0] = 9;
     let card = Card {
         id: content.card_id("CARD.FALLING_STAR").unwrap(),
         ..Card::default()
@@ -59,7 +65,13 @@ fn v44_galactic_dust_block_preview_matches_play() {
     played.step(&content, action).unwrap();
     assert_eq!(preview.block, 10.0);
     assert_eq!(played.combat().unwrap().player.block as f32, preview.block);
-    assert_eq!(played.galactic_dust, 1);
+    assert_eq!(
+        played
+            .relic(&content, "RELIC.GALACTIC_DUST")
+            .unwrap()
+            .counters[0],
+        1
+    );
 }
 
 #[test]
@@ -250,11 +262,13 @@ fn run_features_are_floor_hp_resources_and_hp_weighted_resources() {
         },
         Card::default(),
     ];
-    game.run.relics = vec![
+    game.run.relics = [
         crate::foundation::COMMON_RELICS[0],
         crate::foundation::UNCOMMON_RELICS[0],
         crate::foundation::RARE_RELICS[0],
-    ];
+    ]
+    .map(Relic::new)
+    .to_vec();
     game.run.potions = vec![
         Some(crate::foundation::UNCOMMON_POTIONS[0]),
         Some(crate::foundation::RARE_POTIONS[0]),
@@ -693,7 +707,7 @@ fn v36_play_draw_and_exhaust_hooks_match_play() {
     game.begin_act(&content, 0).unwrap();
     game.start_combat(&content, content.acts[0].encounters[0])
         .unwrap();
-    game.run.relics = vec![content.relic_id("RELIC.CHARONS_ASHES").unwrap()];
+    game.run.relics = vec![Relic::new(content.relic_id("RELIC.CHARONS_ASHES").unwrap())];
     let card = Card {
         id,
         ..Card::default()
@@ -1032,8 +1046,7 @@ fn v53_path_candidates_reuse_canonical_destination_ids() {
     game.map.current = Some(current);
     game.run
         .relics
-        .push(content.relic_id("RELIC.WINGED_BOOTS").unwrap());
-    game.winged_boots = 0;
+        .push(Relic::new(content.relic_id("RELIC.WINGED_BOOTS").unwrap()));
     let observation = build_observation(&game, &content, layout);
     let paths = (observation.candidates.iter())
         .filter(|row| matches!(row.action, Action::Path(_)))
@@ -1663,10 +1676,12 @@ fn relic_counters_are_numeric_inputs_of_any_size() {
     let layout = Layout::new(&content);
     let mut game = Game::new_character_ascension(&content, 555, 0, 10).unwrap();
     game.begin_act(&content, 0).unwrap();
-    (game.pollinous_core, game.pumpkin_candle) = (25, 300);
     let relics = [("RELIC.POLLINOUS_CORE", 25), ("RELIC.PUMPKIN_CANDLE", 300)]
         .map(|(name, counter)| (content.relic_id(name).unwrap() as u32, counter));
-    game.run.relics.extend(relics.map(|(id, _)| id as Id));
+    game.run.relics.extend(relics.map(|(id, counter)| Relic {
+        counters: [counter, 0],
+        ..Relic::new(id as Id)
+    }));
     let observation = build_observation(&game, &content, layout);
     for (id, counter) in relics {
         let token = (placed(&observation, Place::Relic))
@@ -1684,22 +1699,24 @@ fn wax_relics_encode_queue_progress_and_melted_state() {
     let layout = Layout::new(&content);
     let mut game = Game::new_character_ascension(&content, 555, 0, 10).unwrap();
     game.begin_act(&content, 0).unwrap();
-    let id = content.relic_id("RELIC.HAPPY_FLOWER").unwrap();
-    game.run.relics.push(id);
-    let index = game.run.relics.len() - 1;
-    game.wax_relics.push(index);
-    let wax = |game: &Game| {
+    let [first, second] =
+        ["RELIC.HAPPY_FLOWER", "RELIC.ANCHOR"].map(|name| content.relic_id(name).unwrap());
+    for id in [first, second] {
+        game.run.relics.push(Relic::new(id));
+        game.wax_relics.push(game.run.relics.len() - 1);
+    }
+    let wax = |game: &Game, id: Id| {
         let observation = build_observation(game, &content, layout);
         let token = (placed(&observation, Place::Relic))
             .find(|(_, token)| has(token, layout, Semantic::Relic, id as u32))
             .unwrap()
             .1;
-        (token.f[1], token.f[2])
+        token.f.clone()
     };
-    assert_eq!(wax(&game), (1.0, 0.75));
-    game.toy_box_combats = 3;
-    game.melted_relics.push(index);
-    assert_eq!(wax(&game), (1.0, 1.0));
+    assert_eq!(wax(&game, second), [1.0, 0.0, 0.25]);
+    game.melted_relics.push(game.wax_relics[0]);
+    assert_eq!(wax(&game, first), [1.0, 1.0, 0.0]);
+    assert_eq!(wax(&game, second), [1.0, 0.0, 0.0]);
 }
 
 #[test]
@@ -2206,5 +2223,5 @@ fn traced_state_observations_are_stable() {
         }
     }
     assert_eq!(states, 200);
-    assert_eq!(digest, 5341664509664835271);
+    assert_eq!(digest, 13546217295347668749);
 }

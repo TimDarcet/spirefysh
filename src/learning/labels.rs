@@ -93,6 +93,12 @@ pub(super) fn concept_labels(content: &Content) -> Vec<String> {
                 },
                 n if n == Semantic::Power as usize => content.powers[value].id.to_string(),
                 n if n == Semantic::Relic as usize => content.relics[value].id.to_string(),
+                n if n == Semantic::RelicValue as usize => {
+                    format!("{} second counter", content.relics[value].id)
+                }
+                n if n == Semantic::RelicCombat as usize => {
+                    format!("{} combat state", content.relics[value].id)
+                }
                 n if n == Semantic::Potion as usize => content
                     .potions
                     .get(value)

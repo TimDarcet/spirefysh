@@ -1064,7 +1064,7 @@ fn cooking_uses_a_cancelable_completion() {
     game.phase = Phase::Rest;
     game.run
         .relics
-        .push(content.relic_id("RELIC.MEAT_CLEAVER").unwrap());
+        .push(Relic::new(content.relic_id("RELIC.MEAT_CLEAVER").unwrap()));
     let max_hp = game.run.max_hp;
     game.step(&content, Action::Cook).unwrap();
     assert_eq!(game.run_queue.last(), Some(&RunEffect::FinishCooking));
@@ -1209,12 +1209,14 @@ fn fishing_rod_upgrades_every_third_combat() {
     let mut game = first_combat(&content, 0);
     game.run
         .relics
-        .push(content.relic_id("RELIC.FISHING_ROD").unwrap());
+        .push(Relic::new(content.relic_id("RELIC.FISHING_ROD").unwrap()));
     for card in &mut game.run.deck {
         card.upgrades = 1;
     }
     game.run.deck[0].upgrades = 0;
-    game.fishing_rod = 2;
+    game.relic_mut(&content, "RELIC.FISHING_ROD")
+        .unwrap()
+        .counters[0] = 2;
     let combat = game.combat_mut().unwrap();
     for enemy in &mut combat.enemies {
         enemy.creature.hp = 0;
@@ -1229,7 +1231,10 @@ fn fishing_rod_upgrades_every_third_combat() {
 
     game.finish_combat(&content);
 
-    assert_eq!(game.fishing_rod, 0);
+    assert_eq!(
+        game.relic(&content, "RELIC.FISHING_ROD").unwrap().counters[0],
+        0
+    );
     assert_eq!(game.run.deck[0].upgrades, 1);
     assert!(matches!(game.phase, Phase::Rewards(_)));
 }
@@ -2224,7 +2229,7 @@ fn vambrace_only_doubles_the_first_block_card_of_combat() {
     game.begin_act(&content, 0).unwrap();
     game.run
         .relics
-        .push(content.relic_id("RELIC.VAMBRACE").unwrap());
+        .push(Relic::new(content.relic_id("RELIC.VAMBRACE").unwrap()));
     game.start_combat(&content, content.acts[0].encounters[0])
         .unwrap();
     let defend = card(&content, "CARD.DEFEND_REGENT");
@@ -2364,7 +2369,7 @@ fn mini_regent_triggers_once_each_turn() {
     game.begin_act(&content, 0).unwrap();
     game.run
         .relics
-        .push(content.relic_id("RELIC.MINI_REGENT").unwrap());
+        .push(Relic::new(content.relic_id("RELIC.MINI_REGENT").unwrap()));
     game.start_combat(&content, content.acts[0].encounters[0])
         .unwrap();
     let falling_star = content.card_id("CARD.FALLING_STAR").unwrap();
@@ -2906,7 +2911,11 @@ fn max_energy_is_the_run_energy_through_its_listeners() {
     let player = &mut game.combat_mut().unwrap().player;
     player.add_power(power_id::FRIENDSHIP, 2);
     player.add_power(power_id::WASTE_AWAY, 1);
-    game.pumpkin_candle = 5;
+    let candle = content.relic_id("RELIC.PUMPKIN_CANDLE").unwrap();
+    game.run.relics.push(Relic {
+        counters: [5, 0],
+        ..Relic::new(candle)
+    });
     assert_eq!(game.max_energy(&content), base + 3);
     assert_eq!(game.combat().unwrap().max_energy, base);
 }
@@ -2933,12 +2942,12 @@ fn exhaust_with_feel_no_pain_and_forgotten_soul(relic_at_start: bool) -> Game {
     game.begin_act(&content, 0).unwrap();
     let soul = content.relic_id("RELIC.FORGOTTEN_SOUL").unwrap();
     if relic_at_start {
-        game.run.relics.push(soul);
+        game.run.relics.push(Relic::new(soul));
     }
     game.start_combat(&content, content.acts[0].encounters[0])
         .unwrap();
     if !relic_at_start {
-        game.run.relics.push(soul);
+        game.run.relics.push(Relic::new(soul));
     }
     let feel_no_pain = content
         .powers
@@ -3034,7 +3043,9 @@ fn combat_with_relics(relics: &[&str]) -> Game {
     let mut game = Game::new_character_ascension(&content, 1, 0, 0).unwrap();
     game.begin_act(&content, 0).unwrap();
     for relic in relics {
-        game.run.relics.push(content.relic_id(relic).unwrap());
+        game.run
+            .relics
+            .push(Relic::new(content.relic_id(relic).unwrap()));
     }
     game.start_combat(&content, content.acts[0].encounters[0])
         .unwrap();
@@ -3052,10 +3063,12 @@ fn room_entered_strength_follows_relic_order() {
         let content = foundation_content();
         let mut game = Game::new_character_ascension(&content, 1, 0, 0).unwrap();
         game.begin_act(&content, 0).unwrap();
-        game.girya = 2;
         for relic in ["RELIC.RUINED_HELMET"].iter().chain(&relics) {
-            game.run.relics.push(content.relic_id(relic).unwrap());
+            game.run
+                .relics
+                .push(Relic::new(content.relic_id(relic).unwrap()));
         }
+        game.relic_mut(&content, "RELIC.GIRYA").unwrap().counters[0] = 2;
         game.start_combat(&content, content.acts[0].encounters[0])
             .unwrap();
         assert_eq!(
@@ -3225,7 +3238,8 @@ fn paels_eye_takes_an_extra_turn_before_the_enemies_act() {
     game.step(&content, Action::EndTurn).unwrap();
     let combat = game.combat().unwrap();
     assert_eq!(combat.turn, 2);
-    assert!(combat.paels_eye && !combat.extra_turn && !combat.enemy_turn);
+    assert_eq!(game.relic(&content, "RELIC.PAELS_EYE").unwrap().combat, 1);
+    assert!(!combat.extra_turn && !combat.enemy_turn);
     assert_eq!(combat.player.hp, hp);
     assert_eq!(combat.enemies[0].move_history.len(), moves);
     assert!(combat.exhaust.iter().any(|card| card.instance == 1));
@@ -3237,7 +3251,7 @@ fn turn_start_test(content: &Content, character: Id, powers: &[&str], relics: &[
     game.start_combat(content, content.acts[0].encounters[0])
         .unwrap();
     game.run.relics = (relics.iter())
-        .map(|relic| content.relic_id(relic).unwrap())
+        .map(|relic| Relic::new(content.relic_id(relic).unwrap()))
         .collect();
     let combat = game.combat_mut().unwrap();
     combat.hand.clear();
@@ -3332,7 +3346,9 @@ fn seal_of_gold_and_happy_flower_give_energy_in_relic_order() {
     for _ in 0..2 {
         let mut game = turn_start_test(&content, 1, &[], &order);
         game.run.gold = 7;
-        game.happy_flower = 2;
+        game.relic_mut(&content, "RELIC.HAPPY_FLOWER")
+            .unwrap()
+            .counters[0] = 2;
         game.start_turn();
         game.resolve(&content);
         assert_eq!(game.combat().unwrap().energy, game.max_energy(&content) + 2);
@@ -3348,13 +3364,22 @@ fn paels_legion_and_letter_opener_each_count_their_turn() {
     let mut order = ["RELIC.PAELS_LEGION", "RELIC.LETTER_OPENER"];
     for _ in 0..2 {
         let mut game = turn_start_test(&content, 1, &[], &order);
-        let combat = game.combat_mut().unwrap();
-        combat.paels_legion = 2;
-        combat.letter_opener = 2;
+        game.relic_mut(&content, "RELIC.PAELS_LEGION")
+            .unwrap()
+            .combat = 2;
+        game.relic_mut(&content, "RELIC.LETTER_OPENER")
+            .unwrap()
+            .combat = 2;
         game.start_turn();
         game.resolve(&content);
-        assert_eq!(game.combat().unwrap().paels_legion, 1);
-        assert_eq!(game.combat().unwrap().letter_opener, 0);
+        assert_eq!(
+            game.relic(&content, "RELIC.PAELS_LEGION").unwrap().combat,
+            1
+        );
+        assert_eq!(
+            game.relic(&content, "RELIC.LETTER_OPENER").unwrap().combat,
+            0
+        );
         order.reverse();
     }
 }
@@ -3481,7 +3506,9 @@ fn joss_paper_counts_ethereal_exhausts_after_the_flush() {
     let content = foundation_content();
     let defend = content.card_id("CARD.DEFEND_SILENT").unwrap();
     let mut game = turn_start_test(&content, 1, &[], &["RELIC.JOSS_PAPER"]);
-    game.joss_paper = 4;
+    game.relic_mut(&content, "RELIC.JOSS_PAPER")
+        .unwrap()
+        .counters[0] = 4;
     let combat = game.combat_mut().unwrap();
     combat.hand = vec![Card {
         id: defend,
@@ -3498,7 +3525,8 @@ fn joss_paper_counts_ethereal_exhausts_after_the_flush() {
         .collect();
     combat.enemies[0].creature.hp = 200;
     game.step(&content, Action::EndTurn).unwrap();
-    assert_eq!((game.joss_paper, game.joss_paper_ethereal), (0, 0));
+    let joss = game.relic(&content, "RELIC.JOSS_PAPER").unwrap();
+    assert_eq!((joss.counters[0], joss.combat), (0, 0));
     assert_eq!(game.combat().unwrap().hand.len(), 6);
 }
 
@@ -3510,7 +3538,9 @@ fn exhaust_listeners_resolve_in_listener_order() {
     let mut relics = ["RELIC.JOSS_PAPER", "RELIC.BURNING_STICKS"];
     for _ in 0..2 {
         let mut game = turn_start_test(&content, 0, &["POWER.DARK_EMBRACE_POWER"], &relics);
-        game.joss_paper = 4;
+        game.relic_mut(&content, "RELIC.JOSS_PAPER")
+            .unwrap()
+            .counters[0] = 4;
         let combat = game.combat_mut().unwrap();
         combat.draw = vec![card(&content, "CARD.BASH"), card(&content, "CARD.ANGER")];
         combat.hand = vec![card(&content, "CARD.DEFEND_IRONCLAD")];

@@ -318,6 +318,18 @@ const LISTENERS: &[(Trigger, &[&str])] = &[
     ),
 ];
 
+/// The relics whose combat state lasts one turn.
+const PER_TURN_RELICS: [&str; 8] = [
+    "RELIC.DEMON_TONGUE",
+    "RELIC.MINI_REGENT",
+    "RELIC.MUSIC_BOX",
+    "RELIC.RAINBOW_RING",
+    "RELIC.ORNAMENTAL_FAN",
+    "RELIC.KUNAI",
+    "RELIC.SHURIKEN",
+    "RELIC.KUSARIGAMA",
+];
+
 /// The powers that remember each play's amount in BeforeCardPlayed for its AfterCardPlayed
 /// (`amountsForPlayedCards`), so one applied mid-play doesn't hear that play.
 const RECORDERS: &[&str] = &[
@@ -576,10 +588,17 @@ impl Game {
     /// The player's live relics that hear the pass, in relic order.
     fn relic_listeners(&self, content: &Content, trigger: Trigger) -> Vec<Listener> {
         let relics = (0..self.run.relics.len()).filter(|&i| {
-            let relic = content.relics[self.run.relics[i] as usize];
+            let relic = content.relics[self.run.relics[i].id as usize];
             !self.melted_relics.contains(&i) && listens(trigger, relic.id, relic.hooks)
         });
         relics.map(|i| Listener::Relic(i as u8)).collect()
+    }
+
+    /// Advances a relic's run counter that triggers every `period` counts; whether it triggered.
+    fn tick(&mut self, slot: usize, period: i32) -> bool {
+        let counter = &mut self.run.relics[slot].counters[0];
+        *counter = (*counter + 1) % period;
+        *counter == 0
     }
 
     /// One hook pass, pushed in reverse so the first listener resolves first. Most passes don't
@@ -785,10 +804,15 @@ impl Game {
             ),
             Listener::Relic(i) => (
                 Actor::Player,
-                content.relics[self.run.relics[i as usize] as usize].id,
+                content.relics[self.run.relics[i as usize].id as usize].id,
                 0,
             ),
             Listener::Card(_) => return,
+        };
+        let slot = if let Listener::Relic(i) = listener {
+            i as usize
+        } else {
+            0
         };
         let attack = matches!(hit.kind, DamageKind::Attack);
         let powered = matches!(hit.kind, DamageKind::Attack | DamageKind::Move);
@@ -1005,16 +1029,16 @@ impl Game {
                 self.stun(index, 5);
             }
             (Trigger::AfterDamageReceived, "RELIC.DEMON_TONGUE")
-                if hurt && player_turn && !self.combat().unwrap().demon_tongue =>
+                if hurt && player_turn && self.run.relics[slot].combat == 0 =>
             {
-                self.combat_mut().unwrap().demon_tongue = true;
+                self.run.relics[slot].combat = 1;
                 let player = self.creature_mut(Actor::Player);
                 player.hp = (player.hp + hit.lost).min(player.max_hp);
             }
             (Trigger::AfterDamageReceived, "RELIC.CENTENNIAL_PUZZLE")
-                if hurt && !self.combat().unwrap().centennial_puzzle =>
+                if hurt && self.run.relics[slot].combat == 0 =>
             {
-                self.combat_mut().unwrap().centennial_puzzle = true;
+                self.run.relics[slot].combat = 1;
                 self.combat_mut().unwrap().queue.push(Pending {
                     effect: Effect::Draw(3),
                     context: Context::player(),
@@ -1047,7 +1071,7 @@ impl Game {
         let (owner, power) = match listener {
             Listener::Power(owner, power) => (owner, power),
             Listener::Relic(i) => {
-                let id = content.relics[self.run.relics[i as usize] as usize].id;
+                let id = content.relics[self.run.relics[i as usize].id as usize].id;
                 if id == "RELIC.GREMLIN_HORN" && matches!(dead, Actor::Enemy(_)) {
                     for effect in [Effect::Energy(1), Effect::Draw(1)] {
                         let context = Context::player();
@@ -1263,10 +1287,10 @@ impl Game {
                     // Its exhaust energy goes through GeneratePlayCount: replays and play-count
                     // powers (Duplication, Burst, Echo Form, Throwing Axe) multiply it and are spent.
                     (Trigger::AfterCardExhausted, "CARD.DRUM_OF_BATTLE") => {
-                        let throwing_axe = self.has_relic(content, "RELIC.THROWING_AXE")
-                            && !self.combat().unwrap().throwing_axe;
+                        let axe = (self.relic_mut(content, "RELIC.THROWING_AXE"))
+                            .filter(|axe| axe.combat == 0);
+                        let throwing_axe = axe.map(|axe| axe.combat = 1).is_some();
                         let combat = self.combat_mut().unwrap();
-                        combat.throwing_axe |= throwing_axe;
                         let plays = combat.play_count(content, card, throwing_axe);
                         let energy = if card.upgrades > 0 { 3 } else { 2 };
                         combat.queue.extend((0..plays).map(|_| Pending {
@@ -1295,16 +1319,21 @@ impl Game {
                 return;
             }
             Listener::Relic(i) => {
-                let id = self.run.relics[i as usize];
+                let slot = i as usize;
+                let id = self.run.relics[slot].id;
                 let turn = self.combat().unwrap().turn;
                 let mut effects = Vec::new();
                 match (trigger, content.relics[id as usize].id) {
-                    (Trigger::AfterRoomEntered, "RELIC.EMBER_TEA") if self.ember_tea < 5 => {
-                        self.ember_tea += 1;
+                    (Trigger::AfterRoomEntered, "RELIC.EMBER_TEA")
+                        if self.run.relics[slot].counters[0] < 5 =>
+                    {
+                        self.run.relics[slot].counters[0] += 1;
                         self.apply_power(content, Actor::Player, power_id::STRENGTH, 2);
                     }
-                    (Trigger::AfterRoomEntered, "RELIC.GIRYA") if self.girya > 0 => {
-                        let lifts = self.girya as i16;
+                    (Trigger::AfterRoomEntered, "RELIC.GIRYA")
+                        if self.run.relics[slot].counters[0] > 0 =>
+                    {
+                        let lifts = self.run.relics[slot].counters[0] as i16;
                         self.apply_power(content, Actor::Player, power_id::STRENGTH, lifts);
                     }
                     (Trigger::AfterRoomEntered, "RELIC.GORGET") => {
@@ -1319,7 +1348,7 @@ impl Game {
                         if self.creature(Actor::Player).hp * 2
                             <= self.creature(Actor::Player).max_hp =>
                     {
-                        self.combat_mut().unwrap().red_skull = true;
+                        self.run.relics[slot].combat = 1;
                         self.apply_power(content, Actor::Player, power_id::STRENGTH, 3);
                     }
                     (Trigger::AfterRoomEntered, "RELIC.SLING_OF_COURAGE")
@@ -1352,7 +1381,7 @@ impl Game {
                     (Trigger::BeforeCombatStart, "RELIC.BELT_BUCKLE")
                         if self.run.potions.iter().all(Option::is_none) =>
                     {
-                        self.combat_mut().unwrap().belt_buckle = true;
+                        self.run.relics[slot].combat = 1;
                         self.apply_power(content, Actor::Player, power_id::DEXTERITY, 2);
                     }
                     (Trigger::BeforeCombatStart, "RELIC.DELICATE_FROND") => {
@@ -1375,9 +1404,9 @@ impl Game {
                         self.apply_power(content, Actor::Player, power_id::CONFUSED, 1)
                     }
                     (Trigger::BeforeCombatStart, "RELIC.TEA_OF_DISCOURTESY")
-                        if !self.tea_of_discourtesy =>
+                        if self.run.relics[slot].counters[0] == 0 =>
                     {
-                        self.tea_of_discourtesy = true;
+                        self.run.relics[slot].counters[0] = 1;
                         for _ in 0..2 {
                             let dazed = Card {
                                 id: card_id::DAZED,
@@ -1387,7 +1416,7 @@ impl Game {
                         }
                     }
                     (Trigger::BeforeSideTurnStart, "RELIC.POLLINOUS_CORE") => {
-                        self.pollinous_core += 1
+                        self.run.relics[slot].counters[0] += 1
                     }
                     // Two 0-cost draw-pile cards to the hand: a StableShuffle of the pile listed from
                     // its top.
@@ -1427,10 +1456,17 @@ impl Game {
                     }
                     (
                         Trigger::AfterEnergyReset,
-                        "RELIC.VENERABLE_TEA_SET" | "RELIC.FAKE_VENERABLE_TEA_SET",
+                        relic @ ("RELIC.VENERABLE_TEA_SET" | "RELIC.FAKE_VENERABLE_TEA_SET"),
                     ) => {
-                        let energy = std::mem::take(&mut self.tea_set) as i16;
-                        self.gain_energy(energy);
+                        let brewed = std::mem::take(&mut self.run.relics[slot].counters[0]) as i16;
+                        self.gain_energy(
+                            brewed
+                                * if relic == "RELIC.VENERABLE_TEA_SET" {
+                                    2
+                                } else {
+                                    1
+                                },
+                        );
                     }
                     (Trigger::AfterEnergyReset, "RELIC.ART_OF_WAR")
                         if turn > 1 && self.combat().unwrap().last_turn.attacks == 0 =>
@@ -1500,8 +1536,7 @@ impl Game {
                         effects.push(Effect::PassiveAll)
                     }
                     (Trigger::AfterPlayerTurnStart, "RELIC.PENDULUM") => {
-                        self.pendulum = (self.pendulum + 1) % 3;
-                        if self.pendulum == 0 {
+                        if self.tick(slot, 3) {
                             effects.push(Effect::Draw(1));
                         }
                     }
@@ -1531,9 +1566,9 @@ impl Game {
                         effects.push(Effect::Heal(Target::Player, Amount::fixed(heal, heal)))
                     }
                     (Trigger::AfterSideTurnStart, "RELIC.BONE_TEA")
-                        if turn == 1 && !self.bone_tea =>
+                        if turn == 1 && self.run.relics[slot].counters[0] == 0 =>
                     {
-                        self.bone_tea = true;
+                        self.run.relics[slot].counters[0] = 1;
                         effects.push(Effect::Upgrade(Pile::Hand, u8::MAX, false));
                     }
                     (Trigger::AfterSideTurnStart, "RELIC.CROSSBOW") => {
@@ -1583,27 +1618,25 @@ impl Game {
                         effects.push(Effect::Energy(-2))
                     }
                     (Trigger::AfterSideTurnStart, "RELIC.PAELS_LEGION") => {
-                        let combat = self.combat_mut().unwrap();
-                        combat.paels_legion = combat.paels_legion.saturating_sub(1);
+                        let legion = &mut self.run.relics[slot].combat;
+                        *legion = (*legion - 1).max(0);
                     }
                     (Trigger::AfterSideTurnStart, "RELIC.LETTER_OPENER") if turn > 1 => {
-                        self.combat_mut().unwrap().letter_opener = 0
+                        self.run.relics[slot].combat = 0
                     }
                     (Trigger::AfterSideTurnStart, "RELIC.HAPPY_FLOWER") => {
-                        self.happy_flower = (self.happy_flower + 1) % 3;
-                        if self.happy_flower == 0 {
+                        if self.tick(slot, 3) {
                             effects.push(Effect::Energy(1));
                         }
                     }
                     (Trigger::AfterSideTurnStart, "RELIC.FAKE_HAPPY_FLOWER") => {
-                        self.fake_happy_flower = (self.fake_happy_flower + 1) % 5;
-                        if self.fake_happy_flower == 0 {
+                        if self.tick(slot, 5) {
                             effects.push(Effect::Energy(1));
                         }
                     }
                     (Trigger::BeforeSideTurnEnd, "RELIC.PAELS_TEARS") => {
                         let energy = self.combat().unwrap().energy;
-                        self.combat_mut().unwrap().paels_tears = energy > 0;
+                        self.run.relics[slot].combat = (energy > 0) as i32;
                     }
                     // Orichalcum notes whether the player has no block.
                     (
@@ -1611,15 +1644,15 @@ impl Game {
                         "RELIC.ORICHALCUM" | "RELIC.FAKE_ORICHALCUM",
                     ) => {
                         let block = self.creature(Actor::Player).block;
-                        self.combat_mut().unwrap().orichalcum = block == 0;
+                        self.run.relics[slot].combat = (block == 0) as i32;
                     }
                     (Trigger::BeforeSideTurnEnd, "RELIC.ORICHALCUM")
-                        if self.combat().unwrap().orichalcum =>
+                        if self.run.relics[slot].combat != 0 =>
                     {
                         self.gain_block(content, Actor::Player, 6, None, false);
                     }
                     (Trigger::BeforeSideTurnEnd, "RELIC.FAKE_ORICHALCUM")
-                        if self.combat().unwrap().orichalcum =>
+                        if self.run.relics[slot].combat != 0 =>
                     {
                         self.gain_block(content, Actor::Player, 3, None, false);
                     }
@@ -1642,7 +1675,7 @@ impl Game {
                         effects.push(Effect::Damage(Target::AllEnemies, Amount::fixed(52, 52)))
                     }
                     (Trigger::AfterSideTurnStart, "RELIC.PAELS_TEARS")
-                        if self.combat().unwrap().paels_tears =>
+                        if self.run.relics[slot].combat != 0 =>
                     {
                         effects.push(Effect::Energy(2))
                     }
@@ -1705,8 +1738,9 @@ impl Game {
                         }
                     }
                     (Trigger::AfterSideTurnEnd, "RELIC.JOSS_PAPER") => {
-                        let total = self.joss_paper + std::mem::take(&mut self.joss_paper_ethereal);
-                        self.joss_paper = total % 5;
+                        let joss = &mut self.run.relics[slot];
+                        let total = joss.counters[0] + std::mem::take(&mut joss.combat);
+                        joss.counters[0] = total % 5;
                         if total >= 5 {
                             let draws = (total / 5) as i16;
                             effects.push(Effect::DrawAmount(Amount::fixed(draws, draws)));
@@ -1721,16 +1755,15 @@ impl Game {
                         effects.push(Effect::Damage(Target::RandomEnemy, Amount::fixed(6, 6)))
                     }
                     (Trigger::AfterCardExhausted, "RELIC.JOSS_PAPER") if context.ethereal => {
-                        self.joss_paper_ethereal += 1
+                        self.run.relics[slot].combat += 1
                     }
                     (Trigger::AfterCardExhausted, "RELIC.JOSS_PAPER") => {
-                        self.joss_paper = (self.joss_paper + 1) % 5;
-                        if self.joss_paper == 0 {
+                        if self.tick(slot, 5) {
                             effects.push(Effect::Draw(1));
                         }
                     }
                     (Trigger::AfterCardExhausted, "RELIC.BURNING_STICKS")
-                        if !self.combat().unwrap().burning_sticks =>
+                        if self.run.relics[slot].combat == 0 =>
                     {
                         let combat = self.combat().unwrap();
                         let card = (combat.exhaust.iter())
@@ -1742,7 +1775,7 @@ impl Game {
                         if let Some(card) = card.filter(|card| {
                             card.card_type(content.cards[card.id as usize]) == CardType::Skill
                         }) {
-                            self.combat_mut().unwrap().burning_sticks = true;
+                            self.run.relics[slot].combat = 1;
                             self.add_generated(
                                 content,
                                 Pile::Hand,
@@ -1755,9 +1788,9 @@ impl Game {
                     }
                     (Trigger::AfterPotionUsed, "RELIC.BELT_BUCKLE")
                         if self.run.potions.iter().all(Option::is_none)
-                            && !self.combat().unwrap().belt_buckle =>
+                            && self.run.relics[slot].combat == 0 =>
                     {
-                        self.combat_mut().unwrap().belt_buckle = true;
+                        self.run.relics[slot].combat = 1;
                         effects.push(Effect::ApplyPower(
                             Target::Player,
                             power_id::DEXTERITY,
@@ -1777,11 +1810,11 @@ impl Game {
                     (Trigger::BeforeCardPlayed, "RELIC.PEN_NIB")
                         if self.playing(content, CardType::Attack) =>
                     {
-                        self.pen_nib = (self.pen_nib + 1) % 10
+                        self.tick(slot, 10);
                     }
                     (Trigger::BeforeCardPlayed, "RELIC.MUSIC_BOX")
                         if self.playing(content, CardType::Attack)
-                            && !self.combat().unwrap().music_box
+                            && self.run.relics[slot].combat == 0
                             && self.combat().unwrap().music_box_card.is_none() =>
                     {
                         let combat = self.combat_mut().unwrap();
@@ -1792,9 +1825,8 @@ impl Game {
                         if context.card.is_some()
                             && self.combat().unwrap().unsettling_lamp == context.card =>
                     {
-                        let combat = self.combat_mut().unwrap();
-                        combat.unsettling_lamp = None;
-                        combat.unsettling_used = true;
+                        self.combat_mut().unwrap().unsettling_lamp = None;
+                        self.run.relics[slot].combat = 1;
                     }
                     // It copies its attack as the play left it so far (after Razor Tooth's
                     // upgrade if that relic comes first).
@@ -1802,9 +1834,8 @@ impl Game {
                         if context.subject.is_some()
                             && self.combat().unwrap().music_box_card == context.subject =>
                     {
-                        let combat = self.combat_mut().unwrap();
-                        combat.music_box = true;
-                        combat.music_box_card = None;
+                        self.run.relics[slot].combat = 1;
+                        self.combat_mut().unwrap().music_box_card = None;
                         if let Some(&mut card) = self.played_mut(context.subject.unwrap()) {
                             let copy = Card {
                                 instance: 0,
@@ -1835,45 +1866,42 @@ impl Game {
                         self.apply_power(content, Actor::Player, power_id::HELICAL_DART, 1);
                     }
                     (Trigger::AttackPlayed, "RELIC.NUNCHAKU") => {
-                        self.nunchaku = (self.nunchaku + 1) % 10;
-                        if self.nunchaku == 0 {
+                        if self.tick(slot, 10) {
                             self.gain_energy(1);
                         }
                     }
                     (Trigger::SkillPlayed, "RELIC.LETTER_OPENER") => {
-                        let combat = self.combat_mut().unwrap();
-                        combat.letter_opener = (combat.letter_opener + 1) % 3;
-                        if combat.letter_opener == 0 {
+                        let opener = &mut self.run.relics[slot].combat;
+                        *opener = (*opener + 1) % 3;
+                        if *opener == 0 {
                             effects.push(Effect::Damage(Target::AllEnemies, Amount::fixed(5, 5)));
                         }
                     }
                     (_, "RELIC.IRON_CLUB") => {
-                        self.iron_club = (self.iron_club + 1) % 4;
-                        if self.iron_club == 0 {
+                        if self.tick(slot, 4) {
                             effects.push(Effect::Draw(1));
                         }
                     }
                     (Trigger::SkillPlayed, "RELIC.TUNING_FORK") => {
-                        self.tuning_fork = (self.tuning_fork + 1) % 10;
-                        if self.tuning_fork == 0 {
+                        if self.tick(slot, 10) {
                             self.gain_block(content, Actor::Player, 7, None, false);
                         }
                     }
                     // Once per turn, after an attack, a skill and a power have all finished.
                     (_, "RELIC.RAINBOW_RING")
-                        if !self.combat().unwrap().rainbow_ring
+                        if self.run.relics[slot].combat == 0
                             && [CardType::Attack, CardType::Skill, CardType::Power]
                                 .into_iter()
                                 .all(|kind| self.played_this_turn(content, kind) > 0) =>
                     {
-                        self.combat_mut().unwrap().rainbow_ring = true;
+                        self.run.relics[slot].combat = 1;
                         self.apply_power(content, Actor::Player, power_id::STRENGTH, 1);
                         self.apply_power(content, Actor::Player, power_id::DEXTERITY, 1);
                     }
                     (Trigger::PowerPlayed, "RELIC.PERMAFROST")
-                        if !self.combat().unwrap().permafrost =>
+                        if self.run.relics[slot].combat == 0 =>
                     {
-                        self.combat_mut().unwrap().permafrost = true;
+                        self.run.relics[slot].combat = 1;
                         self.gain_block(content, Actor::Player, 7, None, false);
                     }
                     (Trigger::BeforeCombatStartLate, "RELIC.PETRIFIED_TOAD")
@@ -2494,8 +2522,8 @@ impl Game {
     /// Pael's Eye: no card played by hand this turn (Whispering Earring plays turn 1's).
     fn takes_extra_turn(&self, content: &Content) -> bool {
         let combat = self.combat().unwrap();
-        self.has_relic(content, "RELIC.PAELS_EYE")
-            && !combat.paels_eye
+        self.relic(content, "RELIC.PAELS_EYE")
+            .is_some_and(|eye| eye.combat == 0)
             && combat.history.manual_cards == 0
             && !(combat.turn == 1 && self.has_relic(content, "RELIC.WHISPERING_EARRING"))
     }
@@ -2534,16 +2562,16 @@ impl Game {
         }
         match step {
             Step::TurnStart => {
+                for relic in &mut self.run.relics {
+                    if PER_TURN_RELICS.contains(&content.relics[relic.id as usize].id) {
+                        relic.combat = 0;
+                    }
+                }
                 let history_course = self.has_relic(content, "RELIC.HISTORY_COURSE");
                 let combat = self.combat_mut().unwrap();
                 combat.setup = true;
                 combat.turn += 1;
-                combat.demon_tongue = false;
-                combat.mini_regent = false;
-                combat.music_box = false;
                 combat.music_box_card = None;
-                combat.rainbow_ring = false;
-                combat.attacks_mod3 = 0;
                 combat.bound_this_turn = 0;
                 for pile in [
                     &mut combat.draw,
@@ -2635,9 +2663,11 @@ impl Game {
                 if turn > 1 && last_cards <= 3 {
                     count += 3 * relics("RELIC.POCKETWATCH");
                 }
-                if self.pollinous_core == 4 {
+                if let Some(core) = self.relic_mut(content, "RELIC.POLLINOUS_CORE")
+                    && core.counters[0] == 4
+                {
                     count += 2;
-                    self.pollinous_core = 0;
+                    core.counters[0] = 0;
                 }
                 self.creature_mut(Actor::Player)
                     .powers
@@ -2851,9 +2881,8 @@ impl Game {
             // An extra turn (Pael's Eye: ShouldTakeExtraTurn, then AfterTakingExtraTurn) or the
             // enemy side's turn.
             Step::SwitchSide if self.takes_extra_turn(content) => {
-                let combat = self.combat_mut().unwrap();
-                combat.paels_eye = true;
-                combat.extra_turn = true;
+                self.relic_mut(content, "RELIC.PAELS_EYE").unwrap().combat = 1;
+                self.combat_mut().unwrap().extra_turn = true;
                 self.start_turn();
             }
             Step::SwitchSide => {

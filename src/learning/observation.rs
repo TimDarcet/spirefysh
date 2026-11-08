@@ -190,8 +190,8 @@ const DOMAINS: [(&str, usize, &[&str]); 22] = [
     ("move", 1, &[]),
     (
         "relic",
-        2,
-        &["Silver Crucible treasures ÷ 10", "wax", "wax melt rank ÷ 4"],
+        4,
+        &["wax", "melted", "wax relics melting first ÷ 4"],
     ),
     ("potion", 1, &[]),
     ("orb", 4, &[]),
@@ -384,6 +384,8 @@ enum Semantic {
     Power,
     PowerValue,
     Relic,
+    RelicValue,
+    RelicCombat,
     Potion,
     Enemy,
     EnemyMove,
@@ -449,6 +451,8 @@ const SEMANTIC_NAMES: [&str; Semantic::Count as usize] = [
     "power",
     "power_value",
     "relic",
+    "relic_value",
+    "relic_combat",
     "potion",
     "enemy",
     "enemy_move",
@@ -680,6 +684,8 @@ impl Layout {
             (Semantic::Power, content.powers.len()),
             (Semantic::PowerValue, content.powers.len()),
             (Semantic::Relic, content.relics.len()),
+            (Semantic::RelicValue, content.relics.len()),
+            (Semantic::RelicCombat, content.relics.len()),
             (Semantic::Potion, content.potions.len() + 1),
             (Semantic::Enemy, content.enemies.len()),
             (
@@ -1204,8 +1210,8 @@ impl<'a> Items<'a> {
                 match listener {
                     Listener::Power(_, power) => t.code(layout, Semantic::Power, power.id as u32),
                     Listener::Relic(slot) => {
-                        if let Some(&id) = game.run.relics.get(slot as usize) {
-                            t.code(layout, Semantic::Relic, id as u32);
+                        if let Some(relic) = game.run.relics.get(slot as usize) {
+                            t.code(layout, Semantic::Relic, relic.id as u32);
                         }
                     }
                     Listener::Card(listener) => card(t, listener.id),
@@ -1767,14 +1773,14 @@ impl<'a> Items<'a> {
         if content.events[id as usize].id == "EVENT.RANWID_THE_ELDER"
             && index == 2
             && let Some(&owned) = game.event_cards.first()
-            && let Some(&relic) = game.run.relics.get(owned as usize)
+            && let Some(relic) = game.run.relics.get(owned as usize)
         {
-            self.relic(relic);
+            self.relic(relic.id);
         }
         if Some(id) == layout.relic_trader {
             let offered = game.relic_queue.get(index).copied();
             let traded = (game.event_cards.get(index))
-                .and_then(|&owned| game.run.relics.get(owned as usize).copied());
+                .and_then(|&owned| game.run.relics.get(owned as usize).map(|relic| relic.id));
             for relic in [offered, traded].into_iter().flatten() {
                 self.relic(relic);
             }
@@ -2003,18 +2009,34 @@ impl Encoder<'_> {
     fn collections(&mut self) {
         let Ctx { game, content, layout, .. } = self.ctx;
         let mut paels = NONE;
-        for (order, &id) in game.run.relics.iter().enumerate() {
+        for (order, relic) in game.run.relics.iter().enumerate() {
             let mut token = Token::new(RELIC_DOMAIN, Place::Relic, NONE);
-            let state = relic_state(game, content, id);
-            token.amount(layout, Semantic::Relic, id as u32, state[0].round() / 10.0);
+            let id = relic.id as u32;
+            token.amount(layout, Semantic::Relic, id, relic.counters[0] as f32 / 10.0);
+            if relic.counters[1] != 0 {
+                token.amount(
+                    layout,
+                    Semantic::RelicValue,
+                    id,
+                    relic.counters[1] as f32 / 10.0,
+                );
+            }
+            if game.combat().is_some() && relic.combat != 0 {
+                token.amount(
+                    layout,
+                    Semantic::RelicCombat,
+                    id,
+                    relic.combat as f32 / 10.0,
+                );
+            }
             token.code(layout, Semantic::RelicPosition, order.min(256) as u32);
             if let Some(position) = game.wax_relics.iter().position(|&wax| wax == order) {
-                let rank = (3 + game.toy_box_combats / 3).saturating_sub(position as u8).min(4);
-                token.f[1..].copy_from_slice(&[1.0, rank as f32 / 4.0]);
+                let melted = |wax: &usize| game.melted_relics.contains(wax);
+                let ahead = game.wax_relics[..position].iter().filter(|wax| !melted(wax)).count();
+                token.f.copy_from_slice(&[1.0, melted(&order) as u8 as f32, ahead as f32 / 4.0]);
             }
-            token.f[0] = state[1].round() / 10.0;
             let index = self.push(token);
-            if id as u32 == paels_tooth() {
+            if id == paels_tooth() {
                 paels = index;
             }
         }
@@ -2518,7 +2540,11 @@ fn canonical_progress(game: &Game) -> u8 {
     let floor = game.run.floor;
     let progress = match game.run.act {
         0 | 1 => floor,
-        2 if game.golden_compass == Some(2) => 25 + floor,
+        2 if (game.run.relics.iter())
+            .any(|relic| relic.id as u32 == golden_compass() && relic.counters[0] == 3) =>
+        {
+            25 + floor
+        }
         2 => 25 + floor + u8::from(floor >= 7) + u8::from(floor >= 10),
         3 => 54 + floor,
         act => panic!("invalid canonical-progress act {act}"),
@@ -2608,7 +2634,7 @@ fn public_relic_bag(game: &Game, layout: Layout) -> Vec<Vec<Id>> {
         hidden.sort_unstable();
         hidden.dedup();
         for id in hidden {
-            if game.run.relics.contains(&id) {
+            if game.run.relics.iter().any(|relic| relic.id == id) {
                 continue;
             }
             if let Some(rarity) = crate::game::relic_group(id)
@@ -2655,81 +2681,6 @@ fn public_encounters(game: &Game, content: &Content, elite: bool) -> Vec<Id> {
     let refill = start + (visited - start) / pool.len() * pool.len();
     pool.retain(|id| !list[refill..visited].contains(id));
     pool
-}
-
-fn relic_state(game: &Game, content: &Content, id: Id) -> [f32; 2] {
-    let combat = game.combat();
-    let flag = |value: bool| value as u8 as f32;
-    match content.relics[id as usize].id {
-        "RELIC.HAPPY_FLOWER" => [game.happy_flower as f32, 0.0],
-        "RELIC.FAKE_HAPPY_FLOWER" => [game.fake_happy_flower as f32, 0.0],
-        "RELIC.VENERABLE_TEA_SET" => [(game.tea_set / 2 * 2) as f32, 0.0],
-        "RELIC.FAKE_VENERABLE_TEA_SET" => [(game.tea_set % 2) as f32, 0.0],
-        "RELIC.LASTING_CANDY" => [(game.lasting_candy % 2) as f32, 0.0],
-        "RELIC.PAELS_WING" => [(game.paels_wing % 2) as f32, 0.0],
-        "RELIC.SILVER_CRUCIBLE" => [
-            3u8.saturating_sub(game.silver_crucible) as f32,
-            1u8.saturating_sub(game.silver_treasures) as f32,
-        ],
-        "RELIC.WINGED_BOOTS" => [3u8.saturating_sub(game.winged_boots) as f32, 0.0],
-        "RELIC.GIRYA" => [game.girya as f32, 0.0],
-        "RELIC.PUMPKIN_CANDLE" => [game.pumpkin_candle as f32, 0.0],
-        "RELIC.TOY_BOX" => [(game.toy_box_combats % 3) as f32, 0.0],
-        "RELIC.NUNCHAKU" => [game.nunchaku as f32, 0.0],
-        "RELIC.PENDULUM" => [game.pendulum as f32, 0.0],
-        "RELIC.PEN_NIB" => [game.pen_nib as f32, 0.0],
-        "RELIC.IRON_CLUB" => [game.iron_club as f32, 0.0],
-        "RELIC.JOSS_PAPER" => [game.joss_paper as f32, 0.0],
-        "RELIC.TUNING_FORK" => [game.tuning_fork as f32, 0.0],
-        "RELIC.GALACTIC_DUST" => [game.galactic_dust as f32, 0.0],
-        "RELIC.BOOK_OF_FIVE_RINGS" => [game.book_of_five_rings as f32, 0.0],
-        "RELIC.EMBER_TEA" => [game.ember_tea as f32, 0.0],
-        "RELIC.SWORD_OF_STONE" => [game.sword_of_stone as f32, 0.0],
-        "RELIC.MAW_BANK" => [flag(game.maw_bank > 0), 0.0],
-        "RELIC.LIZARD_TAIL" => [flag(game.lizard_tail), 0.0],
-        "RELIC.SILKEN_TRESS" => [flag(game.silken_tress), 0.0],
-        "RELIC.BONE_TEA" => [flag(game.bone_tea), 0.0],
-        "RELIC.TEA_OF_DISCOURTESY" => [flag(game.tea_of_discourtesy), 0.0],
-        "RELIC.WONGOS_MYSTERY_TICKET" => [
-            game.wongo_combats
-                .map_or(0, |combats| 5u8.saturating_sub(combats)) as f32,
-            0.0,
-        ],
-        "RELIC.GOLDEN_COMPASS" => [flag(game.golden_compass == Some(game.run.act)), 0.0],
-        "RELIC.MEAT_CLEAVER" | "RELIC.NEOWS_BONES" | "RELIC.ASTROLABE" => [0.0; 2],
-        "RELIC.FISHING_ROD" => [game.fishing_rod as f32, 0.0],
-        "RELIC.POLLINOUS_CORE" => [game.pollinous_core as f32, 0.0],
-        "RELIC.PAELS_TOOTH" => [0.0; 2],
-        "RELIC.PAELS_TEARS" => [flag(combat.is_some_and(|combat| combat.paels_tears)), 0.0],
-        "RELIC.CENTENNIAL_PUZZLE" => [
-            flag(combat.is_some_and(|combat| combat.centennial_puzzle)),
-            0.0,
-        ],
-        "RELIC.DEMON_TONGUE" => [flag(combat.is_some_and(|combat| combat.demon_tongue)), 0.0],
-        "RELIC.PERMAFROST" => [flag(combat.is_some_and(|combat| combat.permafrost)), 0.0],
-        "RELIC.RUINED_HELMET" => [flag(combat.is_some_and(|combat| combat.ruined_helmet)), 0.0],
-        "RELIC.MUSIC_BOX" => [flag(combat.is_some_and(|combat| combat.music_box)), 0.0],
-        "RELIC.MINI_REGENT" => [flag(combat.is_some_and(|combat| combat.mini_regent)), 0.0],
-        "RELIC.RAINBOW_RING" => [flag(combat.is_some_and(|combat| combat.rainbow_ring)), 0.0],
-        "RELIC.KUSARIGAMA" => [combat.map_or(0, |combat| combat.attacks_mod3) as f32, 0.0],
-        "RELIC.UNSETTLING_LAMP" => [
-            flag(combat.is_some_and(|combat| combat.unsettling_used)),
-            0.0,
-        ],
-        "RELIC.DIAMOND_DIADEM" => [
-            flag(combat.is_some_and(|combat| combat.player.power(power_id::DIAMOND_DIADEM) > 0)),
-            0.0,
-        ],
-        "RELIC.BURNING_STICKS" => [
-            flag(combat.is_some_and(|combat| combat.burning_sticks)),
-            0.0,
-        ],
-        "RELIC.THROWING_AXE" => [flag(combat.is_some_and(|combat| combat.throwing_axe)), 0.0],
-        "RELIC.PAELS_EYE" => [flag(combat.is_some_and(|combat| combat.paels_eye)), 0.0],
-        "RELIC.PAELS_LEGION" => [combat.map_or(0, |combat| combat.paels_legion) as f32, 0.0],
-        "RELIC.BELT_BUCKLE" => [flag(combat.is_some_and(|combat| combat.belt_buckle)), 0.0],
-        _ => [0.0; 2],
-    }
 }
 
 fn candidate_actions(game: &Game, content: &Content) -> (Vec<Action>, Vec<bool>) {
@@ -2936,7 +2887,7 @@ fn resample_hidden(game: &mut Game, content: &Content, seed: u64) {
     hidden_relics.sort_unstable();
     hidden_relics.dedup();
     for relic in hidden_relics {
-        if game.run.relics.contains(&relic) {
+        if game.run.relics.iter().any(|owned| owned.id == relic) {
             continue;
         }
         let Some(rarity) = crate::game::relic_group(relic) else {
@@ -3051,11 +3002,11 @@ fn run_features(game: &Game, content: &Content) -> Vec<f32> {
         deck.len() as f32,
         relics
             .iter()
-            .filter(|&&id| crate::game::relic_group(id) == Some(1))
+            .filter(|relic| crate::game::relic_group(relic.id) == Some(1))
             .count() as f32,
         relics
             .iter()
-            .filter(|&&id| crate::game::relic_group(id) == Some(2))
+            .filter(|relic| crate::game::relic_group(relic.id) == Some(2))
             .count() as f32,
         game.run
             .potions
@@ -3157,6 +3108,16 @@ pub(crate) fn paels_tooth() -> u32 {
     static ID: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
         crate::foundation_content()
             .relic_id("RELIC.PAELS_TOOTH")
+            .unwrap() as u32
+    });
+    *ID
+}
+
+/// Golden Compass's relic id: it counts the act whose map it replaced, plus one.
+fn golden_compass() -> u32 {
+    static ID: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+        crate::foundation_content()
+            .relic_id("RELIC.GOLDEN_COMPASS")
             .unwrap() as u32
     });
     *ID
